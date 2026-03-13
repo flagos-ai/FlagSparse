@@ -1,6 +1,6 @@
 """
-SpMV tests: load SuiteSparse .mtx, batch run, output error and performance.
-Supports: multi .mtx files, value_dtype / index_dtype, --csv to run all dtypes and export CSV.
+SpMV tests (CSR): load SuiteSparse .mtx, batch run, output error and performance.
+Supports: multi .mtx files, value_dtype / index_dtype, --csv-csr to run all dtypes and export CSV.
 """
 import argparse
 import csv
@@ -310,6 +310,9 @@ def run_all_dtypes_export_csv(paths, csv_path, warmup=10, iters=50, run_cusparse
                 iters=iters,
                 run_cusparse=run_cusparse,
             )
+            # 同时把每组 dtype/index 的表格打印出来，方便直接查看过程。
+            print("=" * 120)
+            print_mtx_results(results, value_dtype, index_dtype)
             for r in results:
                 n_rows, n_cols = r["shape"]
                 rows.append({
@@ -440,11 +443,11 @@ def main():
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
     parser.add_argument("--no-cusparse", action="store_true", help="Skip cuSPARSE baseline")
     parser.add_argument(
-        "--csv",
+        "--csv-csr",
         type=str,
         default=None,
         metavar="FILE",
-        help="Run all value_dtype x index_dtype on all .mtx and write results to CSV",
+        help="Run all value_dtype x index_dtype on all .mtx (CSR) and write results to CSV",
     )
     args = parser.parse_args()
     dtype_map = {
@@ -467,24 +470,24 @@ def main():
             paths.append(p)
         elif os.path.isdir(p):
             paths.extend(sorted(glob.glob(os.path.join(p, "*.mtx"))))
-    if not paths and not args.csv:
+    if not paths and not args.csv_csr:
         print("No .mtx files given. Use: python test_spmv.py <file.mtx> [file2.mtx ...] or <dir/>")
         print("Or run synthetic: python test_spmv.py --synthetic")
-        print("Or run all dtypes and export CSV: python test_spmv.py <dir/> --csv results.csv")
+        print("Or run all dtypes and export CSR CSV: python test_spmv.py <dir/> --csv-csr results.csv")
         return
-    if args.csv is not None:
+    if args.csv_csr is not None:
         if not paths:
             paths = sorted(glob.glob("*.mtx"))
         if not paths:
             print("No .mtx files found. Specify files or a directory.")
             return
         print("=" * 80)
-        print("FLAGSPARSE SpMV — all dtypes, export to CSV")
+        print("FLAGSPARSE SpMV (CSR) — all dtypes, export to CSV")
         print("=" * 80)
-        print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {args.csv}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {args.csv_csr}")
         run_all_dtypes_export_csv(
             paths,
-            args.csv,
+            args.csv_csr,
             warmup=args.warmup,
             iters=args.iters,
             run_cusparse=not args.no_cusparse,

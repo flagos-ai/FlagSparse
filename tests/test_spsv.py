@@ -338,6 +338,15 @@ def run_all_dtypes_spsv_csv(mtx_paths, csv_path):
     rows_out = []
     for value_dtype in VALUE_DTYPES:
         for index_dtype in INDEX_DTYPES:
+            print("=" * 110)
+            print(f"SpSV CSV export — value_dtype: {_dtype_name(value_dtype)}  index_dtype: {_dtype_name(index_dtype)}")
+            print("=" * 110)
+            print(
+                f"{'Matrix':<28} {'N':>6} {'NNZ':>10} "
+                f"{'FS(ms)':>10} {'PT(ms)':>10} {'CU(ms)':>10} "
+                f"{'FS/PT':>8} {'FS/CU':>8} {'Err(PT)':>12} {'Err(CU)':>12}"
+            )
+            print("-" * 110)
             for path in mtx_paths:
                 try:
                     data, indices, indptr, shape = _load_mtx_to_csr_torch(
@@ -429,6 +438,14 @@ def run_all_dtypes_spsv_csv(mtx_paths, csv_path):
                             "err_vs_cupy": err_cu,
                         }
                     )
+                    name = os.path.basename(path)
+                    fs_vs_pt_s = f"{fs_vs_pt:.2f}x" if fs_vs_pt is not None else "N/A"
+                    fs_vs_cu_s = f"{fs_vs_cu:.2f}x" if fs_vs_cu is not None else "N/A"
+                    print(
+                        f"{name:<28} {n_rows:>6} {int(data.numel()):>10} "
+                        f"{_fmt_ms(t_ms):>10} {_fmt_ms(pytorch_ms):>10} {_fmt_ms(cupy_ms):>10} "
+                        f"{fs_vs_pt_s:>8} {fs_vs_cu_s:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
+                    )
                 except Exception as e:
                     rows_out.append(
                         {
@@ -481,11 +498,11 @@ def main():
         "--synthetic", action="store_true", help="Run synthetic triangular tests"
     )
     parser.add_argument(
-        "--csv-spsv",
+        "--csv-csr",
         type=str,
         default=None,
         metavar="FILE",
-        help="Run all dtypes/index_dtypes on given .mtx and export SpSV results to CSV",
+        help="Run all dtypes/index_dtypes on given .mtx (CSR SpSV) and export results to CSV",
     )
     args = parser.parse_args()
 
@@ -499,16 +516,16 @@ def main():
             paths.append(p)
         elif os.path.isdir(p):
             paths.extend(sorted(glob.glob(os.path.join(p, "*.mtx"))))
-    if args.csv_spsv:
+    if args.csv_csr:
         if not paths:
             paths = sorted(glob.glob("*.mtx"))
         if not paths:
-            print("No .mtx files found for --csv-spsv")
+            print("No .mtx files found for --csv-csr")
             return
-        run_all_dtypes_spsv_csv(paths, args.csv_spsv)
+        run_all_dtypes_spsv_csv(paths, args.csv_csr)
         return
 
-    print("Use --synthetic or --csv-spsv to run SpSV tests.")
+    print("Use --synthetic or --csv-csr to run SpSV CSR tests.")
 
 
 if __name__ == "__main__":

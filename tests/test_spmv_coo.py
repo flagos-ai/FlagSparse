@@ -187,6 +187,15 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
     device = torch.device("cuda")
     rows_out = []
     for dtype in VALUE_DTYPES:
+        print("=" * 110)
+        print(f"COO SpMV CSV export — dtype: {_dtype_name(dtype)}")
+        print("=" * 110)
+        print(
+            f"{'Matrix':<32} {'M':>6} {'N':>6} {'NNZ':>10} "
+            f"{'FS(ms)':>10} {'PT(ms)':>10} {'CU(ms)':>10} "
+            f"{'FS/PT':>8} {'FS/CU':>8} {'Err(PT)':>12} {'Err(CU)':>12}"
+        )
+        print("-" * 110)
         for path in mtx_paths:
             try:
                 data, row, col, shape = _load_mtx_to_coo_torch(
@@ -263,6 +272,14 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
                         "err_vs_pytorch": err_pt,
                         "err_vs_cupy": err_cu,
                     }
+                )
+                name = os.path.basename(path)
+                fs_vs_pt_s = f"{fs_vs_pt:.2f}x" if fs_vs_pt is not None else "N/A"
+                fs_vs_cu_s = f"{fs_vs_cu:.2f}x" if fs_vs_cu is not None else "N/A"
+                print(
+                    f"{name:<32} {m:>6} {n:>6} {int(data.numel()):>10} "
+                    f"{_fmt_ms(fs_ms):>10} {_fmt_ms(pt_ms):>10} {_fmt_ms(cu_ms):>10} "
+                    f"{fs_vs_pt_s:>8} {fs_vs_cu_s:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
                 )
             except Exception as e:
                 rows_out.append(
