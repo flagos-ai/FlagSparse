@@ -24,6 +24,10 @@ __all__ = [
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spsv_csr",
     "flagsparse_spsv_coo",
+    "flagsparse_spmm_csr",
+    "flagsparse_spmm_coo",
+    "benchmark_spmm_case",
+    "comprehensive_spmm_test",
     "benchmark_spmv_case",
     "create_csr_matrix",
     "create_coo_matrix",
@@ -68,6 +72,10 @@ _OPS_EXPORTS = {
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spsv_csr",
     "flagsparse_spsv_coo",
+    "flagsparse_spmm_csr",
+    "flagsparse_spmm_coo",
+    "benchmark_spmm_case",
+    "comprehensive_spmm_test",
     "benchmark_spmv_case",
 }
 

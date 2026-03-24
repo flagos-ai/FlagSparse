@@ -1,4 +1,4 @@
-"""Benchmarks for gather, scatter, and SpMV."""
+"""Benchmarks for gather, scatter, SpMV, and SpMM."""
 
 from ._common import *
 
@@ -11,6 +11,7 @@ from .gather_scatter import (
     _triton_scatter_impl,
 )
 from .spmv_csr import flagsparse_spmv_csr, prepare_spmv_csr
+from .spmm_csr import benchmark_spmm_case, comprehensive_spmm_test
 
 def benchmark_gather_case(
     dense_size=65536,
