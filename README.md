@@ -50,3 +50,7 @@ python tests/test_spsv.py <dir/> --csv-csr spsv.csv      # .mtx batch, export CS
 ```
 
 **test_gather.py** / **test_scatter.py** — gather/scatter benchmarks (run with pytest or `python tests/test_gather.py`).
+
+## License
+
+Thsi project is licensed under the [Apache (Version 2.0) license]](./LICENSE).
