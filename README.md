@@ -26,53 +26,54 @@ pip install torch triton cupy-cuda12x
 
 Run from project root, or `cd tests` then run scripts (paths like `../matrix` for .mtx dir).
 
-**test_spmv.py** — CSR SpMV (SuiteSparse `.mtx`, synthetic, or CSR CSV export):
+**test_spmv.py** — CSR SpMV (SuiteSparse .mtx, synthetic, or CSV export):
 
 ```bash
 python tests/test_spmv.py <dir_or_file.mtx>              # batch run, default float32
-python tests/test_spmv.py <dir/> --dtype float64        # optional: --index-dtype int32|int64, --warmup, --iters, --no-cusparse
-python tests/test_spmv.py --synthetic                  # synthetic benchmark
-python tests/test_spmv.py <dir/> --csv-csr results.csv # all value×index dtypes → one CSV (per-matrix lines while running)
+python tests/test_spmv.py <dir/> --dtype float64         # optional: --index-dtype int32, --warmup 10, --iters 50, --no-cusparse
+python tests/test_spmv.py --synthetic                    # synthetic benchmark
+python tests/test_spmv.py <dir/> --csv-csr results.csv   # all dtypes, export CSV
 ```
 
-**test_spmv_coo.py** — COO SpMV (requires `--synthetic` or `--csv-coo`; no standalone `.mtx` batch):
+**test_spmv_coo.py** — COO SpMV:
 
 ```bash
-python tests/test_spmv_coo.py --synthetic
-python tests/test_spmv_coo.py <dir/> --csv-coo out.csv
+python tests/test_spmv_coo.py --synthetic                # synthetic
+python tests/test_spmv_coo.py <dir/> --csv-coo out.csv   # .mtx batch, export CSV
 ```
 
-**test_spmv_opt.py** — SpMV baseline vs optimised A/B (`float32` / `float64` only):
+**test_spsv.py** — SpSV CSR (triangular solve, square matrices only):
 
 ```bash
-python tests/test_spmv_opt.py <dir_or_file.mtx> [...]
-python tests/test_spmv_opt.py <dir/> --csv out.csv
+python tests/test_spsv.py --synthetic                     # synthetic vs PyTorch / CuPy
+python tests/test_spsv.py <dir/> --csv-csr spsv_csr.csv  # .mtx batch, export CSV (f32/f64, int32)
 ```
 
-**test_spmm.py** — CSR SpMM (`.mtx` batch, synthetic, or `--csv`):
+**test_spsv_coo.py** — SpSV COO (same workflow as CSR test):
 
 ```bash
-python tests/test_spmm.py <dir_or_file.mtx>
-python tests/test_spmm.py --synthetic                  # optional: --skip-api-checks, --skip-alg1-coverage
-python tests/test_spmm.py <dir/> --csv results.csv    # float32/float64 + int32 in CSV; per-matrix console output
-# common options: --dtype, --index-dtype, --dense-cols, --block-n, --block-nnz, --max-segments, --warmup, --iters, --no-cusparse
+python tests/test_spsv_coo.py --synthetic
+python tests/test_spsv_coo.py <dir/> --csv-coo spsv_coo.csv   # optional: --coo-mode auto|direct|csr
 ```
 
-**test_spmm_coo.py** — native COO SpMM:
+**test_spmm.py** — CSR SpMM (SuiteSparse .mtx, synthetic, CSV; dense RHS width via `--dense-cols`):
 
 ```bash
-python tests/test_spmm_coo.py <dir_or_file.mtx>
-python tests/test_spmm_coo.py --synthetic              # optional: --route rowrun|atomic|compare, --skip-api-checks, --skip-coo-coverage
-python tests/test_spmm_coo.py <dir/> --csv out.csv    # only --route rowrun or atomic (not compare)
-# same tuning flags as CSR SpMM where applicable: --dense-cols, --block-n, --block-nnz, --warmup, --iters, --no-cusparse
+python tests/test_spmm.py <file.mtx> [<more.mtx> ...]   # or a directory of *.mtx
+python tests/test_spmm.py <dir/> --dtype float32        # optional: --index-dtype, --dense-cols, --warmup, --iters
+python tests/test_spmm.py --synthetic                   # full synthetic (API checks + ALG1 tile coverage)
+python tests/test_spmm.py <dir/> --csv results.csv      # float32/float64 + int32 on all matrices → one CSV
+# tuning: --block-n, --block-nnz, --max-segments  |  skip baselines: --no-cusparse
+# synthetic only: --skip-api-checks, --skip-alg1-coverage
 ```
 
-**test_spsv.py** — SpSV (triangular solve; **square** matrices only). CSR and COO share this script; there is **no** `test_spsv_coo.py`.
+**test_spmm_coo.py** — COO SpMM (same CLI shape as CSR; native row-run / atomic / compare):
 
 ```bash
-python tests/test_spsv.py --synthetic
-python tests/test_spsv.py <dir/> --csv-csr spsv.csv
-python tests/test_spsv.py <dir/> --csv-coo out.csv     # same CSV columns as CSR; optional --coo-mode auto|direct|csr (default auto)
+python tests/test_spmm_coo.py <file.mtx> ...            # or directory
+python tests/test_spmm_coo.py --synthetic               # optional: --route rowrun|atomic|compare
+python tests/test_spmm_coo.py <dir/> --csv out.csv      # --route must be rowrun or atomic (not compare)
+# --block-nnz (COO tile), --skip-coo-coverage for synthetic; other flags align with test_spmm.py
 ```
 
-**test_gather.py** / **test_scatter.py** — gather/scatter benchmarks (pytest or `python tests/test_gather.py`).
+**test_gather.py** / **test_scatter.py** — gather/scatter benchmarks (run with pytest or `python tests/test_gather.py`).
