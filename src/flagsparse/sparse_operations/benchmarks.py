@@ -11,7 +11,11 @@ from .gather_scatter import (
     _triton_scatter_impl,
 )
 from .spmv_csr import flagsparse_spmv_csr, prepare_spmv_csr
-from .spmm_csr import benchmark_spmm_case, comprehensive_spmm_test
+from .spmm_csr import (
+    benchmark_spmm_case,
+    benchmark_spmm_opt_case,
+    comprehensive_spmm_test,
+)
 from .spgemm_csr import benchmark_spgemm_case
 from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
