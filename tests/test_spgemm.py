@@ -932,53 +932,6 @@ def run_one_mtx(
 
     triton_result = None
     triton_compare_result = None
-    try:
-        result["triton_started"] = True
-        triton_result, triton_ms, triton_first_ms, meta = _benchmark_flagsparse_spgemm(
-            a_data,
-            a_indices,
-            a_indptr,
-            a_shape,
-            b_data,
-            b_indices,
-            b_indptr,
-            b_shape,
-            warmup=warmup,
-            iters=iters,
-            adaptive_loops=adaptive_loops,
-            target_window_seconds=target_window_seconds,
-            start_time=case_start,
-            mtx_path=mtx_path,
-        )
-        result["triton_ms"] = triton_ms
-        result["triton_first_call_ms"] = triton_first_ms
-        result["prepare_ms"] = meta.get("prepare_ms")
-        result["count_ms"] = meta.get("count_ms")
-        result["fill_ms"] = meta.get("fill_ms")
-        result["bucket_nrows_short"] = meta.get("bucket_nrows_short")
-        result["bucket_nrows_medium"] = meta.get("bucket_nrows_medium")
-        result["bucket_nrows_long"] = meta.get("bucket_nrows_long")
-        result["bucket_ms_short"] = meta.get("bucket_ms_short")
-        result["bucket_ms_medium"] = meta.get("bucket_ms_medium")
-        result["bucket_ms_long"] = meta.get("bucket_ms_long")
-        result["long_row_sliced_count"] = meta.get("long_row_sliced_count")
-        result["effective_warmup"] = meta.get("effective_warmup")
-        result["effective_iters"] = meta.get("effective_iters")
-        result["nnz_c"] = int(triton_result[0].numel()) if triton_result is not None else None
-        triton_compare_result = _convert_result_for_compare(
-            triton_result,
-            compare_device,
-            device=device,
-        )
-        if compare_device == "cpu":
-            triton_result = None
-            if ref_cleanup:
-                _cleanup_reference_pools()
-    except Exception as exc:
-        result["error"] = _append_error(result["error"], f"triton: {exc}")
-
-    if ref_cleanup:
-        _cleanup_reference_pools()
     _log_stage(mtx_path, "reference", case_start)
     result["ref_started"] = True
     pt_compared = False
@@ -1071,8 +1024,53 @@ def run_one_mtx(
         result["cusparse_reason"] = "CuPy/cuSPARSE reference is disabled"
         result["cu_exec_mode"] = "disabled"
         result["attempted_modes_cu"] = "disabled"
-    if ref_cleanup:
-        _cleanup_reference_pools()
+    # Ensure reference-side temporary allocations are released before Triton run.
+    _cleanup_reference_pools()
+
+    _log_stage(mtx_path, "triton", case_start)
+    try:
+        result["triton_started"] = True
+        triton_result, triton_ms, triton_first_ms, meta = _benchmark_flagsparse_spgemm(
+            a_data,
+            a_indices,
+            a_indptr,
+            a_shape,
+            b_data,
+            b_indices,
+            b_indptr,
+            b_shape,
+            warmup=warmup,
+            iters=iters,
+            adaptive_loops=adaptive_loops,
+            target_window_seconds=target_window_seconds,
+            start_time=case_start,
+            mtx_path=mtx_path,
+        )
+        result["triton_ms"] = triton_ms
+        result["triton_first_call_ms"] = triton_first_ms
+        result["prepare_ms"] = meta.get("prepare_ms")
+        result["count_ms"] = meta.get("count_ms")
+        result["fill_ms"] = meta.get("fill_ms")
+        result["bucket_nrows_short"] = meta.get("bucket_nrows_short")
+        result["bucket_nrows_medium"] = meta.get("bucket_nrows_medium")
+        result["bucket_nrows_long"] = meta.get("bucket_nrows_long")
+        result["bucket_ms_short"] = meta.get("bucket_ms_short")
+        result["bucket_ms_medium"] = meta.get("bucket_ms_medium")
+        result["bucket_ms_long"] = meta.get("bucket_ms_long")
+        result["long_row_sliced_count"] = meta.get("long_row_sliced_count")
+        result["effective_warmup"] = meta.get("effective_warmup")
+        result["effective_iters"] = meta.get("effective_iters")
+        result["nnz_c"] = int(triton_result[0].numel()) if triton_result is not None else None
+        triton_compare_result = _convert_result_for_compare(
+            triton_result,
+            compare_device,
+            device=device,
+        )
+        if compare_device == "cpu":
+            triton_result = None
+            _cleanup_reference_pools()
+    except Exception as exc:
+        result["error"] = _append_error(result["error"], f"triton: {exc}")
 
     _log_stage(mtx_path, "compare", case_start)
     if triton_compare_result is not None and pt_ref_result is not None:
