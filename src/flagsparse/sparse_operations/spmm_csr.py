@@ -1467,9 +1467,6 @@ _SPMM_OPT_CANDIDATE_VECTOR_BUCKET_SPECS = (
     {"label": "vector_1024", "min_row_nnz": 513, "max_row_nnz": 1024, "block_nnz": 32, "segments": 8},
 )
 
-_SPMM_OPT_CANDIDATE_MAX_SEGMENTS = 8
-
-
 @triton.jit
 def _spmm_csr_candidate_rows_kernel(
     data_ptr,
@@ -1500,14 +1497,17 @@ def _spmm_csr_candidate_rows_kernel(
     end = tl.load(indptr_ptr + row + 1)
     row_nnz = end - start
     seg_span = (row_nnz + SEGMENTS - 1) // SEGMENTS
-    acc_parts = [
-        tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
-        for _ in range(_SPMM_OPT_CANDIDATE_MAX_SEGMENTS)
-    ]
-    for seg_id in range(_SPMM_OPT_CANDIDATE_MAX_SEGMENTS):
-        if seg_id >= SEGMENTS:
-            continue
-        seg_start = start + seg_id * seg_span
+    acc0 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc1 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc2 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc3 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc4 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc5 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc6 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc7 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+
+    if SEGMENTS > 0:
+        seg_start = start
         seg_end = tl.minimum(end, seg_start + seg_span)
         for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_NNZ):
             chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
@@ -1522,19 +1522,147 @@ def _spmm_csr_candidate_rows_kernel(
                     other=0.0,
                 )
                 chunk_acc = chunk_acc + a_val * b_vals
-            acc_parts[seg_id] = acc_parts[seg_id] + chunk_acc
+            acc0 = acc0 + chunk_acc
 
-    if SEGMENTS <= 2:
-        acc = acc_parts[0] + acc_parts[1]
+    if SEGMENTS > 1:
+        seg_start = start + seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_NNZ):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val * b_vals
+            acc1 = acc1 + chunk_acc
+
+    if SEGMENTS > 2:
+        seg_start = start + 2 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_NNZ):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val * b_vals
+            acc2 = acc2 + chunk_acc
+
+    if SEGMENTS > 3:
+        seg_start = start + 3 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_NNZ):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val * b_vals
+            acc3 = acc3 + chunk_acc
+
+    if SEGMENTS > 4:
+        seg_start = start + 4 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_NNZ):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val * b_vals
+            acc4 = acc4 + chunk_acc
+
+    if SEGMENTS > 5:
+        seg_start = start + 5 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_NNZ):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val * b_vals
+            acc5 = acc5 + chunk_acc
+
+    if SEGMENTS > 6:
+        seg_start = start + 6 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_NNZ):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val * b_vals
+            acc6 = acc6 + chunk_acc
+
+    if SEGMENTS > 7:
+        seg_start = start + 7 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_NNZ):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val * b_vals
+            acc7 = acc7 + chunk_acc
+
+    if SEGMENTS == 1:
+        acc = acc0
+    elif SEGMENTS == 2:
+        acc = acc0 + acc1
     elif SEGMENTS <= 4:
-        acc_left = acc_parts[0] + acc_parts[1]
-        acc_right = acc_parts[2] + acc_parts[3]
+        acc_left = acc0 + acc1
+        acc_right = acc2 + acc3
         acc = acc_left + acc_right
     else:
-        acc01 = acc_parts[0] + acc_parts[1]
-        acc23 = acc_parts[2] + acc_parts[3]
-        acc45 = acc_parts[4] + acc_parts[5]
-        acc67 = acc_parts[6] + acc_parts[7]
+        acc01 = acc0 + acc1
+        acc23 = acc2 + acc3
+        acc45 = acc4 + acc5
+        acc67 = acc6 + acc7
         acc = (acc01 + acc23) + (acc45 + acc67)
     tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
 
