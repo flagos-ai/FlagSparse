@@ -20,6 +20,21 @@ from .spgemm_csr import benchmark_spgemm_case
 from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
 
+
+def _normalize_dtype_name(value):
+    if isinstance(value, str):
+        return value.strip().lower()
+    return str(value).replace("torch.", "")
+
+
+def _resolve_scatter_benchmark_dtype(value_dtype, dtype_policy):
+    requested_name = _normalize_dtype_name(value_dtype)
+    effective_dtype, fallback_applied, fallback_reason = _resolve_scatter_value_dtype(
+        value_dtype, dtype_policy=dtype_policy
+    )
+    return requested_name, effective_dtype, bool(fallback_applied), fallback_reason
+
+
 def benchmark_gather_case(
     dense_size=65536,
     nnz=4096,
@@ -131,30 +146,77 @@ def benchmark_scatter_case(
     block_size=1024,
     run_cusparse=True,
     unique_indices=True,
+    reset_output=True,
+    dtype_policy="auto",
+    index_fallback_policy="auto",
 ):
     """Benchmark Triton scatter vs PyTorch index_copy vs cuSPARSE-backed COO SpMV."""
     device = torch.device("cuda")
-    sparse_values = _build_random_dense(nnz, value_dtype, device)
+    requested_value_dtype, requested_effective_dtype, fallback_applied, fallback_reason = (
+        _resolve_scatter_benchmark_dtype(value_dtype, dtype_policy)
+    )
+    sparse_values = _build_random_dense(nnz, requested_effective_dtype, device)
     indices = _build_indices(nnz, dense_size, index_dtype, device, unique=unique_indices)
 
-    sparse_values, indices, kernel_indices, dense_size = _prepare_scatter_inputs(
-        sparse_values, indices, dense_size=dense_size, out=None
+    sparse_values, indices, kernel_indices, dense_size, prep_meta = _prepare_scatter_inputs(
+        sparse_values,
+        indices,
+        dense_size=dense_size,
+        out=None,
+        dtype_policy=dtype_policy,
+        return_metadata=True,
     )
-    expected = _pytorch_scatter_impl(sparse_values, indices, dense_size)
+    effective_value_dtype = prep_meta["effective_value_dtype"]
+    fallback_applied = fallback_applied or prep_meta["fallback_applied"]
+    fallback_reason = fallback_reason or prep_meta["fallback_reason"]
 
-    pytorch_op = lambda: _pytorch_scatter_impl(sparse_values, indices, dense_size)
-    triton_op = lambda: _triton_scatter_impl(
+    base_out = _build_random_dense(dense_size, sparse_values.dtype, device)
+    expected = _pytorch_scatter_impl(
+        sparse_values,
+        indices,
+        dense_size,
+        out=base_out.clone(),
+        reset_output=reset_output,
+    )
+
+    pytorch_out = base_out.clone()
+    triton_probe_out = base_out.clone()
+    _, triton_index_meta = _triton_scatter_impl(
         sparse_values,
         kernel_indices,
         dense_size=dense_size,
-        out=None,
+        out=triton_probe_out,
         block_size=block_size,
+        reset_output=reset_output,
+        index_fallback_policy=index_fallback_policy,
+        return_metadata=True,
+    )
+    effective_kernel_indices = kernel_indices
+    if triton_index_meta["index_fallback_applied"] and kernel_indices.dtype == torch.int64:
+        effective_kernel_indices = kernel_indices.to(torch.int32)
+    triton_out = base_out.clone()
+
+    pytorch_op = lambda: _pytorch_scatter_impl(
+        sparse_values,
+        indices,
+        dense_size,
+        out=pytorch_out,
+        reset_output=reset_output,
+    )
+    triton_op = lambda: _triton_scatter_impl(
+        sparse_values,
+        effective_kernel_indices,
+        dense_size=dense_size,
+        out=triton_out,
+        block_size=block_size,
+        reset_output=reset_output,
+        index_fallback_policy="strict",
     )
 
     pytorch_values, pytorch_ms = _benchmark_cuda_op(pytorch_op, warmup=warmup, iters=iters)
     triton_values, triton_ms = _benchmark_cuda_op(triton_op, warmup=warmup, iters=iters)
 
-    atol, rtol = _tolerance_for_dtype(value_dtype)
+    atol, rtol = _tolerance_for_dtype(effective_value_dtype)
     triton_match = torch.allclose(triton_values, expected, atol=atol, rtol=rtol)
     triton_max_error = (
         float(torch.max(torch.abs(triton_values - expected)).item())
@@ -167,7 +229,10 @@ def benchmark_scatter_case(
     cusparse_max_error = None
     cusparse_reason = None
     if run_cusparse:
-        skip_reason = _cusparse_baseline_skip_reason(value_dtype)
+        if not reset_output:
+            skip_reason = "cuSPARSE scatter baseline only matches reset_output=True semantics"
+        else:
+            skip_reason = _cusparse_baseline_skip_reason(sparse_values.dtype)
         if skip_reason:
             cusparse_reason = skip_reason
         else:
@@ -203,11 +268,17 @@ def benchmark_scatter_case(
         "parameters": {
             "dense_size": dense_size,
             "nnz": nnz,
-            "value_dtype": str(value_dtype),
+            "value_dtype": requested_value_dtype,
+            "effective_value_dtype": str(effective_value_dtype),
             "index_dtype": str(index_dtype),
             "warmup": warmup,
             "iters": iters,
             "unique_indices": unique_indices,
+            "reset_output": bool(reset_output),
+            "dtype_policy": str(dtype_policy).lower(),
+            "fallback_applied": bool(fallback_applied),
+            "index_fallback_policy": str(index_fallback_policy).lower(),
+            "kernel_index_dtype": triton_index_meta["kernel_index_dtype"],
         },
         "performance": {
             "pytorch_ms": pytorch_ms,
@@ -224,6 +295,9 @@ def benchmark_scatter_case(
         },
         "backend_status": {
             "cusparse_unavailable_reason": cusparse_reason,
+            "fallback_reason": fallback_reason,
+            "index_fallback_applied": bool(triton_index_meta["index_fallback_applied"]),
+            "index_fallback_reason": triton_index_meta["index_fallback_reason"],
         },
         "samples": {
             "pytorch": pytorch_values,
@@ -435,6 +509,9 @@ def comprehensive_scatter_test(
     iters=200,
     run_cusparse=True,
     unique_indices=True,
+    reset_output=True,
+    dtype_policy="auto",
+    index_fallback_policy="auto",
 ):
     """Full scatter test entry for one configuration."""
     return benchmark_scatter_case(
@@ -446,6 +523,9 @@ def comprehensive_scatter_test(
         iters=iters,
         run_cusparse=run_cusparse,
         unique_indices=unique_indices,
+        reset_output=reset_output,
+        dtype_policy=dtype_policy,
+        index_fallback_policy=index_fallback_policy,
     )
 
 

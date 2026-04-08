@@ -18,15 +18,20 @@ except ImportError:
     cp = None
     cpx_sparse = None
 
+_TORCH_COMPLEX32_DTYPE = getattr(torch, "complex32", None)
+if _TORCH_COMPLEX32_DTYPE is None:
+    _TORCH_COMPLEX32_DTYPE = getattr(torch, "chalf", None)
 
-SUPPORTED_VALUE_DTYPES = (
+_SUPPORTED_VALUE_DTYPES = [
     torch.float16,
     torch.bfloat16,
     torch.float32,
     torch.float64,
-    torch.complex64,
-    torch.complex128,
-)
+]
+if _TORCH_COMPLEX32_DTYPE is not None:
+    _SUPPORTED_VALUE_DTYPES.append(_TORCH_COMPLEX32_DTYPE)
+_SUPPORTED_VALUE_DTYPES.extend([torch.complex64, torch.complex128])
+SUPPORTED_VALUE_DTYPES = tuple(_SUPPORTED_VALUE_DTYPES)
 SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 _INDEX_LIMIT_INT32 = 2**31 - 1
 
@@ -35,7 +40,10 @@ __all__ = (
     "SUPPORTED_VALUE_DTYPES",
     "SUPPORTED_INDEX_DTYPES",
     "_INDEX_LIMIT_INT32",
+    "_torch_complex32_dtype",
+    "_is_complex32_dtype",
     "_is_complex_dtype",
+    "_resolve_scatter_value_dtype",
     "_component_dtype_for_complex",
     "_tolerance_for_dtype",
     "_require_cupy",
@@ -61,11 +69,50 @@ __all__ = (
 )
 
 
+def _torch_complex32_dtype():
+    return _TORCH_COMPLEX32_DTYPE
+
+
+def _is_complex32_dtype(value_dtype):
+    return _TORCH_COMPLEX32_DTYPE is not None and value_dtype == _TORCH_COMPLEX32_DTYPE
+
+
 def _is_complex_dtype(value_dtype):
-    return value_dtype in (torch.complex64, torch.complex128)
+    return _is_complex32_dtype(value_dtype) or value_dtype in (torch.complex64, torch.complex128)
+
+
+def _resolve_scatter_value_dtype(value_dtype, dtype_policy="auto"):
+    dtype_policy = str(dtype_policy).lower()
+    if dtype_policy not in ("auto", "strict"):
+        raise ValueError("dtype_policy must be 'auto' or 'strict'")
+    if isinstance(value_dtype, str):
+        token = value_dtype.strip().lower()
+        mapping = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+            "float64": torch.float64,
+            "complex64": torch.complex64,
+            "complex128": torch.complex128,
+        }
+        if token == "complex32":
+            if _TORCH_COMPLEX32_DTYPE is not None:
+                return _TORCH_COMPLEX32_DTYPE, False, None
+            if dtype_policy == "strict":
+                raise TypeError("complex32 is unavailable in this torch build")
+            return torch.complex64, True, "complex32 is unavailable; fallback to complex64"
+        if token not in mapping:
+            raise TypeError(f"Unsupported dtype token: {value_dtype}")
+        value_dtype = mapping[token]
+    if _is_complex32_dtype(value_dtype):
+        # If complex32 exists in torch dtype table, keep native path.
+        return value_dtype, False, None
+    return value_dtype, False, None
 
 
 def _component_dtype_for_complex(value_dtype):
+    if _is_complex32_dtype(value_dtype):
+        return torch.float16
     if value_dtype == torch.complex64:
         return torch.float32
     if value_dtype == torch.complex128:
@@ -76,6 +123,8 @@ def _component_dtype_for_complex(value_dtype):
 def _tolerance_for_dtype(value_dtype):
     if value_dtype == torch.float16:
         return 2e-3, 2e-3
+    if _is_complex32_dtype(value_dtype):
+        return 5e-3, 5e-3
     if value_dtype == torch.bfloat16:
         return 1e-1, 1e-1
     if value_dtype in (torch.float32, torch.complex64):
@@ -106,6 +155,9 @@ def _cupy_dtype_from_torch(torch_dtype):
         torch.int32: cp.int32,
         torch.int64: cp.int64,
     }
+    if _TORCH_COMPLEX32_DTYPE is not None:
+        # CuPy has no native complex32 sparse path; use complex64 for baseline parity.
+        mapping[_TORCH_COMPLEX32_DTYPE] = cp.complex64
     if torch_dtype not in mapping:
         raise TypeError(f"Unsupported dtype conversion to CuPy: {torch_dtype}")
     return mapping[torch_dtype]
@@ -141,6 +193,8 @@ def _to_backend_like(torch_tensor, ref_obj):
 def _cusparse_baseline_skip_reason(value_dtype):
     if value_dtype == torch.bfloat16:
         return "bfloat16 is not supported by the cuSPARSE baseline path; skipped"
+    if _is_complex32_dtype(value_dtype):
+        return "complex32 is not supported by the cuSPARSE baseline path; skipped"
     if cp is None and value_dtype == torch.float16:
         return "float16 is not supported by torch sparse fallback when CuPy is unavailable; skipped"
     return None
@@ -149,6 +203,9 @@ def _cusparse_baseline_skip_reason(value_dtype):
 def _build_random_dense(dense_size, value_dtype, device):
     if value_dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
         return torch.randn(dense_size, dtype=value_dtype, device=device)
+    if _is_complex32_dtype(value_dtype):
+        stacked = torch.randn((dense_size, 2), dtype=torch.float16, device=device)
+        return torch.view_as_complex(stacked)
     if _is_complex_dtype(value_dtype):
         component_dtype = _component_dtype_for_complex(value_dtype)
         real = torch.randn(dense_size, dtype=component_dtype, device=device)
@@ -190,8 +247,7 @@ def _validate_common_inputs(dense_vector, indices):
         raise ValueError("dense_vector and indices must both be CUDA tensors")
     if dense_vector.dtype not in SUPPORTED_VALUE_DTYPES:
         raise TypeError(
-            "dense_vector dtype must be one of: torch.float16, torch.bfloat16, "
-            "torch.float32, torch.float64, torch.complex64, torch.complex128"
+            f"dense_vector dtype must be one of: {', '.join(str(dt) for dt in SUPPORTED_VALUE_DTYPES)}"
         )
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
@@ -224,7 +280,9 @@ def _prepare_inputs(dense_vector, indices):
     return dense_vector, indices, kernel_indices
 
 
-def _prepare_scatter_inputs(sparse_values, indices, dense_size=None, out=None):
+def _prepare_scatter_inputs(
+    sparse_values, indices, dense_size=None, out=None, dtype_policy="auto", return_metadata=False
+):
     if sparse_values.ndim != 1:
         raise ValueError("sparse_values must be a 1D tensor")
     if indices.ndim != 1:
@@ -235,11 +293,17 @@ def _prepare_scatter_inputs(sparse_values, indices, dense_size=None, out=None):
         raise ValueError("sparse_values and indices must both be CUDA tensors")
     if sparse_values.dtype not in SUPPORTED_VALUE_DTYPES:
         raise TypeError(
-            "sparse_values dtype must be one of: torch.float16, torch.bfloat16, "
-            "torch.float32, torch.float64, torch.complex64, torch.complex128"
+            f"sparse_values dtype must be one of: {', '.join(str(dt) for dt in SUPPORTED_VALUE_DTYPES)}"
         )
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
+
+    requested_value_dtype = sparse_values.dtype
+    effective_value_dtype, fallback_applied, fallback_reason = _resolve_scatter_value_dtype(
+        requested_value_dtype, dtype_policy=dtype_policy
+    )
+    if effective_value_dtype != sparse_values.dtype:
+        sparse_values = sparse_values.to(effective_value_dtype)
 
     sparse_values = sparse_values.contiguous()
     indices = indices.contiguous()
@@ -261,12 +325,6 @@ def _prepare_scatter_inputs(sparse_values, indices, dense_size=None, out=None):
             )
 
     kernel_indices = indices
-    if indices.dtype == torch.int64:
-        if max_index > _INDEX_LIMIT_INT32:
-            raise ValueError(
-                f"int64 index value {max_index} exceeds Triton int32 kernel range"
-            )
-        kernel_indices = indices.to(torch.int32)
 
     if out is not None:
         if out.ndim != 1:
@@ -280,6 +338,15 @@ def _prepare_scatter_inputs(sparse_values, indices, dense_size=None, out=None):
         if out.device != sparse_values.device:
             raise ValueError("out must be on the same device as sparse_values")
 
+    metadata = {
+        "requested_value_dtype": requested_value_dtype,
+        "effective_value_dtype": sparse_values.dtype,
+        "fallback_applied": bool(fallback_applied),
+        "fallback_reason": fallback_reason,
+        "dtype_policy": str(dtype_policy).lower(),
+    }
+    if return_metadata:
+        return sparse_values, indices, kernel_indices, dense_size, metadata
     return sparse_values, indices, kernel_indices, dense_size
 
 

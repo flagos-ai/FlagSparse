@@ -18,8 +18,10 @@ from .benchmarks import (
 )
 from .gather_scatter import (
     cusparse_spmv_gather,
+    cusparse_spmv_gather_cupy,
     cusparse_spmv_scatter,
     flagsparse_gather,
+    flagsparse_gather_cupy,
     flagsparse_scatter,
     pytorch_index_gather,
     pytorch_index_scatter,
@@ -73,8 +75,10 @@ __all__ = [
     "comprehensive_spmm_test",
     "comprehensive_spsm_test",
     "cusparse_spmv_gather",
+    "cusparse_spmv_gather_cupy",
     "cusparse_spmv_scatter",
     "flagsparse_gather",
+    "flagsparse_gather_cupy",
     "flagsparse_sddmm_csr",
     "flagsparse_spgemm_csr",
     "flagsparse_spmm_coo",

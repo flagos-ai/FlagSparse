@@ -27,6 +27,7 @@ INDEX_DTYPES = [torch.int32]
 WARMUP = 10
 ITERS = 50
 DEFAULT_DENSE_COLS = 32
+DEFAULT_SEED = None
 
 
 def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
@@ -247,13 +248,22 @@ HEADER = (
 SEP = "-" * 182
 
 
-def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters):
+def _seeded_dense_matrix(shape, dtype, device, seed):
+    if seed is None:
+        return torch.randn(shape, dtype=dtype, device=device)
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    return torch.randn(shape, dtype=dtype, device=device)
+
+
+def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
     device = torch.device("cuda")
     data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
     indices = indices.to(index_dtype)
     n_rows, n_cols = shape
     nnz = data.numel()
-    B = torch.randn((n_cols, dense_cols), dtype=dtype, device=device)
+    B = _seeded_dense_matrix((n_cols, dense_cols), dtype, device, seed)
     ref = _build_reference(data, indices, indptr, B, shape, dtype)
 
     y_base, base_ms = _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters)
@@ -289,6 +299,7 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters):
         "err_opt": err_opt,
         "base_ok": base_ok,
         "opt_ok": opt_ok,
+        "seed": seed,
         "status": status,
     }
 
@@ -307,11 +318,11 @@ def print_row(row):
     )
 
 
-def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters):
+def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
     results = []
     for path in paths:
         try:
-            row = run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters)
+            row = run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=seed)
         except Exception as exc:
             print(f"  ERROR on {os.path.basename(path)}: {exc}")
             continue
@@ -320,7 +331,7 @@ def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters):
     return results
 
 
-def run_all_csv(paths, csv_path, dense_cols, warmup, iters):
+def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None):
     rows = []
     for dtype in VALUE_DTYPES:
         for index_dtype in INDEX_DTYPES:
@@ -336,7 +347,7 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters):
             print(SEP)
             print(HEADER)
             print(SEP)
-            results = run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters)
+            results = run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed=seed)
             print(SEP)
             for row in results:
                 n_rows, n_cols = row["shape"]
@@ -348,6 +359,7 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters):
                     "n_cols": n_cols,
                     "nnz": row["nnz"],
                     "dense_cols": row["dense_cols"],
+                    "seed": row["seed"],
                     "base_ms": row["base_ms"],
                     "opt_ms": row["opt_ms"],
                     "pt_ms": row["pt_ms"],
@@ -367,6 +379,7 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters):
         "n_cols",
         "nnz",
         "dense_cols",
+        "seed",
         "base_ms",
         "opt_ms",
         "pt_ms",
@@ -394,6 +407,7 @@ def main():
     parser.add_argument("--dense-cols", type=int, default=DEFAULT_DENSE_COLS)
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Optional fixed seed for reproducible dense RHS generation")
     args = parser.parse_args()
 
     paths = []
@@ -407,7 +421,7 @@ def main():
         return
 
     if args.csv:
-        run_all_csv(paths, args.csv, args.dense_cols, args.warmup, args.iters)
+        run_all_csv(paths, args.csv, args.dense_cols, args.warmup, args.iters, seed=args.seed)
         return
 
     dtype_map = {"float32": torch.float32, "float64": torch.float64}
@@ -415,6 +429,8 @@ def main():
     print("=" * 182)
     print("FLAGSPARSE SpMM Optimisation A/B Test")
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {args.dtype}  |  Dense cols: {args.dense_cols}  |  Files: {len(paths)}")
+    if args.seed is not None:
+        print(f"Seed: {args.seed}")
     print(
         "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
         "Opt = bucketed CSR SpMM native path. "
@@ -423,7 +439,7 @@ def main():
     print(SEP)
     print(HEADER)
     print(SEP)
-    results = run_batch(paths, dtype, torch.int32, args.dense_cols, args.warmup, args.iters)
+    results = run_batch(paths, dtype, torch.int32, args.dense_cols, args.warmup, args.iters, seed=args.seed)
     print(SEP)
     passed = sum(1 for row in results if row["status"] == "PASS")
     print(f"Passed: {passed} / {len(results)}")
