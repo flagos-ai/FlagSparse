@@ -1454,21 +1454,90 @@ def _run_spmm_opt_split_bucket_stable(prepared, B, C_out, block_n):
     return False
 
 
-_SPMM_OPT_CANDIDATE_SHORT_BUCKET_SPECS = (
-    {"label": "batched_16", "min_row_nnz": 0, "max_row_nnz": 16, "block_nnz": 16, "segments": 2},
-    {"label": "batched_32", "min_row_nnz": 17, "max_row_nnz": 32, "block_nnz": 32, "segments": 4},
-    {"label": "batched_64", "min_row_nnz": 33, "max_row_nnz": 64, "block_nnz": 64, "segments": 4},
-    {"label": "batched_128", "min_row_nnz": 65, "max_row_nnz": 128, "block_nnz": 128, "segments": 8},
+_SPMM_OPT_CANDIDATE_BUCKET_SPECS_F32 = (
+    {"label": "short_16", "kind": "micro", "min_row_nnz": 0, "max_row_nnz": 16, "block_nnz": 16},
+    {"label": "short_32", "kind": "micro", "min_row_nnz": 17, "max_row_nnz": 32, "block_nnz": 32},
+    {"label": "short_64", "kind": "segmented", "min_row_nnz": 33, "max_row_nnz": 64, "block_nnz": 64, "segments": 2},
+    {"label": "short_128", "kind": "segmented", "min_row_nnz": 65, "max_row_nnz": 128, "block_nnz": 128, "segments": 4},
+    {"label": "vector_192", "kind": "segmented", "min_row_nnz": 129, "max_row_nnz": 192, "block_nnz": 64, "segments": 2},
+    {"label": "vector_256", "kind": "segmented", "min_row_nnz": 193, "max_row_nnz": 256, "block_nnz": 64, "segments": 4},
+    {"label": "vector_512", "kind": "segmented", "min_row_nnz": 257, "max_row_nnz": 512, "block_nnz": 64, "segments": 4},
+    {"label": "vector_1024", "kind": "segmented", "min_row_nnz": 513, "max_row_nnz": 1024, "block_nnz": 32, "segments": 8},
+    {"label": "vector_2048", "kind": "segmented", "min_row_nnz": 1025, "max_row_nnz": 2048, "block_nnz": 32, "segments": 8},
 )
 
-_SPMM_OPT_CANDIDATE_VECTOR_BUCKET_SPECS = (
-    {"label": "vector_256", "min_row_nnz": 129, "max_row_nnz": 256, "block_nnz": 64, "segments": 4},
-    {"label": "vector_512", "min_row_nnz": 257, "max_row_nnz": 512, "block_nnz": 64, "segments": 8},
-    {"label": "vector_1024", "min_row_nnz": 513, "max_row_nnz": 1024, "block_nnz": 32, "segments": 8},
+_SPMM_OPT_CANDIDATE_BUCKET_SPECS_F64 = (
+    {"label": "short_16", "kind": "segmented", "min_row_nnz": 0, "max_row_nnz": 16, "block_nnz": 16, "segments": 2},
+    {"label": "short_32", "kind": "segmented", "min_row_nnz": 17, "max_row_nnz": 32, "block_nnz": 32, "segments": 2},
+    {"label": "short_64", "kind": "segmented", "min_row_nnz": 33, "max_row_nnz": 64, "block_nnz": 64, "segments": 2},
+    {"label": "short_128", "kind": "segmented", "min_row_nnz": 65, "max_row_nnz": 128, "block_nnz": 128, "segments": 4},
+    {"label": "vector_256", "kind": "segmented", "min_row_nnz": 129, "max_row_nnz": 256, "block_nnz": 64, "segments": 4},
+    {"label": "vector_512", "kind": "segmented", "min_row_nnz": 257, "max_row_nnz": 512, "block_nnz": 64, "segments": 4},
+    {"label": "vector_1024", "kind": "segmented", "min_row_nnz": 513, "max_row_nnz": 1024, "block_nnz": 32, "segments": 8},
+    {"label": "vector_2048", "kind": "segmented", "min_row_nnz": 1025, "max_row_nnz": 2048, "block_nnz": 32, "segments": 8},
 )
+
+_SPMM_OPT_CANDIDATE_SPLIT_THRESHOLD_F32 = 2048
+_SPMM_OPT_CANDIDATE_SPLIT_THRESHOLD_F64 = 2048
+
+
+def _select_spmm_opt_candidate_specs(dtype):
+    return (
+        _SPMM_OPT_CANDIDATE_BUCKET_SPECS_F64
+        if dtype == torch.float64
+        else _SPMM_OPT_CANDIDATE_BUCKET_SPECS_F32
+    )
+
+
+def _select_spmm_opt_candidate_split_threshold(dtype):
+    return (
+        _SPMM_OPT_CANDIDATE_SPLIT_THRESHOLD_F64
+        if dtype == torch.float64
+        else _SPMM_OPT_CANDIDATE_SPLIT_THRESHOLD_F32
+    )
+
 
 @triton.jit
-def _spmm_csr_candidate_rows_kernel(
+def _spmm_csr_candidate_short_micro_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_bucket_rows:
+        return
+    row = tl.load(rows_ptr + pid_row)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    offs_k = start + tl.arange(0, BLOCK_NNZ)
+    mask_k = offs_k < end
+    a_vals = tl.load(data_ptr + offs_k, mask=mask_k, other=0.0).to(ACC_DTYPE)
+    cols = tl.load(indices_ptr + offs_k, mask=mask_k, other=0)
+    b_ptrs = b_ptr + cols[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    b_mask = mask_k[:, None] & mask_n[None, :]
+    b_vals = tl.load(b_ptrs, mask=b_mask, other=0.0).to(ACC_DTYPE)
+    prod = a_vals[:, None] * b_vals
+    acc = tl.sum(prod, axis=0)
+    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+
+
+@triton.jit
+def _spmm_csr_candidate_segmented_rows_kernel(
     data_ptr,
     indices_ptr,
     indptr_ptr,
@@ -1675,7 +1744,7 @@ def _build_spmm_opt_candidate_buckets(prepared):
     row_index_dtype = torch.int32 if max_row_index <= _INDEX_LIMIT_INT32 else torch.int64
     all_rows = torch.arange(row_count, device=device, dtype=row_index_dtype)
     buckets = []
-    for spec in _SPMM_OPT_CANDIDATE_SHORT_BUCKET_SPECS:
+    for spec in _select_spmm_opt_candidate_specs(prepared.data.dtype):
         lower = int(spec["min_row_nnz"])
         upper = int(spec["max_row_nnz"])
         if lower <= 0:
@@ -1685,34 +1754,17 @@ def _build_spmm_opt_candidate_buckets(prepared):
         rows = all_rows[mask]
         if rows.numel() == 0:
             continue
-        buckets.append(
-            {
-                "label": spec["label"],
-                "kind": "short",
-                "rows": rows,
-                "block_nnz": int(spec["block_nnz"]),
-                "segments": int(spec["segments"]),
-            }
-        )
+        bucket = {
+            "label": spec["label"],
+            "kind": spec["kind"],
+            "rows": rows,
+            "block_nnz": int(spec["block_nnz"]),
+        }
+        if "segments" in spec:
+            bucket["segments"] = int(spec["segments"])
+        buckets.append(bucket)
 
-    for spec in _SPMM_OPT_CANDIDATE_VECTOR_BUCKET_SPECS:
-        lower = int(spec["min_row_nnz"])
-        upper = int(spec["max_row_nnz"])
-        mask = (row_lengths >= lower) & (row_lengths <= upper)
-        rows = all_rows[mask]
-        if rows.numel() == 0:
-            continue
-        buckets.append(
-            {
-                "label": spec["label"],
-                "kind": "vector",
-                "rows": rows,
-                "block_nnz": int(spec["block_nnz"]),
-                "segments": int(spec["segments"]),
-            }
-        )
-
-    split_rows = all_rows[row_lengths > 1024]
+    split_rows = all_rows[row_lengths > _select_spmm_opt_candidate_split_threshold(prepared.data.dtype)]
     if split_rows.numel() > 0:
         buckets.append({"label": "split", "kind": "split", "rows": split_rows, "block_nnz": 256})
     return buckets
@@ -1725,7 +1777,26 @@ def _run_spmm_opt_bucket_candidate(prepared, bucket, B, C_out, block_n):
     dtype = prepared.data.dtype
     acc_dtype = tl.float64 if dtype == torch.float64 else tl.float32
     grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
-    _spmm_csr_candidate_rows_kernel[grid](
+    if bucket["kind"] == "micro":
+        _spmm_csr_candidate_short_micro_kernel[grid](
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            B,
+            C_out,
+            rows,
+            rows.numel(),
+            B.shape[1],
+            B.stride(0),
+            B.stride(1),
+            C_out.stride(0),
+            C_out.stride(1),
+            BLOCK_N=block_n,
+            BLOCK_NNZ=bucket["block_nnz"],
+            ACC_DTYPE=acc_dtype,
+        )
+        return
+    _spmm_csr_candidate_segmented_rows_kernel[grid](
         prepared.data,
         prepared.kernel_indices,
         prepared.kernel_indptr,
