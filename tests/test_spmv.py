@@ -18,6 +18,7 @@ VALUE_DTYPES = [
     torch.float64,
 ]
 INDEX_DTYPES = [torch.int32, torch.int64]
+CSV_VALUE_DTYPE_NAMES = ("float32", "float64", "complex32", "complex64")
 TEST_CASES = [
     (512, 512, 4096),
     (1024, 1024, 16384),
@@ -45,6 +46,10 @@ def _dtype_map():
     if complex32 is not None:
         mapping["complex32"] = complex32
     return mapping
+
+
+def _csv_value_dtypes(dtype_map):
+    return [dtype_map[name] for name in CSV_VALUE_DTYPE_NAMES if name in dtype_map]
 
 
 def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
@@ -523,11 +528,22 @@ def _dtype_str(d):
     return str(d).replace("torch.", "")
 
 
-def run_all_dtypes_export_csv(paths, csv_path, warmup=10, iters=50, run_cusparse=True, transpose=False):
+def run_all_dtypes_export_csv(
+    paths,
+    csv_path,
+    warmup=10,
+    iters=50,
+    run_cusparse=True,
+    transpose=False,
+    value_dtypes=None,
+    index_dtypes=None,
+):
     """Run SpMV for all VALUE_DTYPES x INDEX_DTYPES on each .mtx and write results to CSV."""
     rows = []
-    for value_dtype in VALUE_DTYPES:
-        for index_dtype in INDEX_DTYPES:
+    value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
+    index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
+    for value_dtype in value_dtypes:
+        for index_dtype in index_dtypes:
             print("=" * 150)
             _print_mtx_header(value_dtype, index_dtype, transpose=transpose)
             results = run_mtx_batch(
@@ -669,15 +685,15 @@ def main():
     )
     parser.add_argument(
         "--dtype",
-        default="float32",
+        default=None,
         choices=sorted(dtype_map.keys()),
-        help="Value dtype (default: float32)",
+        help="Value dtype filter (default: float32 for single run; CSV runs float32/float64/complex32/complex64)",
     )
     parser.add_argument(
         "--index-dtype",
-        default="int32",
+        default=None,
         choices=["int32", "int64"],
-        help="Index dtype (default: int32)",
+        help="Index dtype filter (default: int32 for single run; CSV runs int32/int64)",
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs")
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
@@ -691,8 +707,10 @@ def main():
     )
     args = parser.parse_args()
     index_map = {"int32": torch.int32, "int64": torch.int64}
-    value_dtype = dtype_map[args.dtype]
-    index_dtype = index_map[args.index_dtype]
+    value_dtype_name = args.dtype or "float32"
+    index_dtype_name = args.index_dtype or "int32"
+    value_dtype = dtype_map[value_dtype_name]
+    index_dtype = index_map[index_dtype_name]
     if args.synthetic:
         run_comprehensive_synthetic(transpose=args.transpose)
         return
@@ -725,13 +743,15 @@ def main():
             iters=args.iters,
             run_cusparse=not args.no_cusparse,
             transpose=args.transpose,
+            value_dtypes=[dtype_map[args.dtype]] if args.dtype else _csv_value_dtypes(dtype_map),
+            index_dtypes=[index_map[args.index_dtype]] if args.index_dtype else INDEX_DTYPES,
         )
         return
     print("=" * 120)
     print("FLAGSPARSE SpMV SuiteSparse .mtx batch (error + performance)")
     print("=" * 120)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
-    print(f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  transpose: {args.transpose}  warmup: {args.warmup}  iters: {args.iters}")
+    print(f"dtype: {value_dtype_name}  index_dtype: {index_dtype_name}  transpose: {args.transpose}  warmup: {args.warmup}  iters: {args.iters}")
     print()
     results = run_mtx_batch(
         paths,
