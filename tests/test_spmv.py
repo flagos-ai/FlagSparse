@@ -33,6 +33,24 @@ def _complex32_dtype():
     return getattr(torch, "complex32", None) or getattr(torch, "chalf", None)
 
 
+def _is_complex32_dtype(dtype):
+    complex32 = _complex32_dtype()
+    return complex32 is not None and dtype == complex32
+
+
+def _make_complex32_from_real_values(real_values, device):
+    real = torch.as_tensor(real_values, dtype=torch.float16, device=device)
+    pair = torch.stack((real, torch.zeros_like(real)), dim=-1).contiguous()
+    return torch.view_as_complex(pair)
+
+
+def _random_vector(size, dtype, device):
+    if _is_complex32_dtype(dtype):
+        pair = torch.randn((size, 2), dtype=torch.float16, device=device)
+        return torch.view_as_complex(pair.contiguous())
+    return torch.randn(size, dtype=dtype, device=device)
+
+
 def _dtype_map():
     mapping = {
         "float16": torch.float16,
@@ -91,7 +109,10 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 
     n_rows, n_cols, nnz = header_info
     if nnz == 0:
-        data = torch.tensor([], dtype=dtype, device=device)
+        if _is_complex32_dtype(dtype):
+            data = _make_complex32_from_real_values([], device)
+        else:
+            data = torch.tensor([], dtype=dtype, device=device)
         indices = torch.tensor([], dtype=torch.int64, device=device)
         indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
         return data, indices, indptr, (n_rows, n_cols)
@@ -122,7 +143,10 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
             cols_s.append(c)
             vals_s.append(row[c])
         indptr_list.append(len(cols_s))
-    data = torch.tensor(vals_s, dtype=dtype, device=device)
+    if _is_complex32_dtype(dtype):
+        data = _make_complex32_from_real_values(vals_s, device)
+    else:
+        data = torch.tensor(vals_s, dtype=dtype, device=device)
     indices = torch.tensor(cols_s, dtype=torch.int64, device=device)
     indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
     return data, indices, indptr, (n_rows, n_cols)
@@ -131,6 +155,9 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 def _allclose_error_ratio(actual, reference, atol, rtol):
     if actual.numel() == 0:
         return 0.0
+    if _is_complex32_dtype(actual.dtype) or _is_complex32_dtype(reference.dtype):
+        actual = actual.to(torch.complex64)
+        reference = reference.to(torch.complex64)
     diff = torch.abs(actual - reference).to(torch.float64)
     tol = (atol + rtol * torch.abs(reference)).to(torch.float64)
     return float(torch.max(diff / tol).item())
@@ -182,11 +209,18 @@ def _reference_dtype(dtype):
         return torch.float32
     if dtype == torch.float32:
         return torch.float64
-    if dtype == _complex32_dtype():
+    if _is_complex32_dtype(dtype):
         return torch.complex64
     if dtype == torch.complex64:
         return torch.complex128
     return dtype
+
+
+def _cast_reference_output(y_ref, out_dtype):
+    if not _is_complex32_dtype(out_dtype) or y_ref.dtype == out_dtype:
+        return y_ref.to(out_dtype) if y_ref.dtype != out_dtype else y_ref
+    pair = torch.view_as_real(y_ref.to(torch.complex64)).to(torch.float16).contiguous()
+    return torch.view_as_complex(pair)
 
 
 def _pytorch_spmv_reference(data, indices, indptr, x, shape, out_dtype, transpose=False):
@@ -218,7 +252,7 @@ def _pytorch_spmv_reference(data, indices, indptr, x, shape, out_dtype, transpos
         ).coalesce()
         ref_mat = coo_ref.transpose(0, 1) if transpose else coo_ref
         y_ref = torch.sparse.mm(ref_mat, x_ref.unsqueeze(1)).squeeze(1)
-    return y_ref.to(out_dtype) if ref_dtype != out_dtype else y_ref
+    return _cast_reference_output(y_ref, out_dtype)
 
 
 def _cupy_csr_reference(data, indices, indptr, x, shape, out_dtype, transpose=False):
@@ -235,7 +269,7 @@ def _cupy_csr_reference(data, indices, indptr, x, shape, out_dtype, transpose=Fa
     A_csr_ref = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
     y_ref = (A_csr_ref.T @ x_cp) if transpose else (A_csr_ref @ x_cp)
     y_ref_t = torch.utils.dlpack.from_dlpack(y_ref.toDlpack())
-    return y_ref_t.to(out_dtype) if ref_dtype != out_dtype else y_ref_t
+    return _cast_reference_output(y_ref_t, out_dtype)
 
 
 def _tolerance(value_dtype):
@@ -270,7 +304,7 @@ def run_one_mtx(
     transpose = bool(transpose)
     x_size = n_rows if transpose else n_cols
     y_size = n_cols if transpose else n_rows
-    x = torch.randn(x_size, dtype=value_dtype, device=device)
+    x = _random_vector(x_size, value_dtype, device)
     atol, rtol = _tolerance(value_dtype)
 
     triton_y, triton_ms = _benchmark_flagsparse_spmv(
@@ -319,7 +353,11 @@ def run_one_mtx(
     err_cu = None
     triton_ok_cu = False
     csc_ms = None
-    if run_cusparse and value_dtype not in (torch.bfloat16,):
+    if (
+        run_cusparse
+        and value_dtype not in (torch.bfloat16,)
+        and not _is_complex32_dtype(value_dtype)
+    ):
         try:
             import cupy as cp
             import cupyx.scipy.sparse as cpx
