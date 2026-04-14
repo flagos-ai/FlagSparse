@@ -6,6 +6,16 @@ import time
 import triton
 import triton.language as tl
 
+SUPPORTED_SPMV_VALUE_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
+
+
 class PreparedCsrSpmv:
     """Cached CSR metadata for repeated SpMV calls on the same sparse matrix."""
 
@@ -68,8 +78,6 @@ class PreparedCsrSpmv:
             self._baseline_compute_dtype = torch.float32
         elif data.dtype == torch.float32:
             self._baseline_compute_dtype = torch.float64
-        elif _is_complex32_dtype(data.dtype):
-            self._baseline_compute_dtype = torch.complex64
         else:
             self._baseline_compute_dtype = data.dtype
         self._baseline_data = None
@@ -402,7 +410,7 @@ def _normalize_spmv_index_fallback_policy(index_fallback_policy):
 
 def _spmv_dtype_error_message():
     return "data dtype must be one of: " + ", ".join(
-        str(dtype).replace("torch.", "") for dtype in SUPPORTED_VALUE_DTYPES
+        str(dtype).replace("torch.", "") for dtype in SUPPORTED_SPMV_VALUE_DTYPES
     )
 
 
@@ -464,7 +472,7 @@ def _prepare_spmv_csr_matrix(data, indices, indptr, shape, index_fallback_policy
         raise ValueError("data, indices, indptr must be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr)):
         raise ValueError("data, indices, indptr must be on the same CUDA device")
-    if data.dtype not in SUPPORTED_VALUE_DTYPES:
+    if data.dtype not in SUPPORTED_SPMV_VALUE_DTYPES:
         raise TypeError(_spmv_dtype_error_message())
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
@@ -855,10 +863,8 @@ def prepare_spmv_coo_tocsr(
         raise ValueError("data, row, col must all be CUDA tensors")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
         raise ValueError("data, row, col must all be 1D tensors")
-    if data.dtype not in SUPPORTED_VALUE_DTYPES:
-        raise TypeError(
-            "data dtype must be one of: float16, bfloat16, float32, float64, complex64, complex128"
-        )
+    if data.dtype not in SUPPORTED_SPMV_VALUE_DTYPES:
+        raise TypeError(_spmv_dtype_error_message())
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if row.numel() != col.numel() or data.numel() != row.numel():
         raise ValueError("data, row, col must have the same length")
@@ -925,10 +931,8 @@ def flagsparse_spmv_coo_tocsr(
         raise ValueError("data, row, col, x must all be 1D tensors")
 
     n_rows, n_cols = int(shape[0]), int(shape[1])
-    if data.dtype not in SUPPORTED_VALUE_DTYPES:
-        raise TypeError(
-            "data dtype must be one of: float16, bfloat16, float32, float64, complex64, complex128"
-        )
+    if data.dtype not in SUPPORTED_SPMV_VALUE_DTYPES:
+        raise TypeError(_spmv_dtype_error_message())
     if x.dtype != data.dtype:
         raise TypeError("x dtype must match data dtype")
 

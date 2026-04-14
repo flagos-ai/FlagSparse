@@ -11,17 +11,12 @@ spmv_mod = importlib.import_module("flagsparse.sparse_operations.spmv_csr")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _complex32_dtype():
-    return getattr(torch, "complex32", None) or getattr(torch, "chalf", None)
-
-
 def _value_dtype_cases():
     cases = [
         ("float16", torch.float16),
         ("bfloat16", torch.bfloat16),
         ("float32", torch.float32),
         ("float64", torch.float64),
-        ("complex32", _complex32_dtype()),
         ("complex64", torch.complex64),
         ("complex128", torch.complex128),
     ]
@@ -33,16 +28,11 @@ def _skip_unavailable_dtype(name, dtype):
         torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     ):
         pytest.skip("bfloat16 not supported on this GPU")
-    if name == "complex32" and dtype is None:
-        pytest.skip("complex32/chalf not available in this torch build")
 
 
 def _random_dense(shape, dtype, device):
     if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
         return torch.randn(shape, dtype=dtype, device=device)
-    if dtype == _complex32_dtype():
-        stacked = torch.randn((*shape, 2), dtype=torch.float16, device=device)
-        return torch.view_as_complex(stacked)
     if dtype == torch.complex64:
         real = torch.randn(shape, dtype=torch.float32, device=device)
         imag = torch.randn(shape, dtype=torch.float32, device=device)
@@ -59,8 +49,6 @@ def _reference_dtype(dtype):
         return torch.float32
     if dtype == torch.float32:
         return torch.float64
-    if dtype == _complex32_dtype():
-        return torch.complex64
     if dtype == torch.complex64:
         return torch.complex128
     return dtype
@@ -71,8 +59,6 @@ def _tol(dtype):
         return 5e-3, 5e-3
     if dtype == torch.bfloat16:
         return 1e-1, 1e-1
-    if dtype == _complex32_dtype():
-        return 5e-3, 5e-3
     if dtype == torch.float32:
         return 1e-4, 1e-4
     if dtype == torch.complex64:

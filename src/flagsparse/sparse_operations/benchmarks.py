@@ -3,6 +3,8 @@
 from ._common import *
 
 from .gather_scatter import (
+    SUPPORTED_SCATTER_VALUE_DTYPES,
+    _scatter_dtype_error_message,
     _cusparse_spmv,
     _make_gather_selector_matrix,
     _make_scatter_selector_matrix,
@@ -29,9 +31,13 @@ def _normalize_dtype_name(value):
 
 def _resolve_scatter_benchmark_dtype(value_dtype, dtype_policy):
     requested_name = _normalize_dtype_name(value_dtype)
+    if requested_name in ("complex32", "chalf"):
+        raise TypeError(_scatter_dtype_error_message())
     effective_dtype, fallback_applied, fallback_reason = _resolve_scatter_value_dtype(
         value_dtype, dtype_policy=dtype_policy
     )
+    if effective_dtype not in SUPPORTED_SCATTER_VALUE_DTYPES:
+        raise TypeError(_scatter_dtype_error_message())
     return requested_name, effective_dtype, bool(fallback_applied), fallback_reason
 
 

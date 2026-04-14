@@ -13,7 +13,7 @@ DEFAULT_CASES = [
     (524_288, 16_384),
     (1_048_576, 65_536),
 ]
-DEFAULT_VALUE_DTYPES = "float16,float32,float64"
+DEFAULT_VALUE_DTYPES = "float32,float64,complex64,complex128"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
@@ -39,6 +39,13 @@ def _fmt_err(value):
     return f"{value:.2e}"
 
 
+def _fmt_reason(value, width=32):
+    if not value:
+        return ""
+    text = str(value).replace("\n", " ")
+    return text[: width - 3] + "..." if len(text) > width else text
+
+
 def _parse_bool_token(raw, name):
     token = str(raw).strip().lower()
     if token in ("1", "true", "yes", "y", "on"):
@@ -54,7 +61,6 @@ def _parse_value_dtypes(raw):
         "bfloat16",
         "float32",
         "float64",
-        "complex32",
         "complex64",
         "complex128",
     }
@@ -165,13 +171,13 @@ def _write_csv(path, rows, fieldnames):
 
 
 def _print_header():
-    print("-" * 196)
+    print("-" * 232)
     print(
         f"{'ValueReq':>10} {'ValueEff':>10} {'Index':>6} {'Dense':>10} {'NNZ':>10} "
         f"{'Reset':>6} {'FB':>4} {'IFB':>4} {'PT(ms)':>10} {'FS(ms)':>10} {'CS(ms)':>10} "
-        f"{'FS/PT':>8} {'FS/CS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(CS)':>12}"
+        f"{'FS/PT':>8} {'FS/CS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(CS)':>12} {'Reason':<32}"
     )
-    print("-" * 196)
+    print("-" * 232)
 
 
 def _print_row(row):
@@ -182,7 +188,8 @@ def _print_row(row):
         f"{str(row['index_fallback_applied']):>4} "
         f"{_fmt_ms(row['pytorch_ms']):>10} {_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['cusparse_ms']):>10} "
         f"{_fmt_speedup(row['triton_speedup_vs_pytorch']):>8} {_fmt_speedup(row['triton_speedup_vs_cusparse']):>8} "
-        f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['cusparse_max_error']):>12}"
+        f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['cusparse_max_error']):>12} "
+        f"{_fmt_reason(row.get('error_reason')):<32}"
     )
 
 
@@ -246,6 +253,14 @@ def run_cli(args):
                         status = _status_from_result(verify)
                         if status != "PASS":
                             failed_cases += 1
+                        error_reason = None
+                        if status != "PASS":
+                            error_reason = (
+                                backend.get("index_fallback_reason")
+                                or backend.get("fallback_reason")
+                                or backend.get("cusparse_unavailable_reason")
+                                or "validation failed"
+                            )
                         row = {
                             "case_id": case_id,
                             "gpu": torch.cuda.get_device_name(0),
@@ -273,6 +288,7 @@ def run_cli(args):
                             "cusparse_unavailable_reason": backend.get("cusparse_unavailable_reason"),
                             "fallback_reason": backend.get("fallback_reason"),
                             "index_fallback_reason": backend.get("index_fallback_reason"),
+                            "error_reason": error_reason,
                             "status": status,
                         }
                         summary_rows.append(row)
@@ -314,12 +330,13 @@ def run_cli(args):
                             "cusparse_unavailable_reason": str(exc),
                             "fallback_reason": None,
                             "index_fallback_reason": str(exc),
+                            "error_reason": str(exc),
                             "status": "ERROR",
                         }
                         summary_rows.append(row)
                         _print_row(row)
 
-    print("-" * 196)
+    print("-" * 232)
     print(f"Total cases: {total_cases}")
     print(f"Failed cases: {failed_cases}")
     print(f"Passed cases: {total_cases - failed_cases}")
@@ -350,6 +367,7 @@ def run_cli(args):
             "cusparse_unavailable_reason",
             "fallback_reason",
             "index_fallback_reason",
+            "error_reason",
             "status",
         ]
         _write_csv(args.csv_summary, summary_rows, summary_fields)

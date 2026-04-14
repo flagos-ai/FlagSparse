@@ -18,7 +18,7 @@ VALUE_DTYPES = [
     torch.float64,
 ]
 INDEX_DTYPES = [torch.int32, torch.int64]
-CSV_VALUE_DTYPE_NAMES = ("float32", "float64", "complex32", "complex64")
+CSV_VALUE_DTYPE_NAMES = ("float32", "float64", "complex64", "complex128")
 TEST_CASES = [
     (512, 512, 4096),
     (1024, 1024, 16384),
@@ -28,26 +28,7 @@ TEST_CASES = [
 WARMUP = 10
 ITERS = 50
 
-
-def _complex32_dtype():
-    return getattr(torch, "complex32", None) or getattr(torch, "chalf", None)
-
-
-def _is_complex32_dtype(dtype):
-    complex32 = _complex32_dtype()
-    return complex32 is not None and dtype == complex32
-
-
-def _make_complex32_from_real_values(real_values, device):
-    real = torch.as_tensor(real_values, dtype=torch.float16, device=device)
-    pair = torch.stack((real, torch.zeros_like(real)), dim=-1).contiguous()
-    return torch.view_as_complex(pair)
-
-
 def _random_vector(size, dtype, device):
-    if _is_complex32_dtype(dtype):
-        pair = torch.randn((size, 2), dtype=torch.float16, device=device)
-        return torch.view_as_complex(pair.contiguous())
     return torch.randn(size, dtype=dtype, device=device)
 
 
@@ -60,9 +41,6 @@ def _dtype_map():
         "complex64": torch.complex64,
         "complex128": torch.complex128,
     }
-    complex32 = _complex32_dtype()
-    if complex32 is not None:
-        mapping["complex32"] = complex32
     return mapping
 
 
@@ -109,10 +87,7 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 
     n_rows, n_cols, nnz = header_info
     if nnz == 0:
-        if _is_complex32_dtype(dtype):
-            data = _make_complex32_from_real_values([], device)
-        else:
-            data = torch.tensor([], dtype=dtype, device=device)
+        data = torch.tensor([], dtype=dtype, device=device)
         indices = torch.tensor([], dtype=torch.int64, device=device)
         indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
         return data, indices, indptr, (n_rows, n_cols)
@@ -143,10 +118,7 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
             cols_s.append(c)
             vals_s.append(row[c])
         indptr_list.append(len(cols_s))
-    if _is_complex32_dtype(dtype):
-        data = _make_complex32_from_real_values(vals_s, device)
-    else:
-        data = torch.tensor(vals_s, dtype=dtype, device=device)
+    data = torch.tensor(vals_s, dtype=dtype, device=device)
     indices = torch.tensor(cols_s, dtype=torch.int64, device=device)
     indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
     return data, indices, indptr, (n_rows, n_cols)
@@ -155,9 +127,6 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 def _allclose_error_ratio(actual, reference, atol, rtol):
     if actual.numel() == 0:
         return 0.0
-    if _is_complex32_dtype(actual.dtype) or _is_complex32_dtype(reference.dtype):
-        actual = actual.to(torch.complex64)
-        reference = reference.to(torch.complex64)
     diff = torch.abs(actual - reference).to(torch.float64)
     tol = (atol + rtol * torch.abs(reference)).to(torch.float64)
     return float(torch.max(diff / tol).item())
@@ -166,8 +135,7 @@ def _allclose_error_ratio(actual, reference, atol, rtol):
 def _has_non_finite(tensor):
     if tensor is None or tensor.numel() == 0:
         return False
-    probe = tensor.to(torch.complex64) if _is_complex32_dtype(tensor.dtype) else tensor
-    return not bool(torch.isfinite(probe).all().item())
+    return not bool(torch.isfinite(tensor).all().item())
 
 
 def _non_finite_error_reason(actual, reference, reference_name):
@@ -184,21 +152,6 @@ def _non_finite_error_reason(actual, reference, reference_name):
 
 def _has_numeric_error(error_value):
     return error_value is not None and not math.isnan(error_value)
-
-
-def _complex32_output_range_exceeded(reference, out_dtype):
-    if (
-        not _is_complex32_dtype(out_dtype)
-        or reference is None
-        or reference.numel() == 0
-    ):
-        return False
-    reference = reference.to(torch.complex64)
-    if not bool(torch.isfinite(reference).all().item()):
-        return False
-    limit = torch.finfo(torch.float16).max
-    components = torch.view_as_real(reference)
-    return bool(torch.any(torch.abs(components) > limit).item())
 
 
 def _benchmark_flagsparse_spmv(
@@ -247,18 +200,13 @@ def _reference_dtype(dtype):
         return torch.float32
     if dtype == torch.float32:
         return torch.float64
-    if _is_complex32_dtype(dtype):
-        return torch.complex64
     if dtype == torch.complex64:
         return torch.complex128
     return dtype
 
 
 def _cast_reference_output(y_ref, out_dtype):
-    if not _is_complex32_dtype(out_dtype) or y_ref.dtype == out_dtype:
-        return y_ref.to(out_dtype) if y_ref.dtype != out_dtype else y_ref
-    pair = torch.view_as_real(y_ref.to(torch.complex64)).to(torch.float16).contiguous()
-    return torch.view_as_complex(pair)
+    return y_ref.to(out_dtype) if y_ref.dtype != out_dtype else y_ref
 
 
 def _pytorch_spmv_reference(
@@ -324,8 +272,6 @@ def _cupy_csr_reference(data, indices, indptr, x, shape, out_dtype, transpose=Fa
 def _tolerance(value_dtype):
     if value_dtype in (torch.float16, torch.bfloat16):
         return 2e-3, 2e-3
-    if _is_complex32_dtype(value_dtype):
-        return 5e-3, 1.25e-2
     if value_dtype in (torch.float32, torch.complex64):
         return 1.25e-4, 1.25e-2
     if value_dtype in (torch.float64, torch.complex128):
@@ -404,12 +350,9 @@ def run_one_mtx(
         torch.cuda.synchronize()
         pytorch_ms = start_ev.elapsed_time(end_ev) / iters
         if y_size:
-            if _complex32_output_range_exceeded(pt_ref_compute_y, value_dtype):
-                pt_error_reason = "complex32 output range exceeded"
-            else:
-                pt_error_reason = _non_finite_error_reason(
-                    triton_y, pt_ref_y, "PyTorch reference"
-                )
+            pt_error_reason = _non_finite_error_reason(
+                triton_y, pt_ref_y, "PyTorch reference"
+            )
             if pt_error_reason is None:
                 err_pt = _allclose_error_ratio(triton_y, pt_ref_y, atol, rtol)
                 triton_ok_pt = (not math.isnan(err_pt)) and err_pt <= 1.0
@@ -424,11 +367,7 @@ def run_one_mtx(
     triton_ok_cu = False
     cu_error_reason = None
     csc_ms = None
-    if (
-        run_cusparse
-        and value_dtype not in (torch.bfloat16,)
-        and not _is_complex32_dtype(value_dtype)
-    ):
+    if run_cusparse and value_dtype not in (torch.bfloat16,):
         try:
             import cupy as cp
             import cupyx.scipy.sparse as cpx
@@ -503,10 +442,7 @@ def run_one_mtx(
             "triton_ok_cu": False,
             "status": "FAIL" if triton_non_finite else "REF_FAIL",
         }
-    if pt_error_reason == "complex32 output range exceeded":
-        status = "FAIL"
-        error_reason = pt_error_reason
-    elif _has_non_finite(triton_y):
+    if _has_non_finite(triton_y):
         status = "FAIL"
         if (
             pt_error_reason
@@ -833,7 +769,7 @@ def main():
         "--dtype",
         default=None,
         choices=sorted(dtype_map.keys()),
-        help="Value dtype filter (default: float32 for single run; CSV runs float32/float64/complex32/complex64)",
+        help="Value dtype filter (default: float32 for single run; CSV runs float32/float64/complex64/complex128)",
     )
     parser.add_argument(
         "--index-dtype",
