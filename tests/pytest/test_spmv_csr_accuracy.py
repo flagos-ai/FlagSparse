@@ -85,6 +85,20 @@ def _make_x(length, dtype, device):
     return _random_dense((length,), dtype, device)
 
 
+def _op_transposes(op):
+    return op in ("trans", "conj")
+
+
+def _apply_dense_op(dense, op):
+    if op == "non":
+        return dense
+    if op == "trans":
+        return dense.t()
+    if op == "conj":
+        return dense.conj().t()
+    raise ValueError(f"unsupported op: {op}")
+
+
 def _assert_close(actual, expected, dtype):
     rtol, atol = _tol(dtype)
     ref_dtype = _reference_dtype(dtype)
@@ -95,15 +109,16 @@ def _assert_close(actual, expected, dtype):
 @pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
 @pytest.mark.parametrize("name,dtype", _value_dtype_cases(), ids=[c[0] for c in _value_dtype_cases()])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
-@pytest.mark.parametrize("transpose", [False, True], ids=["non_transpose", "transpose"])
-def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, transpose):
+@pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
+def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, op):
     _skip_unavailable_dtype(name, dtype)
     device = torch.device("cuda")
     data, indices, indptr, dense = _random_csr_mn(M, N, dtype, index_dtype, device)
+    transpose = _op_transposes(op)
     x_len = M if transpose else N
     x = _make_x(x_len, dtype, device)
     ref_dtype = _reference_dtype(dtype)
-    ref_mat = dense.t() if transpose else dense
+    ref_mat = _apply_dense_op(dense, op)
     ref = (ref_mat.to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
     out = flagsparse_spmv_csr(
         data,
@@ -111,7 +126,7 @@ def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, transp
         indptr,
         x,
         shape=(M, N),
-        transpose=transpose,
+        op=op,
         index_fallback_policy="auto",
     )
     _assert_close(out, ref, dtype)
@@ -125,6 +140,16 @@ def test_spmv_csr_prepared_transpose_mismatch_rejected():
     x = torch.randn(8, dtype=torch.float32, device=device)
     with pytest.raises(ValueError, match="does not match prepared.transpose"):
         flagsparse_spmv_csr(x=x, prepared=prepared, transpose=False)
+
+
+@pytest.mark.spmv_csr
+def test_spmv_csr_prepared_op_mismatch_rejected():
+    device = torch.device("cuda")
+    data, indices, indptr, _dense = _random_csr_mn(8, 10, torch.complex64, torch.int32, device)
+    prepared = spmv_mod.prepare_spmv_csr(data, indices, indptr, (8, 10), op="conj")
+    x = _make_x(8, torch.complex64, device)
+    with pytest.raises(ValueError, match="does not match prepared.op"):
+        flagsparse_spmv_csr(x=x, prepared=prepared, op="trans")
 
 
 @pytest.mark.spmv_csr

@@ -12,7 +12,15 @@ from .gather_scatter import (
     _triton_gather_impl,
     _triton_scatter_impl,
 )
-from .spmv_csr import flagsparse_spmv_csr, prepare_spmv_csr
+from .spmv_csr import (
+    SPMV_OP_NON,
+    SPMV_OP_TRANS,
+    _normalize_spmv_op,
+    _spmv_op_to_name,
+    _spmv_op_transposes,
+    flagsparse_spmv_csr,
+    prepare_spmv_csr,
+)
 from .spmm_csr import (
     benchmark_spmm_case,
     benchmark_spmm_opt_case,
@@ -21,6 +29,27 @@ from .spmm_csr import (
 from .spgemm_csr import benchmark_spgemm_case
 from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
+
+
+def _cupy_spmv_op_matrix(matrix, op_code):
+    if op_code == SPMV_OP_NON:
+        return matrix
+    if op_code == SPMV_OP_TRANS:
+        return matrix.T
+    matrix_conj = matrix.conj() if hasattr(matrix, "conj") else matrix.conjugate()
+    return matrix_conj.T
+
+
+def _apply_cupy_spmv_op(matrix, vector, op_code):
+    return _cupy_spmv_op_matrix(matrix, op_code) @ vector
+
+
+def _apply_torch_sparse_spmv_op(matrix, vector_2d, op_code):
+    if op_code == SPMV_OP_NON:
+        return torch.sparse.mm(matrix, vector_2d).squeeze(1)
+    if op_code == SPMV_OP_TRANS:
+        return torch.sparse.mm(matrix.transpose(0, 1), vector_2d).squeeze(1)
+    return torch.sparse.mm(matrix.conj().transpose(0, 1), vector_2d).squeeze(1)
 
 
 def _normalize_dtype_name(value):
@@ -324,6 +353,7 @@ def benchmark_spmv_case(
     max_segments=None,
     run_cusparse=True,
     transpose=False,
+    op=None,
     index_fallback_policy="auto",
 ):
     """Benchmark Triton CSR SpMV vs cuSPARSE (CuPy CSR @ x)."""
@@ -331,7 +361,11 @@ def benchmark_spmv_case(
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
-    transpose = bool(transpose)
+    op_code = _normalize_spmv_op(op, transpose=transpose)
+    if op is not None and bool(transpose) and op_code == SPMV_OP_NON:
+        raise ValueError("transpose=True conflicts with op=non")
+    transpose = _spmv_op_transposes(op_code)
+    op_name = _spmv_op_to_name(op_code)
     x_size = n_rows if transpose else n_cols
     y_size = n_cols if transpose else n_rows
     x = _build_random_dense(x_size, value_dtype, device)
@@ -343,7 +377,7 @@ def benchmark_spmv_case(
         shape,
         block_nnz=block_nnz,
         max_segments=max_segments,
-        transpose=transpose,
+        op=op_code,
         index_fallback_policy=index_fallback_policy,
     )
     triton_op = lambda: flagsparse_spmv_csr(
@@ -370,7 +404,7 @@ def benchmark_spmv_case(
         A_csr = cpx_sparse.csr_matrix(
             (data_cp, indices_cp, indptr_cp), shape=shape
         )
-        ref_y = (A_csr.T @ x_cp) if transpose else (A_csr @ x_cp)
+        ref_y = _apply_cupy_spmv_op(A_csr, x_cp, op_code)
         expected = _torch_from_cupy(ref_y)
     else:
         row_indices = torch.repeat_interleave(
@@ -388,11 +422,11 @@ def benchmark_spmv_case(
         if value_dtype in (torch.float16, torch.bfloat16):
             coo_f32 = coo.to(torch.float32)
             x_2d_f32 = x_2d.to(torch.float32)
-            coo_ref = coo_f32.transpose(0, 1) if transpose else coo_f32
-            expected = torch.sparse.mm(coo_ref, x_2d_f32).squeeze(1).to(value_dtype)
+            expected = _apply_torch_sparse_spmv_op(
+                coo_f32, x_2d_f32, op_code
+            ).to(value_dtype)
         else:
-            coo_ref = coo.transpose(0, 1) if transpose else coo
-            expected = torch.sparse.mm(coo_ref, x_2d).squeeze(1)
+            expected = _apply_torch_sparse_spmv_op(coo, x_2d, op_code)
     atol, rtol = _tolerance_for_dtype(value_dtype)
     triton_match = torch.allclose(triton_y, expected, atol=atol, rtol=rtol)
     triton_max_error = (
@@ -415,10 +449,9 @@ def benchmark_spmv_case(
             cusparse_reason = skip_reason
         else:
             try:
+                A_op = _cupy_spmv_op_matrix(A_csr, op_code)
                 cusparse_op = lambda: _torch_from_cupy(
-                    (A_csr.T @ _cupy_from_torch(x))
-                    if transpose
-                    else (A_csr @ _cupy_from_torch(x))
+                    A_op @ _cupy_from_torch(x)
                 )
                 cusparse_values, cusparse_ms = _benchmark_cuda_op(
                     cusparse_op, warmup=warmup, iters=iters
@@ -449,6 +482,7 @@ def benchmark_spmv_case(
             "nnz": nnz,
             "value_dtype": str(value_dtype),
             "index_dtype": str(index_dtype),
+            "op": op_name,
             "transpose": transpose,
             "index_fallback_policy": str(index_fallback_policy).lower(),
             "warmup": warmup,

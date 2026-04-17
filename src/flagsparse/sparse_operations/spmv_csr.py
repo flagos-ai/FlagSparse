@@ -15,6 +15,42 @@ SUPPORTED_SPMV_VALUE_DTYPES = (
     torch.complex128,
 )
 
+SPMV_OP_NON = 0
+SPMV_OP_TRANS = 1
+SPMV_OP_CONJ_TRANS = 2
+SPMV_OP_NAMES = {
+    SPMV_OP_NON: "non",
+    SPMV_OP_TRANS: "trans",
+    SPMV_OP_CONJ_TRANS: "conj",
+}
+_SPMV_OP_NAME_TO_CODE = {name: code for code, name in SPMV_OP_NAMES.items()}
+
+
+def _normalize_spmv_op(op=None, transpose=False):
+    if op is None:
+        return SPMV_OP_TRANS if bool(transpose) else SPMV_OP_NON
+    if isinstance(op, str):
+        token = op.strip().lower()
+        if token not in _SPMV_OP_NAME_TO_CODE:
+            raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+        return _SPMV_OP_NAME_TO_CODE[token]
+    try:
+        op_code = int(op)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj") from exc
+    if op_code not in SPMV_OP_NAMES:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+    return op_code
+
+
+def _spmv_op_to_name(op):
+    op_code = _normalize_spmv_op(op)
+    return SPMV_OP_NAMES[op_code]
+
+
+def _spmv_op_transposes(op):
+    return _normalize_spmv_op(op) in (SPMV_OP_TRANS, SPMV_OP_CONJ_TRANS)
+
 
 class PreparedCsrSpmv:
     """Cached CSR metadata for repeated SpMV calls on the same sparse matrix."""
@@ -32,6 +68,7 @@ class PreparedCsrSpmv:
         "opt_buckets",
         "supports_opt",
         "transpose",
+        "op",
         "index_fallback_policy",
         "index_fallback_applied",
         "index_fallback_reason",
@@ -52,6 +89,7 @@ class PreparedCsrSpmv:
         max_row_nnz,
         opt_buckets,
         transpose=False,
+        op=None,
         index_fallback_policy="auto",
         index_fallback_applied=False,
         index_fallback_reason=None,
@@ -70,7 +108,8 @@ class PreparedCsrSpmv:
             data.dtype in (torch.float32, torch.float64)
             and kernel_indices.dtype == torch.int32
         )
-        self.transpose = bool(transpose)
+        self.op = _normalize_spmv_op(op, transpose=transpose)
+        self.transpose = _spmv_op_transposes(self.op)
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
@@ -536,10 +575,14 @@ def prepare_spmv_csr(
     block_nnz=256,
     max_segments=None,
     transpose=False,
+    op=None,
     index_fallback_policy="auto",
 ):
     index_fallback_policy = _normalize_spmv_index_fallback_policy(index_fallback_policy)
-    transpose = bool(transpose)
+    op_code = _normalize_spmv_op(op, transpose=transpose)
+    if op is not None and bool(transpose) and op_code == SPMV_OP_NON:
+        raise ValueError("transpose=True conflicts with op=non")
+    transpose = _spmv_op_transposes(op_code)
     if transpose:
         data, indices, indptr, *_ = _prepare_spmv_csr_matrix(
             data,
@@ -548,6 +591,10 @@ def prepare_spmv_csr(
             shape,
             index_fallback_policy=index_fallback_policy,
         )
+        if op_code == SPMV_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+            data = data.conj()
+            if hasattr(data, "resolve_conj"):
+                data = data.resolve_conj()
         data, indices, indptr, shape = _transpose_csr_for_spmv(
             data, indices, indptr, shape
         )
@@ -597,6 +644,7 @@ def prepare_spmv_csr(
         max_row_nnz=max_row_nnz,
         opt_buckets=opt_buckets,
         transpose=transpose,
+        op=op_code,
         index_fallback_policy=index_fallback_policy,
     )
 
@@ -719,6 +767,7 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
         max_row_nnz=max_row_nnz,
         opt_buckets=opt_buckets,
         transpose=prepared.transpose,
+        op=prepared.op,
         index_fallback_policy=prepared.index_fallback_policy,
         index_fallback_applied=True,
         index_fallback_reason=str(reason),
@@ -757,15 +806,24 @@ def flagsparse_spmv_csr(
     use_opt=False,
     prepared=None,
     transpose=None,
+    op=None,
     index_fallback_policy="auto",
 ):
     """
-    CSR SpMV: y = A @ x or y = A.T @ x using Triton.
+    CSR SpMV using Triton.
     data, indices, indptr: CSR arrays; x: dense vector; shape: (n_rows, n_cols).
     prepared: cached CSR metadata from prepare_spmv_csr for steady-state runs.
+    op: 0/'non' for A @ x, 1/'trans' for A.T @ x, 2/'conj' for A.conj().T @ x.
     max_segments: None = auto-compute from indptr so all NNZ per row are covered.
     use_opt: if True, use the faster CSR-Vector bucketed path (fp32/fp64 native accum).
     """
+    op_explicit = op is not None
+    op_code = _normalize_spmv_op(
+        op,
+        transpose=False if transpose is None else bool(transpose),
+    )
+    if op_explicit and transpose is not None and bool(transpose) != _spmv_op_transposes(op_code):
+        raise ValueError("transpose conflicts with op")
     if prepared is None:
         if any(arg is None for arg in (data, indices, indptr, shape)):
             raise ValueError(
@@ -778,11 +836,15 @@ def flagsparse_spmv_csr(
             shape,
             block_nnz=block_nnz,
             max_segments=max_segments,
-            transpose=False if transpose is None else bool(transpose),
+            op=op_code,
             index_fallback_policy=index_fallback_policy,
         )
     else:
-        if transpose is not None and bool(transpose) != prepared.transpose:
+        if op_explicit and op_code != prepared.op:
+            raise ValueError(
+                f"op={_spmv_op_to_name(op_code)} does not match prepared.op={_spmv_op_to_name(prepared.op)}"
+            )
+        if not op_explicit and transpose is not None and bool(transpose) != prepared.transpose:
             raise ValueError(
                 f"transpose={bool(transpose)} does not match prepared.transpose={prepared.transpose}"
             )
