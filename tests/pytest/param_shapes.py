@@ -56,8 +56,8 @@ def _dtype_node_id(value):
 
 
 FLOAT_DTYPE_IDS = [_dtype_node_id(d) for d in FLOAT_DTYPES]
-SPMV_COO_DTYPES = (torch.float32, torch.float64)
-SPMV_COO_DTYPE_IDS = ("float32", "float64")
+SPMV_COO_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
+SPMV_COO_DTYPE_IDS = ("float32", "float64", "complex64", "complex128")
 SPMM_FLOAT_DTYPES = FLOAT_DTYPES
 SPMM_FLOAT_DTYPE_IDS = FLOAT_DTYPE_IDS
 SPMM_OPT_DTYPES = (torch.float32, torch.float64)
