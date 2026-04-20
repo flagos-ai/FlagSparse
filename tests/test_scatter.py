@@ -54,7 +54,6 @@ def _parse_value_dtypes(raw):
         "bfloat16",
         "float32",
         "float64",
-        "complex32",
         "complex64",
         "complex128",
     }
