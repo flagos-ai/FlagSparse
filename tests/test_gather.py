@@ -16,7 +16,7 @@ DEFAULT_CASES = [
     (524_288, 16_384),
     (1_048_576, 65_536),
 ]
-DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex32,complex64,complex128"
+DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex64,complex128"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
@@ -48,7 +48,6 @@ def _parse_value_dtypes(raw):
         "bfloat16",
         "float32",
         "float64",
-        "complex32",
         "complex64",
         "complex128",
     }
@@ -164,7 +163,7 @@ def _collect_samples(case_id, expected, flagsparse_out, limit):
 
 
 def _dtype_mode(value_dtype_req):
-    if value_dtype_req in ("float16", "bfloat16", "complex32", "complex64"):
+    if value_dtype_req in ("float16", "bfloat16", "complex64"):
         return "gather_cupy"
     return "gather_triton"
 
@@ -193,8 +192,6 @@ def _build_dense(value_dtype_req, dense_size, device):
         real = torch.randn(dense_size, dtype=torch.float64, device=device)
         imag = torch.randn(dense_size, dtype=torch.float64, device=device)
         return torch.complex(real, imag)
-    if value_dtype_req == "complex32":
-        return torch.randn(dense_size, 2, dtype=torch.float16, device=device)
     raise ValueError(f"Unsupported value dtype request: {value_dtype_req}")
 
 
@@ -206,13 +203,12 @@ def _effective_dtype_name(value_dtype_req):
         "float64": "float64",
         "complex64": "complex64",
         "complex128": "complex128",
-        "complex32": "complex16_pair_f16",
     }
     return mapping[value_dtype_req]
 
 
 def _tolerance(value_dtype_req):
-    if value_dtype_req in ("float16", "complex32"):
+    if value_dtype_req == "float16":
         return 5e-3, 5e-3
     if value_dtype_req in ("bfloat16",):
         return 1e-2, 1e-2
@@ -230,10 +226,10 @@ def _check_dtype_supported(value_dtype_req):
 
 def _is_supported_extra_gather_combo(value_dtype_req, index_dtype):
     # Required extra gather combos only:
-    # Half+Int32/Int64, Bfloat16+Int32/Int64, Complex32+Int32/Int64, Complex64+Int32/Int64
+    # Half+Int32/Int64, Bfloat16+Int32/Int64, Complex64+Int32/Int64
     if value_dtype_req == "float16":
         return index_dtype in (torch.int32, torch.int64)
-    if value_dtype_req in ("bfloat16", "complex32", "complex64"):
+    if value_dtype_req in ("bfloat16", "complex64"):
         return index_dtype in (torch.int32, torch.int64)
     # Original gather path dtypes keep original behavior.
     return True

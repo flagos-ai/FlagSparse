@@ -226,6 +226,10 @@ def _launch_triton_scatter_kernel(
     )
 
 
+def _validate_gather_value_dtype(dense_vector, op_name):
+    return None
+
+
 def _cusparse_spmv(selector_matrix, dense_vector):
     if cp is not None and cpx_sparse is not None and isinstance(selector_matrix, cpx_sparse.spmatrix):
         if torch.is_tensor(dense_vector):
@@ -330,6 +334,7 @@ def flagsparse_gather(a, indices, out=None, mode="raise", block_size=1024, retur
     dense_vector, dense_backend = _to_torch_tensor(a, "a")
     indices_tensor, _ = _to_torch_tensor(indices, "indices")
     dense_vector, indices_tensor, kernel_indices = _prepare_inputs(dense_vector, indices_tensor)
+    _validate_gather_value_dtype(dense_vector, "flagsparse_gather")
 
     torch.cuda.synchronize()
     start_time = time.perf_counter()
@@ -479,6 +484,7 @@ def pytorch_index_scatter(
 def cusparse_spmv_gather(dense_vector, indices, selector_matrix=None):
     """Equivalent gather baseline via cuSPARSE-backed COO SpMV."""
     dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
+    _validate_gather_value_dtype(dense_vector, "cusparse_spmv_gather")
     skip_reason = _cusparse_baseline_skip_reason(dense_vector.dtype)
     if skip_reason:
         raise RuntimeError(skip_reason)
@@ -557,21 +563,14 @@ def _cupy_gather_detect_layout(dense_vector):
         return "scalar16"
     if dense_vector.ndim == 1 and dense_vector.dtype == torch.complex64:
         return "complex64"
-    if (
-        dense_vector.ndim == 2
-        and dense_vector.shape[1] == 2
-        and dense_vector.dtype == torch.float16
-    ):
-        # complex32 alignment with half2 storage.
-        return "complex16_pair"
     raise TypeError(
         "Unsupported gather input format. Expected one of: "
-        "1D float16/bfloat16, 1D complex64, or 2D (N,2) float16."
+        "1D float16/bfloat16 or 1D complex64."
     )
 
 
 def _cupy_gather_dense_size(dense_vector, layout):
-    if layout in ("scalar16", "complex64", "complex16_pair"):
+    if layout in ("scalar16", "complex64"):
         return int(dense_vector.shape[0])
     raise RuntimeError(f"Unknown gather layout: {layout}")
 
@@ -601,7 +600,7 @@ def _cupy_gather_validate_inputs(dense_vector, indices):
 
 def _cupy_gather_validate_combo(dense_vector, indices, layout):
     # Keep only the required extra gather combos:
-    # Half+Int64, Bfloat16+Int32/Int64, Complex32+Int32/Int64, Complex64+Int32/Int64
+    # Half+Int64, Bfloat16+Int32/Int64, Complex64+Int32/Int64
     if layout == "scalar16":
         if dense_vector.dtype == torch.float16:
             if indices.dtype != torch.int64:
@@ -610,11 +609,6 @@ def _cupy_gather_validate_combo(dense_vector, indices, layout):
         if dense_vector.dtype == torch.bfloat16:
             return
         raise TypeError("scalar16 gather_cupy supports only float16/bfloat16")
-
-    if layout == "complex16_pair":
-        if dense_vector.dtype != torch.float16:
-            raise TypeError("complex16_pair gather_cupy supports only float16 pairs")
-        return
 
     if layout == "complex64":
         return
@@ -625,8 +619,6 @@ def _cupy_gather_validate_combo(dense_vector, indices, layout):
 def _cupy_gather_layout_raw_kind(layout):
     if layout == "scalar16":
         return 16
-    if layout == "complex16_pair":
-        return 32
     if layout == "complex64":
         return 64
     raise RuntimeError(f"Unknown gather layout: {layout}")
@@ -675,9 +667,6 @@ def _cupy_gather_dense_to_raw_torch(dense_t, layout):
         return dense_t.reshape(-1).view(torch.uint16)
     if layout == "complex64":
         return dense_t.reshape(-1).view(torch.uint64)
-    if layout == "complex16_pair":
-        lanes_u16 = dense_t.reshape(-1).view(torch.uint16)
-        return lanes_u16.reshape(-1, 2).view(torch.uint32).reshape(-1)
     raise RuntimeError(f"Unknown gather layout: {layout}")
 
 
@@ -686,22 +675,17 @@ def _cupy_gather_raw_to_dense_torch(out_raw_t, layout, dense_t_dtype):
         return out_raw_t.view(dense_t_dtype).reshape(-1)
     if layout == "complex64":
         return out_raw_t.view(torch.complex64).reshape(-1)
-    if layout == "complex16_pair":
-        lanes_u16 = out_raw_t.view(torch.uint16).reshape(-1, 2)
-        return lanes_u16.view(dense_t_dtype).reshape(-1, 2)
     raise RuntimeError(f"Unknown gather layout: {layout}")
 
 
 def _cupy_gather_empty(layout, dense_dtype, device):
     if layout in ("scalar16", "complex64"):
         return torch.empty(0, dtype=dense_dtype, device=device)
-    if layout == "complex16_pair":
-        return torch.empty((0, 2), dtype=dense_dtype, device=device)
     raise RuntimeError(f"Unknown gather layout: {layout}")
 
 
 def _cupy_gather_selector_dtype(layout, dense_dtype):
-    if layout in ("scalar16", "complex16_pair"):
+    if layout == "scalar16":
         return dense_dtype
     if layout == "complex64":
         return torch.complex64
@@ -709,21 +693,12 @@ def _cupy_gather_selector_dtype(layout, dense_dtype):
 
 
 def _cupy_gather_prepare_dense(dense_vector, indices):
-    runtime_dense = dense_vector
-    restore_mode = None
-    native_complex32 = _torch_complex32_dtype()
-    if native_complex32 is not None and dense_vector.ndim == 1 and dense_vector.dtype == native_complex32:
-        runtime_dense = torch.view_as_real(dense_vector).contiguous()
-        restore_mode = "native_complex32"
-
-    layout, dense_size = _cupy_gather_validate_inputs(runtime_dense, indices)
-    _cupy_gather_validate_combo(runtime_dense, indices, layout)
-    return runtime_dense, layout, dense_size, restore_mode
+    layout, dense_size = _cupy_gather_validate_inputs(dense_vector, indices)
+    _cupy_gather_validate_combo(dense_vector, indices, layout)
+    return dense_vector, layout, dense_size, None
 
 
 def _cupy_gather_restore_output(gathered_t, restore_mode):
-    if restore_mode == "native_complex32":
-        return torch.view_as_complex(gathered_t.contiguous())
     return gathered_t
 
 
@@ -880,10 +855,6 @@ def cusparse_spmv_gather_cupy(dense_vector, indices, selector_matrix=None):
         start_time = time.perf_counter()
         if layout in ("scalar16", "complex64"):
             gathered_t = _cusparse_spmv(selector_matrix, runtime_dense_t)
-        elif layout == "complex16_pair":
-            gathered_real = _cusparse_spmv(selector_matrix, runtime_dense_t[:, 0])
-            gathered_imag = _cusparse_spmv(selector_matrix, runtime_dense_t[:, 1])
-            gathered_t = torch.stack([gathered_real, gathered_imag], dim=1)
         else:
             raise RuntimeError(f"Unknown gather layout: {layout}")
         torch.cuda.synchronize()
