@@ -8,8 +8,15 @@ import argparse
 import csv
 import glob
 import os
+import sys
+from pathlib import Path
 
 import torch
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _PROJECT_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
 
@@ -268,13 +275,13 @@ def _csr_to_dense(data, indices, indptr, shape):
     return coo.to_dense()
 
 
-def _csr_to_coo(data, indices, indptr, shape):
+def _csr_to_coo(data, indices, indptr, shape, index_dtype=torch.int64):
     n_rows = int(shape[0])
     row = torch.repeat_interleave(
-        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        torch.arange(n_rows, device=data.device, dtype=index_dtype),
         indptr[1:] - indptr[:-1],
     )
-    col = indices.to(torch.int64)
+    col = indices.to(index_dtype)
     return data, row, col
 
 
@@ -387,9 +394,11 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None, lower=Tr
     return data, indices, indptr, (n_rows, n_cols)
 
 
-def _coo_inputs_for_csv(data, indices, indptr, shape, coo_mode):
+def _coo_inputs_for_csv(data, indices, indptr, shape, coo_mode, index_dtype=torch.int64):
     """Sorted COO from CSR; optional shuffle/duplicate for csr|auto (与原先 CSV 行为一致)."""
-    data_c, row_c, col_c = _csr_to_coo(data, indices, indptr, shape)
+    data_c, row_c, col_c = _csr_to_coo(
+        data, indices, indptr, shape, index_dtype=index_dtype
+    )
     if coo_mode in ("csr", "auto"):
         if data_c.numel() == 0:
             return data_c, row_c, col_c
@@ -634,7 +643,9 @@ def run_spsv_synthetic_all(lower=True):
                                 return_time=True,
                             )
                         else:
-                            dc, rr, cc = _csr_to_coo(data, indices, indptr, shape)
+                            dc, rr, cc = _csr_to_coo(
+                                data, indices, indptr, shape, index_dtype=index_dtype
+                            )
                             x, t_ms = fs.flagsparse_spsv_coo(
                                 dc,
                                 rr,
@@ -726,25 +737,6 @@ def run_spsv_synthetic_all(lower=True):
     print(sep)
 
 
-def _run_one_csv_row_csr(path, value_dtype, index_dtype, device, lower=True):
-    data, indices, indptr, shape = _load_mtx_to_csr_torch(
-        path, dtype=value_dtype, device=device, lower=lower
-    )
-    indices = indices.to(index_dtype)
-    n_rows, n_cols = shape
-    x_true = _randn_by_dtype(n_rows, value_dtype, device)
-    b, _ = fs.flagsparse_spmv_csr(
-        data, indices, indptr, x_true, shape, return_time=True
-    )
-    x, t_ms = fs.flagsparse_spsv_csr(
-        data, indices, indptr, b, shape, lower=lower, return_time=True
-    )
-    return _finalize_csv_row(
-        path, value_dtype, index_dtype, data, indices, indptr, shape,
-        x, t_ms, b, x_true, n_rows, n_cols, lower=lower,
-    )
-
-
 def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode, lower=True):
     data, indices, indptr, shape = _load_mtx_to_csr_torch(
         path, dtype=value_dtype, device=device, lower=lower
@@ -756,7 +748,7 @@ def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode, lower
         data, indices, indptr, x_true, shape, return_time=True
     )
     d_in, r_in, c_in = _coo_inputs_for_csv(
-        data, indices, indptr, shape, coo_mode
+        data, indices, indptr, shape, coo_mode, index_dtype=index_dtype
     )
     x, t_ms = fs.flagsparse_spsv_coo(
         d_in,
@@ -1225,35 +1217,32 @@ def run_all_supported_spsv_csr_csv(
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 
-def run_all_dtypes_spsv_csv(mtx_paths, csv_path, use_coo=False, coo_mode="auto", lower=True):
+def run_all_dtypes_spsv_coo_csv(
+    mtx_paths,
+    csv_path,
+    coo_mode="auto",
+    lower=True,
+    value_dtypes=None,
+    index_dtypes=None,
+):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
         return
-    if not use_coo:
-        run_all_supported_spsv_csr_csv(mtx_paths, csv_path, lower=lower)
-        return
     device = torch.device("cuda")
     rows_out = []
-    label = "COO" if use_coo else "CSR"
-    cu_col = "COO(ms)" if use_coo else "CSR(ms)"
-    fs_cu_hdr = "FS/COO" if use_coo else "FS/CSR"
-    for value_dtype in VALUE_DTYPES:
-        for index_dtype in INDEX_DTYPES:
-            atol, rtol = _tol_for_dtype(value_dtype)
+    selected_value_dtypes = value_dtypes or VALUE_DTYPES
+    selected_index_dtypes = index_dtypes or INDEX_DTYPES
+    for value_dtype in selected_value_dtypes:
+        for index_dtype in selected_index_dtypes:
             print("=" * 150)
             print(
-                f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  {label}"
-                + (f"  triA={'LOWER' if lower else 'UPPER'}" if not use_coo else f"  triA={'LOWER' if lower else 'UPPER'}  coo_mode={coo_mode}")
+                f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  COO"
+                f"  triA={'LOWER' if lower else 'UPPER'}  coo_mode={coo_mode}"
             )
-            if use_coo:
-                print(
-                    "Formats: FlagSparse=COO SpSV, cuSPARSE=COO ref, PyTorch=Dense solve. "
-                    "b 由 CSR SpMV 构造，与 CSR 测试一致。"
-                )
-            else:
-                print(
-                    "Formats: FlagSparse=CSR, cuSPARSE=CSR ref, PyTorch=Dense solve."
-                )
+            print(
+                "Formats: FlagSparse=COO SpSV, cuSPARSE=COO ref, PyTorch=Dense solve. "
+                "b 由 CSR SpMV 构造，与 CSR 测试一致。"
+            )
             print(
                 "Err(X)=|FlagSparse-x_true|, Err(Res)=|A*x-b|, "
                 "Err(PT)=|FlagSparse-PyTorch|, Err(CU)=|FlagSparse-cuSPARSE|. "
@@ -1262,20 +1251,15 @@ def run_all_dtypes_spsv_csv(mtx_paths, csv_path, use_coo=False, coo_mode="auto",
             print("-" * 150)
             print(
                 f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-                f"{'FlagSparse(ms)':>10} {cu_col:>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
-                f"{fs_cu_hdr:>7} {'FS/PT':>7} {'Status':>6} {'Err(X)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(CU)':>10}"
+                f"{'FlagSparse(ms)':>10} {'COO(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
+                f"{'FS/COO':>7} {'FS/PT':>7} {'Status':>6} {'Err(X)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(CU)':>10}"
             )
             print("-" * 150)
             for path in mtx_paths:
                 try:
-                    if use_coo:
-                        row, pt_skip = _run_one_csv_row_coo(
-                            path, value_dtype, index_dtype, device, coo_mode, lower=lower
-                        )
-                    else:
-                        row, pt_skip = _run_one_csv_row_csr(
-                            path, value_dtype, index_dtype, device, lower=lower
-                        )
+                    row, pt_skip = _run_one_csv_row_coo(
+                        path, value_dtype, index_dtype, device, coo_mode, lower=lower
+                    )
                     rows_out.append(row)
                     name = os.path.basename(path)[:27]
                     if len(os.path.basename(path)) > 27:
@@ -1453,13 +1437,30 @@ def main():
         )
         return
     if args.csv_coo:
+        if args.ops:
+            parser.error("--ops is only supported with --csv-csr; COO tests only run opA=NON")
         if not paths:
             paths = sorted(glob.glob("*.mtx"))
         if not paths:
             print("No .mtx files found for --csv-coo")
             return
-        run_all_dtypes_spsv_csv(
-            paths, args.csv_coo, use_coo=True, coo_mode=args.coo_mode, lower=lower
+        value_dtypes = (
+            _parse_value_dtypes_filter(args.value_dtypes)
+            if args.value_dtypes
+            else None
+        )
+        index_dtypes = (
+            _parse_index_dtypes_filter(args.index_dtypes)
+            if args.index_dtypes
+            else None
+        )
+        run_all_dtypes_spsv_coo_csv(
+            paths,
+            args.csv_coo,
+            coo_mode=args.coo_mode,
+            lower=lower,
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
         )
         return
 
