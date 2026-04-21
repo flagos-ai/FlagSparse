@@ -941,8 +941,9 @@ def flagsparse_spsv_csr(
     vec_real = _triton_spsv_csr_vector
     vec_complex = _triton_spsv_csr_vector_complex
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    if return_time:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
     if b_in.ndim == 1:
         if torch.is_complex(data_in):
             x = vec_complex(
@@ -1020,8 +1021,9 @@ def flagsparse_spsv_csr(
     target_dtype = original_output_dtype if original_output_dtype is not None else data.dtype
     if x.dtype != target_dtype:
         x = _restore_spsv_output(x, target_dtype)
-    torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if return_time:
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if out is not None:
         if out.shape != x.shape or out.dtype != x.dtype:
             raise ValueError("out shape/dtype must match result")
@@ -1118,8 +1120,9 @@ def flagsparse_spsv_coo(
     )
     diag_eps = _spsv_diag_eps_for_dtype(compute_dtype)
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    if return_time:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
     if b_in.ndim == 1:
         x = _triton_spsv_coo_vector(
             data_in,
@@ -1159,8 +1162,9 @@ def flagsparse_spsv_coo(
         x = torch.stack(cols_out, dim=1)
     if compute_dtype != data.dtype:
         x = x.to(data.dtype)
-    torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if return_time:
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     if out is not None:
         if out.shape != x.shape or out.dtype != x.dtype:

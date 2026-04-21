@@ -163,15 +163,12 @@ def _collect_samples(case_id, expected, flagsparse_out, limit):
 
 
 def _dtype_mode(value_dtype_req):
-    if value_dtype_req in ("float16", "bfloat16", "complex64"):
-        return "gather_cupy"
     return "gather_triton"
 
 
 def _select_mode(value_dtype_req, index_dtype):
-    # Keep original gather path for half+int32 while retaining cupy path for new combos.
-    if value_dtype_req == "float16" and index_dtype == torch.int32:
-        return "gather_triton"
+    # The required gather coverage is the full 6 value dtypes x 2 index dtypes
+    # matrix, so benchmark the primary Triton gather path for every combo.
     return _dtype_mode(value_dtype_req)
 
 

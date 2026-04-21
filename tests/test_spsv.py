@@ -494,6 +494,67 @@ def _solution_residual_metrics(data, indices, indptr, shape, x, b, value_dtype, 
     return err_res, ok_res
 
 
+def _benchmark_flagsparse(call):
+    x = None
+    for _ in range(WARMUP):
+        x = call()
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    for _ in range(ITERS):
+        x = call()
+    e1.record()
+    torch.cuda.synchronize()
+    return x, e0.elapsed_time(e1) / ITERS
+
+
+def _benchmark_flagsparse_spsv_csr(
+    data,
+    indices,
+    indptr,
+    b,
+    shape,
+    *,
+    lower=True,
+    transpose=False,
+):
+    return _benchmark_flagsparse(
+        lambda: fs.flagsparse_spsv_csr(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            transpose=transpose,
+        )
+    )
+
+
+def _benchmark_flagsparse_spsv_coo(
+    data,
+    row,
+    col,
+    b,
+    shape,
+    *,
+    lower=True,
+    coo_mode="auto",
+):
+    return _benchmark_flagsparse(
+        lambda: fs.flagsparse_spsv_coo(
+            data,
+            row,
+            col,
+            b,
+            shape,
+            lower=lower,
+            coo_mode=coo_mode,
+        )
+    )
+
+
 def _cupy_spsolve_lower_csr_or_coo(
     fmt,
     data,
@@ -668,7 +729,7 @@ def run_spsv_synthetic_all(lower=True):
 
                         torch.cuda.synchronize()
                         if fmt == "CSR":
-                            x, t_ms = fs.flagsparse_spsv_csr(
+                            x, t_ms = _benchmark_flagsparse_spsv_csr(
                                 data,
                                 indices,
                                 indptr,
@@ -676,13 +737,12 @@ def run_spsv_synthetic_all(lower=True):
                                 shape,
                                 lower=lower,
                                 transpose=op_mode,
-                                return_time=True,
                             )
                         else:
                             dc, rr, cc = _csr_to_coo(
                                 data, indices, indptr, shape, index_dtype=index_dtype
                             )
-                            x, t_ms = fs.flagsparse_spsv_coo(
+                            x, t_ms = _benchmark_flagsparse_spsv_coo(
                                 dc,
                                 rr,
                                 cc,
@@ -690,7 +750,6 @@ def run_spsv_synthetic_all(lower=True):
                                 shape,
                                 lower=lower,
                                 coo_mode="auto",
-                                return_time=True,
                             )
                         torch.cuda.synchronize()
 
@@ -796,7 +855,7 @@ def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode, lower
     d_in, r_in, c_in = _coo_inputs_for_csv(
         data, indices, indptr, shape, coo_mode, index_dtype=index_dtype
     )
-    x, t_ms = fs.flagsparse_spsv_coo(
+    x, t_ms = _benchmark_flagsparse_spsv_coo(
         d_in,
         r_in,
         c_in,
@@ -804,7 +863,6 @@ def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode, lower
         shape,
         lower=lower,
         coo_mode=coo_mode,
-        return_time=True,
     )
     return _finalize_csv_row(
         path,
@@ -1018,7 +1076,7 @@ def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device, l
             _dtype_name(index_dtype),
         ),
     )
-    x, t_ms = fs.flagsparse_spsv_csr(
+    x, t_ms = _benchmark_flagsparse_spsv_csr(
         data,
         indices,
         indptr,
@@ -1026,7 +1084,6 @@ def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device, l
         shape,
         lower=lower,
         transpose=op_mode,
-        return_time=True,
     )
     return _finalize_csv_row_csr_full(
         path,
