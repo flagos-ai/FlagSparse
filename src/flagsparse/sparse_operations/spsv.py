@@ -9,12 +9,10 @@ import triton
 import triton.language as tl
 
 SUPPORTED_SPSV_VALUE_DTYPES = (
-    torch.bfloat16,
     torch.float32,
     torch.float64,
     torch.complex64,
     torch.complex128,
-
 )
 SUPPORTED_SPSV_INDEX_DTYPES = (torch.int32, torch.int64)
 SPSV_NON_TRANS_SUPPORTED_COMBOS = (
@@ -68,12 +66,10 @@ def _validate_spsv_non_trans_combo(data_dtype, index_dtype, fmt_name):
     """Validate NON_TRANS support matrix and keep error messages explicit."""
     if (data_dtype, index_dtype) in SPSV_NON_TRANS_SUPPORTED_COMBOS:
         return
-    if data_dtype == torch.bfloat16 and index_dtype == torch.int32:
-        return
     raise TypeError(
         f"{fmt_name} SpSV currently supports NON_TRANS combinations: "
         "(float32, int32/int64), (float64, int32/int64), "
-        "(complex64, int32/int64), (complex128, int32/int64), (bfloat16, int32)"
+        "(complex64, int32/int64), (complex128, int32/int64)"
     )
 
 
@@ -126,7 +122,7 @@ def _prepare_spsv_inputs(data, indices, indptr, b, shape):
 
     if data.dtype not in SUPPORTED_SPSV_VALUE_DTYPES:
         raise TypeError(
-            "data dtype must be one of: bfloat16, float32, float64, complex64, complex128"
+            "data dtype must be one of: float32, float64, complex64, complex128"
         )
     if indices.dtype not in SUPPORTED_SPSV_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
@@ -696,14 +692,13 @@ def _prepare_spsv_coo_inputs(data, row, col, b, shape, transpose=False):
         raise ValueError(f"b.shape[0] must equal n_rows={n_rows}")
 
     if data.dtype not in (
-        torch.bfloat16,
         torch.float32,
         torch.float64,
         torch.complex64,
         torch.complex128,
     ):
         raise TypeError(
-            "data dtype must be one of: bfloat16, float32, float64, complex64, complex128"
+            "data dtype must be one of: float32, float64, complex64, complex128"
         )
     if b.dtype != data.dtype:
         raise TypeError("b dtype must match data dtype")
@@ -796,13 +791,8 @@ def _coo_to_csr_sorted_unique(data, row64, col64, n_rows, n_cols):
     unique_key, inverse = torch.unique_consecutive(key_s, return_inverse=True)
     out_nnz = unique_key.numel()
 
-    if data_s.dtype == torch.bfloat16:
-        reduced_f32 = torch.zeros(out_nnz, dtype=torch.float32, device=data.device)
-        reduced_f32.scatter_add_(0, inverse, data_s.to(torch.float32))
-        data_u = reduced_f32.to(torch.bfloat16)
-    else:
-        data_u = torch.zeros(out_nnz, dtype=data.dtype, device=data.device)
-        data_u.scatter_add_(0, inverse, data_s)
+    data_u = torch.zeros(out_nnz, dtype=data.dtype, device=data.device)
+    data_u.scatter_add_(0, inverse, data_s)
 
     row_u = torch.div(unique_key, max(1, n_cols), rounding_mode="floor")
     col_u = unique_key - row_u * max(1, n_cols)
@@ -877,7 +867,6 @@ def flagsparse_spsv_csr(
     Primary support matrix:
     - NON_TRANS: float32/float64/complex64/complex128 with int32/int64 indices
     - TRANS/CONJ: float32/float64/complex64/complex128 with int32/int64 indices
-    - bfloat16 remains NON_TRANS + int32
     """
     input_data = data
     input_indices = indices
@@ -926,11 +915,7 @@ def flagsparse_spsv_csr(
     compute_dtype = data.dtype
     data_in = kernel_data
     b_in = b
-    if data.dtype == torch.bfloat16:
-        compute_dtype = torch.float32
-        data_in = kernel_data.to(torch.float32)
-        b_in = b.to(torch.float32)
-    elif data.dtype == torch.complex64 and trans_mode in ("T", "C"):
+    if data.dtype == torch.complex64 and trans_mode in ("T", "C"):
         compute_dtype = torch.complex128
         data_in = kernel_data.to(torch.complex128)
         b_in = b.to(torch.complex128)
@@ -1123,11 +1108,7 @@ def flagsparse_spsv_coo(
     compute_dtype = data.dtype
     data_in = data
     b_in = b
-    if data.dtype == torch.bfloat16:
-        compute_dtype = torch.float32
-        data_in = data.to(torch.float32)
-        b_in = b.to(torch.float32)
-    elif data.dtype == torch.float32 and SPSV_PROMOTE_FP32_TO_FP64:
+    if data.dtype == torch.float32 and SPSV_PROMOTE_FP32_TO_FP64:
         compute_dtype = torch.float64
         data_in = data.to(torch.float64)
         b_in = b.to(torch.float64)
