@@ -163,12 +163,12 @@ def _collect_samples(case_id, expected, flagsparse_out, limit):
 
 
 def _dtype_mode(value_dtype_req):
+    _ = value_dtype_req
     return "gather_triton"
 
 
 def _select_mode(value_dtype_req, index_dtype):
-    # The required gather coverage is the full 6 value dtypes x 2 index dtypes
-    # matrix, so benchmark the primary Triton gather path for every combo.
+    _ = index_dtype
     return _dtype_mode(value_dtype_req)
 
 
@@ -221,15 +221,9 @@ def _check_dtype_supported(value_dtype_req):
         raise RuntimeError("bfloat16 not supported on this GPU")
 
 
-def _is_supported_extra_gather_combo(value_dtype_req, index_dtype):
-    # Required extra gather combos only:
-    # Half+Int32/Int64, Bfloat16+Int32/Int64, Complex64+Int32/Int64
-    if value_dtype_req == "float16":
-        return index_dtype in (torch.int32, torch.int64)
-    if value_dtype_req in ("bfloat16", "complex64"):
-        return index_dtype in (torch.int32, torch.int64)
-    # Original gather path dtypes keep original behavior.
-    return True
+def _is_supported_gather_combo(index_dtype):
+    # Required gather coverage is the full 6 value dtypes x 2 index dtypes matrix.
+    return index_dtype in (torch.int32, torch.int64)
 
 
 def _build_indices(dense_size, nnz, index_dtype, device):
@@ -253,28 +247,13 @@ def _benchmark_gather_case(
     expected = dense_vector.index_select(0, indices.to(torch.int64))
 
     mode = _select_mode(value_dtype_req, index_dtype)
-    if mode == "gather_cupy":
-        preview_output, gather_meta = ast.flagsparse_gather_cupy(
-            dense_vector,
-            indices,
-            index_fallback_policy=index_fallback_policy,
-            return_metadata=True,
-        )
-        _ = preview_output
-        flagsparse_op = lambda: ast.flagsparse_gather_cupy(
-            dense_vector,
-            indices,
-            index_fallback_policy=index_fallback_policy,
-        )
-        cusparse_op = lambda: ast.cusparse_spmv_gather_cupy(dense_vector, indices)[0]
-    else:
-        gather_meta = {
-            "index_fallback_applied": False,
-            "index_fallback_reason": None,
-            "kernel_index_dtype": str(index_dtype).replace("torch.", ""),
-        }
-        flagsparse_op = lambda: ast.flagsparse_gather(dense_vector, indices)
-        cusparse_op = lambda: ast.cusparse_spmv_gather(dense_vector, indices)[0]
+    gather_meta = {
+        "index_fallback_applied": False,
+        "index_fallback_reason": None,
+        "kernel_index_dtype": str(index_dtype).replace("torch.", ""),
+    }
+    flagsparse_op = lambda: ast.flagsparse_gather(dense_vector, indices)
+    cusparse_op = lambda: ast.cusparse_spmv_gather(dense_vector, indices)[0]
 
     pytorch_op = lambda: dense_vector.index_select(0, indices.to(torch.int64))
     pytorch_values, pytorch_ms = _bench_cuda_op(pytorch_op, warmup=warmup, iters=iters)
@@ -401,7 +380,7 @@ def run_cli(args):
 
     for value_dtype in value_dtype_tokens:
         for index_name, index_dtype in index_dtype_pairs:
-            if not _is_supported_extra_gather_combo(value_dtype, index_dtype):
+            if not _is_supported_gather_combo(index_dtype):
                 continue
             for dense_size, nnz in work_cases:
                 dense_size = int(dense_size)
@@ -477,7 +456,7 @@ def run_cli(args):
                         "index_dtype": index_name,
                         "dense_size": dense_size,
                         "nnz": nnz,
-                        "mode": _dtype_mode(value_dtype),
+                        "mode": _select_mode(value_dtype, index_dtype),
                         "index_fallback_policy": args.index_fallback_policy,
                         "index_fallback_applied": False,
                         "triton_ms": None,
