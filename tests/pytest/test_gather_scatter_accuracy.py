@@ -29,7 +29,6 @@ def _complex32_dtype():
 
 def _scatter_dtype_cases():
     cases = [(str(dtype).replace("torch.", ""), dtype) for dtype in FLOAT_DTYPES]
-    cases.append(("complex32", _complex32_dtype()))
     cases.append(("complex64", torch.complex64))
     cases.append(("complex128", torch.complex128))
     return cases
@@ -66,6 +65,8 @@ def _build_random_values(size, dtype, device):
 
 
 def _to_cupy(tensor):
+    if tensor.dtype == torch.bfloat16:
+        pytest.skip("CuPy DLPack bfloat16 conversion is unsafe in this environment")
     return cp.from_dlpack(torch.utils.dlpack.to_dlpack(tensor))
 
 

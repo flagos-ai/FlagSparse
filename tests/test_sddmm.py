@@ -38,10 +38,18 @@ INDEX_DTYPES = [torch.int32]
 WARMUP = 5
 ITERS = 20
 DEFAULT_K = 64
+CSV_K_DIMS = (32, 64, 128, 256)
 BASELINE_ATOL = 1e-4
 BASELINE_RTOL = 1e-2
 ACC64_ATOL = 1e-6
 ACC64_RTOL = 1e-5
+DTYPE_MAP = {
+    "float32": torch.float32,
+    "float64": torch.float64,
+}
+INDEX_DTYPE_MAP = {
+    "int32": torch.int32,
+}
 
 
 def _dtype_name(dtype):
@@ -56,6 +64,12 @@ def _fmt_speedup(other_ms, triton_ms):
     if other_ms is None or triton_ms is None or triton_ms <= 0:
         return "N/A"
     return f"{other_ms / triton_ms:.2f}x"
+
+
+def _speedup_ratio(other_ms, triton_ms):
+    if other_ms is None or triton_ms is None or triton_ms <= 0:
+        return None
+    return other_ms / triton_ms
 
 
 def _fmt_err(value):
@@ -134,6 +148,36 @@ def _normalize_csv_path(csv_path):
     if parent:
         os.makedirs(parent, exist_ok=True)
     return csv_path
+
+
+def _parse_mapped_tokens(value, mapping, default_names, option_name):
+    raw = ",".join(default_names) if value is None else str(value)
+    tokens = [token.strip().lower() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError(f"{option_name} must not be empty")
+    invalid = [token for token in tokens if token not in mapping]
+    if invalid:
+        raise ValueError(
+            f"unsupported {option_name}: {', '.join(invalid)}; allowed: {', '.join(mapping)}"
+        )
+    return [mapping[token] for token in tokens]
+
+
+def _parse_k_dims(value, default_dims):
+    raw = ",".join(str(k) for k in default_dims) if value is None else str(value)
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError("--k must not be empty")
+    k_dims = []
+    for token in tokens:
+        try:
+            k_dim = int(token)
+        except ValueError as exc:
+            raise ValueError(f"--k values must be integers, got {token!r}") from exc
+        if k_dim < 0:
+            raise ValueError("--k must be non-negative")
+        k_dims.append(k_dim)
+    return k_dims
 
 
 def _resolve_tolerance(value_dtype, acc_mode):
@@ -437,11 +481,11 @@ def print_mtx_results(results, value_dtype, index_dtype, k_dim, alpha, beta, acc
 def run_all_dtypes_export_csv(
     paths,
     csv_path,
-    value_dtype=torch.float32,
-    index_dtype=torch.int32,
+    value_dtypes=None,
+    index_dtypes=None,
     warmup=WARMUP,
     iters=ITERS,
-    k_dim=DEFAULT_K,
+    k_dims=None,
     alpha=1.0,
     beta=0.0,
     run_cusparse=True,
@@ -449,56 +493,70 @@ def run_all_dtypes_export_csv(
 ):
     csv_path = _normalize_csv_path(csv_path)
     rows = []
-    print("=" * 164)
-    _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mode)
-    results = run_mtx_batch(
-        paths,
-        value_dtype=value_dtype,
-        index_dtype=index_dtype,
-        warmup=warmup,
-        iters=iters,
-        k_dim=k_dim,
-        alpha=alpha,
-        beta=beta,
-        run_cusparse=run_cusparse,
-        on_result=_print_sddmm_mtx_row,
-        acc_mode=acc_mode,
-    )
-    print("-" * 196)
-    for entry in results:
-        n_rows, n_cols = entry["shape"]
-        rows.append(
-            {
-                "matrix": os.path.basename(entry["path"]),
-                "value_dtype": _dtype_name(value_dtype),
-                "index_dtype": _dtype_name(index_dtype),
-                "n_rows": n_rows,
-                "n_cols": n_cols,
-                "nnz": entry["nnz"],
-                "cupy_ms": entry.get("cupy_ms"),
-                "triton_ms": entry.get("triton_ms"),
-                "cusparse_ms": entry.get("cusparse_ms"),
-                "pytorch_ms": entry.get("pytorch_ms"),
-                "pt_status": _status_label(entry.get("triton_ok_pt")),
-                "cu_status": _status_label(entry.get("cu_status")),
-                "status": entry.get("status"),
-                "err_pt": entry.get("err_pt"),
-                "err_cu": entry.get("err_cu"),
-                "error": entry.get("error"),
-                "cu_reason": entry.get("cu_reason"),
-                "triton_started": entry.get("triton_started"),
-                "cu_started": entry.get("cu_started"),
-                "fallback_used": entry.get("fallback_used"),
-                "nnz_pattern": entry.get("nnz_pattern"),
-                "k": entry.get("k"),
-                "alpha": entry.get("alpha"),
-                "beta": entry.get("beta"),
-                "prepare_ms": entry.get("prepare_ms"),
-            }
-        )
+    value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
+    index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
+    k_dims = CSV_K_DIMS if k_dims is None else k_dims
+    for value_dtype in value_dtypes:
+        for index_dtype in index_dtypes:
+            for k_dim in k_dims:
+                print("=" * 164)
+                _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mode)
+                results = run_mtx_batch(
+                    paths,
+                    value_dtype=value_dtype,
+                    index_dtype=index_dtype,
+                    warmup=warmup,
+                    iters=iters,
+                    k_dim=k_dim,
+                    alpha=alpha,
+                    beta=beta,
+                    run_cusparse=run_cusparse,
+                    on_result=_print_sddmm_mtx_row,
+                    acc_mode=acc_mode,
+                )
+                print("-" * 196)
+                for entry in results:
+                    n_rows, n_cols = entry["shape"]
+                    cupy_ms = entry.get("cupy_ms")
+                    cusparse_ms = entry.get("cusparse_ms")
+                    pytorch_ms = entry.get("pytorch_ms")
+                    triton_ms = entry.get("triton_ms")
+                    rows.append(
+                        {
+                            "matrix": os.path.basename(entry["path"]),
+                            "value_dtype": _dtype_name(value_dtype),
+                            "index_dtype": _dtype_name(index_dtype),
+                            "n_rows": n_rows,
+                            "n_cols": n_cols,
+                            "nnz": entry["nnz"],
+                            "cupy_ms": cupy_ms,
+                            "triton_ms": triton_ms,
+                            "cusparse_ms": cusparse_ms,
+                            "pytorch_ms": pytorch_ms,
+                            "triton_speedup_vs_cupy": _speedup_ratio(cupy_ms, triton_ms),
+                            "triton_speedup_vs_cusparse": _speedup_ratio(cusparse_ms, triton_ms),
+                            "triton_speedup_vs_pytorch": _speedup_ratio(pytorch_ms, triton_ms),
+                            "pt_status": _status_label(entry.get("triton_ok_pt")),
+                            "cu_status": _status_label(entry.get("cu_status")),
+                            "status": entry.get("status"),
+                            "err_pt": entry.get("err_pt"),
+                            "err_cu": entry.get("err_cu"),
+                            "error": entry.get("error"),
+                            "cu_reason": entry.get("cu_reason"),
+                            "triton_started": entry.get("triton_started"),
+                            "cu_started": entry.get("cu_started"),
+                            "fallback_used": entry.get("fallback_used"),
+                            "nnz_pattern": entry.get("nnz_pattern"),
+                            "k": entry.get("k"),
+                            "alpha": entry.get("alpha"),
+                            "beta": entry.get("beta"),
+                            "prepare_ms": entry.get("prepare_ms"),
+                        }
+                    )
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
         "triton_ms", "cupy_ms", "cusparse_ms", "pytorch_ms",
+        "triton_speedup_vs_cupy", "triton_speedup_vs_cusparse", "triton_speedup_vs_pytorch",
         "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
         "cu_reason", "triton_started", "cu_started", "fallback_used",
         "nnz_pattern", "k", "alpha", "beta", "prepare_ms",
@@ -589,8 +647,18 @@ def _expand_mtx_paths(raw_paths):
 def main():
     parser = argparse.ArgumentParser(description="FlagSparse SDDMM CSR tests")
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
-    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float64"])
-    parser.add_argument("--index-dtype", type=str, default="int32", choices=["int32"])
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=None,
+        help="Value dtype(s): float32,float64. CSV default: float32,float64; non-CSV default: float32.",
+    )
+    parser.add_argument(
+        "--index-dtype",
+        type=str,
+        default="int32",
+        help="Index dtype(s), currently only int32 is supported by SDDMM CSR.",
+    )
     parser.add_argument(
         "--acc_mode",
         type=str,
@@ -600,7 +668,12 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
-    parser.add_argument("--k", type=int, default=DEFAULT_K, help="Dense feature dimension K")
+    parser.add_argument(
+        "--k",
+        type=str,
+        default=None,
+        help="Dense feature dimension K; accepts one value or comma-separated values, e.g. 64 or 32,64,128. CSV default: 32,64,128,256; non-CSV default: 64.",
+    )
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument(
@@ -617,8 +690,26 @@ def main():
     parser.add_argument("--skip-api-checks", action="store_true")
     args = parser.parse_args()
 
-    if args.k < 0:
-        raise ValueError("--k must be non-negative")
+    try:
+        value_dtypes = _parse_mapped_tokens(
+            args.dtype,
+            DTYPE_MAP,
+            ("float32", "float64") if args.csv is not None else ("float32",),
+            "--dtype",
+        )
+        index_dtypes = _parse_mapped_tokens(
+            args.index_dtype,
+            INDEX_DTYPE_MAP,
+            ("int32",),
+            "--index-dtype",
+        )
+        k_dims = _parse_k_dims(
+            args.k,
+            CSV_K_DIMS if args.csv is not None else (DEFAULT_K,),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if not torch.cuda.is_available():
         print("CUDA is not available.")
         return
@@ -629,8 +720,6 @@ def main():
             raise SystemExit(1)
     run_cupy_ref = not (args.no_cupy_ref or args.no_cusparse)
 
-    value_dtype = torch.float32 if args.dtype == "float32" else torch.float64
-    index_dtype = torch.int32
     paths = _expand_mtx_paths(args.mtx)
     if not paths and not args.csv:
         print("No .mtx files given. Use: python test_sddmm.py <file.mtx> [file2.mtx ...] or <dir/>")
@@ -648,16 +737,16 @@ def main():
         print("FLAGSPARSE SDDMM - export to CSV")
         print("=" * 110)
         print(
-            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  dtype: {args.dtype}  |  acc_mode: {args.acc_mode}  |  K: {args.k}  |  alpha: {args.alpha}  |  beta: {args.beta}  |  CSV: {csv_path}"
+            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  dtypes: {','.join(_dtype_name(d) for d in value_dtypes)}  |  index_dtypes: {','.join(_dtype_name(d) for d in index_dtypes)}  |  acc_mode: {args.acc_mode}  |  K: {','.join(str(k) for k in k_dims)}  |  alpha: {args.alpha}  |  beta: {args.beta}  |  CSV: {csv_path}"
         )
         run_all_dtypes_export_csv(
             paths,
             csv_path,
-            value_dtype=value_dtype,
-            index_dtype=index_dtype,
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
             warmup=args.warmup,
             iters=args.iters,
-            k_dim=args.k,
+            k_dims=k_dims,
             alpha=args.alpha,
             beta=args.beta,
             run_cusparse=run_cupy_ref,
@@ -670,22 +759,34 @@ def main():
     print("=" * 150)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
     print(
-        f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  acc_mode: {args.acc_mode}  K: {args.k}  alpha: {args.alpha}  beta: {args.beta}  warmup: {args.warmup}  iters: {args.iters}"
+        f"dtypes: {','.join(_dtype_name(d) for d in value_dtypes)}  index_dtypes: {','.join(_dtype_name(d) for d in index_dtypes)}  acc_mode: {args.acc_mode}  K: {','.join(str(k) for k in k_dims)}  alpha: {args.alpha}  beta: {args.beta}  warmup: {args.warmup}  iters: {args.iters}"
     )
     print()
-    results = run_mtx_batch(
-        paths,
-        value_dtype=value_dtype,
-        index_dtype=index_dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-        k_dim=args.k,
-        alpha=args.alpha,
-        beta=args.beta,
-        run_cusparse=run_cupy_ref,
-        acc_mode=args.acc_mode,
-    )
-    print_mtx_results(results, value_dtype, index_dtype, args.k, args.alpha, args.beta, args.acc_mode)
+    total_passed = 0
+    total_cases = 0
+    for value_dtype in value_dtypes:
+        for index_dtype in index_dtypes:
+            for k_dim in k_dims:
+                results = run_mtx_batch(
+                    paths,
+                    value_dtype=value_dtype,
+                    index_dtype=index_dtype,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    k_dim=k_dim,
+                    alpha=args.alpha,
+                    beta=args.beta,
+                    run_cusparse=run_cupy_ref,
+                    acc_mode=args.acc_mode,
+                )
+                print_mtx_results(results, value_dtype, index_dtype, k_dim, args.alpha, args.beta, args.acc_mode)
+                passed = sum(1 for entry in results if entry.get("status") == "PASS")
+                total_passed += passed
+                total_cases += len(results)
+                print(
+                    f"dtype={_dtype_name(value_dtype)} index_dtype={_dtype_name(index_dtype)} K={k_dim} Passed: {passed} / {len(results)}"
+                )
+    print(f"Total Passed: {total_passed} / {total_cases}")
 
 
 if __name__ == "__main__":

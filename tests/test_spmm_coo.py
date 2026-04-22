@@ -36,8 +36,8 @@ VALUE_DTYPES = [
     torch.complex128,
 ]
 INDEX_DTYPES = [torch.int32, torch.int64]
-CSV_VALUE_DTYPES = [torch.float32, torch.float64]
-CSV_INDEX_DTYPES = [torch.int32]
+CSV_VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
+CSV_INDEX_DTYPES = [torch.int32, torch.int64]
 TEST_CASES = [
     (512, 512, 4096, 16),
     (1024, 1024, 16384, 32),
@@ -73,6 +73,24 @@ def _fmt_speedup(other_ms, triton_ms):
     if other_ms is None or triton_ms is None or triton_ms <= 0:
         return "N/A"
     return f"{other_ms / triton_ms:.2f}x"
+
+
+def _speedup_ratio(other_ms, triton_ms):
+    if other_ms is None or triton_ms is None or triton_ms <= 0:
+        return None
+    return other_ms / triton_ms
+
+
+def _parse_csv_tokens(value, mapping, option_name):
+    tokens = [token.strip().lower() for token in str(value).split(",") if token.strip()]
+    if not tokens:
+        raise ValueError(f"{option_name} must not be empty")
+    invalid = [token for token in tokens if token not in mapping]
+    if invalid:
+        raise ValueError(
+            f"unsupported {option_name}: {', '.join(invalid)}; allowed: {', '.join(mapping)}"
+        )
+    return [mapping[token] for token in tokens]
 
 
 def _fmt_err(value):
@@ -879,6 +897,8 @@ def run_all_dtypes_export_csv(
     block_n=DEFAULT_BLOCK_N,
     block_nnz=DEFAULT_BLOCK_NNZ,
     route="rowrun",
+    value_dtypes=None,
+    index_dtypes=None,
 ):
     route = _normalize_route(route)
     if route == "compare":
@@ -886,8 +906,10 @@ def run_all_dtypes_export_csv(
     selected_route = _selected_route(route)
     csv_path = _normalize_csv_path(csv_path)
     rows = []
-    for value_dtype in CSV_VALUE_DTYPES:
-        for index_dtype in CSV_INDEX_DTYPES:
+    value_dtypes = CSV_VALUE_DTYPES if value_dtypes is None else value_dtypes
+    index_dtypes = CSV_INDEX_DTYPES if index_dtypes is None else index_dtypes
+    for value_dtype in value_dtypes:
+        for index_dtype in index_dtypes:
             print("=" * 150)
             _print_spmm_coo_mtx_header(value_dtype, index_dtype, route)
             results = run_mtx_batch(
@@ -916,6 +938,12 @@ def run_all_dtypes_export_csv(
                     "triton_ms": entry.get("triton_ms"),
                     "cusparse_ms": entry.get("cusparse_ms"),
                     "pytorch_ms": entry.get("pytorch_ms"),
+                    "triton_speedup_vs_cusparse": _speedup_ratio(
+                        entry.get("cusparse_ms"), entry.get("triton_ms")
+                    ),
+                    "triton_speedup_vs_pytorch": _speedup_ratio(
+                        entry.get("pytorch_ms"), entry.get("triton_ms")
+                    ),
                     "pt_status": _status_label(entry.get("triton_ok_pt")),
                     "cu_status": _status_label(entry.get("triton_ok_cu")),
                     "status": (
@@ -930,6 +958,7 @@ def run_all_dtypes_export_csv(
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
         "triton_ms", "cusparse_ms", "pytorch_ms",
+        "triton_speedup_vs_cusparse", "triton_speedup_vs_pytorch",
         "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
@@ -1262,6 +1291,8 @@ def main():
     parser.add_argument("--synthetic", action="store_true", help="Run synthetic benchmark instead of .mtx")
     parser.add_argument("--dtype", default="float32", choices=["float16", "bfloat16", "float32", "float64", "complex64", "complex128"], help="Value dtype (default: float32)")
     parser.add_argument("--index-dtype", default="int32", choices=["int32", "int64"], help="Index dtype (default: int32)")
+    parser.add_argument("--dtypes", default="float32,float64,complex64,complex128", help="Comma-separated value dtype grid for CSV export: float32,float64,complex64,complex128")
+    parser.add_argument("--index-dtypes", default="int32,int64", help="Comma-separated index dtype grid for CSV export: int32,int64")
     parser.add_argument("--dense-cols", type=int, default=32, help="Dense RHS column count")
     parser.add_argument("--block-n", type=int, default=DEFAULT_BLOCK_N, help="Output column tile override (default: auto from dense-column heuristic)")
     parser.add_argument("--block-nnz", type=int, default=DEFAULT_BLOCK_NNZ, help="COO nnz tile width override (default: 256)")
@@ -1271,7 +1302,7 @@ def main():
     parser.add_argument("--no-cusparse", action="store_true", help="Skip cuSPARSE baseline")
     parser.add_argument("--skip-api-checks", action="store_true", help="Skip API validation checks in synthetic mode")
     parser.add_argument("--skip-coo-coverage", action="store_true", help="Skip dense-column COO heuristic coverage in synthetic mode")
-    parser.add_argument("--csv", type=str, default=None, metavar="FILE", help="Run float32/float64 with int32 indices on all .mtx and write results to one CSV")
+    parser.add_argument("--csv", type=str, default=None, metavar="FILE", help="Run selected dtype/index grids on all .mtx and write results to one CSV")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -1327,11 +1358,15 @@ def main():
             return
         csv_path = _normalize_csv_path(args.csv)
         print("=" * 100)
-        print("FLAGSPARSE COO SpMM - f32/f64 with int32, export to CSV")
+        print("FLAGSPARSE COO SpMM - selected dtype/index grid, export to CSV")
         print("=" * 100)
+        try:
+            csv_value_dtypes = _parse_csv_tokens(args.dtypes, dtype_map, "--dtypes")
+            csv_index_dtypes = _parse_csv_tokens(args.index_dtypes, index_map, "--index-dtypes")
+        except ValueError as exc:
+            parser.error(str(exc))
         print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  DenseN: {args.dense_cols}  |  Route: {args.route}  |  CSV: {csv_path}")
-        if args.dtype != "float32" or args.index_dtype != "int32":
-            print("Note: --csv export ignores --dtype/--index-dtype and always writes float32/float64 with int32 indices.")
+        print(f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}")
         run_all_dtypes_export_csv(
             paths,
             csv_path,
@@ -1342,6 +1377,8 @@ def main():
             block_n=args.block_n,
             block_nnz=args.block_nnz,
             route=args.route,
+            value_dtypes=csv_value_dtypes,
+            index_dtypes=csv_index_dtypes,
         )
         return
 

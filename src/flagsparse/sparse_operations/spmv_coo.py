@@ -1,11 +1,11 @@
-"""COO SpMV **without CSR / indptr** (fp32/fp64).
+"""COO SpMV **without CSR / indptr** (fp32/fp64/complex64/complex128).
 
 - ``sort_by_row=True`` (default): lex-sort (row,col), build compact **row-run** offsets
   ``seg_starts`` (length #runs+1, not ``n_rows+1``), one Triton program per run — register
   reduction + single ``tl.store`` per output row (no atomics on ``y``).
 - ``sort_by_row=False``: grid over NNZ with ``tl.atomic_add`` (slower / contentions).
 
-Storage: sorted ``data, row, col`` plus optional ``seg_starts`` int32 vector — never ``indptr``.
+Storage: sorted ``data, row, col`` plus optional ``seg_starts`` vector — never ``indptr``.
 """
 
 from ._common import *
@@ -14,6 +14,64 @@ import time
 
 import triton
 import triton.language as tl
+
+
+SUPPORTED_SPMV_COO_VALUE_DTYPES = (
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
+
+SPMV_COO_OP_NON = 0
+SPMV_COO_OP_TRANS = 1
+SPMV_COO_OP_CONJ_TRANS = 2
+SPMV_COO_OP_NAMES = {
+    SPMV_COO_OP_NON: "non",
+    SPMV_COO_OP_TRANS: "trans",
+    SPMV_COO_OP_CONJ_TRANS: "conj",
+}
+_SPMV_COO_OP_NAME_TO_CODE = {name: code for code, name in SPMV_COO_OP_NAMES.items()}
+
+
+def _spmv_coo_dtype_error_message():
+    return "COO SpMV supports float32, float64, complex64, and complex128"
+
+
+def _normalize_spmv_coo_op(op=None, transpose=False):
+    if op is None:
+        return SPMV_COO_OP_TRANS if bool(transpose) else SPMV_COO_OP_NON
+    if isinstance(op, str):
+        token = op.strip().lower()
+        if token not in _SPMV_COO_OP_NAME_TO_CODE:
+            raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+        return _SPMV_COO_OP_NAME_TO_CODE[token]
+    try:
+        op_code = int(op)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj") from exc
+    if op_code not in SPMV_COO_OP_NAMES:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+    return op_code
+
+
+def _spmv_coo_op_to_name(op):
+    op_code = _normalize_spmv_coo_op(op)
+    return SPMV_COO_OP_NAMES[op_code]
+
+
+def _spmv_coo_op_transposes(op):
+    return _normalize_spmv_coo_op(op) in (
+        SPMV_COO_OP_TRANS,
+        SPMV_COO_OP_CONJ_TRANS,
+    )
+
+
+def _normalize_spmv_coo_index_fallback_policy(index_fallback_policy):
+    policy = str(index_fallback_policy).lower()
+    if policy not in ("auto", "strict"):
+        raise ValueError("index_fallback_policy must be 'auto' or 'strict'")
+    return policy
 
 
 class PreparedCoo:
@@ -30,9 +88,26 @@ class PreparedCoo:
         "seg_starts",
         "n_segs",
         "use_seg_kernel",
+        "op",
+        "transpose",
+        "index_fallback_policy",
+        "index_fallback_applied",
+        "index_fallback_reason",
     )
 
-    def __init__(self, data, row, col, shape, seg_starts=None):
+    def __init__(
+        self,
+        data,
+        row,
+        col,
+        shape,
+        seg_starts=None,
+        transpose=False,
+        op=None,
+        index_fallback_policy="auto",
+        index_fallback_applied=False,
+        index_fallback_reason=None,
+    ):
         self.data = data
         self.row = row
         self.col = col
@@ -46,6 +121,11 @@ class PreparedCoo:
         else:
             self.n_segs = int(seg_starts.numel()) - 1
             self.use_seg_kernel = self.n_segs > 0
+        self.op = _normalize_spmv_coo_op(op, transpose=transpose)
+        self.transpose = _spmv_coo_op_transposes(self.op)
+        self.index_fallback_policy = str(index_fallback_policy).lower()
+        self.index_fallback_applied = bool(index_fallback_applied)
+        self.index_fallback_reason = index_fallback_reason
 
 
 @triton.jit
@@ -109,6 +189,44 @@ def _spmv_coo_seg_f64(
 
 
 @triton.jit
+def _spmv_coo_seg_complex(
+    data_ri_ptr,
+    col_ptr,
+    row_ptr,
+    x_ri_ptr,
+    y_ri_ptr,
+    seg_starts_ptr,
+    n_segs,
+    BLOCK_INNER: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    seg = tl.program_id(0)
+    if seg >= n_segs:
+        return
+    start = tl.load(seg_starts_ptr + seg)
+    end = tl.load(seg_starts_ptr + seg + 1)
+    row_id = tl.load(row_ptr + start)
+    acc_re = tl.zeros((), dtype=ACC_DTYPE)
+    acc_im = tl.zeros((), dtype=ACC_DTYPE)
+    pos = start
+    while pos < end:
+        offs = pos + tl.arange(0, BLOCK_INNER)
+        m = offs < end
+        a_re = tl.load(data_ri_ptr + offs * 2, mask=m, other=0.0)
+        a_im = tl.load(data_ri_ptr + offs * 2 + 1, mask=m, other=0.0)
+        c = tl.load(col_ptr + offs, mask=m, other=0)
+        x_re = tl.load(x_ri_ptr + c * 2, mask=m, other=0.0)
+        x_im = tl.load(x_ri_ptr + c * 2 + 1, mask=m, other=0.0)
+        prod_re = tl.where(m, a_re * x_re - a_im * x_im, 0.0)
+        prod_im = tl.where(m, a_re * x_im + a_im * x_re, 0.0)
+        acc_re += tl.sum(prod_re)
+        acc_im += tl.sum(prod_im)
+        pos += BLOCK_INNER
+    tl.store(y_ri_ptr + row_id * 2, acc_re)
+    tl.store(y_ri_ptr + row_id * 2 + 1, acc_im)
+
+
+@triton.jit
 def _spmv_coo_atomic_f32(
     data_ptr,
     row_ptr,
@@ -127,6 +245,32 @@ def _spmv_coo_atomic_f32(
     xv = tl.load(x_ptr + c, mask=m, other=0.0)
     contrib = tl.where(m, v * xv, 0.0).to(tl.float32)
     tl.atomic_add(y_ptr + r, contrib, mask=m, sem="relaxed")
+
+
+@triton.jit
+def _spmv_coo_atomic_complex(
+    data_ri_ptr,
+    row_ptr,
+    col_ptr,
+    x_ri_ptr,
+    y_ri_ptr,
+    nnz,
+    BLOCK: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < nnz
+    r = tl.load(row_ptr + offs, mask=m, other=0)
+    c = tl.load(col_ptr + offs, mask=m, other=0)
+    a_re = tl.load(data_ri_ptr + offs * 2, mask=m, other=0.0)
+    a_im = tl.load(data_ri_ptr + offs * 2 + 1, mask=m, other=0.0)
+    x_re = tl.load(x_ri_ptr + c * 2, mask=m, other=0.0)
+    x_im = tl.load(x_ri_ptr + c * 2 + 1, mask=m, other=0.0)
+    prod_re = tl.where(m, a_re * x_re - a_im * x_im, 0.0).to(ACC_DTYPE)
+    prod_im = tl.where(m, a_re * x_im + a_im * x_re, 0.0).to(ACC_DTYPE)
+    tl.atomic_add(y_ri_ptr + r * 2, prod_re, mask=m, sem="relaxed")
+    tl.atomic_add(y_ri_ptr + r * 2 + 1, prod_im, mask=m, sem="relaxed")
 
 
 @triton.jit
@@ -153,28 +297,32 @@ def _spmv_coo_atomic_f64(
 def _sort_coo_lex_inplace(data, row, col, n_cols):
     row64 = row.to(torch.int64)
     col64 = col.to(torch.int64)
+    index_dtype = torch.promote_types(row.dtype, col.dtype)
     if data.numel() == 0:
-        return data.contiguous(), row64, col64
+        return data.contiguous(), row.to(index_dtype).contiguous(), col.to(index_dtype).contiguous()
     key = row64 * max(1, int(n_cols)) + col64
     order = torch.argsort(key)
     return (
         data[order].contiguous(),
-        row64[order].contiguous(),
-        col64[order].contiguous(),
+        row[order].to(index_dtype).contiguous(),
+        col[order].to(index_dtype).contiguous(),
     )
 
 
-def _seg_starts_from_sorted_rows(row_i32, nnz, device):
-    """Boundaries of constant-row runs in sorted COO → int32[n_runs+1]."""
+def _seg_starts_from_sorted_rows(row, nnz, device):
+    """Boundaries of constant-row runs in sorted COO."""
     if nnz == 0:
         return None
-    diff = row_i32[1:] != row_i32[:-1]
-    breaks = torch.nonzero(diff, as_tuple=False).flatten().to(torch.int32) + 1
+    index_dtype = row.dtype
+    if nnz > _INDEX_LIMIT_INT32:
+        index_dtype = torch.int64
+    diff = row[1:] != row[:-1]
+    breaks = torch.nonzero(diff, as_tuple=False).flatten().to(index_dtype) + 1
     return torch.cat(
         [
-            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=index_dtype, device=device),
             breaks,
-            torch.tensor([nnz], dtype=torch.int32, device=device),
+            torch.tensor([nnz], dtype=index_dtype, device=device),
         ]
     )
 
@@ -189,40 +337,69 @@ def _prepare_coo_tensors(data, row, col, shape, sort_by_row):
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if data.numel() != row.numel() or data.numel() != col.numel():
         raise ValueError("data, row, col must have the same length")
-    if data.dtype not in (torch.float32, torch.float64):
-        raise TypeError(
-            "this COO SpMV path supports float32/float64 only (use CSR for other dtypes)"
-        )
+    if data.dtype not in SUPPORTED_SPMV_COO_VALUE_DTYPES:
+        raise TypeError(_spmv_coo_dtype_error_message())
+    if row.dtype not in SUPPORTED_INDEX_DTYPES:
+        raise TypeError("row dtype must be torch.int32 or torch.int64")
+    if col.dtype not in SUPPORTED_INDEX_DTYPES:
+        raise TypeError("col dtype must be torch.int32 or torch.int64")
+    index_dtype = torch.promote_types(row.dtype, col.dtype)
     if sort_by_row:
-        data, row64, col64 = _sort_coo_lex_inplace(data, row, col, n_cols)
-        seg = _seg_starts_from_sorted_rows(
-            row64.to(torch.int32), data.numel(), data.device
-        )
+        data, kr, kc = _sort_coo_lex_inplace(data, row, col, n_cols)
+        seg = _seg_starts_from_sorted_rows(kr, data.numel(), data.device)
     else:
         data = data.contiguous()
-        row64 = row.to(torch.int64).contiguous()
-        col64 = col.to(torch.int64).contiguous()
+        kr = row.to(index_dtype).contiguous()
+        kc = col.to(index_dtype).contiguous()
         seg = None
     if data.numel() > 0:
+        row64 = kr.to(torch.int64)
+        col64 = kc.to(torch.int64)
         if int(row64.min().item()) < 0 or int(row64.max().item()) >= n_rows:
             raise IndexError("row indices out of range")
         if int(col64.min().item()) < 0 or int(col64.max().item()) >= n_cols:
             raise IndexError("col indices out of range")
-        if int(row64.max().item()) > _INDEX_LIMIT_INT32 or int(
-            col64.max().item()
-        ) > _INDEX_LIMIT_INT32:
-            raise ValueError("indices exceed int32 Triton kernel range")
-    kr = row64.to(torch.int32)
-    kc = col64.to(torch.int32)
     return data, kr, kc, seg
 
 
-def prepare_spmv_coo(data, row, col, shape, sort_by_row=True):
+def prepare_spmv_coo(
+    data,
+    row,
+    col,
+    shape,
+    sort_by_row=True,
+    transpose=False,
+    op=None,
+    index_fallback_policy="auto",
+):
     """Cache sorted COO + row-run ``seg_starts`` when ``sort_by_row``. No ``indptr``."""
+    index_fallback_policy = _normalize_spmv_coo_index_fallback_policy(
+        index_fallback_policy
+    )
+    op_code = _normalize_spmv_coo_op(op, transpose=transpose)
+    if op is not None and bool(transpose) and op_code == SPMV_COO_OP_NON:
+        raise ValueError("transpose=True conflicts with op=non")
+    transpose = _spmv_coo_op_transposes(op_code)
+    if transpose:
+        shape = (int(shape[1]), int(shape[0]))
+        row, col = col, row
+        if op_code == SPMV_COO_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+            data = data.conj()
+            if hasattr(data, "resolve_conj"):
+                data = data.resolve_conj()
     d, kr, kc, seg = _prepare_coo_tensors(
         data, row, col, shape, sort_by_row
     )
-    return PreparedCoo(d, kr, kc, shape, seg_starts=seg)
+    return PreparedCoo(
+        d,
+        kr,
+        kc,
+        shape,
+        seg_starts=seg,
+        transpose=transpose,
+        op=op_code,
+        index_fallback_policy=index_fallback_policy,
+    )
 
 
 def _validate_x_coo(x, prepared):
@@ -250,6 +427,40 @@ def _triton_spmv_coo_kernel(
     y = torch.zeros(prepared.n_rows, dtype=dtype, device=prepared.data.device)
     nnz = prepared.nnz
     if nnz == 0:
+        return y
+    if _is_complex_dtype(dtype):
+        data_ri = torch.view_as_real(prepared.data).reshape(-1)
+        x_ri = torch.view_as_real(x).reshape(-1)
+        y_ri = torch.zeros(prepared.n_rows * 2, dtype=data_ri.dtype, device=y.device)
+        acc_dtype = tl.float64 if dtype == torch.complex128 else tl.float32
+        if prepared.use_seg_kernel:
+            grid = (prepared.n_segs,)
+            _spmv_coo_seg_complex[grid](
+                data_ri,
+                prepared.col,
+                prepared.row,
+                x_ri,
+                y_ri,
+                prepared.seg_starts,
+                prepared.n_segs,
+                BLOCK_INNER=block_inner,
+                ACC_DTYPE=acc_dtype,
+                num_warps=1,
+            )
+        else:
+            grid = (triton.cdiv(nnz, block_size),)
+            _spmv_coo_atomic_complex[grid](
+                data_ri,
+                prepared.row,
+                prepared.col,
+                x_ri,
+                y_ri,
+                nnz,
+                BLOCK=block_size,
+                ACC_DTYPE=acc_dtype,
+                num_warps=num_warps,
+            )
+        y.copy_(torch.view_as_complex(y_ri.reshape(prepared.n_rows, 2)))
         return y
     if prepared.use_seg_kernel:
         ker = _spmv_coo_seg_f64 if dtype == torch.float64 else _spmv_coo_seg_f32
@@ -281,6 +492,86 @@ def _triton_spmv_coo_kernel(
     return y
 
 
+def _spmv_coo_uses_int64_indices(prepared):
+    return (
+        prepared.row.dtype == torch.int64
+        or prepared.col.dtype == torch.int64
+        or (
+            prepared.seg_starts is not None
+            and prepared.seg_starts.dtype == torch.int64
+        )
+    )
+
+
+def _spmv_coo_int32_fallback_blocker(prepared):
+    for name, tensor in (("row", prepared.row), ("col", prepared.col)):
+        if tensor.numel() > 0:
+            min_index = int(tensor.min().item())
+            max_index = int(tensor.max().item())
+            if min_index < 0 or max_index > _INDEX_LIMIT_INT32:
+                return (
+                    f"{name} index range [{min_index}, {max_index}] cannot fit int32 "
+                    f"for shape={prepared.shape}"
+                )
+    if prepared.seg_starts is not None and prepared.seg_starts.numel() > 0:
+        max_offset = int(prepared.seg_starts[-1].item())
+        if max_offset > _INDEX_LIMIT_INT32:
+            return f"COO nnz offset {max_offset} cannot fit int32 for shape={prepared.shape}"
+    if prepared.n_rows > _INDEX_LIMIT_INT32 or prepared.n_cols > _INDEX_LIMIT_INT32:
+        return f"shape {prepared.shape} cannot fit int32 row/col metadata"
+    return None
+
+
+def _spmv_coo_prepared_with_int32_indices(prepared, reason):
+    blocker = _spmv_coo_int32_fallback_blocker(prepared)
+    if blocker is not None:
+        raise RuntimeError(
+            f"native int64 COO SpMV failed and int32 fallback is unsafe: {blocker}"
+        )
+    seg_starts = (
+        None
+        if prepared.seg_starts is None
+        else prepared.seg_starts.to(torch.int32).contiguous()
+    )
+    return PreparedCoo(
+        data=prepared.data,
+        row=prepared.row.to(torch.int32).contiguous(),
+        col=prepared.col.to(torch.int32).contiguous(),
+        shape=prepared.shape,
+        seg_starts=seg_starts,
+        transpose=prepared.transpose,
+        op=prepared.op,
+        index_fallback_policy=prepared.index_fallback_policy,
+        index_fallback_applied=True,
+        index_fallback_reason=str(reason),
+    )
+
+
+def _run_spmv_coo_prepared_with_fallback(prepared, x, block_size, num_warps, block_inner):
+    try:
+        return _triton_spmv_coo_kernel(
+            prepared,
+            x,
+            block_size=block_size,
+            num_warps=num_warps,
+            block_inner=block_inner,
+        )
+    except Exception as exc:
+        if (
+            prepared.index_fallback_policy != "auto"
+            or not _spmv_coo_uses_int64_indices(prepared)
+        ):
+            raise
+        fallback_prepared = _spmv_coo_prepared_with_int32_indices(prepared, exc)
+        return _triton_spmv_coo_kernel(
+            fallback_prepared,
+            x,
+            block_size=block_size,
+            num_warps=num_warps,
+            block_inner=block_inner,
+        )
+
+
 def flagsparse_spmv_coo(
     data=None,
     row=None,
@@ -294,23 +585,47 @@ def flagsparse_spmv_coo(
     block_size=256,
     num_warps=4,
     block_inner=128,
+    transpose=None,
+    op=None,
+    index_fallback_policy="auto",
 ):
     """COO SpMV with no CSR indptr. See module docstring.
 
     ``block_inner``: tile for the row-run kernel (``sort_by_row=True``).
     ``block_size`` / ``num_warps``: grid over NNZ when ``sort_by_row=False`` (atomics).
     """
+    op_explicit = op is not None
+    op_code = _normalize_spmv_coo_op(
+        op,
+        transpose=False if transpose is None else bool(transpose),
+    )
+    if op_explicit and transpose is not None and bool(transpose) != _spmv_coo_op_transposes(op_code):
+        raise ValueError("transpose conflicts with op")
     if prepared is None:
         if any(a is None for a in (data, row, col, x, shape)):
             raise ValueError(
                 "data, row, col, x, shape required when prepared is None"
             )
         prepared = prepare_spmv_coo(
-            data, row, col, shape, sort_by_row=sort_by_row
+            data,
+            row,
+            col,
+            shape,
+            sort_by_row=sort_by_row,
+            op=op_code,
+            index_fallback_policy=index_fallback_policy,
         )
     else:
         if x is None:
             raise TypeError("x is required when prepared is set")
+        if op_explicit and op_code != prepared.op:
+            raise ValueError(
+                f"op={_spmv_coo_op_to_name(op_code)} does not match prepared.op={_spmv_coo_op_to_name(prepared.op)}"
+            )
+        if not op_explicit and transpose is not None and bool(transpose) != prepared.transpose:
+            raise ValueError(
+                f"transpose={bool(transpose)} does not match prepared.transpose={prepared.transpose}"
+            )
         if shape is None:
             shape = prepared.shape
         sh = (int(shape[0]), int(shape[1]))
@@ -327,7 +642,7 @@ def flagsparse_spmv_coo(
     if return_time:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    y = _triton_spmv_coo_kernel(
+    y = _run_spmv_coo_prepared_with_fallback(
         prepared,
         x,
         block_size=block_size,

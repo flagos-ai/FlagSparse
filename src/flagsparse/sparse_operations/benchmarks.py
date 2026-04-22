@@ -3,6 +3,8 @@
 from ._common import *
 
 from .gather_scatter import (
+    SUPPORTED_SCATTER_VALUE_DTYPES,
+    _scatter_dtype_error_message,
     _cusparse_spmv,
     _make_gather_selector_matrix,
     _make_scatter_selector_matrix,
@@ -10,7 +12,15 @@ from .gather_scatter import (
     _triton_gather_impl,
     _triton_scatter_impl,
 )
-from .spmv_csr import flagsparse_spmv_csr, prepare_spmv_csr
+from .spmv_csr import (
+    SPMV_OP_NON,
+    SPMV_OP_TRANS,
+    _normalize_spmv_op,
+    _spmv_op_to_name,
+    _spmv_op_transposes,
+    flagsparse_spmv_csr,
+    prepare_spmv_csr,
+)
 from .spmm_csr import (
     benchmark_spmm_case,
     benchmark_spmm_opt_case,
@@ -21,6 +31,27 @@ from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
 
 
+def _cupy_spmv_op_matrix(matrix, op_code):
+    if op_code == SPMV_OP_NON:
+        return matrix
+    if op_code == SPMV_OP_TRANS:
+        return matrix.T
+    matrix_conj = matrix.conj() if hasattr(matrix, "conj") else matrix.conjugate()
+    return matrix_conj.T
+
+
+def _apply_cupy_spmv_op(matrix, vector, op_code):
+    return _cupy_spmv_op_matrix(matrix, op_code) @ vector
+
+
+def _apply_torch_sparse_spmv_op(matrix, vector_2d, op_code):
+    if op_code == SPMV_OP_NON:
+        return torch.sparse.mm(matrix, vector_2d).squeeze(1)
+    if op_code == SPMV_OP_TRANS:
+        return torch.sparse.mm(matrix.transpose(0, 1), vector_2d).squeeze(1)
+    return torch.sparse.mm(matrix.conj().transpose(0, 1), vector_2d).squeeze(1)
+
+
 def _normalize_dtype_name(value):
     if isinstance(value, str):
         return value.strip().lower()
@@ -29,9 +60,13 @@ def _normalize_dtype_name(value):
 
 def _resolve_scatter_benchmark_dtype(value_dtype, dtype_policy):
     requested_name = _normalize_dtype_name(value_dtype)
+    if requested_name in ("complex32", "chalf"):
+        raise TypeError(_scatter_dtype_error_message())
     effective_dtype, fallback_applied, fallback_reason = _resolve_scatter_value_dtype(
         value_dtype, dtype_policy=dtype_policy
     )
+    if effective_dtype not in SUPPORTED_SCATTER_VALUE_DTYPES:
+        raise TypeError(_scatter_dtype_error_message())
     return requested_name, effective_dtype, bool(fallback_applied), fallback_reason
 
 
@@ -317,13 +352,23 @@ def benchmark_spmv_case(
     block_nnz=256,
     max_segments=None,
     run_cusparse=True,
+    transpose=False,
+    op=None,
+    index_fallback_policy="auto",
 ):
     """Benchmark Triton CSR SpMV vs cuSPARSE (CuPy CSR @ x)."""
     device = torch.device("cuda")
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
-    x = _build_random_dense(n_cols, value_dtype, device)
+    op_code = _normalize_spmv_op(op, transpose=transpose)
+    if op is not None and bool(transpose) and op_code == SPMV_OP_NON:
+        raise ValueError("transpose=True conflicts with op=non")
+    transpose = _spmv_op_transposes(op_code)
+    op_name = _spmv_op_to_name(op_code)
+    x_size = n_rows if transpose else n_cols
+    y_size = n_cols if transpose else n_rows
+    x = _build_random_dense(x_size, value_dtype, device)
     shape = (n_rows, n_cols)
     prepared = prepare_spmv_csr(
         data,
@@ -332,6 +377,8 @@ def benchmark_spmv_case(
         shape,
         block_nnz=block_nnz,
         max_segments=max_segments,
+        op=op_code,
+        index_fallback_policy=index_fallback_policy,
     )
     triton_op = lambda: flagsparse_spmv_csr(
         x=x,
@@ -357,7 +404,7 @@ def benchmark_spmv_case(
         A_csr = cpx_sparse.csr_matrix(
             (data_cp, indices_cp, indptr_cp), shape=shape
         )
-        ref_y = A_csr @ x_cp
+        ref_y = _apply_cupy_spmv_op(A_csr, x_cp, op_code)
         expected = _torch_from_cupy(ref_y)
     else:
         row_indices = torch.repeat_interleave(
@@ -375,14 +422,16 @@ def benchmark_spmv_case(
         if value_dtype in (torch.float16, torch.bfloat16):
             coo_f32 = coo.to(torch.float32)
             x_2d_f32 = x_2d.to(torch.float32)
-            expected = torch.sparse.mm(coo_f32, x_2d_f32).squeeze(1).to(value_dtype)
+            expected = _apply_torch_sparse_spmv_op(
+                coo_f32, x_2d_f32, op_code
+            ).to(value_dtype)
         else:
-            expected = torch.sparse.mm(coo, x_2d).squeeze(1)
+            expected = _apply_torch_sparse_spmv_op(coo, x_2d, op_code)
     atol, rtol = _tolerance_for_dtype(value_dtype)
     triton_match = torch.allclose(triton_y, expected, atol=atol, rtol=rtol)
     triton_max_error = (
         float(torch.max(torch.abs(triton_y - expected)).item())
-        if n_rows > 0
+        if y_size > 0
         else 0.0
     )
     cusparse_ms = None
@@ -400,8 +449,9 @@ def benchmark_spmv_case(
             cusparse_reason = skip_reason
         else:
             try:
+                A_op = _cupy_spmv_op_matrix(A_csr, op_code)
                 cusparse_op = lambda: _torch_from_cupy(
-                    A_csr @ _cupy_from_torch(x)
+                    A_op @ _cupy_from_torch(x)
                 )
                 cusparse_values, cusparse_ms = _benchmark_cuda_op(
                     cusparse_op, warmup=warmup, iters=iters
@@ -411,7 +461,7 @@ def benchmark_spmv_case(
                 )
                 cusparse_max_error = (
                     float(torch.max(torch.abs(cusparse_values - expected)).item())
-                    if n_rows > 0
+                    if y_size > 0
                     else 0.0
                 )
             except Exception as exc:
@@ -432,6 +482,9 @@ def benchmark_spmv_case(
             "nnz": nnz,
             "value_dtype": str(value_dtype),
             "index_dtype": str(index_dtype),
+            "op": op_name,
+            "transpose": transpose,
+            "index_fallback_policy": str(index_fallback_policy).lower(),
             "warmup": warmup,
             "iters": iters,
         },

@@ -26,6 +26,17 @@ pip install torch triton cupy-cuda12x
 
 在项目根目录执行，或先 `cd tests` 再运行脚本（.mtx 目录可用 `../matrix` 等相对路径）。
 
+**pytest accuracy suite** - 小规模合成 CUDA 用例，可按算子 marker 选择：
+
+```bash
+pytest tests/pytest --mode quick
+pytest tests/pytest --mode normal -m "spmv_csr or spmm_csr"
+python run_flagsparse_pytest.py --mode quick --ops gather,spmv_csr,spmm_csr --gpus 0
+python run_flagsparse_pytest.py --op-list ops.txt --gpus 0,1 --results-dir pytest_results
+```
+
+runner 会为每个算子写入 `accuracy.log`，并生成 `summary.json`、`summary.csv`；安装 `openpyxl` 时还会生成 `summary.xlsx`。
+
 **test_spmv.py** - CSR SpMV（SuiteSparse `.mtx`、合成数据或 CSR CSV）：
 
 ```bash

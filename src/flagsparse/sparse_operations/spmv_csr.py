@@ -6,6 +6,52 @@ import time
 import triton
 import triton.language as tl
 
+SUPPORTED_SPMV_VALUE_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
+
+SPMV_OP_NON = 0
+SPMV_OP_TRANS = 1
+SPMV_OP_CONJ_TRANS = 2
+SPMV_OP_NAMES = {
+    SPMV_OP_NON: "non",
+    SPMV_OP_TRANS: "trans",
+    SPMV_OP_CONJ_TRANS: "conj",
+}
+_SPMV_OP_NAME_TO_CODE = {name: code for code, name in SPMV_OP_NAMES.items()}
+
+
+def _normalize_spmv_op(op=None, transpose=False):
+    if op is None:
+        return SPMV_OP_TRANS if bool(transpose) else SPMV_OP_NON
+    if isinstance(op, str):
+        token = op.strip().lower()
+        if token not in _SPMV_OP_NAME_TO_CODE:
+            raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+        return _SPMV_OP_NAME_TO_CODE[token]
+    try:
+        op_code = int(op)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj") from exc
+    if op_code not in SPMV_OP_NAMES:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+    return op_code
+
+
+def _spmv_op_to_name(op):
+    op_code = _normalize_spmv_op(op)
+    return SPMV_OP_NAMES[op_code]
+
+
+def _spmv_op_transposes(op):
+    return _normalize_spmv_op(op) in (SPMV_OP_TRANS, SPMV_OP_CONJ_TRANS)
+
+
 class PreparedCsrSpmv:
     """Cached CSR metadata for repeated SpMV calls on the same sparse matrix."""
 
@@ -21,6 +67,11 @@ class PreparedCsrSpmv:
         "max_row_nnz",
         "opt_buckets",
         "supports_opt",
+        "transpose",
+        "op",
+        "index_fallback_policy",
+        "index_fallback_applied",
+        "index_fallback_reason",
         "_baseline_compute_dtype",
         "_baseline_data",
     )
@@ -37,6 +88,11 @@ class PreparedCsrSpmv:
         max_segments,
         max_row_nnz,
         opt_buckets,
+        transpose=False,
+        op=None,
+        index_fallback_policy="auto",
+        index_fallback_applied=False,
+        index_fallback_reason=None,
     ):
         self.data = data
         self.kernel_indices = kernel_indices
@@ -48,7 +104,15 @@ class PreparedCsrSpmv:
         self.max_segments = max_segments
         self.max_row_nnz = max_row_nnz
         self.opt_buckets = opt_buckets
-        self.supports_opt = data.dtype in (torch.float32, torch.float64)
+        self.supports_opt = (
+            data.dtype in (torch.float32, torch.float64)
+            and kernel_indices.dtype == torch.int32
+        )
+        self.op = _normalize_spmv_op(op, transpose=transpose)
+        self.transpose = _spmv_op_transposes(self.op)
+        self.index_fallback_policy = str(index_fallback_policy).lower()
+        self.index_fallback_applied = bool(index_fallback_applied)
+        self.index_fallback_reason = index_fallback_reason
         if data.dtype in (torch.float16, torch.bfloat16):
             self._baseline_compute_dtype = torch.float32
         elif data.dtype == torch.float32:
@@ -376,7 +440,62 @@ def _triton_spmv_csr_impl_opt_prepared(prepared, x):
     return y
 
 
-def _prepare_spmv_csr_matrix(data, indices, indptr, shape):
+def _normalize_spmv_index_fallback_policy(index_fallback_policy):
+    policy = str(index_fallback_policy).lower()
+    if policy not in ("auto", "strict"):
+        raise ValueError("index_fallback_policy must be 'auto' or 'strict'")
+    return policy
+
+
+def _spmv_dtype_error_message():
+    return "data dtype must be one of: " + ", ".join(
+        str(dtype).replace("torch.", "") for dtype in SUPPORTED_SPMV_VALUE_DTYPES
+    )
+
+
+def _transpose_csr_for_spmv(data, indices, indptr, shape):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    nnz = data.numel()
+    device = data.device
+    if nnz == 0:
+        out_index_dtype = indices.dtype if n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+        out_indptr_dtype = indptr.dtype if nnz <= _INDEX_LIMIT_INT32 else torch.int64
+        return (
+            data,
+            torch.empty(0, dtype=out_index_dtype, device=device),
+            torch.zeros(n_cols + 1, dtype=out_indptr_dtype, device=device),
+            (n_cols, n_rows),
+        )
+
+    row_counts = indptr[1:] - indptr[:-1]
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, dtype=torch.int64, device=device),
+        row_counts.to(torch.int64),
+    )
+    col_ids = indices.to(torch.int64)
+    try:
+        order = torch.argsort(col_ids, stable=True)
+    except TypeError:
+        order = torch.argsort(col_ids)
+    sorted_cols = col_ids[order]
+    sorted_rows = row_ids[order]
+    transposed_data = data[order].contiguous()
+
+    nnz_per_transposed_row = torch.bincount(sorted_cols, minlength=n_cols)
+    transposed_indptr64 = torch.zeros(n_cols + 1, dtype=torch.int64, device=device)
+    transposed_indptr64[1:] = torch.cumsum(nnz_per_transposed_row, dim=0)
+    out_index_dtype = indices.dtype if n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+    out_indptr_dtype = indptr.dtype if nnz <= _INDEX_LIMIT_INT32 else torch.int64
+    return (
+        transposed_data,
+        sorted_rows.to(out_index_dtype).contiguous(),
+        transposed_indptr64.to(out_indptr_dtype).contiguous(),
+        (n_cols, n_rows),
+    )
+
+
+def _prepare_spmv_csr_matrix(data, indices, indptr, shape, index_fallback_policy="auto"):
+    _normalize_spmv_index_fallback_policy(index_fallback_policy)
     if not all(torch.is_tensor(t) for t in (data, indices, indptr)):
         raise TypeError("data, indices, indptr must all be torch.Tensor")
     if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
@@ -390,12 +509,14 @@ def _prepare_spmv_csr_matrix(data, indices, indptr, shape):
         raise ValueError("data and indices must have the same length (nnz)")
     if not all(t.is_cuda for t in (data, indices, indptr)):
         raise ValueError("data, indices, indptr must be CUDA tensors")
-    if data.dtype not in SUPPORTED_VALUE_DTYPES:
-        raise TypeError(
-            "data dtype must be one of: float16, bfloat16, float32, float64, complex64, complex128"
-        )
+    if not all(t.device == data.device for t in (indices, indptr)):
+        raise ValueError("data, indices, indptr must be on the same CUDA device")
+    if data.dtype not in SUPPORTED_SPMV_VALUE_DTYPES:
+        raise TypeError(_spmv_dtype_error_message())
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
+    if indptr.dtype not in SUPPORTED_INDEX_DTYPES:
+        raise TypeError("indptr dtype must be torch.int32 or torch.int64")
 
     data = data.contiguous()
     indices = indices.contiguous()
@@ -415,14 +536,8 @@ def _prepare_spmv_csr_matrix(data, indices, indptr, shape):
         max_index = int(indices.max().item())
         if min_index < 0 or max_index >= n_cols:
             raise IndexError("indices out of range for n_cols")
-        if max_index > _INDEX_LIMIT_INT32:
-            raise ValueError(
-                f"int64 column index {max_index} exceeds Triton int32 kernel range"
-            )
-    kernel_indices = indices.to(torch.int32) if indices.dtype == torch.int64 else indices
-    kernel_indptr = (
-        indptr.to(torch.int32) if nnz <= _INDEX_LIMIT_INT32 else indptr.to(torch.int64)
-    )
+    kernel_indices = indices
+    kernel_indptr = indptr
     row_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
     max_row_nnz = int(row_lengths.max().item()) if n_rows > 0 else 0
     return (
@@ -452,7 +567,37 @@ def _validate_spmv_x(x, prepared):
     return x.contiguous()
 
 
-def prepare_spmv_csr(data, indices, indptr, shape, block_nnz=256, max_segments=None):
+def prepare_spmv_csr(
+    data,
+    indices,
+    indptr,
+    shape,
+    block_nnz=256,
+    max_segments=None,
+    transpose=False,
+    op=None,
+    index_fallback_policy="auto",
+):
+    index_fallback_policy = _normalize_spmv_index_fallback_policy(index_fallback_policy)
+    op_code = _normalize_spmv_op(op, transpose=transpose)
+    if op is not None and bool(transpose) and op_code == SPMV_OP_NON:
+        raise ValueError("transpose=True conflicts with op=non")
+    transpose = _spmv_op_transposes(op_code)
+    if transpose:
+        data, indices, indptr, *_ = _prepare_spmv_csr_matrix(
+            data,
+            indices,
+            indptr,
+            shape,
+            index_fallback_policy=index_fallback_policy,
+        )
+        if op_code == SPMV_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+            data = data.conj()
+            if hasattr(data, "resolve_conj"):
+                data = data.resolve_conj()
+        data, indices, indptr, shape = _transpose_csr_for_spmv(
+            data, indices, indptr, shape
+        )
     (
         data,
         kernel_indices,
@@ -461,7 +606,13 @@ def prepare_spmv_csr(data, indices, indptr, shape, block_nnz=256, max_segments=N
         n_cols,
         row_lengths,
         max_row_nnz,
-    ) = _prepare_spmv_csr_matrix(data, indices, indptr, shape)
+    ) = _prepare_spmv_csr_matrix(
+        data,
+        indices,
+        indptr,
+        shape,
+        index_fallback_policy=index_fallback_policy,
+    )
     block_nnz_use = block_nnz
     if max_segments is None:
         max_segments_use = max((max_row_nnz + block_nnz_use - 1) // block_nnz_use, 1)
@@ -492,6 +643,9 @@ def prepare_spmv_csr(data, indices, indptr, shape, block_nnz=256, max_segments=N
         max_segments=max_segments_use,
         max_row_nnz=max_row_nnz,
         opt_buckets=opt_buckets,
+        transpose=transpose,
+        op=op_code,
+        index_fallback_policy=index_fallback_policy,
     )
 
 
@@ -554,6 +708,91 @@ def _triton_spmv_csr_impl_prepared(prepared, x):
     return y
 
 
+def _spmv_uses_int64_indices(prepared):
+    return (
+        prepared.kernel_indices.dtype == torch.int64
+        or prepared.kernel_indptr.dtype == torch.int64
+    )
+
+
+def _spmv_int32_fallback_blocker(prepared):
+    if prepared.kernel_indices.dtype == torch.int64 and prepared.kernel_indices.numel() > 0:
+        min_index = int(prepared.kernel_indices.min().item())
+        max_index = int(prepared.kernel_indices.max().item())
+        if min_index < 0 or max_index > _INDEX_LIMIT_INT32:
+            return (
+                f"column index range [{min_index}, {max_index}] cannot fit int32 "
+                f"for shape={prepared.shape}"
+            )
+    if prepared.kernel_indptr.dtype == torch.int64 and prepared.kernel_indptr.numel() > 0:
+        max_offset = int(prepared.kernel_indptr[-1].item())
+        if max_offset > _INDEX_LIMIT_INT32:
+            return (
+                f"CSR nnz offset {max_offset} cannot fit int32 for shape={prepared.shape}"
+            )
+    if prepared.n_rows > _INDEX_LIMIT_INT32:
+        return f"row count {prepared.n_rows} cannot fit int32 row metadata"
+    return None
+
+
+def _spmv_prepared_with_int32_indices(prepared, reason):
+    blocker = _spmv_int32_fallback_blocker(prepared)
+    if blocker is not None:
+        raise RuntimeError(
+            f"native int64 CSR SpMV failed and int32 fallback is unsafe: {blocker}"
+        )
+    kernel_indices = prepared.kernel_indices.to(torch.int32)
+    kernel_indptr = prepared.kernel_indptr.to(torch.int32)
+    row_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
+    max_row_nnz = int(row_lengths.max().item()) if prepared.n_rows > 0 else 0
+    row_index_dtype = (
+        torch.int32 if prepared.n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+    )
+    opt_buckets = _build_spmv_opt_buckets(
+        row_lengths,
+        max_row_nnz=max_row_nnz,
+        row_index_dtype=row_index_dtype,
+        max_segments=prepared.max_segments,
+        fp64=prepared.data.dtype == torch.float64,
+    )
+    return PreparedCsrSpmv(
+        data=prepared.data,
+        kernel_indices=kernel_indices,
+        kernel_indptr=kernel_indptr,
+        shape=prepared.shape,
+        n_rows=prepared.n_rows,
+        n_cols=prepared.n_cols,
+        block_nnz=prepared.block_nnz,
+        max_segments=prepared.max_segments,
+        max_row_nnz=max_row_nnz,
+        opt_buckets=opt_buckets,
+        transpose=prepared.transpose,
+        op=prepared.op,
+        index_fallback_policy=prepared.index_fallback_policy,
+        index_fallback_applied=True,
+        index_fallback_reason=str(reason),
+    )
+
+
+def _run_spmv_prepared(prepared, x, use_opt=False):
+    if use_opt and prepared.supports_opt:
+        return _triton_spmv_csr_impl_opt_prepared(prepared, x)
+    return _triton_spmv_csr_impl_prepared(prepared, x)
+
+
+def _run_spmv_prepared_with_fallback(prepared, x, use_opt=False):
+    try:
+        return _run_spmv_prepared(prepared, x, use_opt=use_opt)
+    except Exception as exc:
+        if (
+            prepared.index_fallback_policy != "auto"
+            or not _spmv_uses_int64_indices(prepared)
+        ):
+            raise
+        fallback_prepared = _spmv_prepared_with_int32_indices(prepared, exc)
+        return _run_spmv_prepared(fallback_prepared, x, use_opt=use_opt)
+
+
 def flagsparse_spmv_csr(
     data=None,
     indices=None,
@@ -566,14 +805,25 @@ def flagsparse_spmv_csr(
     return_time=False,
     use_opt=False,
     prepared=None,
+    transpose=None,
+    op=None,
+    index_fallback_policy="auto",
 ):
     """
-    CSR SpMV: y = A @ x using Triton (cuSPARSE-aligned dtypes).
+    CSR SpMV using Triton.
     data, indices, indptr: CSR arrays; x: dense vector; shape: (n_rows, n_cols).
     prepared: cached CSR metadata from prepare_spmv_csr for steady-state runs.
+    op: 0/'non' for A @ x, 1/'trans' for A.T @ x, 2/'conj' for A.conj().T @ x.
     max_segments: None = auto-compute from indptr so all NNZ per row are covered.
     use_opt: if True, use the faster CSR-Vector bucketed path (fp32/fp64 native accum).
     """
+    op_explicit = op is not None
+    op_code = _normalize_spmv_op(
+        op,
+        transpose=False if transpose is None else bool(transpose),
+    )
+    if op_explicit and transpose is not None and bool(transpose) != _spmv_op_transposes(op_code):
+        raise ValueError("transpose conflicts with op")
     if prepared is None:
         if any(arg is None for arg in (data, indices, indptr, shape)):
             raise ValueError(
@@ -586,21 +836,33 @@ def flagsparse_spmv_csr(
             shape,
             block_nnz=block_nnz,
             max_segments=max_segments,
+            op=op_code,
+            index_fallback_policy=index_fallback_policy,
         )
+    else:
+        if op_explicit and op_code != prepared.op:
+            raise ValueError(
+                f"op={_spmv_op_to_name(op_code)} does not match prepared.op={_spmv_op_to_name(prepared.op)}"
+            )
+        if not op_explicit and transpose is not None and bool(transpose) != prepared.transpose:
+            raise ValueError(
+                f"transpose={bool(transpose)} does not match prepared.transpose={prepared.transpose}"
+            )
     x = _validate_spmv_x(x, prepared)
     t0 = None
     if return_time:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    if use_opt and prepared.supports_opt:
-        y = _triton_spmv_csr_impl_opt_prepared(prepared, x)
-    else:
-        y = _triton_spmv_csr_impl_prepared(prepared, x)
+    y = _run_spmv_prepared_with_fallback(prepared, x, use_opt=use_opt)
     elapsed_ms = None
     if return_time:
         torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if out is not None:
+        if not out.is_cuda:
+            raise ValueError("out must be a CUDA tensor")
+        if out.device != y.device:
+            raise ValueError("out must be on the same CUDA device as the result")
         if out.shape != y.shape or out.dtype != y.dtype:
             raise ValueError("out shape/dtype must match result")
         out.copy_(y)
@@ -663,10 +925,8 @@ def prepare_spmv_coo_tocsr(
         raise ValueError("data, row, col must all be CUDA tensors")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
         raise ValueError("data, row, col must all be 1D tensors")
-    if data.dtype not in SUPPORTED_VALUE_DTYPES:
-        raise TypeError(
-            "data dtype must be one of: float16, bfloat16, float32, float64, complex64, complex128"
-        )
+    if data.dtype not in SUPPORTED_SPMV_VALUE_DTYPES:
+        raise TypeError(_spmv_dtype_error_message())
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if row.numel() != col.numel() or data.numel() != row.numel():
         raise ValueError("data, row, col must have the same length")
@@ -733,10 +993,8 @@ def flagsparse_spmv_coo_tocsr(
         raise ValueError("data, row, col, x must all be 1D tensors")
 
     n_rows, n_cols = int(shape[0]), int(shape[1])
-    if data.dtype not in SUPPORTED_VALUE_DTYPES:
-        raise TypeError(
-            "data dtype must be one of: float16, bfloat16, float32, float64, complex64, complex128"
-        )
+    if data.dtype not in SUPPORTED_SPMV_VALUE_DTYPES:
+        raise TypeError(_spmv_dtype_error_message())
     if x.dtype != data.dtype:
         raise TypeError("x dtype must match data dtype")
 

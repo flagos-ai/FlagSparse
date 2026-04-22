@@ -331,6 +331,8 @@ def run_all_csv(paths, csv_path, warmup, iters):
                     "opt_vs_base": r["base_ms"] / r["opt_ms"] if r["opt_ms"] and r["opt_ms"] > 0 else None,
                     "opt_vs_pt": r["pt_ms"] / r["opt_ms"] if r["pt_ms"] and r["opt_ms"] and r["opt_ms"] > 0 else None,
                     "opt_vs_cu": r["cu_ms"] / r["opt_ms"] if r["cu_ms"] and r["opt_ms"] and r["opt_ms"] > 0 else None,
+                    "triton_speedup_vs_pytorch": r["pt_ms"] / r["opt_ms"] if r["pt_ms"] and r["opt_ms"] and r["opt_ms"] > 0 else None,
+                    "triton_speedup_vs_cusparse": r["cu_ms"] / r["opt_ms"] if r["cu_ms"] and r["opt_ms"] and r["opt_ms"] > 0 else None,
                     "err_base": r["err_base"], "err_opt": r["err_opt"],
                     "status": r["status"],
                 })
@@ -339,6 +341,7 @@ def run_all_csv(paths, csv_path, warmup, iters):
         "n_rows", "n_cols", "nnz",
         "base_ms", "opt_ms", "pt_ms", "cu_ms",
         "opt_vs_base", "opt_vs_pt", "opt_vs_cu",
+        "triton_speedup_vs_pytorch", "triton_speedup_vs_cusparse",
         "err_base", "err_opt", "status",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:

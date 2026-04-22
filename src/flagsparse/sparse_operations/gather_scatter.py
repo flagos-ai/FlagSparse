@@ -5,6 +5,27 @@ from ._common import *
 import triton
 import triton.language as tl
 
+SUPPORTED_SCATTER_VALUE_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
+
+
+def _scatter_dtype_error_message():
+    return "scatter value dtype must be one of: " + ", ".join(
+        str(dtype).replace("torch.", "") for dtype in SUPPORTED_SCATTER_VALUE_DTYPES
+    )
+
+
+def _validate_scatter_value_dtype(sparse_values):
+    if sparse_values.dtype not in SUPPORTED_SCATTER_VALUE_DTYPES:
+        raise TypeError(_scatter_dtype_error_message())
+
+
 @triton.jit
 def _gather_real_kernel(
     sparse_values_ptr,
@@ -130,6 +151,7 @@ def _triton_scatter_impl(
     index_fallback_policy="auto",
     return_metadata=False,
 ):
+    _validate_scatter_value_dtype(sparse_values)
     index_fallback_policy = str(index_fallback_policy).lower()
     if index_fallback_policy not in ("auto", "strict"):
         raise ValueError("index_fallback_policy must be 'auto' or 'strict'")
@@ -379,6 +401,7 @@ def flagsparse_scatter(
         dtype_policy=dtype_policy,
         return_metadata=True,
     )
+    _validate_scatter_value_dtype(values_tensor)
 
     torch.cuda.synchronize()
     start_time = time.perf_counter()
@@ -466,6 +489,7 @@ def pytorch_index_scatter(
         dtype_policy=dtype_policy,
         return_metadata=True,
     )
+    _validate_scatter_value_dtype(sparse_values)
     torch.cuda.synchronize()
     start_time = time.perf_counter()
     dense_values = _pytorch_scatter_impl(
@@ -514,6 +538,7 @@ def cusparse_spmv_scatter(
         dtype_policy=dtype_policy,
         return_metadata=True,
     )
+    _validate_scatter_value_dtype(sparse_values)
     skip_reason = _cusparse_baseline_skip_reason(sparse_values.dtype)
     if skip_reason:
         raise RuntimeError(skip_reason)
