@@ -235,9 +235,14 @@ def _gpu_dense_ref_fits(shape, dtype):
     except Exception as e:
         return False, f"cannot query CUDA memory ({e})"
     if estimated_bytes > free_bytes:
+        dense_gib = dense_bytes / (1024 ** 3)
         need_gib = estimated_bytes / (1024 ** 3)
         free_gib = free_bytes / (1024 ** 3)
-        return False, f"CUDA dense fallback too large ({need_gib:.1f} GiB est > {free_gib:.1f} GiB free)"
+        return (
+            False,
+            "CUDA dense fallback too large "
+            f"(dense matrix {dense_gib:.1f} GiB, est {need_gib:.1f} GiB > {free_gib:.1f} GiB free)",
+        )
     return True, None
 
 
@@ -961,10 +966,8 @@ def run_spsv_synthetic_all(lower=True):
                             f"{(f'{fs_vs_cu:.2f}' if fs_vs_cu is not None else 'N/A'):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
                         )
-                        if pt_backend and pt_backend != "gpu_sparse":
-                            print(f"      NOTE: pt_backend={pt_backend}")
-                        if pt_skip_reason:
-                            print(f"      NOTE: {pt_skip_reason}")
+                        # Synthetic benchmark keeps the main row compact; PyTorch fallback notes
+                        # are only emitted in matrix CSV runs where failed reference checks matter.
             print("-" * 110)
             print()
 
@@ -1376,7 +1379,7 @@ def run_all_supported_spsv_csr_csv(
                 )
                 print(
                     "Formats: FlagSparse=CSR, cuSPARSE=CSR ref, "
-                    "PyTorch(ms)=CUDA sparse solve preferred, CUDA dense fallback if needed."
+                    "PyTorch(ms)=CUDA reference (sparse if available, else dense triangular solve)"
                 )
                 print(
                     "RHS is generated directly, matching Library-main's SpSV test style. "
@@ -1416,10 +1419,11 @@ def run_all_supported_spsv_csr_csv(
                             f"{_fmt_speedup(cupy_ms, t_ms):>10} {_fmt_speedup(pytorch_ms, t_ms):>10} "
                             f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                         )
-                        if row["pytorch_backend"] and row["pytorch_backend"] != "gpu_sparse":
-                            print(f"  NOTE: pt_backend={row['pytorch_backend']}")
-                        if pt_skip:
-                            print(f"  NOTE: {pt_skip}")
+                        if status in ("FAIL", "REF_FAIL"):
+                            if row["pytorch_backend"] and row["pytorch_backend"] != "gpu_sparse":
+                                print(f"  NOTE: pt_backend={row['pytorch_backend']}")
+                            if pt_skip:
+                                print(f"  NOTE: {pt_skip}")
                     except Exception as e:
                         err_msg = str(e)
                         status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
@@ -1522,7 +1526,7 @@ def run_all_dtypes_spsv_coo_csv(
             )
             print(
                 "Formats: FlagSparse=COO SpSV, cuSPARSE=COO ref, "
-                "PyTorch(ms)=CUDA sparse solve preferred, CUDA dense fallback if needed. "
+                "PyTorch(ms)=CUDA reference (sparse if available, else dense triangular solve). "
                 "RHS is generated directly, matching Library-main's SpSV test style."
             )
             print(
@@ -1561,10 +1565,11 @@ def run_all_dtypes_spsv_coo_csv(
                         f"{_fmt_speedup(cupy_ms, t_ms):>10} {_fmt_speedup(pytorch_ms, t_ms):>10} "
                         f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                     )
-                    if row["pytorch_backend"] and row["pytorch_backend"] != "gpu_sparse":
-                        print(f"  NOTE: pt_backend={row['pytorch_backend']}")
-                    if pt_skip:
-                        print(f"  NOTE: {pt_skip}")
+                    if status in ("FAIL", "REF_FAIL"):
+                        if row["pytorch_backend"] and row["pytorch_backend"] != "gpu_sparse":
+                            print(f"  NOTE: pt_backend={row['pytorch_backend']}")
+                        if pt_skip:
+                            print(f"  NOTE: {pt_skip}")
                 except Exception as e:
                     err_msg = str(e)
                     status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
