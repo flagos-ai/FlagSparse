@@ -246,29 +246,89 @@ def _build_spsv_frontiers(indptr, indices, levels, lower=True):
     return merged
 
 
+def _build_spsv_reverse_frontiers(indptr, indices, levels, lower=True):
+    """Greedily merge reverse-topological launch groups for transpose push.
+
+    Rows processed by the currently active reverse frontier push residual
+    updates into their dependency targets. A candidate row can be merged only
+    when no active row would update it; otherwise it must be delayed until the
+    current frontier completes.
+    """
+    if not levels:
+        return []
+
+    indptr_h = indptr.to(torch.int64).cpu()
+    indices_h = indices.to(torch.int64).cpu()
+    device = indptr.device
+    dependency_targets = {}
+    for rows_lv in levels:
+        for row in rows_lv.to(torch.int64).cpu().tolist():
+            start = int(indptr_h[row].item())
+            end = int(indptr_h[row + 1].item())
+            targets = set()
+            for p in range(start, end):
+                col = int(indices_h[p].item())
+                is_dep = (col < row) if lower else (col > row)
+                if is_dep:
+                    targets.add(col)
+            dependency_targets[int(row)] = targets
+
+    frontier_rows = []
+    frontier_targets = set()
+    merged = []
+
+    def _flush_frontier():
+        nonlocal frontier_rows, frontier_targets
+        if frontier_rows:
+            merged.append(torch.tensor(frontier_rows, dtype=torch.int32, device=device))
+            frontier_rows = []
+            frontier_targets = set()
+
+    for rows_lv in reversed(levels):
+        for row in rows_lv.to(torch.int64).cpu().tolist():
+            if int(row) in frontier_targets:
+                _flush_frontier()
+            frontier_rows.append(int(row))
+            frontier_targets.update(dependency_targets.get(int(row), ()))
+    _flush_frontier()
+    return merged
+
+
 def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, trans_mode):
     if trans_mode == "N":
         levels = _build_spsv_levels(indptr64, indices64, n_rows, lower=lower)
+        default_block_nnz, default_max_segments = _auto_spsv_launch_config(indptr64)
         return {
             "solve_kind": "csr_levels",
             "kernel_data": data,
             "kernel_indices64": indices64,
+            "kernel_indices32": indices64.to(torch.int32),
             "kernel_indptr64": indptr64,
             "lower_eff": lower,
             "launch_groups": _build_spsv_frontiers(
                 indptr64, indices64, levels, lower=lower
             ),
+            "default_block_nnz": default_block_nnz,
+            "default_max_segments": default_max_segments,
             "transpose_conjugate": False,
         }
 
     levels = _build_spsv_levels(indptr64, indices64, n_rows, lower=lower)
+    default_block_nnz, default_max_segments = _choose_transpose_family_launch_config(
+        indptr64
+    )
     return {
         "solve_kind": "transpose_push",
         "kernel_data": data,
         "kernel_indices64": indices64,
+        "kernel_indices32": indices64.to(torch.int32),
         "kernel_indptr64": indptr64,
         "lower_eff": lower,
-        "launch_groups": list(reversed(levels)),
+        "launch_groups": _build_spsv_reverse_frontiers(
+            indptr64, indices64, levels, lower=lower
+        ),
+        "default_block_nnz": default_block_nnz,
+        "default_max_segments": default_max_segments,
         "transpose_conjugate": trans_mode == "C",
     }
 
@@ -1237,15 +1297,14 @@ def flagsparse_spsv_csr(
     solve_kind = solve_plan["solve_kind"]
     kernel_data = solve_plan["kernel_data"]
     kernel_indices64 = solve_plan["kernel_indices64"]
+    kernel_indices32 = solve_plan["kernel_indices32"]
     kernel_indptr64 = solve_plan["kernel_indptr64"]
     lower_eff = solve_plan["lower_eff"]
     launch_groups = solve_plan["launch_groups"]
     transpose_conjugate = solve_plan["transpose_conjugate"]
-    kernel_indices = (
-        kernel_indices64.to(torch.int32)
-        if kernel_indices64.dtype != torch.int32
-        else kernel_indices64
-    )
+    default_block_nnz = solve_plan["default_block_nnz"]
+    default_max_segments = solve_plan["default_max_segments"]
+    kernel_indices = kernel_indices32
     kernel_indptr = kernel_indptr64
     compute_dtype = data.dtype
     data_in = kernel_data
@@ -1272,15 +1331,21 @@ def flagsparse_spsv_csr(
         b_in = b.to(torch.float64)
 
     if solve_kind == "transpose_push":
-        block_nnz_use, max_segments_use = _choose_transpose_family_launch_config(
-            kernel_indptr, block_nnz=block_nnz, max_segments=max_segments
-        )
+        if block_nnz is None and max_segments is None:
+            block_nnz_use, max_segments_use = default_block_nnz, default_max_segments
+        else:
+            block_nnz_use, max_segments_use = _choose_transpose_family_launch_config(
+                kernel_indptr, block_nnz=block_nnz, max_segments=max_segments
+            )
         vec_real = _triton_spsv_csr_transpose_push_vector
         vec_complex = _triton_spsv_csr_transpose_push_vector_complex
     else:
-        block_nnz_use, max_segments_use = _auto_spsv_launch_config(
-            kernel_indptr, block_nnz=block_nnz, max_segments=max_segments
-        )
+        if block_nnz is None and max_segments is None:
+            block_nnz_use, max_segments_use = default_block_nnz, default_max_segments
+        else:
+            block_nnz_use, max_segments_use = _auto_spsv_launch_config(
+                kernel_indptr, block_nnz=block_nnz, max_segments=max_segments
+            )
         vec_real = _triton_spsv_csr_vector
         vec_complex = _triton_spsv_csr_vector_complex
     diag_eps = _spsv_diag_eps_for_dtype(compute_dtype)
