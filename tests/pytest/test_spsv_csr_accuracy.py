@@ -42,19 +42,6 @@ def _rand_like(dtype, shape, device):
     i = torch.randn(shape, dtype=base, device=device)
     return torch.complex(r, i)
 
-
-def _ref_dtype(dtype):
-    return dtype
-
-
-def _safe_cast_tensor(tensor, dtype):
-    return tensor.to(dtype)
-
-
-def _cmp_view(tensor, dtype):
-    return tensor
-
-
 def _apply_ref_op(A, op_mode):
     if op_mode == "TRANS":
         return A.transpose(-2, -1)
@@ -159,7 +146,7 @@ def test_spsv_csr_non_trans_supported_combos(n, dtype, index_dtype):
     A = _build_triangular(n, dtype, device, lower=True)
     b = _rand_like(dtype, (n,), device)
     x_ref = torch.linalg.solve_triangular(
-        A.to(_ref_dtype(dtype)), b.to(_ref_dtype(dtype)).unsqueeze(-1), upper=False
+        A.to(dtype), b.to(dtype).unsqueeze(-1), upper=False
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
@@ -178,7 +165,7 @@ def test_spsv_csr_non_trans_supported_combos(n, dtype, index_dtype):
         transpose=False,
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(_cmp_view(x, dtype), _cmp_view(x_ref, dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -190,8 +177,8 @@ def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mo
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=True)
     b = _rand_like(dtype, (n,), device)
-    A_ref = A.to(_ref_dtype(dtype))
-    b_ref = b.to(_ref_dtype(dtype))
+    A_ref = A.to(dtype)
+    b_ref = b.to(dtype)
     x_ref = torch.linalg.solve_triangular(
         _apply_ref_op(A_ref, op_mode), b_ref.unsqueeze(-1), upper=_effective_upper(True, op_mode)
     ).squeeze(-1)
@@ -212,7 +199,7 @@ def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mo
         transpose=_transpose_arg(op_mode),
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(_cmp_view(x, dtype), _cmp_view(x_ref, dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -239,7 +226,7 @@ def test_spsv_csr_matches_cusparse_non_trans(n, dtype):
     x_non_ref = _cupy_ref_spsv(A_cp, b, lower=True, unit_diagonal=False)
 
     rtol, atol = _tol(dtype)
-    assert torch.allclose(_cmp_view(x_non, dtype), _cmp_view(x_non_ref, dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(x_non, x_non_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -280,7 +267,7 @@ def test_spsv_csr_matches_cusparse_transpose_family(n, dtype, index_dtype, op_mo
     )
 
     rtol, atol = _tol(dtype)
-    assert torch.allclose(_cmp_view(x_trans, dtype), _cmp_view(x_trans_ref, dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(x_trans, x_trans_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -292,7 +279,7 @@ def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
     A = _build_triangular(n, dtype, device, lower=False)
     b = _rand_like(dtype, (n,), device)
     x_ref = torch.linalg.solve_triangular(
-        A.to(_ref_dtype(dtype)), b.to(_ref_dtype(dtype)).unsqueeze(-1), upper=True
+        A.to(dtype), b.to(dtype).unsqueeze(-1), upper=True
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
@@ -311,7 +298,7 @@ def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
         transpose=False,
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(_cmp_view(x, dtype), _cmp_view(x_ref, dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -323,8 +310,8 @@ def test_spsv_csr_upper_transpose_family_supported_combos(n, dtype, index_dtype,
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=False)
     b = _rand_like(dtype, (n,), device)
-    A_ref = A.to(_ref_dtype(dtype))
-    b_ref = b.to(_ref_dtype(dtype))
+    A_ref = A.to(dtype)
+    b_ref = b.to(dtype)
     x_ref = torch.linalg.solve_triangular(
         _apply_ref_op(A_ref, op_mode), b_ref.unsqueeze(-1), upper=_effective_upper(False, op_mode)
     ).squeeze(-1)
@@ -345,7 +332,7 @@ def test_spsv_csr_upper_transpose_family_supported_combos(n, dtype, index_dtype,
         transpose=_transpose_arg(op_mode),
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(_cmp_view(x, dtype), _cmp_view(x_ref, dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -372,7 +359,7 @@ def test_spsv_csr_matches_cusparse_upper_non_trans(n, dtype):
     x_non_ref = _cupy_ref_spsv(A_cp, b, lower=False, unit_diagonal=False)
 
     rtol, atol = _tol(dtype)
-    assert torch.allclose(_cmp_view(x_non, dtype), _cmp_view(x_non_ref, dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(x_non, x_non_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -413,7 +400,7 @@ def test_spsv_csr_matches_cusparse_upper_transpose_family(n, dtype, index_dtype,
     )
 
     rtol, atol = _tol(dtype)
-    assert torch.allclose(_cmp_view(x_trans, dtype), _cmp_view(x_trans_ref, dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(x_trans, x_trans_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv

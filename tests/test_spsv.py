@@ -1,7 +1,8 @@
 """SpSV tests: synthetic triangular systems and optional .mtx (CSR/COO).
 
-与 CSR 相同的计时列、PyTorch 稠密参考、CSV 字段与 PASS 判定；COO 测试时 CuPy 基线使用
-``coo_matrix``（与 FlagSparse COO 输入同构），CSR 测试时仍用 ``csr_matrix``。
+与 CSR 相同的计时列、PyTorch CUDA sparse 参考、CSV 字段与 PASS 判定；COO 测试时
+CuPy 基线使用 ``coo_matrix``（与 FlagSparse COO 输入同构），CSR 测试时仍用
+``csr_matrix``。
 """
 
 import argparse
@@ -153,20 +154,8 @@ def _randn_by_dtype(n, dtype, device, generator=None):
     return torch.complex(real, imag)
 
 
-def _dense_ref_dtype(dtype):
-    return dtype
-
-
 def _tensor_from_scalar_values(values, dtype, device):
     return torch.tensor(values, dtype=dtype, device=device)
-
-
-def _safe_cast_tensor(tensor, dtype):
-    return tensor.to(dtype)
-
-
-def _cast_real_tensor_to_value_dtype(values, value_dtype):
-    return values.to(value_dtype)
 
 
 def _matrix_market_value(parts, mm_field):
@@ -179,22 +168,6 @@ def _matrix_market_value(parts, mm_field):
     if mm_field == "pattern":
         return 1.0
     raise ValueError("MatrixMarket entry is missing a numeric value")
-
-
-def _triangular_solve_reference(A, b, *, lower, op_mode="NON"):
-    if op_mode == "TRANS":
-        A_eff = A.transpose(0, 1)
-        upper = lower
-    elif op_mode == "CONJ":
-        A_eff = A.transpose(0, 1).conj() if torch.is_complex(A) else A.transpose(0, 1)
-        upper = lower
-    else:
-        A_eff = A
-        upper = not lower
-    return torch.linalg.solve_triangular(
-        A_eff, b.unsqueeze(1), upper=upper
-    ).squeeze(1)
-
 
 def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode):
     if op_mode == "TRANS":
@@ -223,116 +196,34 @@ def _benchmark_pytorch_sparse_reference(data, indices, indptr, shape, b, *, op_m
     if sparse_spsolve is None:
         raise NotImplementedError("torch.sparse.spsolve is unavailable")
     A_csr = _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode)
-    if A_csr.is_cuda:
-        torch.cuda.synchronize()
-        e0 = torch.cuda.Event(True)
-        e1 = torch.cuda.Event(True)
-        e0.record()
-        x_ref = sparse_spsolve(A_csr, b)
-        e1.record()
-        torch.cuda.synchronize()
-        elapsed_ms = e0.elapsed_time(e1)
-    else:
-        t0 = time.perf_counter()
-        x_ref = sparse_spsolve(A_csr, b)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    return x_ref.to(b.dtype), elapsed_ms
-
-
-def _benchmark_pytorch_dense_reference(data, indices, indptr, shape, b, *, lower, op_mode):
-    A_dense = _csr_to_dense(
-        data, indices.to(torch.int64), indptr.to(torch.int64), shape
-    ).to(_dense_ref_dtype(b.dtype))
-    b_ref = b.to(A_dense.dtype)
-    if A_dense.is_cuda:
-        torch.cuda.synchronize()
-        e0 = torch.cuda.Event(True)
-        e1 = torch.cuda.Event(True)
-        e0.record()
-        x_ref = _triangular_solve_reference(
-            A_dense, b_ref, lower=lower, op_mode=op_mode
-        )
-        e1.record()
-        torch.cuda.synchronize()
-        elapsed_ms = e0.elapsed_time(e1)
-    else:
-        t0 = time.perf_counter()
-        x_ref = _triangular_solve_reference(
-            A_dense, b_ref, lower=lower, op_mode=op_mode
-        )
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if not A_csr.is_cuda:
+        raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    x_ref = sparse_spsolve(A_csr, b)
+    e1.record()
+    torch.cuda.synchronize()
+    elapsed_ms = e0.elapsed_time(e1)
     return x_ref.to(b.dtype), elapsed_ms
 
 
 def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_mode):
-    sparse_err = None
+    del lower
     try:
         x_ref, ms = _benchmark_pytorch_sparse_reference(
             data, indices, indptr, shape, b, op_mode=op_mode
         )
-        return x_ref, ms, None, None
-    except RuntimeError as e:
-        sparse_err = e
-        if "out of memory" in str(e).lower():
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    except NotImplementedError as e:
-        sparse_err = e
-
-    try:
-        data_cpu = data.detach().cpu()
-        indices_cpu = indices.to(torch.int64).detach().cpu()
-        indptr_cpu = indptr.to(torch.int64).detach().cpu()
-        b_cpu = b.detach().cpu()
-        x_ref_cpu, ms_cpu = _benchmark_pytorch_sparse_reference(
-            data_cpu, indices_cpu, indptr_cpu, shape, b_cpu, op_mode=op_mode
-        )
-        return (
-            x_ref_cpu.to(b.device, dtype=b.dtype),
-            None,
-            ms_cpu,
-            "PyTorch ref used CPU sparse.spsolve",
-        )
-    except RuntimeError as e:
-        sparse_err = e
-    except NotImplementedError:
-        pass
-
-    try:
-        data_cpu = data.detach().cpu()
-        indices_cpu = indices.to(torch.int64).detach().cpu()
-        indptr_cpu = indptr.to(torch.int64).detach().cpu()
-        b_cpu = b.detach().cpu()
-        x_ref_cpu, ms_cpu = _benchmark_pytorch_dense_reference(
-            data_cpu,
-            indices_cpu,
-            indptr_cpu,
-            shape,
-            b_cpu,
-            lower=lower,
-            op_mode=op_mode,
-        )
-        note = "PyTorch sparse ref unavailable; CPU dense solve_triangular fallback"
-        if sparse_err is None:
-            note = "PyTorch ref used CPU dense solve_triangular"
-        return (
-            x_ref_cpu.to(b.device, dtype=b.dtype),
-            None,
-            ms_cpu,
-            note,
-        )
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            return None, None, None, "PyTorch sparse ref unavailable; CPU dense ref OOM; skipped"
-        raise
+        return x_ref, ms, None
+    except Exception as e:
+        if "out of memory" in str(e).lower() and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return None, None, f"PyTorch CUDA sparse ref unavailable; skipped ({e})"
 
 
 def _cupy_ref_inputs(data, b):
     return data, b
-
-
-def _compare_view(tensor, value_dtype):
-    return tensor
 
 
 def _supported_csr_full_ops(value_dtype, index_dtype):
@@ -343,28 +234,6 @@ def _supported_csr_full_ops(value_dtype, index_dtype):
     if index_dtype == torch.int64:
         return ["NON", "TRANS", "CONJ"]
     return []
-
-
-def _fill_mode_name(lower):
-    return "LOWER" if lower else "UPPER"
-
-
-def _diag_type_name(unit_diagonal):
-    return "UNIT" if unit_diagonal else "NON_UNIT"
-
-
-def _triton_alg_name(fmt, op_mode=None, coo_mode=None):
-    if fmt == "CSR":
-        if op_mode in ("TRANS", "CONJ"):
-            return "TRITON_CSR_LEVEL_TRANSPOSE_FAMILY"
-        return "TRITON_CSR_LEVEL"
-    if coo_mode:
-        return f"TRITON_COO_{str(coo_mode).upper()}"
-    return "TRITON_COO_LEVEL"
-
-
-def _cusparse_alg_name():
-    return "CUPY_SPSOLVE_TRIANGULAR"
 
 
 def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True):
@@ -441,22 +310,6 @@ def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True
     indptr[1:] = torch.cumsum(nnz_per_row, dim=0)
     indices = cols_t.to(index_dtype)
     return vals_t, indices, indptr, (n, n)
-
-
-def _csr_to_dense(data, indices, indptr, shape):
-    n_rows, n_cols = shape
-    row_ind = torch.repeat_interleave(
-        torch.arange(n_rows, device=data.device, dtype=torch.int64),
-        indptr[1:] - indptr[:-1],
-    )
-    coo = torch.sparse_coo_tensor(
-        torch.stack([row_ind, indices.to(torch.int64)]),
-        data,
-        (n_rows, n_cols),
-        device=data.device,
-    ).coalesce()
-    return coo.to_dense()
-
 
 def _csr_to_coo(data, indices, indptr, shape, index_dtype=torch.int64):
     n_rows = int(shape[0])
@@ -947,7 +800,7 @@ def run_spsv_synthetic_all(lower=True):
                             )
                         torch.cuda.synchronize()
 
-                        x_pt, pytorch_ms, _pytorch_cpu_ms, pt_skip_reason = _benchmark_pytorch_reference(
+                        x_pt, pytorch_ms, pt_skip_reason = _benchmark_pytorch_reference(
                             data,
                             indices,
                             indptr,
@@ -1119,7 +972,7 @@ def _finalize_csv_row(
     err_pt = None
     ok_pt = False
     pt_skip_reason = None
-    x_ref, pytorch_ms, _pytorch_cpu_ms, pt_skip_reason = _benchmark_pytorch_reference(
+    x_ref, pytorch_ms, pt_skip_reason = _benchmark_pytorch_reference(
         data,
         indices,
         indptr,
@@ -1129,8 +982,8 @@ def _finalize_csv_row(
         op_mode="NON",
     )
     if x_ref is not None:
-        x_cmp = _compare_view(x, value_dtype)
-        x_ref_cmp = _compare_view(x_ref, value_dtype)
+        x_cmp = x
+        x_ref_cmp = x_ref
         err_pt = (
             float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
             if n_rows > 0
@@ -1203,8 +1056,8 @@ def _finalize_csv_row(
             c1.synchronize()
             cupy_ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
             x_cu_t = torch.utils.dlpack.from_dlpack(x_cu.toDlpack())
-            x_cmp = _compare_view(x, value_dtype)
-            x_cu_cmp = _compare_view(x_cu_t, value_dtype)
+            x_cmp = x
+            x_cu_cmp = x_cu_t
             err_cu = (
                 float(torch.max(torch.abs(x_cmp - x_cu_cmp)).item())
                 if n_rows > 0
@@ -1331,7 +1184,7 @@ def _finalize_csv_row_csr_full(
     err_pt = None
     ok_pt = False
     pt_skip_reason = None
-    x_ref, pytorch_ms, _pytorch_cpu_ms, pt_skip_reason = _benchmark_pytorch_reference(
+    x_ref, pytorch_ms, pt_skip_reason = _benchmark_pytorch_reference(
         data,
         indices,
         indptr,
@@ -1341,8 +1194,8 @@ def _finalize_csv_row_csr_full(
         op_mode=op_mode,
     )
     if x_ref is not None:
-        x_cmp = _compare_view(x, value_dtype)
-        x_ref_cmp = _compare_view(x_ref, value_dtype)
+        x_cmp = x
+        x_ref_cmp = x_ref
         err_pt = (
             float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
             if n_rows > 0
@@ -1358,8 +1211,8 @@ def _finalize_csv_row_csr_full(
         data, indices, indptr, shape, b, op_mode, lower
     )
     if x_cu_t is not None:
-        x_cmp = _compare_view(x, value_dtype)
-        x_cu_cmp = _compare_view(x_cu_t, value_dtype)
+        x_cmp = x
+        x_cu_cmp = x_cu_t
         err_cu = (
             float(torch.max(torch.abs(x_cmp - x_cu_cmp)).item())
             if n_rows > 0

@@ -54,27 +54,6 @@ def _clear_spsv_csr_preprocess_cache():
     _SPSV_CSR_PREPROCESS_CACHE.clear()
 
 
-def _csr_to_dense(data, indices, indptr, shape):
-    """Convert CSR (torch CUDA tensors) to dense matrix on the same device."""
-    device = data.device
-    dtype = data.dtype
-    n_rows, n_cols = int(shape[0]), int(shape[1])
-    if n_rows == 0 or n_cols == 0:
-        return torch.zeros((n_rows, n_cols), dtype=dtype, device=device)
-    row_ind = torch.repeat_interleave(
-        torch.arange(n_rows, device=device, dtype=torch.int64),
-        indptr[1:] - indptr[:-1],
-    )
-    col_ind = indices.to(torch.int64)
-    coo = torch.sparse_coo_tensor(
-        torch.stack([row_ind, col_ind]),
-        data,
-        (n_rows, n_cols),
-        device=device,
-    ).coalesce()
-    return coo.to_dense()
-
-
 def _validate_spsv_non_trans_combo(data_dtype, index_dtype, fmt_name):
     """Validate NON_TRANS support matrix and keep error messages explicit."""
     if (data_dtype, index_dtype) in SPSV_NON_TRANS_SUPPORTED_COMBOS:
@@ -173,15 +152,6 @@ def _prepare_spsv_inputs(data, indices, indptr, b, shape):
         n_rows,
         n_cols,
     )
-
-
-def _prepare_spsv_working_inputs(data, b):
-    return data, b, None
-
-
-def _restore_spsv_output(x, target_dtype):
-    return x.to(target_dtype)
-
 
 def _spsv_diag_eps_for_dtype(value_dtype):
     return 1e-12 if value_dtype in (torch.float64, torch.complex128) else 1e-6
@@ -320,7 +290,6 @@ def _resolve_spsv_csr_runtime(
         data, indices, indptr, b, shape
     )
     original_output_dtype = None
-    data, b, original_output_dtype = _prepare_spsv_working_inputs(data, b)
     if n_rows != n_cols:
         raise ValueError(f"A must be square, got shape={shape}")
     if trans_mode == "N":
@@ -1469,7 +1438,7 @@ def flagsparse_spsv_csr(
         x = torch.stack(cols, dim=1)
     target_dtype = original_output_dtype if original_output_dtype is not None else data.dtype
     if x.dtype != target_dtype:
-        x = _restore_spsv_output(x, target_dtype)
+        x = x.to(target_dtype)
     if return_time:
         torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
