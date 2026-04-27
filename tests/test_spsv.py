@@ -1,8 +1,8 @@
 """SpSV tests: synthetic triangular systems and optional .mtx (CSR/COO).
 
-与 CSR 相同的计时列、PyTorch CUDA sparse 参考、CSV 字段与 PASS 判定；COO 测试时
-CuPy 基线使用 ``coo_matrix``（与 FlagSparse COO 输入同构），CSR 测试时仍用
-``csr_matrix``。
+与 CSR 相同的计时列、PyTorch CUDA 参考（优先 sparse，必要时 dense fallback）、
+CSV 字段与 PASS 判定；COO 测试时 CuPy 基线使用 ``coo_matrix``（与 FlagSparse
+COO 输入同构），CSR 测试时仍用 ``csr_matrix``。
 """
 
 import argparse
@@ -39,6 +39,7 @@ WARMUP = 5
 ITERS = 20
 
 SPSV_TRIANGULAR_DIAG_DOMINANCE = 4.0
+SPSV_PYTORCH_DENSE_GPU_SAFETY_FACTOR = 3.0
 # CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
 CSR_FULL_VALUE_DTYPES = [
     torch.float32,
@@ -169,6 +170,24 @@ def _matrix_market_value(parts, mm_field):
         return 1.0
     raise ValueError("MatrixMarket entry is missing a numeric value")
 
+
+def _csr_to_dense(data, indices, indptr, shape):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if n_rows == 0 or n_cols == 0:
+        return torch.zeros((n_rows, n_cols), dtype=data.dtype, device=data.device)
+    row_ind = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        indptr[1:] - indptr[:-1],
+    )
+    coo = torch.sparse_coo_tensor(
+        torch.stack([row_ind, indices.to(torch.int64)]),
+        data,
+        (n_rows, n_cols),
+        device=data.device,
+    ).coalesce()
+    return coo.to_dense()
+
+
 def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode):
     if op_mode == "TRANS":
         data_eff, indices_eff, indptr_eff = _csr_transpose(
@@ -191,6 +210,37 @@ def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode):
     )
 
 
+def _apply_dense_triangular_op(A_dense, b, *, lower, op_mode):
+    if op_mode == "TRANS":
+        A_eff = A_dense.transpose(0, 1)
+        upper = lower
+    elif op_mode == "CONJ":
+        A_eff = A_dense.transpose(0, 1).conj() if torch.is_complex(A_dense) else A_dense.transpose(0, 1)
+        upper = lower
+    else:
+        A_eff = A_dense
+        upper = not lower
+    return torch.linalg.solve_triangular(A_eff, b.unsqueeze(1), upper=upper).squeeze(1)
+
+
+def _gpu_dense_ref_fits(shape, dtype):
+    if not torch.cuda.is_available():
+        return False, "CUDA unavailable"
+    element_size = torch.empty((), dtype=dtype).element_size()
+    dense_bytes = int(shape[0]) * int(shape[1]) * element_size
+    rhs_bytes = int(shape[0]) * element_size
+    estimated_bytes = int(dense_bytes * SPSV_PYTORCH_DENSE_GPU_SAFETY_FACTOR + rhs_bytes * 4)
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info()
+    except Exception as e:
+        return False, f"cannot query CUDA memory ({e})"
+    if estimated_bytes > free_bytes:
+        need_gib = estimated_bytes / (1024 ** 3)
+        free_gib = free_bytes / (1024 ** 3)
+        return False, f"CUDA dense fallback too large ({need_gib:.1f} GiB est > {free_gib:.1f} GiB free)"
+    return True, None
+
+
 def _benchmark_pytorch_sparse_reference(data, indices, indptr, shape, b, *, op_mode):
     sparse_spsolve = getattr(torch.sparse, "spsolve", None)
     if sparse_spsolve is None:
@@ -209,17 +259,52 @@ def _benchmark_pytorch_sparse_reference(data, indices, indptr, shape, b, *, op_m
     return x_ref.to(b.dtype), elapsed_ms
 
 
+def _benchmark_pytorch_dense_reference(data, indices, indptr, shape, b, *, lower, op_mode):
+    if not data.is_cuda:
+        raise RuntimeError("PyTorch CUDA dense fallback requires CUDA tensors")
+    fits, reason = _gpu_dense_ref_fits(shape, b.dtype)
+    if not fits:
+        raise RuntimeError(reason)
+    A_dense = _csr_to_dense(data, indices, indptr, shape)
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    x_ref = _apply_dense_triangular_op(A_dense, b, lower=lower, op_mode=op_mode)
+    e1.record()
+    torch.cuda.synchronize()
+    elapsed_ms = e0.elapsed_time(e1)
+    return x_ref.to(b.dtype), elapsed_ms
+
+
 def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_mode):
-    del lower
+    sparse_err = None
     try:
         x_ref, ms = _benchmark_pytorch_sparse_reference(
             data, indices, indptr, shape, b, op_mode=op_mode
         )
-        return x_ref, ms, None
+        return x_ref, ms, "gpu_sparse", None
     except Exception as e:
+        sparse_err = e
         if "out of memory" in str(e).lower() and torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return None, None, f"PyTorch CUDA sparse ref unavailable; skipped ({e})"
+    try:
+        x_ref, ms = _benchmark_pytorch_dense_reference(
+            data, indices, indptr, shape, b, lower=lower, op_mode=op_mode
+        )
+        return (
+            x_ref,
+            ms,
+            "gpu_dense",
+            f"sparse unavailable ({sparse_err}); using CUDA dense solve_triangular",
+        )
+    except Exception as dense_err:
+        if "out of memory" in str(dense_err).lower() and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        reason = f"sparse unavailable ({sparse_err}); dense unavailable ({dense_err})"
+        if sparse_err is None:
+            reason = f"CUDA ref unavailable ({dense_err})"
+        return None, None, "unavailable", reason
 
 
 def _cupy_ref_inputs(data, b):
@@ -800,7 +885,7 @@ def run_spsv_synthetic_all(lower=True):
                             )
                         torch.cuda.synchronize()
 
-                        x_pt, pytorch_ms, pt_skip_reason = _benchmark_pytorch_reference(
+                        x_pt, pytorch_ms, pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
                             data,
                             indices,
                             indptr,
@@ -876,6 +961,8 @@ def run_spsv_synthetic_all(lower=True):
                             f"{(f'{fs_vs_cu:.2f}' if fs_vs_cu is not None else 'N/A'):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
                         )
+                        if pt_backend and pt_backend != "gpu_sparse":
+                            print(f"      NOTE: pt_backend={pt_backend}")
                         if pt_skip_reason:
                             print(f"      NOTE: {pt_skip_reason}")
             print("-" * 110)
@@ -972,7 +1059,7 @@ def _finalize_csv_row(
     err_pt = None
     ok_pt = False
     pt_skip_reason = None
-    x_ref, pytorch_ms, pt_skip_reason = _benchmark_pytorch_reference(
+    x_ref, pytorch_ms, pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
         data,
         indices,
         indptr,
@@ -1090,6 +1177,7 @@ def _finalize_csv_row(
         "triton_time_total_ms": _sum_ms(analysis_ms, t_ms),
         "cusparse_solve_ms": cupy_ms,
         "pytorch_solve_ms": pytorch_ms,
+        "pytorch_backend": pt_backend,
         "cusparse/triton": _safe_ratio(cupy_ms, t_ms),
         "pytorch/triton": _safe_ratio(pytorch_ms, t_ms),
         "pt_status": _status_str(ok_pt, err_pt is not None),
@@ -1184,7 +1272,7 @@ def _finalize_csv_row_csr_full(
     err_pt = None
     ok_pt = False
     pt_skip_reason = None
-    x_ref, pytorch_ms, pt_skip_reason = _benchmark_pytorch_reference(
+    x_ref, pytorch_ms, pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
         data,
         indices,
         indptr,
@@ -1239,6 +1327,7 @@ def _finalize_csv_row_csr_full(
         "triton_time_total_ms": _sum_ms(analysis_ms, t_ms),
         "cusparse_solve_ms": cupy_ms,
         "pytorch_solve_ms": pytorch_ms,
+        "pytorch_backend": pt_backend,
         "cusparse/triton": _safe_ratio(cupy_ms, t_ms),
         "pytorch/triton": _safe_ratio(pytorch_ms, t_ms),
         "pt_status": _status_str(ok_pt, err_pt is not None),
@@ -1286,7 +1375,8 @@ def run_all_supported_spsv_csr_csv(
                     f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  CSR  |  triA={'LOWER' if lower else 'UPPER'}  |  opA={op_mode}"
                 )
                 print(
-                    "Formats: FlagSparse=CSR, cuSPARSE=CSR ref, PyTorch(ms)=CUDA sparse solve only."
+                    "Formats: FlagSparse=CSR, cuSPARSE=CSR ref, "
+                    "PyTorch(ms)=CUDA sparse solve preferred, CUDA dense fallback if needed."
                 )
                 print(
                     "RHS is generated directly, matching Library-main's SpSV test style. "
@@ -1326,6 +1416,8 @@ def run_all_supported_spsv_csr_csv(
                             f"{_fmt_speedup(cupy_ms, t_ms):>10} {_fmt_speedup(pytorch_ms, t_ms):>10} "
                             f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                         )
+                        if row["pytorch_backend"] and row["pytorch_backend"] != "gpu_sparse":
+                            print(f"  NOTE: pt_backend={row['pytorch_backend']}")
                         if pt_skip:
                             print(f"  NOTE: {pt_skip}")
                     except Exception as e:
@@ -1345,6 +1437,7 @@ def run_all_supported_spsv_csr_csv(
                                 "triton_time_total_ms": None,
                                 "cusparse_solve_ms": None,
                                 "pytorch_solve_ms": None,
+                                "pytorch_backend": None,
                                 "cusparse/triton": None,
                                 "pytorch/triton": None,
                                 "pt_status": "N/A",
@@ -1383,6 +1476,7 @@ def run_all_supported_spsv_csr_csv(
         "triton_time_total_ms",
         "cusparse_solve_ms",
         "pytorch_solve_ms",
+        "pytorch_backend",
         "cusparse/triton",
         "pytorch/triton",
         "pt_status",
@@ -1427,7 +1521,8 @@ def run_all_dtypes_spsv_coo_csv(
                 f"  triA={'LOWER' if lower else 'UPPER'}  coo_mode={coo_mode}"
             )
             print(
-                "Formats: FlagSparse=COO SpSV, cuSPARSE=COO ref, PyTorch(ms)=CUDA sparse solve only. "
+                "Formats: FlagSparse=COO SpSV, cuSPARSE=COO ref, "
+                "PyTorch(ms)=CUDA sparse solve preferred, CUDA dense fallback if needed. "
                 "RHS is generated directly, matching Library-main's SpSV test style."
             )
             print(
@@ -1466,6 +1561,8 @@ def run_all_dtypes_spsv_coo_csv(
                         f"{_fmt_speedup(cupy_ms, t_ms):>10} {_fmt_speedup(pytorch_ms, t_ms):>10} "
                         f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                     )
+                    if row["pytorch_backend"] and row["pytorch_backend"] != "gpu_sparse":
+                        print(f"  NOTE: pt_backend={row['pytorch_backend']}")
                     if pt_skip:
                         print(f"  NOTE: {pt_skip}")
                 except Exception as e:
@@ -1485,6 +1582,7 @@ def run_all_dtypes_spsv_coo_csv(
                             "triton_time_total_ms": None,
                             "cusparse_solve_ms": None,
                             "pytorch_solve_ms": None,
+                            "pytorch_backend": None,
                             "cusparse/triton": None,
                             "pytorch/triton": None,
                             "pt_status": "N/A",
@@ -1522,6 +1620,7 @@ def run_all_dtypes_spsv_coo_csv(
         "triton_time_total_ms",
         "cusparse_solve_ms",
         "pytorch_solve_ms",
+        "pytorch_backend",
         "cusparse/triton",
         "pytorch/triton",
         "pt_status",
@@ -1627,7 +1726,7 @@ def _check_one_csr_transpose_case(path, value_dtype, index_dtype, op_mode, devic
 
     ref_err = None
     ref_ok = None
-    x_ref, _, _ = _benchmark_pytorch_reference(
+    x_ref, _, _, _ = _benchmark_pytorch_reference(
         data,
         indices,
         indptr,
