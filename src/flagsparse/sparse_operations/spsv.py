@@ -186,11 +186,12 @@ def _spsv_cache_put(cache, key, value, max_entries):
         cache.popitem(last=False)
 
 
-def _csr_preprocess_cache_key(data, indices, indptr, shape, lower, trans_mode):
+def _csr_preprocess_cache_key(data, indices, indptr, shape, lower, trans_mode, unit_diagonal):
     return (
         "csr_preprocess",
         trans_mode,
         bool(lower),
+        bool(unit_diagonal),
         int(shape[0]),
         int(shape[1]),
         _tensor_cache_token(data),
@@ -294,11 +295,233 @@ def _build_spsv_reverse_frontiers(indptr, indices, levels, lower=True):
     return merged
 
 
-def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, trans_mode):
+def _prepare_spsv_transpose_cw_metadata(data, indices64, indptr64, n_rows, lower, unit_diagonal=False):
+    indegree = torch.zeros(n_rows, dtype=torch.int32, device=data.device)
+    diag = torch.ones(n_rows, dtype=data.dtype, device=data.device)
+    if n_rows == 0:
+        return diag, indegree
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        indptr64[1:] - indptr64[:-1],
+    )
+    dep_mask = indices64 < row_ids if lower else indices64 > row_ids
+    if dep_mask.numel() > 0:
+        dep_rows = row_ids[dep_mask]
+        dep_counts = torch.bincount(dep_rows, minlength=n_rows)
+        indegree.copy_(dep_counts.to(torch.int32))
+    if not unit_diagonal:
+        indegree.add_(1)
+        diag_mask = indices64 == row_ids
+        if bool(torch.any(diag_mask).item()):
+            diag.scatter_(0, row_ids[diag_mask], data[diag_mask])
+    return diag, indegree
+
+
+def _sort_csr_rows(data, indices64, indptr64, n_rows, n_cols, lower=True):
+    if data.numel() == 0:
+        return data, indices64, indptr64
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        indptr64[1:] - indptr64[:-1],
+    )
+    key = row_ids * max(1, n_cols)
+    if lower:
+        key = key + indices64
+    else:
+        key = key + (n_cols - 1 - indices64)
+    try:
+        order = torch.argsort(key, stable=True)
+    except TypeError:
+        order = torch.argsort(key)
+    return data[order], indices64[order], indptr64
+
+
+def _prepare_spsv_nontrans_cw_metadata(data, indices64, indptr64, n_rows, lower, unit_diagonal=False):
+    diag = torch.ones(n_rows, dtype=data.dtype, device=data.device)
+    if n_rows == 0:
+        return diag
+    if unit_diagonal:
+        return diag
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        indptr64[1:] - indptr64[:-1],
+    )
+    diag_mask = indices64 == row_ids
+    if bool(torch.any(diag_mask).item()):
+        diag.scatter_(0, row_ids[diag_mask], data[diag_mask])
+    return diag
+
+
+def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs):
+    if n_rows <= 0:
+        return 1
+    target = max(256, min(n_rows, 4096))
+    if max_frontier > 0:
+        target = min(target, max(256, min(n_rows, max_frontier * 8)))
+    if avg_nnz_per_row > 2048:
+        target = max(128, target // 2)
+    if n_rhs >= 16:
+        target = max(128, target // 2)
+    return int(max(1, min(n_rows, target)))
+
+
+def _spsv_level_stats(levels, n_rows):
+    if not levels:
+        return {
+            "num_levels": 0,
+            "max_frontier": 0,
+            "avg_frontier": 0.0,
+            "frontier_ratio": 0.0,
+        }
+    num_levels = len(levels)
+    max_frontier = max(int(rows.numel()) for rows in levels)
+    avg_frontier = float(n_rows) / float(max(num_levels, 1))
+    frontier_ratio = float(max_frontier) / float(max(n_rows, 1))
+    return {
+        "num_levels": num_levels,
+        "max_frontier": max_frontier,
+        "avg_frontier": avg_frontier,
+        "frontier_ratio": frontier_ratio,
+    }
+
+
+def _build_spsv_matrix_stats(indptr64, levels, n_rows):
+    stats = _spsv_level_stats(levels, n_rows)
+    if indptr64.numel() <= 1:
+        avg_nnz_per_row = 0.0
+        max_nnz_per_row = 0
+    else:
+        row_lengths = indptr64[1:] - indptr64[:-1]
+        avg_nnz_per_row = float(row_lengths.to(torch.float32).mean().item())
+        max_nnz_per_row = int(row_lengths.max().item())
+    stats["avg_nnz_per_row"] = avg_nnz_per_row
+    stats["max_nnz_per_row"] = max_nnz_per_row
+    stats["n_rows"] = int(n_rows)
+    return stats
+
+
+def _choose_spsv_block_rhs(n_rhs, matrix_stats, complex_mode=False):
+    avg_nnz = float(matrix_stats.get("avg_nnz_per_row", 0.0))
+    max_nnz = int(matrix_stats.get("max_nnz_per_row", 0))
+    frontier_ratio = float(matrix_stats.get("frontier_ratio", 0.0))
+    if n_rhs <= 1:
+        return 1
+    if complex_mode:
+        if avg_nnz > 512 or max_nnz > 4096:
+            return 4 if n_rhs >= 4 else n_rhs
+        return 8 if n_rhs >= 8 else n_rhs
+    if avg_nnz > 2048 or max_nnz > 16384:
+        return 4 if n_rhs >= 4 else n_rhs
+    if avg_nnz > 512 or frontier_ratio < 0.02:
+        return 8 if n_rhs >= 8 else n_rhs
+    if avg_nnz > 128:
+        return 16 if n_rhs >= 16 else n_rhs
+    if n_rhs <= 8:
+        return n_rhs
+    if n_rhs <= 16:
+        return 16
+    if n_rhs <= 32:
+        return 32
+    return 64
+
+
+def _score_nontrans_levels(matrix_stats, n_rhs, complex_mode):
+    score = 0.0
+    score += float(matrix_stats["frontier_ratio"]) * 10.0
+    score += min(float(matrix_stats["avg_frontier"]) / 64.0, 6.0)
+    score += min(float(matrix_stats["avg_nnz_per_row"]) / 256.0, 4.0)
+    if n_rhs >= 8:
+        score += 2.5
+    if complex_mode:
+        score += 2.0
+    return score
+
+
+def _score_nontrans_cw(matrix_stats, n_rhs, complex_mode):
+    score = 0.0
+    if matrix_stats["num_levels"] > 1024:
+        score += 2.0
+    if matrix_stats["num_levels"] > 4096:
+        score += 2.0
+    if matrix_stats["frontier_ratio"] < 0.03:
+        score += 4.0
+    elif matrix_stats["frontier_ratio"] < 0.06:
+        score += 2.0
+    if matrix_stats["avg_frontier"] < 16.0:
+        score += 3.0
+    elif matrix_stats["avg_frontier"] < 32.0:
+        score += 1.5
+    if matrix_stats["avg_nnz_per_row"] <= 128.0:
+        score += 1.5
+    if matrix_stats["max_nnz_per_row"] > 4096:
+        score -= 2.5
+    if n_rhs >= 8:
+        score -= 3.0
+    elif n_rhs >= 4:
+        score -= 1.5
+    if complex_mode:
+        score -= 2.0
+    return score
+
+
+def _score_transpose_push(matrix_stats, n_rhs, complex_mode):
+    score = 0.0
+    score += float(matrix_stats["frontier_ratio"]) * 12.0
+    score += min(float(matrix_stats["avg_frontier"]) / 48.0, 6.0)
+    score += min(float(matrix_stats["avg_nnz_per_row"]) / 256.0, 4.0)
+    if n_rhs >= 4:
+        score += 2.0
+    if complex_mode:
+        score += 2.5
+    return score
+
+
+def _score_transpose_cw(matrix_stats, n_rhs, complex_mode):
+    score = 0.0
+    if matrix_stats["num_levels"] > 2048:
+        score += 2.0
+    if matrix_stats["num_levels"] > 8192:
+        score += 2.0
+    if matrix_stats["frontier_ratio"] < 0.02:
+        score += 4.0
+    elif matrix_stats["frontier_ratio"] < 0.05:
+        score += 2.0
+    if matrix_stats["avg_frontier"] < 12.0:
+        score += 3.0
+    elif matrix_stats["avg_frontier"] < 24.0:
+        score += 1.5
+    if matrix_stats["avg_nnz_per_row"] <= 96.0:
+        score += 1.0
+    if matrix_stats["max_nnz_per_row"] > 2048:
+        score -= 2.5
+    if n_rhs >= 4:
+        score -= 2.5
+    elif n_rhs >= 2:
+        score -= 1.0
+    if complex_mode:
+        score -= 2.5
+    return score
+
+
+def _select_nontrans_route(matrix_stats, n_rhs, complex_mode):
+    levels_score = _score_nontrans_levels(matrix_stats, n_rhs, complex_mode)
+    cw_score = _score_nontrans_cw(matrix_stats, n_rhs, complex_mode)
+    return "csr_cw" if cw_score > levels_score else "csr_levels"
+
+
+def _select_transpose_route(matrix_stats, n_rhs, complex_mode):
+    push_score = _score_transpose_push(matrix_stats, n_rhs, complex_mode)
+    cw_score = _score_transpose_cw(matrix_stats, n_rhs, complex_mode)
+    return "transpose_cw" if cw_score > push_score else "transpose_push"
+
+
+def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, trans_mode, unit_diagonal):
+    complex_mode = torch.is_complex(data)
     if trans_mode == "N":
         levels = _build_spsv_levels(indptr64, indices64, n_rows, lower=lower)
+        matrix_stats = _build_spsv_matrix_stats(indptr64, levels, n_rows)
         default_block_nnz, default_max_segments = _auto_spsv_launch_config(indptr64)
-        return {
+        levels_plan = {
             "solve_kind": "csr_levels",
             "kernel_data": data,
             "kernel_indices64": indices64,
@@ -311,13 +534,49 @@ def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, t
             "default_block_nnz": default_block_nnz,
             "default_max_segments": default_max_segments,
             "transpose_conjugate": False,
+            "cw_worker_count": None,
+            "matrix_stats": matrix_stats,
+            "route_name": "csr_levels",
+            "alt_plan": None,
         }
+        data_sorted, indices_sorted64, indptr_sorted64 = _sort_csr_rows(
+            data, indices64, indptr64, n_rows, n_cols, lower=lower
+        )
+        default_block_nnz, default_max_segments = _auto_spsv_launch_config(indptr_sorted64)
+        cw_plan = {
+            "solve_kind": "csr_cw",
+            "kernel_data": data_sorted,
+            "kernel_indices64": indices_sorted64,
+            "kernel_indices32": indices_sorted64.to(torch.int32),
+            "kernel_indptr64": indptr_sorted64,
+            "lower_eff": lower,
+            "launch_groups": None,
+            "default_block_nnz": default_block_nnz,
+            "default_max_segments": default_max_segments,
+            "transpose_conjugate": False,
+            "cw_diag": _prepare_spsv_nontrans_cw_metadata(
+                data_sorted, indices_sorted64, indptr_sorted64, n_rows, lower, unit_diagonal=unit_diagonal
+            ),
+            "cw_worker_count": _cw_worker_count(
+                n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
+            ),
+            "matrix_stats": matrix_stats,
+            "route_name": "csr_cw",
+            "alt_plan": None,
+        }
+        preferred_kind = _select_nontrans_route(matrix_stats, 1, complex_mode)
+        if preferred_kind == "csr_cw":
+            cw_plan["alt_plan"] = levels_plan
+            return cw_plan
+        levels_plan["alt_plan"] = cw_plan
+        return levels_plan
 
     levels = _build_spsv_levels(indptr64, indices64, n_rows, lower=lower)
+    matrix_stats = _build_spsv_matrix_stats(indptr64, levels, n_rows)
     default_block_nnz, default_max_segments = _choose_transpose_family_launch_config(
         indptr64
     )
-    return {
+    push_plan = {
         "solve_kind": "transpose_push",
         "kernel_data": data,
         "kernel_indices64": indices64,
@@ -330,7 +589,44 @@ def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, t
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
         "transpose_conjugate": trans_mode == "C",
+        "cw_worker_count": None,
+        "matrix_stats": matrix_stats,
+        "route_name": "transpose_push",
+        "alt_plan": None,
     }
+
+    diag, indegree_init = _prepare_spsv_transpose_cw_metadata(
+        data, indices64, indptr64, n_rows, lower, unit_diagonal=unit_diagonal
+    )
+    default_block_nnz, default_max_segments = _choose_transpose_family_launch_config(
+        indptr64
+    )
+    cw_plan = {
+        "solve_kind": "transpose_cw",
+        "kernel_data": data,
+        "kernel_indices64": indices64,
+        "kernel_indices32": indices64.to(torch.int32),
+        "kernel_indptr64": indptr64,
+        "lower_eff": lower,
+        "launch_groups": None,
+        "default_block_nnz": default_block_nnz,
+        "default_max_segments": default_max_segments,
+        "transpose_conjugate": trans_mode == "C",
+        "transpose_diag": diag,
+        "transpose_indegree_init": indegree_init,
+        "cw_worker_count": _cw_worker_count(
+            n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
+        ),
+        "matrix_stats": matrix_stats,
+        "route_name": "transpose_cw",
+        "alt_plan": None,
+    }
+    preferred_kind = _select_transpose_route(matrix_stats, 1, complex_mode)
+    if preferred_kind == "transpose_cw":
+        cw_plan["alt_plan"] = push_plan
+        return cw_plan
+    push_plan["alt_plan"] = cw_plan
+    return push_plan
 
 
 def _resolve_spsv_csr_runtime(
@@ -341,6 +637,7 @@ def _resolve_spsv_csr_runtime(
     shape,
     lower,
     transpose,
+    unit_diagonal=False,
 ):
     input_data = data
     input_indices = indices
@@ -358,7 +655,7 @@ def _resolve_spsv_csr_runtime(
         _validate_spsv_trans_combo(data.dtype, input_index_dtype, "CSR")
 
     preprocess_key = _csr_preprocess_cache_key(
-        input_data, input_indices, input_indptr, (n_rows, n_cols), lower, trans_mode
+        input_data, input_indices, input_indptr, (n_rows, n_cols), lower, trans_mode, unit_diagonal
     )
     cached = _spsv_cache_get(_SPSV_CSR_PREPROCESS_CACHE, preprocess_key)
     if cached is None:
@@ -370,6 +667,7 @@ def _resolve_spsv_csr_runtime(
             n_cols,
             lower,
             trans_mode,
+            unit_diagonal,
         )
         _spsv_cache_put(
             _SPSV_CSR_PREPROCESS_CACHE,
@@ -386,6 +684,24 @@ def _resolve_spsv_csr_runtime(
         n_cols,
         cached,
     )
+
+
+def _select_spsv_runtime_plan(solve_plan, rhs_cols, compute_dtype, trans_mode):
+    matrix_stats = solve_plan.get("matrix_stats", {})
+    route_name = solve_plan.get("route_name", solve_plan["solve_kind"])
+    alt_plan = solve_plan.get("alt_plan")
+    complex_mode = compute_dtype in (torch.complex64, torch.complex128)
+    if trans_mode == "N":
+        desired = _select_nontrans_route(matrix_stats, rhs_cols, complex_mode)
+    else:
+        desired = _select_transpose_route(matrix_stats, rhs_cols, complex_mode)
+        if complex_mode and rhs_cols >= 2:
+            desired = "transpose_push"
+    if desired == route_name or alt_plan is None:
+        return solve_plan
+    if alt_plan.get("route_name", alt_plan["solve_kind"]) == desired:
+        return alt_plan
+    return solve_plan
 
 
 @triton.jit
@@ -539,6 +855,168 @@ def _spsv_csr_level_kernel_complex(
 
 
 @triton.jit
+def _spsv_csr_cw_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    diag_ptr,
+    b_ptr,
+    x_ptr,
+    ready_ptr,
+    row_counter_ptr,
+    n_rows,
+    n_rhs,
+    stride_b0,
+    stride_x0,
+    BLOCK_RHS: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
+    LOWER: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+):
+    row = tl.atomic_add(row_counter_ptr, 1)
+    while row < n_rows:
+        start = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        diag = tl.load(diag_ptr + row)
+        diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
+
+        for rhs_base in range(0, n_rhs, BLOCK_RHS):
+            rhs_offsets = rhs_base + tl.arange(0, BLOCK_RHS)
+            rhs_mask = rhs_offsets < n_rhs
+            acc = tl.zeros((BLOCK_RHS,), dtype=tl.float32)
+            for seg in range(MAX_SEGMENTS):
+                idx = start + seg * BLOCK_NNZ
+                nnz_offsets = idx + tl.arange(0, BLOCK_NNZ)
+                nnz_mask = nnz_offsets < end
+                a = tl.load(data_ptr + nnz_offsets, mask=nnz_mask, other=0.0)
+                col = tl.load(indices_ptr + nnz_offsets, mask=nnz_mask, other=0)
+                if LOWER:
+                    dep_mask = nnz_mask & (col < row)
+                else:
+                    dep_mask = nnz_mask & (col > row)
+
+                for k in range(BLOCK_NNZ):
+                    if dep_mask[k]:
+                        dep_col = col[k]
+                        while tl.load(ready_ptr + dep_col) == 0:
+                            pass
+                        x_ptrs = x_ptr + dep_col * stride_x0 + rhs_offsets
+                        x_vals = tl.load(x_ptrs, mask=rhs_mask, other=0.0)
+                        acc += a[k] * x_vals
+
+            rhs_ptrs = b_ptr + row * stride_b0 + rhs_offsets
+            rhs = tl.load(rhs_ptrs, mask=rhs_mask, other=0.0)
+            x_row = (rhs - acc) / diag_safe
+            x_row = tl.where(x_row == x_row, x_row, 0.0)
+            out_ptrs = x_ptr + row * stride_x0 + rhs_offsets
+            tl.store(out_ptrs, x_row, mask=rhs_mask)
+
+        tl.debug_barrier()
+        tl.store(ready_ptr + row, 1)
+        row = tl.atomic_add(row_counter_ptr, 1)
+
+
+@triton.jit
+def _spsv_csr_cw_kernel_complex(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    diag_ri_ptr,
+    b_ri_ptr,
+    x_ri_ptr,
+    ready_ptr,
+    row_counter_ptr,
+    n_rows,
+    BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
+    LOWER: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+):
+    row = tl.atomic_add(row_counter_ptr, 1)
+    while row < n_rows:
+        start = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        if UNIT_DIAG:
+            diag_re = 1.0
+            diag_im = 0.0
+        else:
+            diag_re = tl.load(diag_ri_ptr + row * 2)
+            diag_im = tl.load(diag_ri_ptr + row * 2 + 1)
+        if USE_FP64_ACC:
+            diag_re = diag_re.to(tl.float64)
+            diag_im = diag_im.to(tl.float64)
+            acc_re = tl.zeros((1,), dtype=tl.float64)
+            acc_im = tl.zeros((1,), dtype=tl.float64)
+        else:
+            diag_re = diag_re.to(tl.float32)
+            diag_im = diag_im.to(tl.float32)
+            acc_re = tl.zeros((1,), dtype=tl.float32)
+            acc_im = tl.zeros((1,), dtype=tl.float32)
+
+        for seg in range(MAX_SEGMENTS):
+            idx = start + seg * BLOCK_NNZ
+            offsets = idx + tl.arange(0, BLOCK_NNZ)
+            mask = offsets < end
+            col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+            a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
+            a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
+            if USE_FP64_ACC:
+                a_re = a_re.to(tl.float64)
+                a_im = a_im.to(tl.float64)
+            else:
+                a_re = a_re.to(tl.float32)
+                a_im = a_im.to(tl.float32)
+            if LOWER:
+                dep_mask = mask & (col < row)
+            else:
+                dep_mask = mask & (col > row)
+
+            for k in range(BLOCK_NNZ):
+                if dep_mask[k]:
+                    dep_col = col[k]
+                    while tl.load(ready_ptr + dep_col) == 0:
+                        pass
+                    x_re = tl.load(x_ri_ptr + dep_col * 2)
+                    x_im = tl.load(x_ri_ptr + dep_col * 2 + 1)
+                    if USE_FP64_ACC:
+                        x_re = x_re.to(tl.float64)
+                        x_im = x_im.to(tl.float64)
+                    else:
+                        x_re = x_re.to(tl.float32)
+                        x_im = x_im.to(tl.float32)
+                    acc_re += a_re[k] * x_re - a_im[k] * x_im
+                    acc_im += a_re[k] * x_im + a_im[k] * x_re
+
+        rhs_re = tl.load(b_ri_ptr + row * 2)
+        rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
+        if USE_FP64_ACC:
+            rhs_re = rhs_re.to(tl.float64)
+            rhs_im = rhs_im.to(tl.float64)
+        else:
+            rhs_re = rhs_re.to(tl.float32)
+            rhs_im = rhs_im.to(tl.float32)
+
+        num_re = rhs_re - acc_re
+        num_im = rhs_im - acc_im
+        den = diag_re * diag_re + diag_im * diag_im
+        den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+        x_re_out = (num_re * diag_re + num_im * diag_im) / den_safe
+        x_im_out = (num_im * diag_re - num_re * diag_im) / den_safe
+        x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
+        x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
+
+        tl.store(x_ri_ptr + row * 2, x_re_out)
+        tl.store(x_ri_ptr + row * 2 + 1, x_im_out)
+        tl.debug_barrier()
+        tl.store(ready_ptr + row, 1)
+        row = tl.atomic_add(row_counter_ptr, 1)
+
+
+@triton.jit
 def _spsv_csr_transpose_push_kernel(
     data_ptr,
     indices_ptr,
@@ -688,6 +1166,145 @@ def _spsv_csr_transpose_push_kernel_complex(
         prod_im = a_re * x_im_out + a_im * x_re_out
         tl.atomic_add(residual_ri_ptr + col * 2, -prod_re, mask=target_mask)
         tl.atomic_add(residual_ri_ptr + col * 2 + 1, -prod_im, mask=target_mask)
+
+
+@triton.jit
+def _spsv_csr_transpose_cw_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    diag_ptr,
+    indegree_ptr,
+    residual_ptr,
+    x_ptr,
+    row_counter_ptr,
+    n_rows,
+    BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
+    LOWER: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+):
+    row = tl.atomic_add(row_counter_ptr, 1)
+    while row < n_rows:
+        ready_value = 0 if UNIT_DIAG else 1
+        while tl.load(indegree_ptr + row) != ready_value:
+            pass
+
+        rhs = tl.load(residual_ptr + row)
+        if UNIT_DIAG:
+            diag = rhs * 0 + 1.0
+        else:
+            diag = tl.load(diag_ptr + row)
+        diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
+        x_row = rhs / diag_safe
+        x_row = tl.where(x_row == x_row, x_row, 0.0)
+        tl.store(x_ptr + row, x_row)
+
+        start = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        for seg in range(MAX_SEGMENTS):
+            idx = start + seg * BLOCK_NNZ
+            offsets = idx + tl.arange(0, BLOCK_NNZ)
+            mask = offsets < end
+            a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
+            col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+            if LOWER:
+                target_mask = mask & (col < row)
+            else:
+                target_mask = mask & (col > row)
+            tl.atomic_add(residual_ptr + col, -a * x_row, mask=target_mask)
+            tl.atomic_add(indegree_ptr + col, -1, mask=target_mask)
+        row = tl.atomic_add(row_counter_ptr, 1)
+
+
+@triton.jit
+def _spsv_csr_transpose_cw_kernel_complex(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    diag_ri_ptr,
+    indegree_ptr,
+    residual_ri_ptr,
+    x_ri_ptr,
+    row_counter_ptr,
+    n_rows,
+    BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
+    LOWER: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+    CONJ_TRANS: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+):
+    row = tl.atomic_add(row_counter_ptr, 1)
+    while row < n_rows:
+        ready_value = 0 if UNIT_DIAG else 1
+        while tl.load(indegree_ptr + row) != ready_value:
+            pass
+
+        rhs_re = tl.load(residual_ri_ptr + row * 2)
+        rhs_im = tl.load(residual_ri_ptr + row * 2 + 1)
+        if USE_FP64_ACC:
+            rhs_re = rhs_re.to(tl.float64)
+            rhs_im = rhs_im.to(tl.float64)
+        else:
+            rhs_re = rhs_re.to(tl.float32)
+            rhs_im = rhs_im.to(tl.float32)
+
+        if UNIT_DIAG:
+            diag_re = rhs_re * 0 + 1.0
+            diag_im = rhs_im * 0
+        else:
+            diag_re = tl.load(diag_ri_ptr + row * 2)
+            diag_im = tl.load(diag_ri_ptr + row * 2 + 1)
+            if CONJ_TRANS:
+                diag_im = -diag_im
+            if USE_FP64_ACC:
+                diag_re = diag_re.to(tl.float64)
+                diag_im = diag_im.to(tl.float64)
+            else:
+                diag_re = diag_re.to(tl.float32)
+                diag_im = diag_im.to(tl.float32)
+
+        den = diag_re * diag_re + diag_im * diag_im
+        den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+        x_re_out = (rhs_re * diag_re + rhs_im * diag_im) / den_safe
+        x_im_out = (rhs_im * diag_re - rhs_re * diag_im) / den_safe
+        x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
+        x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
+
+        offs1 = tl.arange(0, 1)
+        tl.store(x_ri_ptr + row * 2 + offs1, x_re_out)
+        tl.store(x_ri_ptr + row * 2 + 1 + offs1, x_im_out)
+
+        start = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        for seg in range(MAX_SEGMENTS):
+            idx = start + seg * BLOCK_NNZ
+            offsets = idx + tl.arange(0, BLOCK_NNZ)
+            mask = offsets < end
+            col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+            a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
+            a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
+            if CONJ_TRANS:
+                a_im = -a_im
+            if USE_FP64_ACC:
+                a_re = a_re.to(tl.float64)
+                a_im = a_im.to(tl.float64)
+            else:
+                a_re = a_re.to(tl.float32)
+                a_im = a_im.to(tl.float32)
+            if LOWER:
+                target_mask = mask & (col < row)
+            else:
+                target_mask = mask & (col > row)
+            prod_re = a_re * x_re_out - a_im * x_im_out
+            prod_im = a_re * x_im_out + a_im * x_re_out
+            tl.atomic_add(residual_ri_ptr + col * 2, -prod_re, mask=target_mask)
+            tl.atomic_add(residual_ri_ptr + col * 2 + 1, -prod_im, mask=target_mask)
+            tl.atomic_add(indegree_ptr + col, -1, mask=target_mask)
+        row = tl.atomic_add(row_counter_ptr, 1)
 
 
 @triton.jit
@@ -946,6 +1563,168 @@ def _triton_spsv_csr_vector_complex(
     return x
 
 
+def _triton_spsv_csr_cw_vector(
+    data,
+    indices,
+    indptr,
+    diag,
+    b_vec,
+    n_rows,
+    lower=True,
+    unit_diagonal=False,
+    block_nnz=None,
+    max_segments=None,
+    diag_eps=1e-12,
+    block_nnz_use=None,
+    max_segments_use=None,
+    worker_count=None,
+    matrix_stats=None,
+):
+    if b_vec.ndim == 1:
+        b_mat = b_vec.unsqueeze(1).contiguous()
+    else:
+        b_mat = b_vec.contiguous()
+    x = torch.zeros_like(b_mat)
+    ready = torch.zeros(n_rows, dtype=torch.int32, device=b_mat.device)
+    row_counter = torch.zeros(1, dtype=torch.int32, device=b_mat.device)
+    n_rhs = int(b_mat.shape[1])
+    if n_rows == 0 or n_rhs == 0:
+        return x.squeeze(1) if b_vec.ndim == 1 else x
+    if block_nnz_use is None or max_segments_use is None:
+        block_nnz_use, max_segments_use = _auto_spsv_launch_config(
+            indptr, block_nnz=block_nnz, max_segments=max_segments
+        )
+    matrix_stats = matrix_stats or {}
+    block_rhs = _choose_spsv_block_rhs(n_rhs, matrix_stats, complex_mode=False)
+    if worker_count is None:
+        worker_count = _cw_worker_count(
+            n_rows,
+            int(matrix_stats.get("max_frontier", n_rows)),
+            float(matrix_stats.get("avg_nnz_per_row", 0.0)),
+            n_rhs,
+        )
+    grid = (worker_count,)
+    _spsv_csr_cw_kernel[grid](
+        data,
+        indices,
+        indptr,
+        diag,
+        b_mat,
+        x,
+        ready,
+        row_counter,
+        n_rows,
+        n_rhs,
+        b_mat.stride(0),
+        x.stride(0),
+        BLOCK_RHS=block_rhs,
+        BLOCK_NNZ=block_nnz_use,
+        MAX_SEGMENTS=max_segments_use,
+        LOWER=lower,
+        UNIT_DIAG=unit_diagonal,
+        DIAG_EPS=diag_eps,
+    )
+    return x.squeeze(1) if b_vec.ndim == 1 else x
+
+
+def _triton_spsv_csr_cw_vector_complex(
+    data,
+    indices,
+    indptr,
+    diag,
+    b_vec,
+    n_rows,
+    lower=True,
+    unit_diagonal=False,
+    block_nnz=None,
+    max_segments=None,
+    diag_eps=1e-12,
+    block_nnz_use=None,
+    max_segments_use=None,
+    worker_count=None,
+    matrix_stats=None,
+):
+    if b_vec.ndim != 1:
+        cols = []
+        for j in range(b_vec.shape[1]):
+            cols.append(
+                _triton_spsv_csr_cw_vector_complex(
+                    data,
+                    indices,
+                    indptr,
+                    diag,
+                    b_vec[:, j].contiguous(),
+                    n_rows,
+                    lower=lower,
+                    unit_diagonal=unit_diagonal,
+                    block_nnz=block_nnz,
+                    max_segments=max_segments,
+                    diag_eps=diag_eps,
+                    block_nnz_use=block_nnz_use,
+                    max_segments_use=max_segments_use,
+                    worker_count=worker_count,
+                    matrix_stats=matrix_stats,
+                )
+            )
+        return torch.stack(cols, dim=1)
+
+    x = torch.zeros_like(b_vec)
+    ready = torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    row_counter = torch.zeros(1, dtype=torch.int32, device=b_vec.device)
+    if n_rows == 0:
+        return x
+    if block_nnz_use is None or max_segments_use is None:
+        block_nnz_use, max_segments_use = _auto_spsv_launch_config(
+            indptr, block_nnz=block_nnz, max_segments=max_segments
+        )
+
+    if data.layout != torch.strided:
+        data_strided = torch.empty(data.shape, dtype=data.dtype, device=data.device)
+        data_strided.copy_(data)
+    else:
+        data_strided = data.contiguous()
+    if diag.layout != torch.strided:
+        diag_strided = torch.empty(diag.shape, dtype=diag.dtype, device=diag.device)
+        diag_strided.copy_(diag)
+    else:
+        diag_strided = diag.contiguous()
+
+    data_ri = torch.view_as_real(data_strided).reshape(-1).contiguous()
+    diag_ri = torch.view_as_real(diag_strided).reshape(-1).contiguous()
+    b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
+    component_dtype = _component_dtype_for_complex(data.dtype)
+    use_fp64 = component_dtype == torch.float64
+    x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
+
+    if worker_count is None:
+        matrix_stats = matrix_stats or {}
+        worker_count = _cw_worker_count(
+            n_rows,
+            int(matrix_stats.get("max_frontier", n_rows)),
+            float(matrix_stats.get("avg_nnz_per_row", 0.0)),
+            1,
+        )
+    grid = (worker_count,)
+    _spsv_csr_cw_kernel_complex[grid](
+        data_ri,
+        indices,
+        indptr,
+        diag_ri,
+        b_ri,
+        x_ri,
+        ready,
+        row_counter,
+        n_rows,
+        BLOCK_NNZ=block_nnz_use,
+        MAX_SEGMENTS=max_segments_use,
+        LOWER=lower,
+        UNIT_DIAG=unit_diagonal,
+        USE_FP64_ACC=use_fp64,
+        DIAG_EPS=diag_eps,
+    )
+    return x
+
+
 def _triton_spsv_csr_transpose_push_vector(
     data,
     indices,
@@ -1060,6 +1839,146 @@ def _triton_spsv_csr_transpose_push_vector_complex(
             USE_FP64_ACC=use_fp64,
             DIAG_EPS=diag_eps,
         )
+    if component_dtype == torch.float16:
+        return torch.view_as_complex(x_ri_work.contiguous())
+    return x
+
+
+def _triton_spsv_csr_transpose_cw_vector(
+    data,
+    indices,
+    indptr,
+    diag,
+    indegree_init,
+    b_vec,
+    n_rows,
+    lower=True,
+    unit_diagonal=False,
+    block_nnz=None,
+    max_segments=None,
+    diag_eps=1e-12,
+    block_nnz_use=None,
+    max_segments_use=None,
+    worker_count=None,
+    matrix_stats=None,
+):
+    x = torch.zeros_like(b_vec)
+    if n_rows == 0:
+        return x
+    residual = b_vec.clone()
+    indegree = indegree_init.clone()
+    row_counter = torch.zeros(1, dtype=torch.int32, device=b_vec.device)
+    if block_nnz_use is None or max_segments_use is None:
+        block_nnz_use, max_segments_use = _choose_transpose_family_launch_config(
+            indptr, block_nnz=block_nnz, max_segments=max_segments
+        )
+    if worker_count is None:
+        matrix_stats = matrix_stats or {}
+        worker_count = _cw_worker_count(
+            n_rows,
+            int(matrix_stats.get("max_frontier", n_rows)),
+            float(matrix_stats.get("avg_nnz_per_row", 0.0)),
+            1,
+        )
+    grid = (worker_count,)
+    _spsv_csr_transpose_cw_kernel[grid](
+        data,
+        indices,
+        indptr,
+        diag,
+        indegree,
+        residual,
+        x,
+        row_counter,
+        n_rows,
+        BLOCK_NNZ=block_nnz_use,
+        MAX_SEGMENTS=max_segments_use,
+        LOWER=lower,
+        UNIT_DIAG=unit_diagonal,
+        DIAG_EPS=diag_eps,
+    )
+    return x
+
+
+def _triton_spsv_csr_transpose_cw_vector_complex(
+    data,
+    indices,
+    indptr,
+    diag,
+    indegree_init,
+    b_vec,
+    n_rows,
+    lower=True,
+    unit_diagonal=False,
+    conjugate=False,
+    block_nnz=None,
+    max_segments=None,
+    diag_eps=1e-12,
+    block_nnz_use=None,
+    max_segments_use=None,
+    worker_count=None,
+    matrix_stats=None,
+):
+    x = torch.zeros_like(b_vec)
+    if n_rows == 0:
+        return x
+    if block_nnz_use is None or max_segments_use is None:
+        block_nnz_use, max_segments_use = _choose_transpose_family_launch_config(
+            indptr, block_nnz=block_nnz, max_segments=max_segments
+        )
+
+    if data.layout != torch.strided:
+        data_strided = torch.empty(data.shape, dtype=data.dtype, device=data.device)
+        data_strided.copy_(data)
+    else:
+        data_strided = data.contiguous()
+    if diag.layout != torch.strided:
+        diag_strided = torch.empty(diag.shape, dtype=diag.dtype, device=diag.device)
+        diag_strided.copy_(diag)
+    else:
+        diag_strided = diag.contiguous()
+
+    residual_work = b_vec.contiguous().clone()
+    indegree = indegree_init.clone()
+    row_counter = torch.zeros(1, dtype=torch.int32, device=b_vec.device)
+    data_ri = torch.view_as_real(data_strided).reshape(-1).contiguous()
+    diag_ri = torch.view_as_real(diag_strided).reshape(-1).contiguous()
+    residual_ri = torch.view_as_real(residual_work).reshape(-1).contiguous()
+    component_dtype = _component_dtype_for_complex(data.dtype)
+    use_fp64 = component_dtype == torch.float64
+    if component_dtype == torch.float16:
+        x_ri_work = torch.zeros((n_rows, 2), dtype=torch.float32, device=b_vec.device)
+        x_ri = x_ri_work.reshape(-1).contiguous()
+    else:
+        x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
+
+    if worker_count is None:
+        matrix_stats = matrix_stats or {}
+        worker_count = _cw_worker_count(
+            n_rows,
+            int(matrix_stats.get("max_frontier", n_rows)),
+            float(matrix_stats.get("avg_nnz_per_row", 0.0)),
+            1,
+        )
+    grid = (worker_count,)
+    _spsv_csr_transpose_cw_kernel_complex[grid](
+        data_ri,
+        indices,
+        indptr,
+        diag_ri,
+        indegree,
+        residual_ri,
+        x_ri,
+        row_counter,
+        n_rows,
+        BLOCK_NNZ=block_nnz_use,
+        MAX_SEGMENTS=max_segments_use,
+        LOWER=lower,
+        UNIT_DIAG=unit_diagonal,
+        CONJ_TRANS=conjugate,
+        USE_FP64_ACC=use_fp64,
+        DIAG_EPS=diag_eps,
+    )
     if component_dtype == torch.float16:
         return torch.view_as_complex(x_ri_work.contiguous())
     return x
@@ -1292,8 +2211,13 @@ def flagsparse_spsv_csr(
         shape,
         lower,
         transpose,
+        unit_diagonal,
     )
 
+    rhs_cols = 1 if b.ndim == 1 else int(b.shape[1])
+    solve_plan = _select_spsv_runtime_plan(
+        solve_plan, rhs_cols, data.dtype, trans_mode
+    )
     solve_kind = solve_plan["solve_kind"]
     kernel_data = solve_plan["kernel_data"]
     kernel_indices64 = solve_plan["kernel_indices64"]
@@ -1304,6 +2228,11 @@ def flagsparse_spsv_csr(
     transpose_conjugate = solve_plan["transpose_conjugate"]
     default_block_nnz = solve_plan["default_block_nnz"]
     default_max_segments = solve_plan["default_max_segments"]
+    transpose_diag = solve_plan.get("transpose_diag")
+    transpose_indegree_init = solve_plan.get("transpose_indegree_init")
+    cw_diag = solve_plan.get("cw_diag")
+    cw_worker_count = solve_plan.get("cw_worker_count")
+    matrix_stats = solve_plan.get("matrix_stats", {})
     kernel_indices = kernel_indices32
     kernel_indptr = kernel_indptr64
     compute_dtype = data.dtype
@@ -1330,15 +2259,28 @@ def flagsparse_spsv_csr(
         data_in = kernel_data.to(torch.float64)
         b_in = b.to(torch.float64)
 
-    if solve_kind == "transpose_push":
+    if solve_kind in ("transpose_push", "transpose_cw"):
         if block_nnz is None and max_segments is None:
             block_nnz_use, max_segments_use = default_block_nnz, default_max_segments
         else:
             block_nnz_use, max_segments_use = _choose_transpose_family_launch_config(
                 kernel_indptr, block_nnz=block_nnz, max_segments=max_segments
             )
-        vec_real = _triton_spsv_csr_transpose_push_vector
-        vec_complex = _triton_spsv_csr_transpose_push_vector_complex
+        if solve_kind == "transpose_cw":
+            vec_real = _triton_spsv_csr_transpose_cw_vector
+            vec_complex = _triton_spsv_csr_transpose_cw_vector_complex
+        else:
+            vec_real = _triton_spsv_csr_transpose_push_vector
+            vec_complex = _triton_spsv_csr_transpose_push_vector_complex
+    elif solve_kind == "csr_cw":
+        if block_nnz is None and max_segments is None:
+            block_nnz_use, max_segments_use = default_block_nnz, default_max_segments
+        else:
+            block_nnz_use, max_segments_use = _auto_spsv_launch_config(
+                kernel_indptr, block_nnz=block_nnz, max_segments=max_segments
+            )
+        vec_real = _triton_spsv_csr_cw_vector
+        vec_complex = _triton_spsv_csr_cw_vector_complex
     else:
         if block_nnz is None and max_segments is None:
             block_nnz_use, max_segments_use = default_block_nnz, default_max_segments
@@ -1353,6 +2295,22 @@ def flagsparse_spsv_csr(
     if return_time:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+    transpose_diag_in = transpose_diag
+    if transpose_diag is not None and compute_dtype != data.dtype:
+        transpose_diag_in = transpose_diag.to(compute_dtype)
+    cw_diag_in = cw_diag
+    if cw_diag is not None and compute_dtype != data.dtype:
+        cw_diag_in = cw_diag.to(compute_dtype)
+    worker_count_use = cw_worker_count
+    rhs_cols = 1 if b_in.ndim == 1 else int(b_in.shape[1])
+    matrix_stats_use = dict(matrix_stats)
+    if solve_kind in ("csr_cw", "transpose_cw"):
+        worker_count_use = _cw_worker_count(
+            n_rows,
+            int(matrix_stats_use.get("max_frontier", cw_worker_count if cw_worker_count is not None else n_rows)),
+            float(matrix_stats_use.get("avg_nnz_per_row", default_block_nnz)),
+            rhs_cols,
+        )
     if b_in.ndim == 1:
         if torch.is_complex(data_in):
             if solve_kind == "transpose_push":
@@ -1371,6 +2329,43 @@ def flagsparse_spsv_csr(
                     launch_groups=launch_groups,
                     block_nnz_use=block_nnz_use,
                     max_segments_use=max_segments_use,
+                )
+            elif solve_kind == "transpose_cw":
+                x = vec_complex(
+                    data_in,
+                    kernel_indices,
+                    kernel_indptr,
+                    transpose_diag_in,
+                    transpose_indegree_init,
+                    b_in,
+                    n_rows,
+                    lower=lower_eff,
+                    unit_diagonal=unit_diagonal,
+                    conjugate=transpose_conjugate,
+                    block_nnz=block_nnz,
+                    max_segments=max_segments,
+                    diag_eps=diag_eps,
+                    block_nnz_use=block_nnz_use,
+                    max_segments_use=max_segments_use,
+                    matrix_stats=matrix_stats_use,
+                )
+            elif solve_kind == "csr_cw":
+                x = vec_complex(
+                    data_in,
+                    kernel_indices,
+                    kernel_indptr,
+                    cw_diag_in,
+                    b_in,
+                    n_rows,
+                    lower=lower_eff,
+                    unit_diagonal=unit_diagonal,
+                    block_nnz=block_nnz,
+                    max_segments=max_segments,
+                    diag_eps=diag_eps,
+                    block_nnz_use=block_nnz_use,
+                    max_segments_use=max_segments_use,
+                    worker_count=worker_count_use,
+                    matrix_stats=matrix_stats_use,
                 )
             else:
                 x = vec_complex(
@@ -1404,6 +2399,42 @@ def flagsparse_spsv_csr(
                     launch_groups=launch_groups,
                     block_nnz_use=block_nnz_use,
                     max_segments_use=max_segments_use,
+                )
+            elif solve_kind == "transpose_cw":
+                x = vec_real(
+                    data_in,
+                    kernel_indices,
+                    kernel_indptr,
+                    transpose_diag_in,
+                    transpose_indegree_init,
+                    b_in,
+                    n_rows,
+                    lower=lower_eff,
+                    unit_diagonal=unit_diagonal,
+                    block_nnz=block_nnz,
+                    max_segments=max_segments,
+                    diag_eps=diag_eps,
+                    block_nnz_use=block_nnz_use,
+                    max_segments_use=max_segments_use,
+                    matrix_stats=matrix_stats_use,
+                )
+            elif solve_kind == "csr_cw":
+                x = vec_real(
+                    data_in,
+                    kernel_indices,
+                    kernel_indptr,
+                    cw_diag_in,
+                    b_in,
+                    n_rows,
+                    lower=lower_eff,
+                    unit_diagonal=unit_diagonal,
+                    block_nnz=block_nnz,
+                    max_segments=max_segments,
+                    diag_eps=diag_eps,
+                    block_nnz_use=block_nnz_use,
+                    max_segments_use=max_segments_use,
+                    worker_count=worker_count_use,
+                    matrix_stats=matrix_stats_use,
                 )
             else:
                 x = vec_real(
@@ -1445,6 +2476,47 @@ def flagsparse_spsv_csr(
                             max_segments_use=max_segments_use,
                         )
                     )
+                elif solve_kind == "transpose_cw":
+                    cols.append(
+                        vec_complex(
+                            data_in,
+                            kernel_indices,
+                            kernel_indptr,
+                            transpose_diag_in,
+                            transpose_indegree_init,
+                            bj,
+                            n_rows,
+                            lower=lower_eff,
+                            unit_diagonal=unit_diagonal,
+                            conjugate=transpose_conjugate,
+                            block_nnz=block_nnz,
+                            max_segments=max_segments,
+                            diag_eps=diag_eps,
+                            block_nnz_use=block_nnz_use,
+                            max_segments_use=max_segments_use,
+                            matrix_stats=matrix_stats_use,
+                        )
+                    )
+                elif solve_kind == "csr_cw":
+                    cols.append(
+                        vec_complex(
+                            data_in,
+                            kernel_indices,
+                            kernel_indptr,
+                            cw_diag_in,
+                            bj,
+                            n_rows,
+                            lower=lower_eff,
+                            unit_diagonal=unit_diagonal,
+                            block_nnz=block_nnz,
+                            max_segments=max_segments,
+                            diag_eps=diag_eps,
+                            block_nnz_use=block_nnz_use,
+                            max_segments_use=max_segments_use,
+                            worker_count=worker_count_use,
+                            matrix_stats=matrix_stats_use,
+                        )
+                    )
                 else:
                     cols.append(
                         vec_complex(
@@ -1480,6 +2552,47 @@ def flagsparse_spsv_csr(
                             launch_groups=launch_groups,
                             block_nnz_use=block_nnz_use,
                             max_segments_use=max_segments_use,
+                        )
+                    )
+                elif solve_kind == "transpose_cw":
+                    cols.append(
+                        vec_real(
+                            data_in,
+                            kernel_indices,
+                            kernel_indptr,
+                            transpose_diag_in,
+                            transpose_indegree_init,
+                            bj,
+                            n_rows,
+                            lower=lower_eff,
+                            unit_diagonal=unit_diagonal,
+                            block_nnz=block_nnz,
+                            max_segments=max_segments,
+                            diag_eps=diag_eps,
+                            block_nnz_use=block_nnz_use,
+                            max_segments_use=max_segments_use,
+                            worker_count=worker_count_use,
+                            matrix_stats=matrix_stats_use,
+                        )
+                    )
+                elif solve_kind == "csr_cw":
+                    cols.append(
+                        vec_real(
+                            data_in,
+                            kernel_indices,
+                            kernel_indptr,
+                            cw_diag_in,
+                            bj,
+                            n_rows,
+                            lower=lower_eff,
+                            unit_diagonal=unit_diagonal,
+                            block_nnz=block_nnz,
+                            max_segments=max_segments,
+                            diag_eps=diag_eps,
+                            block_nnz_use=block_nnz_use,
+                            max_segments_use=max_segments_use,
+                            worker_count=worker_count_use,
+                            matrix_stats=matrix_stats_use,
                         )
                     )
                 else:
@@ -1530,7 +2643,6 @@ def _analyze_spsv_csr(
     clear_cache=False,
     return_time=False,
 ):
-    del unit_diagonal
     if clear_cache:
         _clear_spsv_csr_preprocess_cache()
     if return_time:
@@ -1544,6 +2656,7 @@ def _analyze_spsv_csr(
         shape,
         lower,
         transpose,
+        unit_diagonal,
     )
     if return_time:
         torch.cuda.synchronize()

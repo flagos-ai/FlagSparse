@@ -368,43 +368,6 @@ def _build_spsm_levels(indptr, indices, n_rows, lower=True):
     return [torch.tensor(rows, dtype=torch.int32, device=device) for rows in buckets if rows]
 
 
-def _build_spsm_frontiers(indptr, indices, levels, lower=True):
-    if not levels:
-        return []
-
-    indptr_h = indptr.to(torch.int64).cpu()
-    indices_h = indices.to(torch.int64).cpu()
-    device = indptr.device
-    frontier_rows = []
-    frontier_row_set = set()
-    merged = []
-
-    def _flush_frontier():
-        nonlocal frontier_rows, frontier_row_set
-        if frontier_rows:
-            merged.append(torch.tensor(frontier_rows, dtype=torch.int32, device=device))
-            frontier_rows = []
-            frontier_row_set = set()
-
-    for rows_lv in levels:
-        for row in rows_lv.to(torch.int64).cpu().tolist():
-            start = int(indptr_h[row].item())
-            end = int(indptr_h[row + 1].item())
-            depends_on_frontier = False
-            for p in range(start, end):
-                col = int(indices_h[p].item())
-                is_dep = col < row if lower else col > row
-                if is_dep and col in frontier_row_set:
-                    depends_on_frontier = True
-                    break
-            if depends_on_frontier:
-                _flush_frontier()
-            frontier_rows.append(int(row))
-            frontier_row_set.add(int(row))
-    _flush_frontier()
-    return merged
-
-
 def _auto_spsm_launch_config(indptr, block_nnz=None, max_segments=None):
     if indptr.numel() <= 1:
         max_nnz_per_row = 0
@@ -493,7 +456,7 @@ def _prepare_spsm_csr_system(data, indices64, indptr64, n_rows, lower):
         "kernel_indices64": indices64,
         "kernel_indices32": indices64.to(torch.int32),
         "kernel_indptr64": indptr64,
-        "launch_groups": _build_spsm_frontiers(indptr64, indices64, levels, lower=lower),
+        "launch_groups": levels,
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
         "lower_eff": bool(lower),
@@ -509,7 +472,7 @@ def _prepare_spsm_coo_system(data, row64, col64, n_rows, n_cols, lower):
         "kernel_cols64": col_u64,
         "kernel_cols32": col_u64.to(torch.int32),
         "kernel_row_ptr64": row_ptr,
-        "launch_groups": _build_spsm_frontiers(row_ptr, col_u64, levels, lower=lower),
+        "launch_groups": levels,
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
         "lower_eff": bool(lower),
@@ -580,7 +543,7 @@ def _run_spsm_csr_core(
 
     if launch_groups is None:
         levels = _build_spsm_levels(indptr64, indices32, n_rows, lower=lower)
-        launch_groups = _build_spsm_frontiers(indptr64, indices32, levels, lower=lower)
+        launch_groups = levels
     if block_nnz_use is None or max_segments_use is None:
         block_nnz_use, max_segments_use = _auto_spsm_launch_config(
             indptr64, block_nnz=block_nnz, max_segments=max_segments
@@ -647,7 +610,7 @@ def _run_spsm_coo_core(
 
     if launch_groups is None:
         levels = _build_spsm_levels(row_ptr64, cols32, n_rows, lower=lower)
-        launch_groups = _build_spsm_frontiers(row_ptr64, cols32, levels, lower=lower)
+        launch_groups = levels
     if block_nnz_use is None or max_segments_use is None:
         block_nnz_use, max_segments_use = _auto_spsm_launch_config(
             row_ptr64, block_nnz=block_nnz, max_segments=max_segments
