@@ -127,6 +127,32 @@ def _status_str(ok_flag, has_value):
     return "FAIL" if has_value else "N/A"
 
 
+def _csv_export_row_spsv(row):
+    return {
+        "matrix": row.get("matrix"),
+        "value_dtype": row.get("value_dtype"),
+        "index_dtype": row.get("index_dtype"),
+        "opA": row.get("opA"),
+        "n_rows": row.get("n_rows"),
+        "n_cols": row.get("n_cols"),
+        "nnz": row.get("nnz"),
+        "triton_ms": row.get("triton_ms"),
+        "cusparse_ms": row.get("cusparse_ms"),
+        "pytorch_ms": row.get("pytorch_ms"),
+        "cusparse/triton": row.get("cusparse/triton"),
+        "pytorch/triton": row.get("pytorch/triton"),
+        "pt_status": row.get("pt_status"),
+        "cu_status": row.get("cu_status"),
+        "status": row.get("status"),
+        "err_ref": row.get("err_ref"),
+        "err_res": row.get("err_res"),
+        "err_pt": row.get("err_pt"),
+        "err_cu": row.get("err_cu"),
+        "pytorch_reason": row.get("pytorch_reason"),
+        "error": row.get("error"),
+    }
+
+
 def _tol_for_dtype(dtype):
     if dtype in (torch.float32, torch.complex64):
         return 1e-4, 1e-2
@@ -1175,12 +1201,9 @@ def _finalize_csv_row(
         "n_rows": n_rows,
         "n_cols": n_cols,
         "nnz": nnz_out,
-        "triton_analysis_ms": analysis_ms,
-        "triton_solve_ms": t_ms,
-        "triton_time_total_ms": _sum_ms(analysis_ms, t_ms),
-        "cusparse_solve_ms": cupy_ms,
-        "pytorch_solve_ms": pytorch_ms,
-        "pytorch_backend": pt_backend,
+        "triton_ms": t_ms,
+        "cusparse_ms": cupy_ms,
+        "pytorch_ms": pytorch_ms,
         "cusparse/triton": _safe_ratio(cupy_ms, t_ms),
         "pytorch/triton": _safe_ratio(pytorch_ms, t_ms),
         "pt_status": _status_str(ok_pt, err_pt is not None),
@@ -1191,10 +1214,6 @@ def _finalize_csv_row(
         "err_pt": err_pt,
         "err_cu": err_cu,
         "pytorch_reason": pt_skip_reason,
-        "cusparse_reason": None if (cupy_ms is not None or x_cu_t is not None) else (
-            "CuPy/cuSPARSE unavailable" if (cp is None or cpx_sparse is None or cpx_spsolve_triangular is None)
-            else "cuSPARSE solve failed"
-        ),
         "error": None,
     }
     return row, pt_skip_reason
@@ -1325,12 +1344,9 @@ def _finalize_csv_row_csr_full(
         "n_rows": n_rows,
         "n_cols": n_cols,
         "nnz": int(data.numel()),
-        "triton_analysis_ms": analysis_ms,
-        "triton_solve_ms": t_ms,
-        "triton_time_total_ms": _sum_ms(analysis_ms, t_ms),
-        "cusparse_solve_ms": cupy_ms,
-        "pytorch_solve_ms": pytorch_ms,
-        "pytorch_backend": pt_backend,
+        "triton_ms": t_ms,
+        "cusparse_ms": cupy_ms,
+        "pytorch_ms": pytorch_ms,
         "cusparse/triton": _safe_ratio(cupy_ms, t_ms),
         "pytorch/triton": _safe_ratio(pytorch_ms, t_ms),
         "pt_status": _status_str(ok_pt, err_pt is not None),
@@ -1341,10 +1357,6 @@ def _finalize_csv_row_csr_full(
         "err_pt": err_pt,
         "err_cu": err_cu,
         "pytorch_reason": pt_skip_reason,
-        "cusparse_reason": None if x_cu_t is not None else (
-            "CuPy/cuSPARSE unavailable" if (cp is None or cpx_sparse is None or cpx_spsolve_triangular is None)
-            else "cuSPARSE solve failed"
-        ),
         "error": None,
     }
     return row, pt_skip_reason
@@ -1383,7 +1395,7 @@ def run_all_supported_spsv_csr_csv(
                 )
                 print(
                     "RHS is generated directly, matching Library-main's SpSV test style. "
-                    "FlagSparse analysis is measured separately; FlagSparse(ms) below reports solve only. "
+                    "FlagSparse(ms) below reports solve only. "
                     "Err(Ref)=best |FlagSparse-reference|, Err(Res)=|op(A)*x-b|, "
                     "Err(PT)=|FlagSparse-PyTorch|, Err(CU)=|FlagSparse-cuSPARSE|. "
                     "PASS if PyTorch / cuSPARSE reference passes. Residual is diagnostic only."
@@ -1391,7 +1403,7 @@ def run_all_supported_spsv_csr_csv(
                 print("-" * 150)
                 print(
                     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-                    f"{'FS.anlys':>10} {'FS.solve':>10} {'FS.total':>10} {'cu.solve':>10} {'pt.solve':>10} "
+                    f"{'FS.solve':>10} {'cu.solve':>10} {'pt.solve':>10} "
                     f"{'cu/triton':>10} {'pt/triton':>10} {'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(CU)':>10}"
                 )
                 print("-" * 150)
@@ -1406,22 +1418,19 @@ def run_all_supported_spsv_csr_csv(
                             name = name + "…"
                         n_rows, n_cols = row["n_rows"], row["n_cols"]
                         nnz = row["nnz"]
-                        analysis_ms = row["triton_analysis_ms"]
-                        t_ms = row["triton_solve_ms"]
-                        cupy_ms = row["cusparse_solve_ms"]
-                        pytorch_ms = row["pytorch_solve_ms"]
+                        t_ms = row["triton_ms"]
+                        cupy_ms = row["cusparse_ms"]
+                        pytorch_ms = row["pytorch_ms"]
                         err_ref, err_res = row["err_ref"], row["err_res"]
                         err_pt, err_cu = row["err_pt"], row["err_cu"]
                         status = row["status"]
                         print(
                             f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
-                            f"{_fmt_ms(analysis_ms):>10} {_fmt_ms(t_ms):>10} {_fmt_ms(row['triton_time_total_ms']):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(pytorch_ms):>10} "
+                            f"{_fmt_ms(t_ms):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(pytorch_ms):>10} "
                             f"{_fmt_speedup(cupy_ms, t_ms):>10} {_fmt_speedup(pytorch_ms, t_ms):>10} "
                             f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                         )
                         if status in ("FAIL", "REF_FAIL"):
-                            if row["pytorch_backend"] and row["pytorch_backend"] != "gpu_sparse":
-                                print(f"  NOTE: pt_backend={row['pytorch_backend']}")
                             if pt_skip:
                                 print(f"  NOTE: {pt_skip}")
                     except Exception as e:
@@ -1436,12 +1445,9 @@ def run_all_supported_spsv_csr_csv(
                                 "n_rows": "ERR",
                                 "n_cols": "ERR",
                                 "nnz": "ERR",
-                                "triton_analysis_ms": None,
-                                "triton_solve_ms": None,
-                                "triton_time_total_ms": None,
-                                "cusparse_solve_ms": None,
-                                "pytorch_solve_ms": None,
-                                "pytorch_backend": None,
+                                "triton_ms": None,
+                                "cusparse_ms": None,
+                                "pytorch_ms": None,
                                 "cusparse/triton": None,
                                 "pytorch/triton": None,
                                 "pt_status": "N/A",
@@ -1452,7 +1458,6 @@ def run_all_supported_spsv_csr_csv(
                                 "err_pt": None,
                                 "err_cu": None,
                                 "pytorch_reason": None,
-                                "cusparse_reason": None,
                                 "error": err_msg,
                             }
                         )
@@ -1461,7 +1466,7 @@ def run_all_supported_spsv_csr_csv(
                             name = name + "…"
                         print(
                             f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
-                            f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
+                            f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
                             f"{'N/A':>10} {'N/A':>10} "
                             f"{status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
                         )
@@ -1475,12 +1480,9 @@ def run_all_supported_spsv_csr_csv(
         "n_rows",
         "n_cols",
         "nnz",
-        "triton_analysis_ms",
-        "triton_solve_ms",
-        "triton_time_total_ms",
-        "cusparse_solve_ms",
-        "pytorch_solve_ms",
-        "pytorch_backend",
+        "triton_ms",
+        "cusparse_ms",
+        "pytorch_ms",
         "cusparse/triton",
         "pytorch/triton",
         "pt_status",
@@ -1491,14 +1493,13 @@ def run_all_supported_spsv_csr_csv(
         "err_pt",
         "err_cu",
         "pytorch_reason",
-        "cusparse_reason",
         "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows_out:
-            w.writerow({k: ("" if v is None else v) for k, v in r.items()})
+            w.writerow({k: ("" if v is None else v) for k, v in _csv_export_row_spsv(r).items()})
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 
@@ -1537,7 +1538,7 @@ def run_all_dtypes_spsv_coo_csv(
             print("-" * 150)
             print(
                 f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-                f"{'FS.anlys':>10} {'FS.solve':>10} {'FS.total':>10} {'cu.solve':>10} {'pt.solve':>10} "
+                f"{'FS.solve':>10} {'cu.solve':>10} {'pt.solve':>10} "
                 f"{'cu/triton':>10} {'pt/triton':>10} {'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(CU)':>10}"
             )
             print("-" * 150)
@@ -1552,22 +1553,19 @@ def run_all_dtypes_spsv_coo_csv(
                         name = name + "…"
                     n_rows, n_cols = row["n_rows"], row["n_cols"]
                     nnz = row["nnz"]
-                    analysis_ms = row["triton_analysis_ms"]
-                    t_ms = row["triton_solve_ms"]
-                    cupy_ms = row["cusparse_solve_ms"]
-                    pytorch_ms = row["pytorch_solve_ms"]
+                    t_ms = row["triton_ms"]
+                    cupy_ms = row["cusparse_ms"]
+                    pytorch_ms = row["pytorch_ms"]
                     err_ref, err_res = row["err_ref"], row["err_res"]
                     err_pt, err_cu = row["err_pt"], row["err_cu"]
                     status = row["status"]
                     print(
                         f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
-                        f"{_fmt_ms(analysis_ms):>10} {_fmt_ms(t_ms):>10} {_fmt_ms(row['triton_time_total_ms']):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(pytorch_ms):>10} "
+                        f"{_fmt_ms(t_ms):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(pytorch_ms):>10} "
                         f"{_fmt_speedup(cupy_ms, t_ms):>10} {_fmt_speedup(pytorch_ms, t_ms):>10} "
                         f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                     )
                     if status in ("FAIL", "REF_FAIL"):
-                        if row["pytorch_backend"] and row["pytorch_backend"] != "gpu_sparse":
-                            print(f"  NOTE: pt_backend={row['pytorch_backend']}")
                         if pt_skip:
                             print(f"  NOTE: {pt_skip}")
                 except Exception as e:
@@ -1582,12 +1580,9 @@ def run_all_dtypes_spsv_coo_csv(
                             "n_rows": "ERR",
                             "n_cols": "ERR",
                             "nnz": "ERR",
-                            "triton_analysis_ms": None,
-                            "triton_solve_ms": None,
-                            "triton_time_total_ms": None,
-                            "cusparse_solve_ms": None,
-                            "pytorch_solve_ms": None,
-                            "pytorch_backend": None,
+                            "triton_ms": None,
+                            "cusparse_ms": None,
+                            "pytorch_ms": None,
                             "cusparse/triton": None,
                             "pytorch/triton": None,
                             "pt_status": "N/A",
@@ -1598,7 +1593,6 @@ def run_all_dtypes_spsv_coo_csv(
                             "err_pt": None,
                             "err_cu": None,
                             "pytorch_reason": None,
-                            "cusparse_reason": None,
                             "error": err_msg,
                         }
                     )
@@ -1607,7 +1601,7 @@ def run_all_dtypes_spsv_coo_csv(
                         name = name + "…"
                     print(
                         f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
-                        f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
+                        f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
                         f"{'N/A':>10} {'N/A':>10} {status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
                     )
                     print(f"  {status}: {e}")
@@ -1620,12 +1614,9 @@ def run_all_dtypes_spsv_coo_csv(
         "n_rows",
         "n_cols",
         "nnz",
-        "triton_analysis_ms",
-        "triton_solve_ms",
-        "triton_time_total_ms",
-        "cusparse_solve_ms",
-        "pytorch_solve_ms",
-        "pytorch_backend",
+        "triton_ms",
+        "cusparse_ms",
+        "pytorch_ms",
         "cusparse/triton",
         "pytorch/triton",
         "pt_status",
@@ -1636,14 +1627,13 @@ def run_all_dtypes_spsv_coo_csv(
         "err_pt",
         "err_cu",
         "pytorch_reason",
-        "cusparse_reason",
         "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows_out:
-            w.writerow({k: ("" if v is None else v) for k, v in r.items()})
+            w.writerow({k: ("" if v is None else v) for k, v in _csv_export_row_spsv(r).items()})
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 

@@ -66,6 +66,31 @@ def _safe_ratio(other_ms, triton_ms):
     return other_ms / triton_ms
 
 
+def _csv_export_row_spsm(row):
+    return {
+        "matrix": row.get("matrix"),
+        "value_dtype": row.get("value_dtype"),
+        "index_dtype": row.get("index_dtype"),
+        "format": row.get("format"),
+        "n_rows": row.get("n_rows"),
+        "n_cols": row.get("n_cols"),
+        "nnz": row.get("nnz"),
+        "n_rhs": row.get("n_rhs"),
+        "triton_ms": row.get("triton_ms"),
+        "cusparse_ms": row.get("cusparse_ms"),
+        "pytorch_ms": row.get("pytorch_ms"),
+        "cusparse/triton": row.get("cusparse/triton"),
+        "pytorch/triton": row.get("pytorch/triton"),
+        "status": row.get("status"),
+        "err_ref": row.get("err_ref"),
+        "err_res": row.get("err_res"),
+        "err_pt": row.get("err_pt"),
+        "err_cu": row.get("err_cu"),
+        "pytorch_reason": row.get("pytorch_reason"),
+        "error": row.get("error"),
+    }
+
+
 def _parse_csv_tokens(raw):
     return [tok.strip() for tok in str(raw).split(",") if tok.strip()]
 
@@ -405,9 +430,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
             B,
             shape,
         )
-    total_ms = analysis_ms + solve_ms if analysis_ms is not None and solve_ms is not None else None
-
-    X_cu, cusparse_ms, cusparse_reason = _benchmark_cusparse_reference(
+    X_cu, cusparse_ms, _cusparse_reason = _benchmark_cusparse_reference(
         data, row, col, indptr, B, shape, fmt
     )
     X_pt, pytorch_ms, pt_backend, pytorch_reason = _benchmark_pytorch_reference(
@@ -448,12 +471,9 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         "n_cols": int(shape[1]),
         "nnz": int(data.numel()),
         "n_rhs": int(n_rhs),
-        "triton_analysis_ms": analysis_ms,
-        "triton_solve_ms": solve_ms,
-        "triton_time_total_ms": total_ms,
-        "cusparse_solve_ms": cusparse_ms,
-        "pytorch_solve_ms": pytorch_ms,
-        "pytorch_backend": pt_backend,
+        "triton_ms": solve_ms,
+        "cusparse_ms": cusparse_ms,
+        "pytorch_ms": pytorch_ms,
         "cusparse/triton": _safe_ratio(cusparse_ms, solve_ms),
         "pytorch/triton": _safe_ratio(pytorch_ms, solve_ms),
         "status": status,
@@ -462,7 +482,6 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         "err_pt": err_pt,
         "err_cu": err_cu,
         "pytorch_reason": pytorch_reason,
-        "cusparse_reason": cusparse_reason,
         "error": None,
     }
 
@@ -478,11 +497,11 @@ def run_spsm_synthetic_all(n=512, n_rhs=32):
     print("=" * 160)
     print(
         "PyTorch(ms)=CUDA reference (dense triangular solve). "
-        "FlagSparse analysis is measured separately; FlagSparse(ms) below reports solve only."
+        "FlagSparse(ms) below reports solve only."
     )
     print(
         f"{'Fmt':>5} {'dtype':>9} {'index':>7} {'N':>6} {'RHS':>6} {'NNZ':>10} "
-        f"{'FS.anlys':>10} {'FS.solve':>10} {'FS.total':>10} "
+        f"{'FS.solve':>10} "
         f"{'cu.solve':>10} {'pt.solve':>10} {'cu/triton':>10} {'pt/triton':>10} "
         f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(CU)':>12}"
     )
@@ -512,19 +531,15 @@ def run_spsm_synthetic_all(n=512, n_rhs=32):
                 print(
                     f"{fmt:>5} {_dtype_name(value_dtype):>9} {_dtype_name(index_dtype):>7} "
                     f"{shape[0]:>6} {n_rhs:>6} {one['nnz']:>10} "
-                    f"{_fmt_ms(one['triton_analysis_ms']):>10} {_fmt_ms(one['triton_solve_ms']):>10} {_fmt_ms(one['triton_time_total_ms']):>10} "
-                    f"{_fmt_ms(one['cusparse_solve_ms']):>10} {_fmt_ms(one['pytorch_solve_ms']):>10} "
+                    f"{_fmt_ms(one['triton_ms']):>10} "
+                    f"{_fmt_ms(one['cusparse_ms']):>10} {_fmt_ms(one['pytorch_ms']):>10} "
                     f"{_fmt_ratio(one['cusparse/triton']):>10} {_fmt_ratio(one['pytorch/triton']):>10} "
                     f"{one['status']:>10} {_fmt_err(one['err_ref']):>12} {_fmt_err(one['err_res']):>12} "
                     f"{_fmt_err(one['err_pt']):>12} {_fmt_err(one['err_cu']):>12}"
                 )
                 if one["status"] in ("FAIL", "REF_FAIL"):
-                    if one["pytorch_backend"] and one["pytorch_backend"] != "gpu_dense":
-                        print(f"  NOTE: pt_backend={one['pytorch_backend']}")
                     if one["pytorch_reason"]:
                         print(f"  NOTE: {one['pytorch_reason']}")
-                    if one["cusparse_reason"]:
-                        print(f"  NOTE: {one['cusparse_reason']}")
     print("-" * 160)
     print(f"Total cases: {total}  Failed: {failed}")
     print("=" * 160)
@@ -546,7 +561,7 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
     print("=" * 176)
     print(
         f"{'Matrix':<28} {'dtype':>9} {'index':>7} {'N':>7} {'RHS':>6} {'NNZ':>10} "
-        f"{'FS.anlys':>10} {'FS.solve':>10} {'FS.total':>10} "
+        f"{'FS.solve':>10} "
         f"{'cu.solve':>10} {'pt.solve':>10} {'cu/triton':>10} {'pt/triton':>10} "
         f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(CU)':>12}"
     )
@@ -587,19 +602,15 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{row['n_rows']:>7} {row['n_rhs']:>6} {row['nnz']:>10} "
-                        f"{_fmt_ms(row['triton_analysis_ms']):>10} {_fmt_ms(row['triton_solve_ms']):>10} {_fmt_ms(row['triton_time_total_ms']):>10} "
-                        f"{_fmt_ms(row['cusparse_solve_ms']):>10} {_fmt_ms(row['pytorch_solve_ms']):>10} "
+                        f"{_fmt_ms(row['triton_ms']):>10} "
+                        f"{_fmt_ms(row['cusparse_ms']):>10} {_fmt_ms(row['pytorch_ms']):>10} "
                         f"{_fmt_ratio(row['cusparse/triton']):>10} {_fmt_ratio(row['pytorch/triton']):>10} "
                         f"{row['status']:>10} {_fmt_err(row['err_ref']):>12} {_fmt_err(row['err_res']):>12} "
                         f"{_fmt_err(row['err_pt']):>12} {_fmt_err(row['err_cu']):>12}"
                     )
                     if row["status"] in ("FAIL", "REF_FAIL"):
-                        if row["pytorch_backend"] and row["pytorch_backend"] != "gpu_dense":
-                            print(f"  NOTE: pt_backend={row['pytorch_backend']}")
                         if row["pytorch_reason"]:
                             print(f"  NOTE: {row['pytorch_reason']}")
-                        if row["cusparse_reason"]:
-                            print(f"  NOTE: {row['cusparse_reason']}")
                 except Exception as exc:
                     err_msg = str(exc)
                     status = "SKIP" if "SpSM requires square matrices" in err_msg else "ERROR"
@@ -610,12 +621,9 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
                         "n_cols": "ERR",
                         "nnz": "ERR",
                         "n_rhs": int(n_rhs),
-                        "triton_analysis_ms": None,
-                        "triton_solve_ms": None,
-                        "triton_time_total_ms": None,
-                        "cusparse_solve_ms": None,
-                        "pytorch_solve_ms": None,
-                        "pytorch_backend": None,
+                        "triton_ms": None,
+                        "cusparse_ms": None,
+                        "pytorch_ms": None,
                         "cusparse/triton": None,
                         "pytorch/triton": None,
                         "status": status,
@@ -624,7 +632,6 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
                         "err_pt": None,
                         "err_cu": None,
                         "pytorch_reason": None,
-                        "cusparse_reason": None,
                         "error": err_msg,
                     }
                     rows_out.append(row)
@@ -633,7 +640,6 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{'ERR':>7} {int(n_rhs):>6} {'ERR':>10} "
                         f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
-                        f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} "
                         f"{'N/A':>10} {'N/A':>10} {status:>10} "
                         f"{_fmt_err(None):>12} {_fmt_err(None):>12} {_fmt_err(None):>12} {_fmt_err(None):>12}"
                     )
@@ -649,12 +655,9 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
         "n_cols",
         "nnz",
         "n_rhs",
-        "triton_analysis_ms",
-        "triton_solve_ms",
-        "triton_time_total_ms",
-        "cusparse_solve_ms",
-        "pytorch_solve_ms",
-        "pytorch_backend",
+        "triton_ms",
+        "cusparse_ms",
+        "pytorch_ms",
         "cusparse/triton",
         "pytorch/triton",
         "status",
@@ -663,14 +666,13 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
         "err_pt",
         "err_cu",
         "pytorch_reason",
-        "cusparse_reason",
         "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for row in rows_out:
-            w.writerow(row)
+            w.writerow({k: ("" if v is None else v) for k, v in _csv_export_row_spsm(row).items()})
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 

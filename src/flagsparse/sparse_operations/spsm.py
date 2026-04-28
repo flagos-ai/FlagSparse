@@ -1,7 +1,6 @@
 """Sparse triangular matrix-matrix solve (SpSM) for CSR/COO."""
 
 from collections import OrderedDict
-import os
 
 from ._common import *
 
@@ -14,12 +13,6 @@ SPSM_NON_TRANS_PRIMARY_COMBOS = (
     ("coo", torch.float32, torch.int32),
     ("coo", torch.float64, torch.int32),
 )
-def _spsm_env_flag(name, default="0"):
-    return str(os.environ.get(name, default)).lower() in ("1", "true", "yes", "on")
-
-
-SPSM_ENABLE_TILED_KERNEL = _spsm_env_flag("FLAGSPARSE_SPSM_ENABLE_TILED_KERNEL", "1")
-SPSM_TILED_MIN_RHS = 16
 _SPSM_PREPROCESS_CACHE = OrderedDict()
 _SPSM_PREPROCESS_CACHE_SIZE = 8
 
@@ -188,6 +181,14 @@ def _prepare_spsm_diag(data, indices64, indptr64, n_rows, unit_diagonal=False):
     return diag
 
 
+def _prepare_spsm_inv_diag(diag):
+    if diag.numel() == 0:
+        return diag
+    eps = 1e-12 if diag.dtype == torch.float64 else 1e-6
+    safe_diag = torch.where(torch.abs(diag) < eps, torch.ones_like(diag), diag)
+    return torch.reciprocal(safe_diag)
+
+
 def _prepare_spsm_kernel_row_ptr(indptr64):
     if indptr64.numel() == 0:
         return indptr64.to(torch.int32)
@@ -289,61 +290,9 @@ def _alpha_to_host_scalar(alpha):
     return float(alpha)
 
 
-def _should_use_spsm_tiled_kernel(fmt_name, rhs, dtype):
-    if not SPSM_ENABLE_TILED_KERNEL:
-        return False
-    if dtype not in (torch.float32, torch.float64):
-        return False
-    if rhs.ndim != 2:
-        return False
-    n_rhs = int(rhs.shape[1])
-    if n_rhs < SPSM_TILED_MIN_RHS:
-        return False
-    fmt = str(fmt_name).lower()
-    if fmt == "csr":
-        return True
-    if fmt == "coo":
-        return True
-    return False
-
-
 @triton.jit
-def _spsm_pack_rhs_work_kernel(
-    src_ptr,
-    dst_ptr,
-    n_rows,
-    n_rhs,
-    stride_src0,
-    stride_dst0,
-    alpha,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_RHS: tl.constexpr,
-    USE_FP64_ACC: tl.constexpr,
-):
-    pid_row = tl.program_id(0)
-    pid_rhs = tl.program_id(1)
-
-    row_offsets = pid_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    rhs_offsets = pid_rhs * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
-    mask = (row_offsets[:, None] < n_rows) & (rhs_offsets[None, :] < n_rhs)
-
-    src_ptrs = src_ptr + row_offsets[:, None] * stride_src0 + rhs_offsets[None, :]
-    vals = tl.load(src_ptrs, mask=mask, other=0.0)
-    if USE_FP64_ACC:
-        vals = vals.to(tl.float64) * alpha
-    else:
-        vals = vals.to(tl.float32) * alpha
-
-    dst_ptrs = dst_ptr + row_offsets[:, None] * stride_dst0 + rhs_offsets[None, :]
-    tl.store(dst_ptrs, vals, mask=mask)
-
-
-@triton.jit
-def _spsm_csr_level_kernel_real(
-    data_ptr,
-    indices_ptr,
-    indptr_ptr,
-    diag_ptr,
+def _spsm_csr_diag_only_kernel_real(
+    inv_diag_ptr,
     b_ptr,
     x_ptr,
     rows_ptr,
@@ -351,12 +300,55 @@ def _spsm_csr_level_kernel_real(
     n_rhs,
     stride_b0,
     stride_x0,
+    alpha,
+    BLOCK_RHS: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_rhs = tl.program_id(1)
+    if pid_row >= n_level_rows:
+        return
+
+    row = tl.load(rows_ptr + pid_row)
+    rhs_offsets = pid_rhs * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+    rhs_mask = rhs_offsets < n_rhs
+
+    b_ptrs = b_ptr + row * stride_b0 + rhs_offsets
+    rhs = tl.load(b_ptrs, mask=rhs_mask, other=0.0)
+    if USE_FP64_ACC:
+        rhs = rhs.to(tl.float64)
+        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float64)
+    else:
+        rhs = rhs.to(tl.float32)
+        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float32)
+
+    inv_diag = tl.load(inv_diag_ptr + row)
+    inv_diag = inv_diag.to(tl.float64) if USE_FP64_ACC else inv_diag.to(tl.float32)
+    out = rhs * alpha_val * inv_diag
+    out = tl.where(out == out, out, 0.0)
+
+    out_ptrs = x_ptr + row * stride_x0 + rhs_offsets
+    tl.store(out_ptrs, out, mask=rhs_mask)
+
+
+@triton.jit
+def _spsm_csr_level_kernel_real(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    inv_diag_ptr,
+    b_ptr,
+    x_ptr,
+    rows_ptr,
+    n_level_rows,
+    n_rhs,
+    stride_b0,
+    stride_x0,
+    alpha,
     BLOCK_NNZ: tl.constexpr,
     BLOCK_RHS: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
-    LOWER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
-    DIAG_EPS: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_rhs = tl.program_id(1)
@@ -386,8 +378,6 @@ def _spsm_csr_level_kernel_real(
         else:
             a = a.to(tl.float32)
 
-        solved_mask = col < row if LOWER else col > row
-
         x_ptrs = x_ptr + col[:, None] * stride_x0 + rhs_offsets[None, :]
         x_mask = nnz_mask[:, None] & rhs_mask[None, :]
         x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
@@ -396,17 +386,21 @@ def _spsm_csr_level_kernel_real(
         else:
             x_vals = x_vals.to(tl.float32)
 
-        contrib = tl.where((nnz_mask & solved_mask)[:, None], a[:, None] * x_vals, 0.0)
+        contrib = tl.where(nnz_mask[:, None], a[:, None] * x_vals, 0.0)
         acc += tl.sum(contrib, axis=0)
 
     b_ptrs = b_ptr + row * stride_b0 + rhs_offsets
     rhs = tl.load(b_ptrs, mask=rhs_mask, other=0.0)
-    rhs = rhs.to(tl.float64) if USE_FP64_ACC else rhs.to(tl.float32)
+    if USE_FP64_ACC:
+        rhs = rhs.to(tl.float64)
+        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float64)
+    else:
+        rhs = rhs.to(tl.float32)
+        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float32)
 
-    diag = tl.load(diag_ptr + row)
-    diag = diag.to(tl.float64) if USE_FP64_ACC else diag.to(tl.float32)
-    diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
-    out = (rhs - acc) / diag_safe
+    inv_diag = tl.load(inv_diag_ptr + row)
+    inv_diag = inv_diag.to(tl.float64) if USE_FP64_ACC else inv_diag.to(tl.float32)
+    out = (rhs * alpha_val - acc) * inv_diag
     out = tl.where(out == out, out, 0.0)
 
     out_ptrs = x_ptr + row * stride_x0 + rhs_offsets
@@ -414,11 +408,11 @@ def _spsm_csr_level_kernel_real(
 
 
 @triton.jit
-def _spsm_coo_level_kernel_real(
+def _spsm_csr_level_kernel_single_segment_real(
     data_ptr,
-    row_ptr_ptr,
-    col_ptr,
-    diag_ptr,
+    indices_ptr,
+    indptr_ptr,
+    inv_diag_ptr,
     b_ptr,
     x_ptr,
     rows_ptr,
@@ -426,12 +420,10 @@ def _spsm_coo_level_kernel_real(
     n_rhs,
     stride_b0,
     stride_x0,
+    alpha,
     BLOCK_NNZ: tl.constexpr,
     BLOCK_RHS: tl.constexpr,
-    MAX_SEGMENTS: tl.constexpr,
-    LOWER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
-    DIAG_EPS: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_rhs = tl.program_id(1)
@@ -442,46 +434,37 @@ def _spsm_coo_level_kernel_real(
     rhs_offsets = pid_rhs * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
     rhs_mask = rhs_offsets < n_rhs
 
-    start = tl.load(row_ptr_ptr + row)
-    end = tl.load(row_ptr_ptr + row + 1)
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    nnz_offsets = start + tl.arange(0, BLOCK_NNZ)
+    nnz_mask = nnz_offsets < end
 
+    a = tl.load(data_ptr + nnz_offsets, mask=nnz_mask, other=0.0)
+    col = tl.load(indices_ptr + nnz_offsets, mask=nnz_mask, other=0)
     if USE_FP64_ACC:
-        acc = tl.zeros((BLOCK_RHS,), dtype=tl.float64)
+        a = a.to(tl.float64)
     else:
-        acc = tl.zeros((BLOCK_RHS,), dtype=tl.float32)
+        a = a.to(tl.float32)
 
-    for seg in range(MAX_SEGMENTS):
-        nnz_offsets = start + seg * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
-        nnz_mask = nnz_offsets < end
-        a = tl.load(data_ptr + nnz_offsets, mask=nnz_mask, other=0.0)
-        col = tl.load(col_ptr + nnz_offsets, mask=nnz_mask, other=0)
-
-        if USE_FP64_ACC:
-            a = a.to(tl.float64)
-        else:
-            a = a.to(tl.float32)
-
-        solved_mask = col < row if LOWER else col > row
-
-        x_ptrs = x_ptr + col[:, None] * stride_x0 + rhs_offsets[None, :]
-        x_mask = nnz_mask[:, None] & rhs_mask[None, :]
-        x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
-        if USE_FP64_ACC:
-            x_vals = x_vals.to(tl.float64)
-        else:
-            x_vals = x_vals.to(tl.float32)
-
-        contrib = tl.where((nnz_mask & solved_mask)[:, None], a[:, None] * x_vals, 0.0)
-        acc += tl.sum(contrib, axis=0)
+    x_ptrs = x_ptr + col[:, None] * stride_x0 + rhs_offsets[None, :]
+    x_mask = nnz_mask[:, None] & rhs_mask[None, :]
+    x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
+    if USE_FP64_ACC:
+        x_vals = x_vals.to(tl.float64)
+        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float64)
+    else:
+        x_vals = x_vals.to(tl.float32)
+        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float32)
+    contrib = tl.where(nnz_mask[:, None], a[:, None] * x_vals, 0.0)
+    acc = tl.sum(contrib, axis=0)
 
     b_ptrs = b_ptr + row * stride_b0 + rhs_offsets
     rhs = tl.load(b_ptrs, mask=rhs_mask, other=0.0)
     rhs = rhs.to(tl.float64) if USE_FP64_ACC else rhs.to(tl.float32)
 
-    diag = tl.load(diag_ptr + row)
-    diag = diag.to(tl.float64) if USE_FP64_ACC else diag.to(tl.float32)
-    diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
-    out = (rhs - acc) / diag_safe
+    inv_diag = tl.load(inv_diag_ptr + row)
+    inv_diag = inv_diag.to(tl.float64) if USE_FP64_ACC else inv_diag.to(tl.float32)
+    out = (rhs * alpha_val - acc) * inv_diag
     out = tl.where(out == out, out, 0.0)
 
     out_ptrs = x_ptr + row * stride_x0 + rhs_offsets
@@ -489,78 +472,96 @@ def _spsm_coo_level_kernel_real(
 
 
 @triton.jit
-def _spsm_csr_tiled_kernel_real(
+def _spsm_csr_level_kernel_staged_real(
     data_ptr,
     indices_ptr,
-    dep_ptr_ptr,
-    diag_ptr,
-    y_ptr,
-    ready_ptr,
-    n_rows,
+    indptr_ptr,
+    inv_diag_ptr,
+    work_ptr,
+    rows_ptr,
+    n_level_rows,
     n_rhs,
-    stride_y0,
-    ready_stride0,
+    stride_work0,
+    alpha,
     BLOCK_NNZ: tl.constexpr,
     BLOCK_RHS: tl.constexpr,
+    RHS_TILE_GROUPS: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
-    DIAG_EPS: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    pid_rhs = tl.program_id(1)
-    if row >= n_rows:
+    pid_row = tl.program_id(0)
+    pid_rhs_group = tl.program_id(1)
+    if pid_row >= n_level_rows:
         return
 
-    rhs_offsets = pid_rhs * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
-    rhs_mask = rhs_offsets < n_rhs
-    ready_row_ptr = ready_ptr + pid_rhs * ready_stride0
-
-    start = tl.load(dep_ptr_ptr + row)
-    end = tl.load(dep_ptr_ptr + row + 1)
+    row = tl.load(rows_ptr + pid_row)
+    rhs_group_base = pid_rhs_group * BLOCK_RHS * RHS_TILE_GROUPS
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
 
     if USE_FP64_ACC:
-        acc = tl.zeros((BLOCK_RHS,), dtype=tl.float64)
+        inv_diag = tl.load(inv_diag_ptr + row).to(tl.float64)
+        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float64)
+        acc0 = tl.zeros((BLOCK_RHS,), dtype=tl.float64)
+        acc1 = tl.zeros((BLOCK_RHS,), dtype=tl.float64)
+        acc2 = tl.zeros((BLOCK_RHS,), dtype=tl.float64)
+        acc3 = tl.zeros((BLOCK_RHS,), dtype=tl.float64)
     else:
-        acc = tl.zeros((BLOCK_RHS,), dtype=tl.float32)
+        inv_diag = tl.load(inv_diag_ptr + row).to(tl.float32)
+        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float32)
+        acc0 = tl.zeros((BLOCK_RHS,), dtype=tl.float32)
+        acc1 = tl.zeros((BLOCK_RHS,), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_RHS,), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_RHS,), dtype=tl.float32)
 
     for seg in range(MAX_SEGMENTS):
         nnz_offsets = start + seg * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
         nnz_mask = nnz_offsets < end
         a = tl.load(data_ptr + nnz_offsets, mask=nnz_mask, other=0.0)
         col = tl.load(indices_ptr + nnz_offsets, mask=nnz_mask, other=0)
-
         if USE_FP64_ACC:
             a = a.to(tl.float64)
         else:
             a = a.to(tl.float32)
 
-        for k in range(BLOCK_NNZ):
-            if nnz_mask[k]:
-                dep_col = col[k]
-                while tl.load(ready_row_ptr + dep_col) == 0:
-                    pass
-                x_ptrs = y_ptr + dep_col * stride_y0 + rhs_offsets
-                x_vals = tl.load(x_ptrs, mask=rhs_mask, other=0.0)
-                if USE_FP64_ACC:
-                    x_vals = x_vals.to(tl.float64)
-                else:
-                    x_vals = x_vals.to(tl.float32)
-                acc += a[k] * x_vals
+        for tile_id in range(RHS_TILE_GROUPS):
+            rhs_offsets = rhs_group_base + tile_id * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+            rhs_mask = rhs_offsets < n_rhs
+            x_ptrs = work_ptr + col[:, None] * stride_work0 + rhs_offsets[None, :]
+            x_mask = nnz_mask[:, None] & rhs_mask[None, :]
+            x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
+            if USE_FP64_ACC:
+                x_vals = x_vals.to(tl.float64)
+            else:
+                x_vals = x_vals.to(tl.float32)
+            contrib = tl.where(nnz_mask[:, None], a[:, None] * x_vals, 0.0)
+            tile_acc = tl.sum(contrib, axis=0)
+            if tile_id == 0:
+                acc0 += tile_acc
+            elif tile_id == 1:
+                acc1 += tile_acc
+            elif tile_id == 2:
+                acc2 += tile_acc
+            else:
+                acc3 += tile_acc
 
-    rhs_ptrs = y_ptr + row * stride_y0 + rhs_offsets
-    rhs = tl.load(rhs_ptrs, mask=rhs_mask, other=0.0)
-    rhs = rhs.to(tl.float64) if USE_FP64_ACC else rhs.to(tl.float32)
-
-    diag = tl.load(diag_ptr + row)
-    diag = diag.to(tl.float64) if USE_FP64_ACC else diag.to(tl.float32)
-    diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
-    out = (rhs - acc) / diag_safe
-    out = tl.where(out == out, out, 0.0)
-
-    out_ptrs = y_ptr + row * stride_y0 + rhs_offsets
-    tl.store(out_ptrs, out, mask=rhs_mask)
-    tl.debug_barrier()
-    tl.store(ready_row_ptr + row, 1)
+    for tile_id in range(RHS_TILE_GROUPS):
+        rhs_offsets = rhs_group_base + tile_id * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+        rhs_mask = rhs_offsets < n_rhs
+        work_ptrs = work_ptr + row * stride_work0 + rhs_offsets
+        rhs = tl.load(work_ptrs, mask=rhs_mask, other=0.0)
+        rhs = rhs.to(tl.float64) if USE_FP64_ACC else rhs.to(tl.float32)
+        if tile_id == 0:
+            acc_tile = acc0
+        elif tile_id == 1:
+            acc_tile = acc1
+        elif tile_id == 2:
+            acc_tile = acc2
+        else:
+            acc_tile = acc3
+        out = (rhs * alpha_val - acc_tile) * inv_diag
+        out = tl.where(out == out, out, 0.0)
+        tl.store(work_ptrs, out, mask=rhs_mask)
 
 
 def _build_spsm_levels(indptr, indices, n_rows, lower=True):
@@ -600,52 +601,91 @@ def _build_spsm_levels(indptr, indices, n_rows, lower=True):
     return [torch.tensor(rows, dtype=torch.int32, device=device) for rows in buckets if rows]
 
 
+def _spsm_block_nnz_for_row_length(max_nnz_per_row):
+    max_nnz_per_row = int(max_nnz_per_row)
+    if max_nnz_per_row <= 32:
+        return 32
+    if max_nnz_per_row <= 64:
+        return 64
+    if max_nnz_per_row <= 128:
+        return 128
+    if max_nnz_per_row <= 256:
+        return 256
+    if max_nnz_per_row <= 512:
+        return 512
+    if max_nnz_per_row <= 1024:
+        return 1024
+    if max_nnz_per_row <= 4096:
+        return 1024
+    return 1024
+
+
+def _spsm_single_segment_block_nnz(limit):
+    return _spsm_block_nnz_for_row_length(limit)
+
+
+def _bucketize_spsm_launch_groups(levels, indptr_like):
+    if not levels:
+        return []
+    row_lengths = (indptr_like[1:] - indptr_like[:-1]).to(torch.int64)
+    bucket_limits = (32, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
+    grouped = []
+    for rows_lv in levels:
+        if rows_lv.numel() == 0:
+            continue
+        rows_i64 = rows_lv.to(torch.int64)
+        lv_lengths = row_lengths.index_select(0, rows_i64)
+        remaining = torch.ones(rows_lv.numel(), dtype=torch.bool, device=rows_lv.device)
+        zero_mask = remaining & (lv_lengths == 0)
+        if bool(torch.any(zero_mask).item()):
+            grouped.append(
+                {
+                    "rows": rows_lv[zero_mask],
+                    "diag_only": True,
+                }
+            )
+            remaining = remaining & (~zero_mask)
+        for limit in bucket_limits:
+            mask = remaining & (lv_lengths <= limit)
+            if bool(torch.any(mask).item()):
+                bucket_rows = rows_lv[mask]
+                # Keep single-segment buckets fully covered while staying on hardware-friendly powers of two.
+                block_nnz = _spsm_single_segment_block_nnz(limit)
+                grouped.append(
+                    {
+                        "rows": bucket_rows,
+                        "block_nnz": block_nnz,
+                        "max_segments": 1,
+                        "diag_only": False,
+                        "single_segment": True,
+                        "staged": False,
+                    }
+                )
+                remaining = remaining & (~mask)
+        if bool(torch.any(remaining).item()):
+            bucket_rows = rows_lv[remaining]
+            bucket_lengths = lv_lengths[remaining]
+            bucket_max = int(bucket_lengths.max().item()) if bucket_lengths.numel() > 0 else 0
+            block_nnz = _spsm_block_nnz_for_row_length(bucket_max)
+            max_segments = max((bucket_max + block_nnz - 1) // block_nnz, 1)
+            grouped.append(
+                {
+                    "rows": bucket_rows,
+                    "block_nnz": block_nnz,
+                    "max_segments": max_segments,
+                    "diag_only": False,
+                    "single_segment": max_segments == 1,
+                    "staged": bucket_max >= 256 or max_segments > 1,
+                }
+            )
+    return grouped
+
+
 def _auto_spsm_launch_config(indptr, block_nnz=None, max_segments=None):
     if indptr.numel() <= 1:
         max_nnz_per_row = 0
     else:
         row_lengths = indptr[1:] - indptr[:-1]
-        max_nnz_per_row = int(row_lengths.max().item())
-
-    auto_block = block_nnz is None
-    if block_nnz is None:
-        if max_nnz_per_row <= 64:
-            block_nnz_use = 64
-        elif max_nnz_per_row <= 256:
-            block_nnz_use = 128
-        elif max_nnz_per_row <= 1024:
-            block_nnz_use = 256
-        elif max_nnz_per_row <= 4096:
-            block_nnz_use = 512
-        else:
-            block_nnz_use = 1024
-    else:
-        block_nnz_use = int(block_nnz)
-        if block_nnz_use <= 0:
-            raise ValueError("block_nnz must be positive")
-
-    required_segments = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
-    if max_segments is None:
-        max_segments_use = required_segments
-        if auto_block:
-            while max_segments_use > 2048 and block_nnz_use < 65536:
-                block_nnz_use *= 2
-                max_segments_use = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
-    else:
-        max_segments_use = int(max_segments)
-        if max_segments_use <= 0:
-            raise ValueError("max_segments must be positive")
-        if max_segments_use < required_segments:
-            raise ValueError(
-                f"max_segments={max_segments_use} is too small; at least {required_segments} required"
-            )
-    return block_nnz_use, max_segments_use
-
-
-def _auto_spsm_launch_config_from_row_lengths(row_lengths, block_nnz=None, max_segments=None):
-    if row_lengths.numel() == 0:
-        max_nnz_per_row = 0
-    else:
         max_nnz_per_row = int(row_lengths.max().item())
 
     auto_block = block_nnz is None
@@ -696,32 +736,46 @@ def _auto_rhs_block(n_rhs):
     return 64
 
 
-def _pack_spsm_rhs_work_buffer(rhs, alpha):
-    if rhs.ndim != 2:
-        raise ValueError("rhs must be 2D")
-    n_rows, n_rhs = int(rhs.shape[0]), int(rhs.shape[1])
-    work = torch.empty_like(rhs, memory_format=torch.contiguous_format)
-    if n_rows == 0 or n_rhs == 0:
-        return work
+def _choose_group_block_rhs(
+    n_rhs,
+    *,
+    block_nnz,
+    max_segments,
+    diag_only,
+    single_segment,
+    value_dtype,
+):
+    base = _auto_rhs_block(n_rhs)
+    if diag_only:
+        return min(base, 32 if value_dtype == torch.float32 else 16)
+    if block_nnz <= 64 and single_segment:
+        return min(base, 32 if value_dtype == torch.float32 else 16)
+    if block_nnz <= 128 and single_segment:
+        return min(base, 16 if value_dtype == torch.float32 else 8)
+    if max_segments > 2 or block_nnz >= 512:
+        return min(base, 8)
+    if max_segments > 1 or block_nnz >= 256:
+        return min(base, 16 if value_dtype == torch.float32 else 8)
+    return base
 
-    block_rows = 32
-    block_rhs = _auto_rhs_block(n_rhs)
-    alpha_value = _alpha_to_host_scalar(alpha)
-    use_fp64 = rhs.dtype == torch.float64
-    grid = (triton.cdiv(n_rows, block_rows), triton.cdiv(n_rhs, block_rhs))
-    _spsm_pack_rhs_work_kernel[grid](
-        rhs,
-        work,
-        n_rows,
-        n_rhs,
-        rhs.stride(0),
-        work.stride(0),
-        alpha_value,
-        BLOCK_ROWS=block_rows,
-        BLOCK_RHS=block_rhs,
-        USE_FP64_ACC=use_fp64,
-    )
-    return work
+
+def _choose_group_rhs_tile_groups(n_rhs, block_rhs_use, staged):
+    if not staged:
+        return 1
+    if block_rhs_use <= 0:
+        return 1
+    if n_rhs >= block_rhs_use * 4:
+        return 4
+    if n_rhs >= block_rhs_use * 2:
+        return 2
+    return 1
+
+
+def _prepare_spsm_rhs_work_buffer(rhs):
+    # Library-main solves through a dedicated RHS work buffer. In our current
+    # row-major NON_TRANS path that buffer already matches the final layout, so
+    # we keep a contiguous in-place work copy rather than doing an extra transpose.
+    return rhs.contiguous().clone()
 
 
 def _coo_to_csr_sorted_unique(data, row64, col64, n_rows, n_cols):
@@ -758,26 +812,20 @@ def _prepare_spsm_csr_system(data, indices64, indptr64, n_rows, lower, unit_diag
     dep_data, dep_indices64, dep_ptr64 = _prepare_spsm_csr_dependency_view(
         sorted_data, sorted_indices64, indptr64, n_rows, lower=lower, row_ids=row_ids
     )
-    levels = _build_spsm_levels(indptr64, sorted_indices64, n_rows, lower=lower)
-    default_block_nnz, default_max_segments = _auto_spsm_launch_config(indptr64)
-    tiled_block_nnz, tiled_max_segments = _auto_spsm_launch_config_from_row_lengths(
-        dep_ptr64[1:] - dep_ptr64[:-1]
+    levels = _build_spsm_levels(dep_ptr64, dep_indices64, n_rows, lower=lower)
+    launch_groups = _bucketize_spsm_launch_groups(levels, dep_ptr64)
+    diag = _prepare_spsm_diag(
+        sorted_data, sorted_indices64, indptr64, n_rows, unit_diagonal=unit_diagonal
     )
+    default_block_nnz, default_max_segments = _auto_spsm_launch_config(dep_ptr64)
     return {
-        "kernel_data": sorted_data,
-        "kernel_indices32": sorted_indices64.to(torch.int32),
         "kernel_dep_data": dep_data,
         "kernel_dep_indices32": dep_indices64.to(torch.int32),
         "kernel_dep_ptr": _prepare_spsm_kernel_row_ptr(dep_ptr64),
-        "kernel_diag": _prepare_spsm_diag(
-            sorted_data, sorted_indices64, indptr64, n_rows, unit_diagonal=unit_diagonal
-        ),
-        "kernel_indptr": _prepare_spsm_kernel_row_ptr(indptr64),
-        "launch_groups": levels,
+        "kernel_inv_diag": _prepare_spsm_inv_diag(diag),
+        "launch_groups": launch_groups,
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
-        "tiled_block_nnz": tiled_block_nnz,
-        "tiled_max_segments": tiled_max_segments,
         "lower_eff": bool(lower),
     }
 
@@ -787,26 +835,20 @@ def _prepare_spsm_coo_system(data, row64, col64, n_rows, n_cols, lower, unit_dia
     dep_data, dep_indices64, dep_ptr64 = _prepare_spsm_csr_dependency_view(
         data_u, col_u64, row_ptr, n_rows, lower=lower
     )
-    levels = _build_spsm_levels(row_ptr, col_u64, n_rows, lower=lower)
-    default_block_nnz, default_max_segments = _auto_spsm_launch_config(row_ptr)
-    tiled_block_nnz, tiled_max_segments = _auto_spsm_launch_config_from_row_lengths(
-        dep_ptr64[1:] - dep_ptr64[:-1]
+    levels = _build_spsm_levels(dep_ptr64, dep_indices64, n_rows, lower=lower)
+    launch_groups = _bucketize_spsm_launch_groups(levels, dep_ptr64)
+    diag = _prepare_spsm_diag(
+        data_u, col_u64, row_ptr, n_rows, unit_diagonal=unit_diagonal
     )
+    default_block_nnz, default_max_segments = _auto_spsm_launch_config(dep_ptr64)
     return {
-        "kernel_data": data_u,
-        "kernel_cols32": col_u64.to(torch.int32),
         "kernel_dep_data": dep_data,
         "kernel_dep_indices32": dep_indices64.to(torch.int32),
         "kernel_dep_ptr": _prepare_spsm_kernel_row_ptr(dep_ptr64),
-        "kernel_diag": _prepare_spsm_diag(
-            data_u, col_u64, row_ptr, n_rows, unit_diagonal=unit_diagonal
-        ),
-        "kernel_row_ptr": _prepare_spsm_kernel_row_ptr(row_ptr),
-        "launch_groups": levels,
+        "kernel_inv_diag": _prepare_spsm_inv_diag(diag),
+        "launch_groups": launch_groups,
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
-        "tiled_block_nnz": tiled_block_nnz,
-        "tiled_max_segments": tiled_max_segments,
         "lower_eff": bool(lower),
     }
 
@@ -855,12 +897,12 @@ def _run_spsm_csr_core(
     data,
     indices32,
     indptr,
-    diag,
+    inv_diag,
     rhs,
     n_rows,
     *,
+    alpha=1.0,
     lower=True,
-    unit_diagonal=False,
     block_nnz=None,
     max_segments=None,
     block_rhs=None,
@@ -874,180 +916,128 @@ def _run_spsm_csr_core(
     if rhs.shape[0] != n_rows:
         raise ValueError("rhs first dim must equal n_rows")
     n_rhs = int(rhs.shape[1])
-    x = torch.zeros_like(rhs)
+    rhs_work = _prepare_spsm_rhs_work_buffer(rhs)
     if n_rows == 0 or n_rhs == 0:
-        return x
+        return rhs_work
 
     if launch_groups is None:
         levels = _build_spsm_levels(indptr, indices32, n_rows, lower=lower)
-        launch_groups = levels
+        launch_groups = _bucketize_spsm_launch_groups(levels, indptr)
     if block_nnz_use is None or max_segments_use is None:
         block_nnz_use, max_segments_use = _auto_spsm_launch_config(
             indptr, block_nnz=block_nnz, max_segments=max_segments
         )
-    block_rhs_use = _auto_rhs_block(n_rhs) if block_rhs is None else int(block_rhs)
-    if block_rhs_use <= 0:
-        raise ValueError("block_rhs must be positive")
-
     use_fp64 = data.dtype == torch.float64
-    diag_eps = 1e-12 if use_fp64 else 1e-6
 
-    for rows_lv in launch_groups:
+    for group in launch_groups:
+        if isinstance(group, dict):
+            rows_lv = group["rows"]
+            diag_only = bool(group.get("diag_only", False))
+            single_segment = bool(group.get("single_segment", False))
+            staged = bool(group.get("staged", False))
+            block_nnz_lv = int(group.get("block_nnz", block_nnz_use))
+            max_segments_lv = int(group.get("max_segments", max_segments_use))
+        else:
+            rows_lv = group
+            diag_only = False
+            single_segment = False
+            staged = False
+            block_nnz_lv = block_nnz_use
+            max_segments_lv = max_segments_use
         n_lv = rows_lv.numel()
         if n_lv == 0:
+            continue
+        block_rhs_use = (
+            int(block_rhs)
+            if block_rhs is not None
+            else _choose_group_block_rhs(
+                n_rhs,
+                block_nnz=block_nnz_lv,
+                max_segments=max_segments_lv,
+                diag_only=diag_only,
+                single_segment=single_segment,
+                value_dtype=data.dtype,
+            )
+        )
+        if block_rhs_use <= 0:
+            raise ValueError("block_rhs must be positive")
+        rhs_tile_groups = _choose_group_rhs_tile_groups(n_rhs, block_rhs_use, staged)
+        if diag_only:
+            grid = (n_lv, triton.cdiv(n_rhs, block_rhs_use))
+            _spsm_csr_diag_only_kernel_real[grid](
+                inv_diag,
+                rhs_work,
+                rhs_work,
+                rows_lv,
+                n_level_rows=n_lv,
+                n_rhs=n_rhs,
+                stride_b0=rhs_work.stride(0),
+                stride_x0=rhs_work.stride(0),
+                alpha=alpha,
+                BLOCK_RHS=block_rhs_use,
+                USE_FP64_ACC=use_fp64,
+            )
+            continue
+        if single_segment:
+            grid = (n_lv, triton.cdiv(n_rhs, block_rhs_use))
+            _spsm_csr_level_kernel_single_segment_real[grid](
+                data,
+                indices32,
+                indptr,
+                inv_diag,
+                rhs_work,
+                rhs_work,
+                rows_lv,
+                n_level_rows=n_lv,
+                n_rhs=n_rhs,
+                stride_b0=rhs_work.stride(0),
+                stride_x0=rhs_work.stride(0),
+                alpha=alpha,
+                BLOCK_NNZ=block_nnz_lv,
+                BLOCK_RHS=block_rhs_use,
+                USE_FP64_ACC=use_fp64,
+            )
+            continue
+        if staged:
+            grid = (n_lv, triton.cdiv(n_rhs, block_rhs_use * rhs_tile_groups))
+            _spsm_csr_level_kernel_staged_real[grid](
+                data,
+                indices32,
+                indptr,
+                inv_diag,
+                rhs_work,
+                rows_lv,
+                n_level_rows=n_lv,
+                n_rhs=n_rhs,
+                stride_work0=rhs_work.stride(0),
+                alpha=alpha,
+                BLOCK_NNZ=block_nnz_lv,
+                BLOCK_RHS=block_rhs_use,
+                RHS_TILE_GROUPS=rhs_tile_groups,
+                MAX_SEGMENTS=max_segments_lv,
+                USE_FP64_ACC=use_fp64,
+            )
             continue
         grid = (n_lv, triton.cdiv(n_rhs, block_rhs_use))
         _spsm_csr_level_kernel_real[grid](
             data,
             indices32,
             indptr,
-            diag,
-            rhs,
-            x,
+            inv_diag,
+            rhs_work,
+            rhs_work,
             rows_lv,
             n_level_rows=n_lv,
             n_rhs=n_rhs,
-            stride_b0=rhs.stride(0),
-            stride_x0=x.stride(0),
-            BLOCK_NNZ=block_nnz_use,
+            stride_b0=rhs_work.stride(0),
+            stride_x0=rhs_work.stride(0),
+            alpha=alpha,
+            BLOCK_NNZ=block_nnz_lv,
             BLOCK_RHS=block_rhs_use,
-            MAX_SEGMENTS=max_segments_use,
-            LOWER=lower,
+            MAX_SEGMENTS=max_segments_lv,
             USE_FP64_ACC=use_fp64,
-            DIAG_EPS=diag_eps,
         )
-    return x
-
-
-def _run_spsm_csr_tiled_core(
-    data,
-    indices32,
-    dep_ptr,
-    diag,
-    rhs,
-    n_rows,
-    *,
-    alpha=1.0,
-    block_nnz=None,
-    max_segments=None,
-    block_rhs=None,
-    block_nnz_use=None,
-    max_segments_use=None,
-):
-    if rhs.ndim != 2:
-        raise ValueError("rhs must be 2D")
-    rhs = rhs.contiguous()
-    if rhs.shape[0] != n_rows:
-        raise ValueError("rhs first dim must equal n_rows")
-    n_rhs = int(rhs.shape[1])
-    y = _pack_spsm_rhs_work_buffer(rhs, alpha)
-    if n_rows == 0 or n_rhs == 0:
-        return y
-
-    if block_nnz_use is None or max_segments_use is None:
-        block_nnz_use, max_segments_use = _auto_spsm_launch_config_from_row_lengths(
-            dep_ptr[1:] - dep_ptr[:-1],
-            block_nnz=block_nnz,
-            max_segments=max_segments,
-        )
-    block_rhs_use = _auto_rhs_block(n_rhs) if block_rhs is None else int(block_rhs)
-    if block_rhs_use <= 0:
-        raise ValueError("block_rhs must be positive")
-
-    use_fp64 = data.dtype == torch.float64
-    diag_eps = 1e-12 if use_fp64 else 1e-6
-    rhs_tiles = triton.cdiv(n_rhs, block_rhs_use)
-    ready = torch.zeros((rhs_tiles, n_rows), dtype=torch.int32, device=rhs.device)
-
-    grid = (n_rows, rhs_tiles)
-    _spsm_csr_tiled_kernel_real[grid](
-        data,
-        indices32,
-        dep_ptr,
-        diag,
-        y,
-        ready,
-        n_rows,
-        n_rhs,
-        y.stride(0),
-        ready.stride(0),
-        BLOCK_NNZ=block_nnz_use,
-        BLOCK_RHS=block_rhs_use,
-        MAX_SEGMENTS=max_segments_use,
-        USE_FP64_ACC=use_fp64,
-        DIAG_EPS=diag_eps,
-    )
-    return y
-
-
-def _run_spsm_coo_core(
-    data,
-    cols32,
-    row_ptr,
-    diag,
-    rhs,
-    n_rows,
-    *,
-    lower=True,
-    unit_diagonal=False,
-    block_nnz=None,
-    max_segments=None,
-    block_rhs=None,
-    launch_groups=None,
-    block_nnz_use=None,
-    max_segments_use=None,
-):
-    if rhs.ndim != 2:
-        raise ValueError("rhs must be 2D")
-    rhs = rhs.contiguous()
-    if rhs.shape[0] != n_rows:
-        raise ValueError("rhs first dim must equal n_rows")
-    n_rhs = int(rhs.shape[1])
-    x = torch.zeros_like(rhs)
-    if n_rows == 0 or n_rhs == 0:
-        return x
-
-    if launch_groups is None:
-        levels = _build_spsm_levels(row_ptr, cols32, n_rows, lower=lower)
-        launch_groups = levels
-    if block_nnz_use is None or max_segments_use is None:
-        block_nnz_use, max_segments_use = _auto_spsm_launch_config(
-            row_ptr, block_nnz=block_nnz, max_segments=max_segments
-        )
-    block_rhs_use = _auto_rhs_block(n_rhs) if block_rhs is None else int(block_rhs)
-    if block_rhs_use <= 0:
-        raise ValueError("block_rhs must be positive")
-
-    use_fp64 = data.dtype == torch.float64
-    diag_eps = 1e-12 if use_fp64 else 1e-6
-
-    for rows_lv in launch_groups:
-        n_lv = rows_lv.numel()
-        if n_lv == 0:
-            continue
-        grid = (n_lv, triton.cdiv(n_rhs, block_rhs_use))
-        _spsm_coo_level_kernel_real[grid](
-            data,
-            row_ptr,
-            cols32,
-            diag,
-            rhs,
-            x,
-            rows_lv,
-            n_level_rows=n_lv,
-            n_rhs=n_rhs,
-            stride_b0=rhs.stride(0),
-            stride_x0=x.stride(0),
-            BLOCK_NNZ=block_nnz_use,
-            BLOCK_RHS=block_rhs_use,
-            MAX_SEGMENTS=max_segments_use,
-            LOWER=lower,
-            USE_FP64_ACC=use_fp64,
-            DIAG_EPS=diag_eps,
-        )
-    return x
-
-
+    return rhs_work
 
 
 def flagsparse_spsm_csr(
@@ -1068,38 +1058,23 @@ def flagsparse_spsm_csr(
     data, B, n_rows, _n_cols, solve_plan = _resolve_spsm_csr_runtime(
         data, indices, indptr, B, shape, lower, unit_diagonal, opA, opB, major
     )
-    use_tiled_kernel = _should_use_spsm_tiled_kernel("csr", B, data.dtype)
     alpha_value = 1.0 if _alpha_is_one(alpha) else _alpha_to_host_scalar(alpha)
-    rhs = B if use_tiled_kernel else (B if alpha_value == 1.0 else torch.as_tensor(alpha, dtype=B.dtype, device=B.device) * B)
     if return_time:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    if use_tiled_kernel:
-        x = _run_spsm_csr_tiled_core(
-            solve_plan["kernel_dep_data"],
-            solve_plan["kernel_dep_indices32"],
-            solve_plan["kernel_dep_ptr"],
-            solve_plan["kernel_diag"],
-            rhs,
-            n_rows,
-            alpha=alpha_value,
-            block_nnz_use=solve_plan["tiled_block_nnz"],
-            max_segments_use=solve_plan["tiled_max_segments"],
-        )
-    else:
-        x = _run_spsm_csr_core(
-            solve_plan["kernel_data"],
-            solve_plan["kernel_indices32"],
-            solve_plan["kernel_indptr"],
-            solve_plan["kernel_diag"],
-            rhs,
-            n_rows,
-            lower=solve_plan["lower_eff"],
-            unit_diagonal=unit_diagonal,
-            launch_groups=solve_plan["launch_groups"],
-            block_nnz_use=solve_plan["default_block_nnz"],
-            max_segments_use=solve_plan["default_max_segments"],
-        )
+    x = _run_spsm_csr_core(
+        solve_plan["kernel_dep_data"],
+        solve_plan["kernel_dep_indices32"],
+        solve_plan["kernel_dep_ptr"],
+        solve_plan["kernel_inv_diag"],
+        B,
+        n_rows,
+        alpha=alpha_value,
+        lower=solve_plan["lower_eff"],
+        launch_groups=solve_plan["launch_groups"],
+        block_nnz_use=solve_plan["default_block_nnz"],
+        max_segments_use=solve_plan["default_max_segments"],
+    )
     if return_time:
         torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -1131,38 +1106,23 @@ def flagsparse_spsm_coo(
     data, B, n_rows, _n_cols, solve_plan = _resolve_spsm_coo_runtime(
         data, row, col, B, shape, lower, unit_diagonal, opA, opB, major
     )
-    use_tiled_kernel = _should_use_spsm_tiled_kernel("coo", B, data.dtype)
     alpha_value = 1.0 if _alpha_is_one(alpha) else _alpha_to_host_scalar(alpha)
-    rhs = B if use_tiled_kernel else (B if alpha_value == 1.0 else torch.as_tensor(alpha, dtype=B.dtype, device=B.device) * B)
     if return_time:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    if use_tiled_kernel:
-        x = _run_spsm_csr_tiled_core(
-            solve_plan["kernel_dep_data"],
-            solve_plan["kernel_dep_indices32"],
-            solve_plan["kernel_dep_ptr"],
-            solve_plan["kernel_diag"],
-            rhs,
-            n_rows,
-            alpha=alpha_value,
-            block_nnz_use=solve_plan["tiled_block_nnz"],
-            max_segments_use=solve_plan["tiled_max_segments"],
-        )
-    else:
-        x = _run_spsm_coo_core(
-            solve_plan["kernel_data"],
-            solve_plan["kernel_cols32"],
-            solve_plan["kernel_row_ptr"],
-            solve_plan["kernel_diag"],
-            rhs,
-            n_rows,
-            lower=solve_plan["lower_eff"],
-            unit_diagonal=unit_diagonal,
-            launch_groups=solve_plan["launch_groups"],
-            block_nnz_use=solve_plan["default_block_nnz"],
-            max_segments_use=solve_plan["default_max_segments"],
-        )
+    x = _run_spsm_csr_core(
+        solve_plan["kernel_dep_data"],
+        solve_plan["kernel_dep_indices32"],
+        solve_plan["kernel_dep_ptr"],
+        solve_plan["kernel_inv_diag"],
+        B,
+        n_rows,
+        alpha=alpha_value,
+        lower=solve_plan["lower_eff"],
+        launch_groups=solve_plan["launch_groups"],
+        block_nnz_use=solve_plan["default_block_nnz"],
+        max_segments_use=solve_plan["default_max_segments"],
+    )
     if return_time:
         torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
