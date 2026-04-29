@@ -1,6 +1,6 @@
 """FlagSparse sparse operations (gather, scatter, SpMV, SpMM, SpGEMM, SDDMM, SpSM)."""
 
-from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES, cp, cpx_sparse
+from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES
 from .benchmarks import (
     benchmark_gather_case,
     benchmark_performance,

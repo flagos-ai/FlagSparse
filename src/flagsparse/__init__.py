@@ -107,8 +107,8 @@ _OPS_EXPORTS = {
     "benchmark_spgemm_case",
     "benchmark_sddmm_case",
     "comprehensive_spmm_test",
-    "benchmark_spmv_case",
     "comprehensive_spsm_test",
+    "benchmark_spmv_case",
 }
 
 _FORMAT_EXPORTS = {

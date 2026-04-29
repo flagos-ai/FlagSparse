@@ -1,7 +1,8 @@
 """SpSV tests: synthetic triangular systems and optional .mtx (CSR/COO).
 
-与 CSR 相同的计时列、PyTorch 稠密参考、CSV 字段与 PASS 判定；COO 测试时 CuPy 基线使用
-``coo_matrix``（与 FlagSparse COO 输入同构），CSR 测试时仍用 ``csr_matrix``。
+与 CSR 相同的计时列、PyTorch CUDA 参考（优先 sparse，必要时 dense fallback）、
+CSV 字段与 PASS 判定；COO 测试时 CuPy 基线使用 ``coo_matrix``（与 FlagSparse
+COO 输入同构），CSR 测试时仍用 ``csr_matrix``。
 """
 
 import argparse
@@ -37,8 +38,8 @@ TEST_SIZES = [256, 512, 1024, 2048]
 WARMUP = 5
 ITERS = 20
 
-DENSE_REF_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 SPSV_TRIANGULAR_DIAG_DOMINANCE = 4.0
+SPSV_PYTORCH_DENSE_GPU_SAFETY_FACTOR = 3.0
 # CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
 CSR_FULL_VALUE_DTYPES = [
     torch.float32,
@@ -101,11 +102,55 @@ def _fmt_ms(v):
 def _fmt_speedup(other_ms, triton_ms):
     if other_ms is None or triton_ms is None or triton_ms <= 0:
         return "N/A"
-    return f"{other_ms / triton_ms:.2f}x"
+    return f"{other_ms / triton_ms:.2f}"
 
 
 def _fmt_err(v):
     return "N/A" if v is None else f"{v:.2e}"
+
+
+def _safe_ratio(other_ms, base_ms):
+    if other_ms is None or base_ms is None or base_ms <= 0:
+        return None
+    return other_ms / base_ms
+
+
+def _sum_ms(*values):
+    if any(v is None for v in values):
+        return None
+    return sum(values)
+
+
+def _status_str(ok_flag, has_value):
+    if ok_flag:
+        return "PASS"
+    return "FAIL" if has_value else "N/A"
+
+
+def _csv_export_row_spsv(row):
+    return {
+        "matrix": row.get("matrix"),
+        "value_dtype": row.get("value_dtype"),
+        "index_dtype": row.get("index_dtype"),
+        "opA": row.get("opA"),
+        "n_rows": row.get("n_rows"),
+        "n_cols": row.get("n_cols"),
+        "nnz": row.get("nnz"),
+        "triton_ms": row.get("triton_ms"),
+        "cusparse_ms": row.get("cusparse_ms"),
+        "pytorch_ms": row.get("pytorch_ms"),
+        "cusparse/triton": row.get("cusparse/triton"),
+        "pytorch/triton": row.get("pytorch/triton"),
+        "pt_status": row.get("pt_status"),
+        "cu_status": row.get("cu_status"),
+        "status": row.get("status"),
+        "err_ref": row.get("err_ref"),
+        "err_res": row.get("err_res"),
+        "err_pt": row.get("err_pt"),
+        "err_cu": row.get("err_cu"),
+        "pytorch_reason": row.get("pytorch_reason"),
+        "error": row.get("error"),
+    }
 
 
 def _tol_for_dtype(dtype):
@@ -136,20 +181,8 @@ def _randn_by_dtype(n, dtype, device, generator=None):
     return torch.complex(real, imag)
 
 
-def _dense_ref_dtype(dtype):
-    return dtype
-
-
 def _tensor_from_scalar_values(values, dtype, device):
     return torch.tensor(values, dtype=dtype, device=device)
-
-
-def _safe_cast_tensor(tensor, dtype):
-    return tensor.to(dtype)
-
-
-def _cast_real_tensor_to_value_dtype(values, value_dtype):
-    return values.to(value_dtype)
 
 
 def _matrix_market_value(parts, mm_field):
@@ -164,27 +197,149 @@ def _matrix_market_value(parts, mm_field):
     raise ValueError("MatrixMarket entry is missing a numeric value")
 
 
-def _triangular_solve_reference(A, b, *, lower, op_mode="NON"):
+def _csr_to_dense(data, indices, indptr, shape):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if n_rows == 0 or n_cols == 0:
+        return torch.zeros((n_rows, n_cols), dtype=data.dtype, device=data.device)
+    row_ind = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        indptr[1:] - indptr[:-1],
+    )
+    coo = torch.sparse_coo_tensor(
+        torch.stack([row_ind, indices.to(torch.int64)]),
+        data,
+        (n_rows, n_cols),
+        device=data.device,
+    ).coalesce()
+    return coo.to_dense()
+
+
+def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode):
     if op_mode == "TRANS":
-        A_eff = A.transpose(0, 1)
+        data_eff, indices_eff, indptr_eff = _csr_transpose(
+            data, indices.to(torch.int64), indptr.to(torch.int64), shape, conjugate=False
+        )
+    elif op_mode == "CONJ":
+        data_eff, indices_eff, indptr_eff = _csr_transpose(
+            data, indices.to(torch.int64), indptr.to(torch.int64), shape, conjugate=True
+        )
+    else:
+        data_eff = data
+        indices_eff = indices.to(torch.int64)
+        indptr_eff = indptr.to(torch.int64)
+    return torch.sparse_csr_tensor(
+        indptr_eff,
+        indices_eff,
+        data_eff,
+        size=shape,
+        device=data.device,
+    )
+
+
+def _apply_dense_triangular_op(A_dense, b, *, lower, op_mode):
+    if op_mode == "TRANS":
+        A_eff = A_dense.transpose(0, 1)
         upper = lower
     elif op_mode == "CONJ":
-        A_eff = A.transpose(0, 1).conj() if torch.is_complex(A) else A.transpose(0, 1)
+        A_eff = A_dense.transpose(0, 1).conj() if torch.is_complex(A_dense) else A_dense.transpose(0, 1)
         upper = lower
     else:
-        A_eff = A
+        A_eff = A_dense
         upper = not lower
-    return torch.linalg.solve_triangular(
-        A_eff, b.unsqueeze(1), upper=upper
-    ).squeeze(1)
+    return torch.linalg.solve_triangular(A_eff, b.unsqueeze(1), upper=upper).squeeze(1)
+
+
+def _gpu_dense_ref_fits(shape, dtype):
+    if not torch.cuda.is_available():
+        return False, "CUDA unavailable"
+    element_size = torch.empty((), dtype=dtype).element_size()
+    dense_bytes = int(shape[0]) * int(shape[1]) * element_size
+    rhs_bytes = int(shape[0]) * element_size
+    estimated_bytes = int(dense_bytes * SPSV_PYTORCH_DENSE_GPU_SAFETY_FACTOR + rhs_bytes * 4)
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info()
+    except Exception as e:
+        return False, f"cannot query CUDA memory ({e})"
+    if estimated_bytes > free_bytes:
+        dense_gib = dense_bytes / (1024 ** 3)
+        need_gib = estimated_bytes / (1024 ** 3)
+        free_gib = free_bytes / (1024 ** 3)
+        return (
+            False,
+            "CUDA dense fallback too large "
+            f"(dense matrix {dense_gib:.1f} GiB, est {need_gib:.1f} GiB > {free_gib:.1f} GiB free)",
+        )
+    return True, None
+
+
+def _benchmark_pytorch_sparse_reference(data, indices, indptr, shape, b, *, op_mode):
+    sparse_spsolve = getattr(torch.sparse, "spsolve", None)
+    if sparse_spsolve is None:
+        raise NotImplementedError("torch.sparse.spsolve is unavailable")
+    A_csr = _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode)
+    if not A_csr.is_cuda:
+        raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    x_ref = sparse_spsolve(A_csr, b)
+    e1.record()
+    torch.cuda.synchronize()
+    elapsed_ms = e0.elapsed_time(e1)
+    return x_ref.to(b.dtype), elapsed_ms
+
+
+def _benchmark_pytorch_dense_reference(data, indices, indptr, shape, b, *, lower, op_mode):
+    if not data.is_cuda:
+        raise RuntimeError("PyTorch CUDA dense fallback requires CUDA tensors")
+    fits, reason = _gpu_dense_ref_fits(shape, b.dtype)
+    if not fits:
+        raise RuntimeError(reason)
+    A_dense = _csr_to_dense(data, indices, indptr, shape)
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    x_ref = _apply_dense_triangular_op(A_dense, b, lower=lower, op_mode=op_mode)
+    e1.record()
+    torch.cuda.synchronize()
+    elapsed_ms = e0.elapsed_time(e1)
+    return x_ref.to(b.dtype), elapsed_ms
+
+
+def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_mode):
+    sparse_err = None
+    try:
+        x_ref, ms = _benchmark_pytorch_sparse_reference(
+            data, indices, indptr, shape, b, op_mode=op_mode
+        )
+        return x_ref, ms, "gpu_sparse", None
+    except Exception as e:
+        sparse_err = e
+        if "out of memory" in str(e).lower() and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    try:
+        x_ref, ms = _benchmark_pytorch_dense_reference(
+            data, indices, indptr, shape, b, lower=lower, op_mode=op_mode
+        )
+        return (
+            x_ref,
+            ms,
+            "gpu_dense",
+            f"sparse unavailable ({sparse_err}); using CUDA dense solve_triangular",
+        )
+    except Exception as dense_err:
+        if "out of memory" in str(dense_err).lower() and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        reason = f"sparse unavailable ({sparse_err}); dense unavailable ({dense_err})"
+        if sparse_err is None:
+            reason = f"CUDA ref unavailable ({dense_err})"
+        return None, None, "unavailable", reason
 
 
 def _cupy_ref_inputs(data, b):
     return data, b
-
-
-def _compare_view(tensor, value_dtype):
-    return tensor
 
 
 def _supported_csr_full_ops(value_dtype, index_dtype):
@@ -195,13 +350,6 @@ def _supported_csr_full_ops(value_dtype, index_dtype):
     if index_dtype == torch.int64:
         return ["NON", "TRANS", "CONJ"]
     return []
-
-
-def _allow_dense_pytorch_ref(shape, dtype):
-    n_rows, n_cols = int(shape[0]), int(shape[1])
-    elem_bytes = torch.empty((), dtype=dtype).element_size()
-    dense_bytes = n_rows * n_cols * elem_bytes
-    return dense_bytes <= DENSE_REF_MAX_BYTES
 
 
 def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True):
@@ -278,22 +426,6 @@ def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True
     indptr[1:] = torch.cumsum(nnz_per_row, dim=0)
     indices = cols_t.to(index_dtype)
     return vals_t, indices, indptr, (n, n)
-
-
-def _csr_to_dense(data, indices, indptr, shape):
-    n_rows, n_cols = shape
-    row_ind = torch.repeat_interleave(
-        torch.arange(n_rows, device=data.device, dtype=torch.int64),
-        indptr[1:] - indptr[:-1],
-    )
-    coo = torch.sparse_coo_tensor(
-        torch.stack([row_ind, indices.to(torch.int64)]),
-        data,
-        (n_rows, n_cols),
-        device=data.device,
-    ).coalesce()
-    return coo.to_dense()
-
 
 def _csr_to_coo(data, indices, indptr, shape, index_dtype=torch.int64):
     n_rows = int(shape[0])
@@ -532,6 +664,39 @@ def _benchmark_flagsparse_spsv_csr(
     )
 
 
+def _benchmark_flagsparse_spsv_csr_split(
+    data,
+    indices,
+    indptr,
+    b,
+    shape,
+    *,
+    lower=True,
+    transpose=False,
+):
+    analysis_ms = fs_spsv_impl._analyze_spsv_csr(
+        data,
+        indices,
+        indptr,
+        b,
+        shape,
+        lower=lower,
+        transpose=transpose,
+        clear_cache=True,
+        return_time=True,
+    )
+    x, solve_ms = _benchmark_flagsparse_spsv_csr(
+        data,
+        indices,
+        indptr,
+        b,
+        shape,
+        lower=lower,
+        transpose=transpose,
+    )
+    return x, analysis_ms, solve_ms
+
+
 def _benchmark_flagsparse_spsv_coo(
     data,
     row,
@@ -680,8 +845,8 @@ def run_spsv_synthetic_all(lower=True):
     print()
 
     hdr = (
-        f"{'Fmt':>5} {'opA':>5} {'N':>6} {'FlagSparse(ms)':>14} {'PyTorch(ms)':>12} {'CuPy(ms)':>10} "
-        f"{'FS/PT':>8} {'FS/CU':>8} {'Status':>8} {'Err(PT)':>12} {'Err(CU)':>12}"
+        f"{'Fmt':>5} {'opA':>5} {'N':>6} {'FS.analysis':>12} {'FS.solve(ms)':>14} {'FS.total':>10} "
+        f"{'PyTorch(ms)':>12} {'cuSPARSE':>10} {'pt/triton':>10} {'cu/triton':>10} {'Status':>8} {'Err(PT)':>12} {'Err(CU)':>12}"
     )
 
     total = 0
@@ -707,9 +872,6 @@ def run_spsv_synthetic_all(lower=True):
                         data, indices, indptr, shape = _build_random_triangular_csr(
                             n, value_dtype, index_dtype, device, lower=lower
                         )
-                        A_dense = _csr_to_dense(
-                            data, indices.to(torch.int64), indptr, shape
-                        )
                         rhs_op = op_mode if fmt == "CSR" else "NON"
                         b = _random_rhs_for_spsv(
                             shape,
@@ -729,7 +891,7 @@ def run_spsv_synthetic_all(lower=True):
 
                         torch.cuda.synchronize()
                         if fmt == "CSR":
-                            x, t_ms = _benchmark_flagsparse_spsv_csr(
+                            x, analysis_ms, t_ms = _benchmark_flagsparse_spsv_csr_split(
                                 data,
                                 indices,
                                 indptr,
@@ -739,6 +901,7 @@ def run_spsv_synthetic_all(lower=True):
                                 transpose=op_mode,
                             )
                         else:
+                            analysis_ms = None
                             dc, rr, cc = _csr_to_coo(
                                 data, indices, indptr, shape, index_dtype=index_dtype
                             )
@@ -753,19 +916,20 @@ def run_spsv_synthetic_all(lower=True):
                             )
                         torch.cuda.synchronize()
 
-                        A_ref = A_dense
-                        b_ref = b
-                        torch.cuda.synchronize()
-                        e0 = torch.cuda.Event(True)
-                        e1 = torch.cuda.Event(True)
-                        e0.record()
-                        x_pt = _triangular_solve_reference(
-                            A_ref, b_ref, lower=lower, op_mode=op_mode
+                        x_pt, pytorch_ms, pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
+                            data,
+                            indices,
+                            indptr,
+                            shape,
+                            b,
+                            lower=lower,
+                            op_mode=op_mode,
                         )
-                        e1.record()
-                        torch.cuda.synchronize()
-                        pytorch_ms = e0.elapsed_time(e1)
-                        err_pt = float(torch.max(torch.abs(x - x_pt)).item()) if n > 0 else 0.0
+                        err_pt = (
+                            float(torch.max(torch.abs(x - x_pt)).item())
+                            if (x_pt is not None and n > 0)
+                            else None
+                        )
 
                         cupy_ms = None
                         err_cu = None
@@ -797,7 +961,11 @@ def run_spsv_synthetic_all(lower=True):
                             )
 
                         atol, rtol = _tol_for_dtype(value_dtype)
-                        ok_pt = torch.allclose(x, x_pt, atol=atol, rtol=rtol)
+                        ok_pt = (
+                            torch.allclose(x, x_pt, atol=atol, rtol=rtol)
+                            if x_pt is not None
+                            else False
+                        )
                         ok_cu = (
                             True
                             if x_cu_t is None
@@ -818,12 +986,14 @@ def run_spsv_synthetic_all(lower=True):
                             else None
                         )
                         print(
-                            f"{fmt:>5} {op_mode:>5} {n:>6} {_fmt_ms(t_ms):>14} {_fmt_ms(pytorch_ms):>12} "
+                            f"{fmt:>5} {op_mode:>5} {n:>6} {_fmt_ms(analysis_ms):>12} {_fmt_ms(t_ms):>14} {_fmt_ms(_sum_ms(analysis_ms, t_ms)):>10} {_fmt_ms(pytorch_ms):>12} "
                             f"{_fmt_ms(cupy_ms):>10} "
-                            f"{(f'{fs_vs_pt:.2f}x' if fs_vs_pt is not None else 'N/A'):>8} "
-                            f"{(f'{fs_vs_cu:.2f}x' if fs_vs_cu is not None else 'N/A'):>8} "
+                            f"{(f'{fs_vs_pt:.2f}' if fs_vs_pt is not None else 'N/A'):>10} "
+                            f"{(f'{fs_vs_cu:.2f}' if fs_vs_cu is not None else 'N/A'):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
                         )
+                        # Synthetic benchmark keeps the main row compact; PyTorch fallback notes
+                        # are only emitted in matrix CSV runs where failed reference checks matter.
             print("-" * 110)
             print()
 
@@ -855,6 +1025,7 @@ def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode, lower
     d_in, r_in, c_in = _coo_inputs_for_csv(
         data, indices, indptr, shape, coo_mode, index_dtype=index_dtype
     )
+    analysis_ms = None
     x, t_ms = _benchmark_flagsparse_spsv_coo(
         d_in,
         r_in,
@@ -873,11 +1044,13 @@ def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode, lower
         indptr,
         shape,
         x,
+        analysis_ms,
         t_ms,
         b,
         n_rows,
         n_cols,
         lower=lower,
+        coo_mode=coo_mode,
         nnz_display=int(d_in.numel()),
         cupy_coo_data=d_in,
         cupy_coo_row=r_in,
@@ -894,12 +1067,14 @@ def _finalize_csv_row(
     indptr,
     shape,
     x,
+    analysis_ms,
     t_ms,
     b,
     n_rows,
     n_cols,
     *,
     lower=True,
+    coo_mode="auto",
     nnz_display=None,
     cupy_coo_data=None,
     cupy_coo_row=None,
@@ -913,41 +1088,24 @@ def _finalize_csv_row(
     err_pt = None
     ok_pt = False
     pt_skip_reason = None
-    if _allow_dense_pytorch_ref(shape, value_dtype):
-        try:
-            A_dense = _csr_to_dense(
-                data, indices.to(torch.int64), indptr, shape
-            )
-            ref_dtype = _dense_ref_dtype(value_dtype)
-            A_ref = A_dense.to(ref_dtype)
-            b_ref = b.to(ref_dtype)
-            e0 = torch.cuda.Event(True)
-            e1 = torch.cuda.Event(True)
-            torch.cuda.synchronize()
-            e0.record()
-            x_ref = _triangular_solve_reference(
-                A_ref, b_ref, lower=lower, op_mode="NON"
-            )
-            x_cmp = _compare_view(x, value_dtype)
-            x_ref_cmp = _compare_view(x_ref, value_dtype)
-            e1.record()
-            torch.cuda.synchronize()
-            pytorch_ms = e0.elapsed_time(e1)
-            err_pt = (
-                float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
-                if n_rows > 0
-                else 0.0
-            )
-            ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                pt_skip_reason = "PyTorch dense ref OOM; skipped"
-            else:
-                raise
-    else:
-        pt_skip_reason = (
-            f"PyTorch dense ref skipped (> {DENSE_REF_MAX_BYTES // (1024**3)} GiB dense matrix)"
+    x_ref, pytorch_ms, pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
+        data,
+        indices,
+        indptr,
+        shape,
+        b,
+        lower=lower,
+        op_mode="NON",
+    )
+    if x_ref is not None:
+        x_cmp = x
+        x_ref_cmp = x_ref
+        err_pt = (
+            float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
+            if n_rows > 0
+            else 0.0
         )
+        ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
 
     cupy_ms = None
     err_cu = None
@@ -1014,8 +1172,8 @@ def _finalize_csv_row(
             c1.synchronize()
             cupy_ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
             x_cu_t = torch.utils.dlpack.from_dlpack(x_cu.toDlpack())
-            x_cmp = _compare_view(x, value_dtype)
-            x_cu_cmp = _compare_view(x_cu_t, value_dtype)
+            x_cmp = x
+            x_cu_cmp = x_cu_t
             err_cu = (
                 float(torch.max(torch.abs(x_cmp - x_cu_cmp)).item())
                 if n_rows > 0
@@ -1039,18 +1197,24 @@ def _finalize_csv_row(
         "matrix": os.path.basename(path),
         "value_dtype": _dtype_name(value_dtype),
         "index_dtype": _dtype_name(index_dtype),
+        "opA": "NON",
         "n_rows": n_rows,
         "n_cols": n_cols,
         "nnz": nnz_out,
         "triton_ms": t_ms,
-        "pytorch_ms": pytorch_ms,
         "cusparse_ms": cupy_ms,
-        "csc_ms": None,
+        "pytorch_ms": pytorch_ms,
+        "cusparse/triton": _safe_ratio(cupy_ms, t_ms),
+        "pytorch/triton": _safe_ratio(pytorch_ms, t_ms),
+        "pt_status": _status_str(ok_pt, err_pt is not None),
+        "cu_status": _status_str(ok_cu, err_cu is not None),
         "status": status,
         "err_ref": err_ref,
         "err_res": err_res,
         "err_pt": err_pt,
         "err_cu": err_cu,
+        "pytorch_reason": pt_skip_reason,
+        "error": None,
     }
     return row, pt_skip_reason
 
@@ -1076,7 +1240,7 @@ def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device, l
             _dtype_name(index_dtype),
         ),
     )
-    x, t_ms = _benchmark_flagsparse_spsv_csr(
+    x, analysis_ms, t_ms = _benchmark_flagsparse_spsv_csr_split(
         data,
         indices,
         indptr,
@@ -1095,6 +1259,7 @@ def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device, l
         indptr,
         shape,
         x,
+        analysis_ms,
         t_ms,
         b,
         n_rows,
@@ -1113,6 +1278,7 @@ def _finalize_csv_row_csr_full(
     indptr,
     shape,
     x,
+    analysis_ms,
     t_ms,
     b,
     n_rows,
@@ -1128,38 +1294,24 @@ def _finalize_csv_row_csr_full(
     err_pt = None
     ok_pt = False
     pt_skip_reason = None
-    if _allow_dense_pytorch_ref(shape, value_dtype):
-        try:
-            A_dense = _csr_to_dense(
-                data, indices.to(torch.int64), indptr.to(torch.int64), shape
-            ).to(_dense_ref_dtype(value_dtype))
-            e0 = torch.cuda.Event(True)
-            e1 = torch.cuda.Event(True)
-            torch.cuda.synchronize()
-            e0.record()
-            x_ref = _triangular_solve_reference(
-                A_dense, b.to(A_dense.dtype), lower=lower, op_mode=op_mode
-            )
-            x_cmp = _compare_view(x, value_dtype)
-            x_ref_cmp = _compare_view(x_ref, value_dtype)
-            e1.record()
-            torch.cuda.synchronize()
-            pytorch_ms = e0.elapsed_time(e1)
-            err_pt = (
-                float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
-                if n_rows > 0
-                else 0.0
-            )
-            ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                pt_skip_reason = "PyTorch dense ref OOM; skipped"
-            else:
-                raise
-    else:
-        pt_skip_reason = (
-            f"PyTorch dense ref skipped (> {DENSE_REF_MAX_BYTES // (1024**3)} GiB dense matrix)"
+    x_ref, pytorch_ms, pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
+        data,
+        indices,
+        indptr,
+        shape,
+        b,
+        lower=lower,
+        op_mode=op_mode,
+    )
+    if x_ref is not None:
+        x_cmp = x
+        x_ref_cmp = x_ref
+        err_pt = (
+            float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
+            if n_rows > 0
+            else 0.0
         )
+        ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
 
     cupy_ms = None
     err_cu = None
@@ -1169,8 +1321,8 @@ def _finalize_csv_row_csr_full(
         data, indices, indptr, shape, b, op_mode, lower
     )
     if x_cu_t is not None:
-        x_cmp = _compare_view(x, value_dtype)
-        x_cu_cmp = _compare_view(x_cu_t, value_dtype)
+        x_cmp = x
+        x_cu_cmp = x_cu_t
         err_cu = (
             float(torch.max(torch.abs(x_cmp - x_cu_cmp)).item())
             if n_rows > 0
@@ -1193,14 +1345,19 @@ def _finalize_csv_row_csr_full(
         "n_cols": n_cols,
         "nnz": int(data.numel()),
         "triton_ms": t_ms,
-        "pytorch_ms": pytorch_ms,
         "cusparse_ms": cupy_ms,
-        "csc_ms": None,
+        "pytorch_ms": pytorch_ms,
+        "cusparse/triton": _safe_ratio(cupy_ms, t_ms),
+        "pytorch/triton": _safe_ratio(pytorch_ms, t_ms),
+        "pt_status": _status_str(ok_pt, err_pt is not None),
+        "cu_status": _status_str(ok_cu, err_cu is not None),
         "status": status,
         "err_ref": err_ref,
         "err_res": err_res,
         "err_pt": err_pt,
         "err_cu": err_cu,
+        "pytorch_reason": pt_skip_reason,
+        "error": None,
     }
     return row, pt_skip_reason
 
@@ -1233,10 +1390,12 @@ def run_all_supported_spsv_csr_csv(
                     f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  CSR  |  triA={'LOWER' if lower else 'UPPER'}  |  opA={op_mode}"
                 )
                 print(
-                    "Formats: FlagSparse=CSR, cuSPARSE=CSR ref, PyTorch=Dense solve."
+                    "Formats: FlagSparse=CSR, cuSPARSE=CSR ref, "
+                    "PyTorch(ms)=CUDA reference (sparse if available, else dense triangular solve)"
                 )
                 print(
                     "RHS is generated directly, matching Library-main's SpSV test style. "
+                    "FlagSparse(ms) below reports solve only. "
                     "Err(Ref)=best |FlagSparse-reference|, Err(Res)=|op(A)*x-b|, "
                     "Err(PT)=|FlagSparse-PyTorch|, Err(CU)=|FlagSparse-cuSPARSE|. "
                     "PASS if PyTorch / cuSPARSE reference passes. Residual is diagnostic only."
@@ -1244,8 +1403,8 @@ def run_all_supported_spsv_csr_csv(
                 print("-" * 150)
                 print(
                     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-                    f"{'FlagSparse(ms)':>10} {'CSR(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
-                    f"{'FS/CSR':>7} {'FS/PT':>7} {'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(CU)':>10}"
+                    f"{'FS.solve':>10} {'cu.solve':>10} {'pt.solve':>10} "
+                    f"{'cu/triton':>10} {'pt/triton':>10} {'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(CU)':>10}"
                 )
                 print("-" * 150)
                 for path in mtx_paths:
@@ -1267,12 +1426,13 @@ def run_all_supported_spsv_csr_csv(
                         status = row["status"]
                         print(
                             f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
-                            f"{_fmt_ms(t_ms):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(None):>10} {_fmt_ms(pytorch_ms):>11} "
-                            f"{_fmt_speedup(cupy_ms, t_ms):>7} {_fmt_speedup(pytorch_ms, t_ms):>7} "
+                            f"{_fmt_ms(t_ms):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(pytorch_ms):>10} "
+                            f"{_fmt_speedup(cupy_ms, t_ms):>10} {_fmt_speedup(pytorch_ms, t_ms):>10} "
                             f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                         )
-                        if pt_skip:
-                            print(f"  NOTE: {pt_skip}")
+                        if status in ("FAIL", "REF_FAIL"):
+                            if pt_skip:
+                                print(f"  NOTE: {pt_skip}")
                     except Exception as e:
                         err_msg = str(e)
                         status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
@@ -1286,14 +1446,19 @@ def run_all_supported_spsv_csr_csv(
                                 "n_cols": "ERR",
                                 "nnz": "ERR",
                                 "triton_ms": None,
-                                "pytorch_ms": None,
                                 "cusparse_ms": None,
-                                "csc_ms": None,
+                                "pytorch_ms": None,
+                                "cusparse/triton": None,
+                                "pytorch/triton": None,
+                                "pt_status": "N/A",
+                                "cu_status": "N/A",
                                 "status": status,
                                 "err_ref": None,
                                 "err_res": None,
                                 "err_pt": None,
                                 "err_cu": None,
+                                "pytorch_reason": None,
+                                "error": err_msg,
                             }
                         )
                         name = os.path.basename(path)[:27]
@@ -1301,8 +1466,8 @@ def run_all_supported_spsv_csr_csv(
                             name = name + "…"
                         print(
                             f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
-                            f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>11} "
-                            f"{'N/A':>7} {'N/A':>7} "
+                            f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
+                            f"{'N/A':>10} {'N/A':>10} "
                             f"{status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
                         )
                         print(f"  {status}: {e}")
@@ -1316,20 +1481,25 @@ def run_all_supported_spsv_csr_csv(
         "n_cols",
         "nnz",
         "triton_ms",
-        "pytorch_ms",
         "cusparse_ms",
-        "csc_ms",
+        "pytorch_ms",
+        "cusparse/triton",
+        "pytorch/triton",
+        "pt_status",
+        "cu_status",
         "status",
         "err_ref",
         "err_res",
         "err_pt",
         "err_cu",
+        "pytorch_reason",
+        "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows_out:
-            w.writerow(r)
+            w.writerow({k: ("" if v is None else v) for k, v in _csv_export_row_spsv(r).items()})
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 
@@ -1356,7 +1526,8 @@ def run_all_dtypes_spsv_coo_csv(
                 f"  triA={'LOWER' if lower else 'UPPER'}  coo_mode={coo_mode}"
             )
             print(
-                "Formats: FlagSparse=COO SpSV, cuSPARSE=COO ref, PyTorch=Dense solve. "
+                "Formats: FlagSparse=COO SpSV, cuSPARSE=COO ref, "
+                "PyTorch(ms)=CUDA reference (sparse if available, else dense triangular solve). "
                 "RHS is generated directly, matching Library-main's SpSV test style."
             )
             print(
@@ -1367,8 +1538,8 @@ def run_all_dtypes_spsv_coo_csv(
             print("-" * 150)
             print(
                 f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-                f"{'FlagSparse(ms)':>10} {'COO(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
-                f"{'FS/COO':>7} {'FS/PT':>7} {'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(CU)':>10}"
+                f"{'FS.solve':>10} {'cu.solve':>10} {'pt.solve':>10} "
+                f"{'cu/triton':>10} {'pt/triton':>10} {'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(CU)':>10}"
             )
             print("-" * 150)
             for path in mtx_paths:
@@ -1390,12 +1561,13 @@ def run_all_dtypes_spsv_coo_csv(
                     status = row["status"]
                     print(
                         f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
-                        f"{_fmt_ms(t_ms):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(None):>10} {_fmt_ms(pytorch_ms):>11} "
-                        f"{_fmt_speedup(cupy_ms, t_ms):>7} {_fmt_speedup(pytorch_ms, t_ms):>7} "
+                        f"{_fmt_ms(t_ms):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(pytorch_ms):>10} "
+                        f"{_fmt_speedup(cupy_ms, t_ms):>10} {_fmt_speedup(pytorch_ms, t_ms):>10} "
                         f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                     )
-                    if pt_skip:
-                        print(f"  NOTE: {pt_skip}")
+                    if status in ("FAIL", "REF_FAIL"):
+                        if pt_skip:
+                            print(f"  NOTE: {pt_skip}")
                 except Exception as e:
                     err_msg = str(e)
                     status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
@@ -1404,18 +1576,24 @@ def run_all_dtypes_spsv_coo_csv(
                             "matrix": os.path.basename(path),
                             "value_dtype": _dtype_name(value_dtype),
                             "index_dtype": _dtype_name(index_dtype),
+                            "opA": "NON",
                             "n_rows": "ERR",
                             "n_cols": "ERR",
                             "nnz": "ERR",
                             "triton_ms": None,
-                            "pytorch_ms": None,
                             "cusparse_ms": None,
-                            "csc_ms": None,
+                            "pytorch_ms": None,
+                            "cusparse/triton": None,
+                            "pytorch/triton": None,
+                            "pt_status": "N/A",
+                            "cu_status": "N/A",
                             "status": status,
                             "err_ref": None,
                             "err_res": None,
                             "err_pt": None,
                             "err_cu": None,
+                            "pytorch_reason": None,
+                            "error": err_msg,
                         }
                     )
                     name = os.path.basename(path)[:27]
@@ -1423,8 +1601,8 @@ def run_all_dtypes_spsv_coo_csv(
                         name = name + "…"
                     print(
                         f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
-                        f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>11} "
-                        f"{'N/A':>7} {'N/A':>7} {status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
+                        f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
+                        f"{'N/A':>10} {'N/A':>10} {status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
                     )
                     print(f"  {status}: {e}")
             print("-" * 150)
@@ -1432,24 +1610,30 @@ def run_all_dtypes_spsv_coo_csv(
         "matrix",
         "value_dtype",
         "index_dtype",
+        "opA",
         "n_rows",
         "n_cols",
         "nnz",
         "triton_ms",
-        "pytorch_ms",
         "cusparse_ms",
-        "csc_ms",
+        "pytorch_ms",
+        "cusparse/triton",
+        "pytorch/triton",
+        "pt_status",
+        "cu_status",
         "status",
         "err_ref",
         "err_res",
         "err_pt",
         "err_cu",
+        "pytorch_reason",
+        "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows_out:
-            w.writerow(r)
+            w.writerow({k: ("" if v is None else v) for k, v in _csv_export_row_spsv(r).items()})
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 
@@ -1537,13 +1721,16 @@ def _check_one_csr_transpose_case(path, value_dtype, index_dtype, op_mode, devic
 
     ref_err = None
     ref_ok = None
-    if _allow_dense_pytorch_ref(shape, value_dtype):
-        A_dense = _csr_to_dense(
-            data, indices.to(torch.int64), indptr.to(torch.int64), shape
-        ).to(_dense_ref_dtype(value_dtype))
-        x_ref = _triangular_solve_reference(
-            A_dense, b.to(A_dense.dtype), lower=lower, op_mode=op_mode
-        )
+    x_ref, _, _, _ = _benchmark_pytorch_reference(
+        data,
+        indices,
+        indptr,
+        shape,
+        b,
+        lower=lower,
+        op_mode=op_mode,
+    )
+    if x_ref is not None:
         ref_err = (
             float(torch.max(torch.abs(x_op - x_ref)).item()) if x_op.numel() > 0 else 0.0
         )
