@@ -227,7 +227,7 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
     spmv_ops = op_names(modules["spmv_csr"]) if "spmv_csr" in modules else ("non", "trans", "conj")
     spmm_values = normalize_dtype_values(modules["spmm_csr"].get("SUPPORTED_SPMM_VALUE_DTYPES")) if "spmm_csr" in modules else None
     return (
-        ApiSpec("gather", "flagsparse_gather", "gather_scatter", "index", "triton", values=DEFAULT_VALUE_DTYPES + ("complex32",), indices=DEFAULT_INDEX_DTYPES),
+        ApiSpec("gather", "flagsparse_gather", "gather_scatter", "index", "triton", values=DEFAULT_VALUE_DTYPES, indices=DEFAULT_INDEX_DTYPES),
         ApiSpec("scatter", "flagsparse_scatter", "gather_scatter", "index", "triton", value_const="SUPPORTED_SCATTER_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES"),
         ApiSpec("spmv", "flagsparse_spmv_csr", "spmv_csr", "CSR", "triton", value_const="SUPPORTED_SPMV_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_ops, notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent"),
         ApiSpec("spmv", "flagsparse_spmv_coo", "spmv_coo", "COO", "triton", values=("float32", "float64"), indices=DEFAULT_INDEX_DTYPES, ops=("non",), notes="COO path casts kernel indices to int32 after range check"),
