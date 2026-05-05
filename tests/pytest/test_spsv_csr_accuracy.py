@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from flagsparse import flagsparse_spsv_coo, flagsparse_spsv_csr
+from flagsparse import flagsparse_spsv_csr
+import flagsparse.sparse_operations.spsv as fs_spsv_impl
 
 from tests.pytest.param_shapes import SPSV_N
 
@@ -62,6 +63,17 @@ def _transpose_arg(op_mode):
     if op_mode == "NON":
         return False
     return op_mode
+
+
+def _dense_ref_spsv(A, b, *, lower, op_mode="NON", unit_diagonal=False):
+    A_eff = _apply_ref_op(A, op_mode)
+    x = torch.linalg.solve_triangular(
+        A_eff,
+        b.unsqueeze(-1),
+        upper=_effective_upper(lower, op_mode),
+        unitriangular=unit_diagonal,
+    )
+    return x.squeeze(-1)
 
 
 def _cupy_apply_op(A_cp, op_mode):
@@ -166,6 +178,144 @@ def test_spsv_csr_non_trans_supported_combos(n, dtype, index_dtype):
     )
     rtol, atol = _tol(dtype)
     assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+def test_spsv_csr_rejects_matrix_rhs():
+    device = torch.device("cuda")
+    dtype = torch.float32
+    n = SPSV_N[0]
+    A = _build_triangular(n, dtype, device, lower=True)
+    b = torch.randn(n, 2, dtype=dtype, device=device)
+
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(torch.int32)
+    indptr = Asp.crow_indices().to(torch.int32)
+
+    with pytest.raises(ValueError, match="DnVec"):
+        flagsparse_spsv_csr(
+            data,
+            indices,
+            indptr,
+            b,
+            (n, n),
+            lower=True,
+            unit_diagonal=False,
+            transpose=False,
+        )
+
+
+@pytest.mark.spsv
+@pytest.mark.parametrize("n", SPSV_N)
+@pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize("lower", [True, False], ids=["lower", "upper"])
+def test_spsv_csr_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
+    device = torch.device("cuda")
+    A = _build_triangular(n, dtype, device, lower=lower)
+    b = _rand_like(dtype, (n,), device)
+    x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=lower, unit_diagonal=True)
+
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(index_dtype)
+    indptr = Asp.crow_indices().to(index_dtype)
+
+    x = flagsparse_spsv_csr(
+        data,
+        indices,
+        indptr,
+        b,
+        (n, n),
+        lower=lower,
+        unit_diagonal=True,
+        transpose=False,
+    )
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+@pytest.mark.parametrize("n", SPSV_N)
+@pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize("lower", [True, False], ids=["lower", "upper"])
+@pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
+def test_spsv_csr_unit_transpose_family_supported_combos(
+    n, dtype, index_dtype, lower, op_mode
+):
+    device = torch.device("cuda")
+    A = _build_triangular(n, dtype, device, lower=lower)
+    b = _rand_like(dtype, (n,), device)
+    x_ref = _dense_ref_spsv(
+        A.to(dtype),
+        b.to(dtype),
+        lower=lower,
+        op_mode=op_mode,
+        unit_diagonal=True,
+    )
+
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(index_dtype)
+    indptr = Asp.crow_indices().to(index_dtype)
+
+    x = flagsparse_spsv_csr(
+        data,
+        indices,
+        indptr,
+        b,
+        (n, n),
+        lower=lower,
+        unit_diagonal=True,
+        transpose=_transpose_arg(op_mode),
+    )
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+def test_spsv_csr_complex_non_trans_defaults_to_cw_route():
+    device = torch.device("cuda")
+    n = SPSV_N[0]
+    dtype = torch.complex64
+    A = _build_triangular(n, dtype, device, lower=True)
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(torch.int32)
+    indptr = Asp.crow_indices().to(torch.int32)
+    b = _rand_like(dtype, (n,), device)
+
+    _, _, _, trans_mode, _, _, solve_plan = fs_spsv_impl._resolve_spsv_csr_runtime(
+        data, indices, indptr, b, (n, n), True, False, False
+    )
+    selected = fs_spsv_impl._select_spsv_runtime_plan(
+        solve_plan, 1, data.dtype, trans_mode
+    )
+    assert selected["solve_kind"] == "csr_cw"
+
+
+@pytest.mark.spsv
+@pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
+def test_spsv_csr_transpose_family_defaults_to_cw_route(op_mode):
+    device = torch.device("cuda")
+    n = SPSV_N[0]
+    dtype = torch.complex128
+    A = _build_triangular(n, dtype, device, lower=True)
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(torch.int32)
+    indptr = Asp.crow_indices().to(torch.int32)
+    b = _rand_like(dtype, (n,), device)
+
+    _, _, _, trans_mode, _, _, solve_plan = fs_spsv_impl._resolve_spsv_csr_runtime(
+        data, indices, indptr, b, (n, n), True, _transpose_arg(op_mode), False
+    )
+    selected = fs_spsv_impl._select_spsv_runtime_plan(
+        solve_plan, 1, data.dtype, trans_mode
+    )
+    assert selected["solve_kind"] == "transpose_cw"
 
 
 @pytest.mark.spsv
@@ -401,34 +551,3 @@ def test_spsv_csr_matches_cusparse_upper_transpose_family(n, dtype, index_dtype,
 
     rtol, atol = _tol(dtype)
     assert torch.allclose(x_trans, x_trans_ref, rtol=rtol, atol=atol)
-
-
-@pytest.mark.spsv
-@pytest.mark.parametrize("n", SPSV_N)
-@pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
-def test_spsv_coo_transpose_family_complex128_routes_through_csr(n, op_mode):
-    device = torch.device("cuda")
-    dtype = torch.complex128
-    A = _build_triangular(n, dtype, device, lower=True)
-    b = _rand_like(dtype, (n,), device)
-    x_ref = torch.linalg.solve_triangular(
-        _apply_ref_op(A, op_mode), b.unsqueeze(-1), upper=_effective_upper(True, op_mode)
-    ).squeeze(-1)
-
-    A_coo = A.to_sparse_coo().coalesce()
-    row, col = A_coo.indices()
-    data = A_coo.values()
-
-    x = flagsparse_spsv_coo(
-        data,
-        row.to(torch.int32),
-        col.to(torch.int32),
-        b,
-        (n, n),
-        lower=True,
-        unit_diagonal=False,
-        transpose=_transpose_arg(op_mode),
-        coo_mode="auto",
-    )
-    rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
