@@ -355,6 +355,7 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None):
                     "non = compute only; trans/conj = op processing + compute."
                 )
                 print("Base(ms) = row-run (seg) kernel; Opt(ms) = NNZ atomic kernel.")
+                print("Speedups use Opt(ms) as the Triton comparison path; Base(ms) is reported separately.")
                 print(COO_SEP)
                 print(COO_HEADER)
                 print(COO_SEP)
@@ -469,12 +470,10 @@ def _run_one_coo_case(
         "nnz": int(data.numel()),
         "base_ms": base_ms,
         "opt_ms": opt_ms,
-        "triton_ms": opt_ms,
         "cusparse_ms": cu_ms,
         "pytorch_ms": pt_ms,
-        "csc_ms": None,
-        "triton_speedup_vs_cusparse": _speedup_ratio(cu_ms, opt_ms),
-        "triton_speedup_vs_pytorch": _speedup_ratio(pt_ms, opt_ms),
+        "opt_speedup_vs_cusparse": _speedup_ratio(cu_ms, opt_ms),
+        "opt_speedup_vs_pytorch": _speedup_ratio(pt_ms, opt_ms),
         "pt_status": _status_str(triton_ok_pt, err_pt is not None),
         "cu_status": _status_str(triton_ok_cu, err_cu is not None),
         "status": status,
@@ -698,12 +697,10 @@ def _error_row(path, dtype, index_dtype, op):
         "nnz": "ERR",
         "base_ms": None,
         "opt_ms": None,
-        "triton_ms": None,
         "cusparse_ms": None,
         "pytorch_ms": None,
-        "csc_ms": None,
-        "triton_speedup_vs_cusparse": None,
-        "triton_speedup_vs_pytorch": None,
+        "opt_speedup_vs_cusparse": None,
+        "opt_speedup_vs_pytorch": None,
         "status": "ERROR",
         "err_base": None,
         "err_opt": None,
@@ -787,12 +784,10 @@ def run_all_dtypes_coo_csv(
         "nnz",
         "base_ms",
         "opt_ms",
-        "triton_ms",
         "cusparse_ms",
         "pytorch_ms",
-        "csc_ms",
-        "triton_speedup_vs_cusparse",
-        "triton_speedup_vs_pytorch",
+        "opt_speedup_vs_cusparse",
+        "opt_speedup_vs_pytorch",
         "pt_status",
         "cu_status",
         "status",
