@@ -12,6 +12,7 @@ import glob
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -45,8 +46,14 @@ SUMMARY_FIELDS = [
     "base_ms",
     "opt_ms",
     "opt_alg2_ms",
+    "opt_alg2_symbolic_ms",
+    "opt_alg2_compute_ms",
+    "opt_alg2_op_total_ms",
     "torch_ms",
     "cusparse_ms",
+    "base_vs_opt_alg2_speedup",
+    "torch_vs_opt_alg2_speedup",
+    "cusparse_vs_opt_alg2_speedup",
     "base_vs_torch_err",
     "base_vs_cusparse_err",
     "opt_vs_torch_err",
@@ -140,12 +147,43 @@ def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
 def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
     prepared = fs.prepare_spmm_csr_opt_alg2(data, indices, indptr, shape)
     first, meta = fs.flagsparse_spmm_csr_opt_alg2(B=B, prepared=prepared, return_meta=True)
-    timed_value, elapsed = _benchmark(
-        lambda: fs.flagsparse_spmm_csr_opt_alg2(B=B, prepared=prepared),
-        warmup,
-        iters,
+    torch.cuda.synchronize()
+    for _ in range(max(0, int(warmup))):
+        warm_prepared = fs.prepare_spmm_csr_opt_alg2(data, indices, indptr, shape)
+        _ = fs.flagsparse_spmm_csr_opt_alg2(B=B, prepared=warm_prepared)
+    torch.cuda.synchronize()
+
+    total_ms = 0.0
+    symbolic_ms = 0.0
+    compute_ms = 0.0
+    measured_prepared = prepared
+    measured_meta = meta
+    measured_value = first
+    count = max(1, int(iters))
+    for _ in range(count):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        measured_prepared = fs.prepare_spmm_csr_opt_alg2(data, indices, indptr, shape)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        measured_value, measured_meta = fs.flagsparse_spmm_csr_opt_alg2(
+            B=B,
+            prepared=measured_prepared,
+            return_meta=True,
+        )
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        symbolic_ms += (t1 - t0) * 1000.0
+        compute_ms += (t2 - t1) * 1000.0
+        total_ms += (t2 - t0) * 1000.0
+    return (
+        measured_value,
+        total_ms / count,
+        measured_prepared,
+        measured_meta,
+        symbolic_ms / count,
+        compute_ms / count,
     )
-    return first, elapsed, prepared, meta
 
 
 def _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters):
@@ -318,7 +356,14 @@ def run_one_case(
     B = _seeded_dense_matrix((n_cols, dense_cols), dtype, device, seed)
     base_out, base_ms = _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters)
     opt_out, opt_ms = _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters)
-    alg2_out, alg2_ms, prepared_alg2, alg2_meta = _timed_spmm_opt_alg2(
+    (
+        alg2_out,
+        alg2_ms,
+        prepared_alg2,
+        alg2_meta,
+        alg2_symbolic_ms,
+        alg2_compute_ms,
+    ) = _timed_spmm_opt_alg2(
         data,
         indices,
         indptr,
@@ -361,8 +406,20 @@ def run_one_case(
         "base_ms": base_ms,
         "opt_ms": opt_ms,
         "opt_alg2_ms": alg2_ms,
+        "opt_alg2_symbolic_ms": alg2_symbolic_ms,
+        "opt_alg2_compute_ms": alg2_compute_ms,
+        "opt_alg2_op_total_ms": alg2_ms,
         "torch_ms": torch_ms,
         "cusparse_ms": cusparse_ms,
+        "base_vs_opt_alg2_speedup": (
+            base_ms / alg2_ms if alg2_ms is not None and alg2_ms > 0 else None
+        ),
+        "torch_vs_opt_alg2_speedup": (
+            torch_ms / alg2_ms if torch_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+        ),
+        "cusparse_vs_opt_alg2_speedup": (
+            cusparse_ms / alg2_ms if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+        ),
         "base_vs_torch_err": base_vs_torch["global_err"],
         "base_vs_cusparse_err": base_vs_cusparse["global_err"],
         "opt_vs_torch_err": opt_vs_torch["global_err"],
@@ -408,6 +465,10 @@ def _fmt(value):
     return "N/A" if value is None else f"{value:.4f}"
 
 
+def _speed(value):
+    return "N/A" if value is None else f"{value:.2f}x"
+
+
 def _err(value):
     return "N/A" if value is None else f"{value:.2e}"
 
@@ -417,7 +478,11 @@ def print_row(row):
     print(
         f"{name:<28} {row['n_rows']:>7} {row['n_cols']:>7} {row['nnz']:>10} {row['dense_cols']:>8}  "
         f"{_fmt(row['base_ms']):>9} {_fmt(row['opt_ms']):>9} {_fmt(row['opt_alg2_ms']):>9} "
+        f"{_fmt(row['opt_alg2_symbolic_ms']):>9} {_fmt(row['opt_alg2_compute_ms']):>9} "
         f"{_fmt(row['torch_ms']):>9} {_fmt(row['cusparse_ms']):>9}  "
+        f"{_speed(row['base_vs_opt_alg2_speedup']):>8} "
+        f"{_speed(row['torch_vs_opt_alg2_speedup']):>8} "
+        f"{_speed(row['cusparse_vs_opt_alg2_speedup']):>8}  "
         f"{_err(row['opt_vs_torch_err']):>10} {_err(row['opt_vs_cusparse_err']):>10} "
         f"{_err(row['opt_alg2_vs_torch_err']):>10} {_err(row['opt_alg2_vs_cusparse_err']):>10} "
         f"{row['matrix_status']:>6}"
@@ -516,7 +581,8 @@ def main():
     )
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8}  "
-        f"{'Base(ms)':>9} {'Opt(ms)':>9} {'Alg2(ms)':>9} {'Torch(ms)':>9} {'CU(ms)':>9}  "
+        f"{'Base(ms)':>9} {'Opt(ms)':>9} {'Alg2(ms)':>9} {'A2Sym':>9} {'A2Comp':>9} "
+        f"{'Torch(ms)':>9} {'CU(ms)':>9}  {'B/A2':>8} {'T/A2':>8} {'CU/A2':>8}  "
         f"{'Opt/Torch':>10} {'Opt/CU':>10} {'Alg2/T':>10} {'Alg2/CU':>10} {'Status':>6}"
     )
     print("=" * 220)

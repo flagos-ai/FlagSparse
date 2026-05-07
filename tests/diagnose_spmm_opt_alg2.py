@@ -79,6 +79,10 @@ def _write_csv(path, rows, fieldnames):
             writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
 
 
+def _fmt_speed(value):
+    return "N/A" if value is None else f"{value:.2f}x"
+
+
 def _bucket_label_map(prepared):
     label_map = {}
     for bucket in prepared.opt_buckets:
@@ -216,6 +220,12 @@ def main():
         worst_rows.extend(_build_worst_rows(matrix_name, result["prepared_alg2"], result["profiles"], args.top_rows))
         print(
             f"{matrix_name}: matrix_status={result['summary']['matrix_status']}  "
+            f"opt_alg2_total_ms={result['summary']['opt_alg2_op_total_ms']:.4f}  "
+            f"symbolic_ms={result['summary']['opt_alg2_symbolic_ms']:.4f}  "
+            f"compute_ms={result['summary']['opt_alg2_compute_ms']:.4f}  "
+            f"Base/Alg2={result['summary']['base_vs_opt_alg2_speedup']:.2f}x  "
+            f"Torch/Alg2={result['summary']['torch_vs_opt_alg2_speedup']:.2f}x  "
+            f"CU/Alg2={_fmt_speed(result['summary']['cusparse_vs_opt_alg2_speedup'])}  "
             f"opt_alg2_vs_torch_err={result['summary']['opt_alg2_vs_torch_err']}"
         )
 

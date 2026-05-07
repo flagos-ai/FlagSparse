@@ -384,14 +384,112 @@ class PreparedCsrSpmmOpt:
         self.long_row_fallback_only = bool(long_row_fallback_only)
 
 
-_SPMM_OPT_BUCKET_SPECS = (
-    {"max_row_nnz": 32, "kind": "batched", "batch_rows": 8, "block_nnz": 32},
-    {"max_row_nnz": 128, "kind": "batched", "batch_rows": 4, "block_nnz": 64},
-    {"max_row_nnz": 512, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
-    {"max_row_nnz": 2048, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
-    {"max_row_nnz": None, "kind": "split", "batch_rows": 1, "block_nnz": 256},
-)
 _SPMM_OPT_LONG_ROW_THRESHOLD = 2048
+_SPMM_OPT_SPLIT_BLOCK_NNZ = 256
+
+_SPMM_OPT_BUCKET_SPECS_F32 = (
+    {
+        "label": "short_16",
+        "kind": "batched2d",
+        "min_row_nnz": 0,
+        "max_row_nnz": 16,
+        "batch_rows": 8,
+        "block_k": 16,
+        "block_n_cap": 32,
+    },
+    {
+        "label": "short_64",
+        "kind": "batched2d",
+        "min_row_nnz": 17,
+        "max_row_nnz": 64,
+        "batch_rows": 4,
+        "block_k": 32,
+        "block_n_cap": 64,
+    },
+    {
+        "label": "row_256",
+        "kind": "row2d",
+        "min_row_nnz": 65,
+        "max_row_nnz": 256,
+        "batch_rows": 1,
+        "block_k": 64,
+        "block_n_cap": 64,
+    },
+    {
+        "label": "seg_1024",
+        "kind": "row2d_segmented",
+        "min_row_nnz": 257,
+        "max_row_nnz": 1024,
+        "batch_rows": 1,
+        "block_k": 64,
+        "block_n_cap": 128,
+        "segments": 4,
+    },
+    {
+        "label": "seg_2048",
+        "kind": "row2d_segmented",
+        "min_row_nnz": 1025,
+        "max_row_nnz": _SPMM_OPT_LONG_ROW_THRESHOLD,
+        "batch_rows": 1,
+        "block_k": 128,
+        "block_n_cap": 128,
+        "segments": 8,
+    },
+)
+
+_SPMM_OPT_BUCKET_SPECS_F64 = (
+    {
+        "label": "short_16",
+        "kind": "batched2d",
+        "min_row_nnz": 0,
+        "max_row_nnz": 16,
+        "batch_rows": 4,
+        "block_k": 16,
+        "block_n_cap": 16,
+    },
+    {
+        "label": "short_64",
+        "kind": "batched2d",
+        "min_row_nnz": 17,
+        "max_row_nnz": 64,
+        "batch_rows": 2,
+        "block_k": 32,
+        "block_n_cap": 32,
+    },
+    {
+        "label": "row_256",
+        "kind": "row2d",
+        "min_row_nnz": 65,
+        "max_row_nnz": 256,
+        "batch_rows": 1,
+        "block_k": 32,
+        "block_n_cap": 32,
+    },
+    {
+        "label": "seg_1024",
+        "kind": "row2d_segmented",
+        "min_row_nnz": 257,
+        "max_row_nnz": 1024,
+        "batch_rows": 1,
+        "block_k": 32,
+        "block_n_cap": 64,
+        "segments": 4,
+    },
+    {
+        "label": "seg_2048",
+        "kind": "row2d_segmented",
+        "min_row_nnz": 1025,
+        "max_row_nnz": _SPMM_OPT_LONG_ROW_THRESHOLD,
+        "batch_rows": 1,
+        "block_k": 64,
+        "block_n_cap": 64,
+        "segments": 8,
+    },
+)
+
+
+def _spmm_opt_bucket_specs(dtype):
+    return _SPMM_OPT_BUCKET_SPECS_F64 if dtype == torch.float64 else _SPMM_OPT_BUCKET_SPECS_F32
 
 
 def _select_spmm_opt_block_n(n_dense_cols):
@@ -413,10 +511,12 @@ def _normalize_spmm_opt_device_props(device):
     max_threads_per_mp = int(
         getattr(props, "max_threads_per_multi_processor", 2048) or 2048
     )
+    shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     return {
         "warp_size": max(1, warp_size),
         "max_threads_per_block": max(32, max_threads_per_block),
         "max_threads_per_mp": max(32, max_threads_per_mp),
+        "shared_memory_per_block": max(0, shared_memory_per_block),
     }
 
 
@@ -473,6 +573,76 @@ def _resolve_spmm_opt_launch(kind, block_n, block_nnz, batch_rows, dtype, device
     return {"num_warps": int(num_warps), "num_stages": int(num_stages)}
 
 
+def _select_spmm_opt_block_n_for_bucket(n_dense_cols, block_n_cap):
+    return max(8, min(_select_spmm_opt_block_n(n_dense_cols), int(block_n_cap)))
+
+
+def _select_spmm_opt_2d_num_warps(bucket, block_n, device_props, dtype):
+    warp_size = max(1, int(device_props["warp_size"]))
+    max_threads_per_block = max(32, int(device_props["max_threads_per_block"]))
+    max_threads_per_mp = max(max_threads_per_block, int(device_props["max_threads_per_mp"]))
+    dense_lane_need = max(1, triton.cdiv(int(block_n), warp_size))
+    kind = bucket["kind"]
+    block_k = int(bucket["block_k"])
+    segments = int(bucket.get("segments", 1))
+    batch_rows = int(bucket.get("batch_rows", 1))
+
+    if kind == "batched2d":
+        desired = max(dense_lane_need, 1 if block_k <= 16 else 2)
+        if batch_rows >= 8 and block_n >= 64:
+            desired = max(desired, 2)
+    elif kind == "row2d":
+        desired = max(dense_lane_need, 2 if block_k <= 32 else 4)
+    else:
+        desired = max(dense_lane_need, 4)
+        if segments >= 4:
+            desired = max(desired, 8 if block_k >= 64 else 4)
+        if segments >= 8:
+            desired = max(desired, 16 if dtype == torch.float32 and block_n >= 64 else 8)
+
+    if dtype == torch.float64:
+        desired = min(desired, 8)
+    if max_threads_per_mp < 1536:
+        desired = min(desired, 8)
+    return _clip_spmm_opt_num_warps(desired, device_props)
+
+
+def _select_spmm_opt_2d_num_stages(bucket, block_n, num_warps, device_props, dtype):
+    kind = bucket["kind"]
+    segments = int(bucket.get("segments", 1))
+    shared_memory_per_block = int(device_props.get("shared_memory_per_block", 0))
+    if dtype == torch.float64:
+        stages = 1 if kind == "row2d_segmented" else (2 if block_n <= 32 and num_warps <= 4 else 1)
+    elif kind == "batched2d":
+        stages = 2
+    elif kind == "row2d":
+        stages = 2 if block_n <= 64 else 1
+    else:
+        stages = 1 if segments >= 8 or num_warps >= 16 else 2
+
+    if shared_memory_per_block and shared_memory_per_block < 65536:
+        stages = min(stages, 2)
+    if kind == "row2d_segmented" and block_n >= 128:
+        stages = min(stages, 2)
+    return max(1, min(int(stages), 4))
+
+
+def _resolve_spmm_opt_2d_launch(bucket, n_dense_cols, dtype, device_props):
+    block_n = _select_spmm_opt_block_n_for_bucket(n_dense_cols, bucket["block_n_cap"])
+    num_warps = _select_spmm_opt_2d_num_warps(bucket, block_n, device_props, dtype)
+    num_stages = _select_spmm_opt_2d_num_stages(bucket, block_n, num_warps, device_props, dtype)
+    return {
+        "bucket_label": bucket.get("label"),
+        "kind": bucket["kind"],
+        "block_k": int(bucket["block_k"]),
+        "block_n": int(block_n),
+        "num_warps": int(num_warps),
+        "num_stages": int(num_stages),
+        "batch_rows": int(bucket.get("batch_rows", 1)),
+        "segments": int(bucket.get("segments", 1)),
+    }
+
+
 def _build_spmm_opt_split_metadata(kernel_indptr, long_rows, part_block_nnz):
     device = kernel_indptr.device
     row_dtype = long_rows.dtype if long_rows.numel() > 0 else torch.int32
@@ -510,39 +680,48 @@ def _build_spmm_opt_split_metadata(kernel_indptr, long_rows, part_block_nnz):
     )
 
 
-def _build_spmm_opt_buckets(row_lengths):
+def _build_spmm_opt_buckets(row_lengths, dtype):
     device = row_lengths.device
-    max_row_index = int(row_lengths.numel()) - 1
-    row_index_dtype = (
-        torch.int32 if max_row_index <= _INDEX_LIMIT_INT32 else torch.int64
-    )
+    row_count = int(row_lengths.numel())
+    row_index_dtype = torch.int32 if row_count <= _INDEX_LIMIT_INT32 else torch.int64
+    all_rows = torch.arange(row_count, device=device, dtype=row_index_dtype)
     buckets = []
-    lower = 0
-    long_rows = torch.empty((0,), dtype=row_index_dtype, device=device)
-    for spec in _SPMM_OPT_BUCKET_SPECS:
+    for spec in _spmm_opt_bucket_specs(dtype):
+        lower = int(spec["min_row_nnz"])
         upper = spec["max_row_nnz"]
-        if upper is None:
-            mask = row_lengths > lower
-        elif lower == 0:
+        if lower <= 0:
             mask = row_lengths <= upper
         else:
-            mask = (row_lengths > lower) & (row_lengths <= upper)
-        rows = torch.nonzero(mask, as_tuple=False).flatten().to(row_index_dtype)
+            mask = (row_lengths >= lower) & (row_lengths <= upper)
+        rows = all_rows[mask]
         if rows.numel() == 0:
-            if upper is not None:
-                lower = upper
             continue
         bucket = {
+            "label": spec["label"],
             "kind": spec["kind"],
             "rows": rows,
             "batch_rows": int(spec["batch_rows"]),
-            "block_nnz": int(spec["block_nnz"]),
+            "block_k": int(spec["block_k"]),
+            "block_n_cap": int(spec["block_n_cap"]),
+            "min_row_nnz": lower,
+            "max_row_nnz": int(upper),
         }
+        if "segments" in spec:
+            bucket["segments"] = int(spec["segments"])
         buckets.append(bucket)
-        if spec["kind"] == "split":
-            long_rows = rows
-        if upper is not None:
-            lower = upper
+    long_rows = all_rows[row_lengths > _SPMM_OPT_LONG_ROW_THRESHOLD]
+    if long_rows.numel() > 0:
+        buckets.append(
+            {
+                "label": "split_long",
+                "kind": "split",
+                "rows": long_rows,
+                "batch_rows": 1,
+                "block_k": _SPMM_OPT_SPLIT_BLOCK_NNZ,
+                "block_n_cap": 128,
+                "segments": 1,
+            }
+        )
     return buckets, long_rows
 
 
@@ -583,7 +762,7 @@ def prepare_spmm_csr_opt(data, indices, indptr, shape):
 
 
 def _build_spmm_csr_opt_runtime_symbolic(prepared):
-    row_buckets, long_rows = _build_spmm_opt_buckets(prepared.row_lengths)
+    row_buckets, long_rows = _build_spmm_opt_buckets(prepared.row_lengths, prepared.data.dtype)
     long_part_rows = torch.empty((0,), dtype=long_rows.dtype, device=prepared.data.device)
     long_part_starts = torch.empty((0,), dtype=torch.int64, device=prepared.data.device)
     long_part_ends = torch.empty((0,), dtype=torch.int64, device=prepared.data.device)
@@ -869,6 +1048,296 @@ def _spmm_csr_vector_rows_f64_kernel(
             )
             acc = acc + a_val * b_vals
     tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+
+
+@triton.jit
+def _spmm_csr_opt_batched2d_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BATCH: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+
+    for batch_idx in tl.static_range(0, BATCH):
+        ridx = pid_row * BATCH + batch_idx
+        active = ridx < n_bucket_rows
+        row = tl.load(rows_ptr + ridx, mask=active, other=0)
+        start = tl.load(indptr_ptr + row, mask=active, other=0)
+        end = tl.load(indptr_ptr + row + 1, mask=active, other=0)
+        row_nnz = end - start
+        acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+        for chunk_start in tl.range(0, row_nnz, BLOCK_K):
+            for kk in tl.static_range(0, BLOCK_K):
+                idx = start + chunk_start + kk
+                valid = active & (idx < end)
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+        tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n & active)
+
+
+@triton.jit
+def _spmm_csr_opt_row2d_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_bucket_rows:
+        return
+
+    row = tl.load(rows_ptr + pid_row)
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    row_nnz = end - start
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    for chunk_start in tl.range(0, row_nnz, BLOCK_K):
+        for kk in tl.static_range(0, BLOCK_K):
+            idx = start + chunk_start + kk
+            valid = idx < end
+            a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+            a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            b_vals = tl.load(
+                b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid,
+                other=0.0,
+            )
+            acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n)
+
+
+@triton.jit
+def _spmm_csr_opt_segmented2d_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SEGMENTS: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_bucket_rows:
+        return
+
+    row = tl.load(rows_ptr + pid_row)
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    row_nnz = end - start
+    seg_span = (row_nnz + SEGMENTS - 1) // SEGMENTS
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    acc0 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc1 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc2 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc3 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc4 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc5 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc6 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc7 = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+
+    if SEGMENTS > 0:
+        seg_start = start
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_K):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            acc0 = acc0 + chunk_acc
+
+    if SEGMENTS > 1:
+        seg_start = start + seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_K):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            acc1 = acc1 + chunk_acc
+
+    if SEGMENTS > 2:
+        seg_start = start + 2 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_K):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            acc2 = acc2 + chunk_acc
+
+    if SEGMENTS > 3:
+        seg_start = start + 3 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_K):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            acc3 = acc3 + chunk_acc
+
+    if SEGMENTS > 4:
+        seg_start = start + 4 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_K):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            acc4 = acc4 + chunk_acc
+
+    if SEGMENTS > 5:
+        seg_start = start + 5 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_K):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            acc5 = acc5 + chunk_acc
+
+    if SEGMENTS > 6:
+        seg_start = start + 6 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_K):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            acc6 = acc6 + chunk_acc
+
+    if SEGMENTS > 7:
+        seg_start = start + 7 * seg_span
+        seg_end = tl.minimum(end, seg_start + seg_span)
+        for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
+            chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for kk in tl.static_range(0, BLOCK_K):
+                idx = seg_start + chunk_offset + kk
+                valid = idx < seg_end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            acc7 = acc7 + chunk_acc
+
+    if SEGMENTS == 1:
+        acc = acc0
+    elif SEGMENTS == 2:
+        acc = acc0 + acc1
+    elif SEGMENTS <= 4:
+        acc = (acc0 + acc1) + (acc2 + acc3)
+    else:
+        acc = ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))
+    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n)
 
 
 @triton.jit
@@ -1350,25 +1819,20 @@ def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props):
     if rows.numel() == 0:
         return
     dtype = prepared.data.dtype
-    kernel_map = {
-        ("batched", torch.float32): _spmm_csr_batched_rows_f32_kernel,
-        ("batched", torch.float64): _spmm_csr_batched_rows_f64_kernel,
-        ("vector", torch.float32): _spmm_csr_vector_rows_f32_kernel,
-        ("vector", torch.float64): _spmm_csr_vector_rows_f64_kernel,
+    launch = _resolve_spmm_opt_2d_launch(bucket, int(B.shape[1]), dtype, device_props)
+    acc_dtype = tl.float64 if dtype == torch.float64 else tl.float32
+    out_dtype = tl.float64 if dtype == torch.float64 else tl.float32
+    common_kwargs = {
+        "num_warps": launch["num_warps"],
+        "num_stages": launch["num_stages"],
     }
-    launch = _resolve_spmm_opt_launch(
-        bucket["kind"],
-        block_n,
-        bucket["block_nnz"],
-        bucket.get("batch_rows", 1),
-        dtype,
-        device_props,
-    )
-    if bucket["kind"] == "batched":
-        batch_rows = int(bucket["batch_rows"])
-        grid = (triton.cdiv(rows.numel(), batch_rows), triton.cdiv(B.shape[1], block_n))
-        kernel = kernel_map[(bucket["kind"], dtype)]
-        kernel[grid](
+
+    if bucket["kind"] == "batched2d":
+        grid = (
+            triton.cdiv(rows.numel(), launch["batch_rows"]),
+            triton.cdiv(B.shape[1], launch["block_n"]),
+        )
+        _spmm_csr_opt_batched2d_kernel[grid](
             prepared.data,
             prepared.kernel_indices,
             prepared.kernel_indptr,
@@ -1381,17 +1845,40 @@ def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props):
             B.stride(1),
             C_out.stride(0),
             C_out.stride(1),
-            BATCH=batch_rows,
-            BLOCK_N=block_n,
-            BLOCK_NNZ=bucket["block_nnz"],
-            num_warps=launch["num_warps"],
-            num_stages=launch["num_stages"],
+            BATCH=launch["batch_rows"],
+            BLOCK_N=launch["block_n"],
+            BLOCK_K=launch["block_k"],
+            ACC_DTYPE=acc_dtype,
+            OUT_DTYPE=out_dtype,
+            **common_kwargs,
         )
         return
 
-    grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
-    kernel = kernel_map[(bucket["kind"], dtype)]
-    kernel[grid](
+    if bucket["kind"] == "row2d":
+        grid = (rows.numel(), triton.cdiv(B.shape[1], launch["block_n"]))
+        _spmm_csr_opt_row2d_kernel[grid](
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            B,
+            C_out,
+            rows,
+            rows.numel(),
+            B.shape[1],
+            B.stride(0),
+            B.stride(1),
+            C_out.stride(0),
+            C_out.stride(1),
+            BLOCK_N=launch["block_n"],
+            BLOCK_K=launch["block_k"],
+            ACC_DTYPE=acc_dtype,
+            OUT_DTYPE=out_dtype,
+            **common_kwargs,
+        )
+        return
+
+    grid = (rows.numel(), triton.cdiv(B.shape[1], launch["block_n"]))
+    _spmm_csr_opt_segmented2d_kernel[grid](
         prepared.data,
         prepared.kernel_indices,
         prepared.kernel_indptr,
@@ -1404,10 +1891,12 @@ def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props):
         B.stride(1),
         C_out.stride(0),
         C_out.stride(1),
-        BLOCK_N=block_n,
-        BLOCK_NNZ=bucket["block_nnz"],
-        num_warps=launch["num_warps"],
-        num_stages=launch["num_stages"],
+        BLOCK_N=launch["block_n"],
+        BLOCK_K=launch["block_k"],
+        SEGMENTS=launch["segments"],
+        ACC_DTYPE=acc_dtype,
+        OUT_DTYPE=out_dtype,
+        **common_kwargs,
     )
 
 
@@ -1487,13 +1976,10 @@ def _run_spmm_opt_bucket_stable(prepared, bucket, B, C_out, block_n):
         ("vector", torch.float32): _spmm_csr_stable_vector_f32_kernel,
         ("vector", torch.float64): _spmm_csr_stable_vector_f64_kernel,
     }
-    if bucket["kind"] == "batched":
-        # Diagnose-only stable path: run short-row buckets through the
-        # row-per-program fp64-accum vector kernel instead of the merged
-        # batched kernel. This favors numerical stability over throughput.
-        kind = "vector"
-    else:
-        kind = bucket["kind"]
+    # Diagnose-only stable path: run every non-split opt bucket through the
+    # row-per-program fp64-accum vector kernel. Runtime buckets now use
+    # alg2-style 2D kinds, so keep this adapter independent of bucket naming.
+    kind = "vector"
 
     grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
     kernel = kernel_map[(kind, dtype)]
@@ -1511,7 +1997,7 @@ def _run_spmm_opt_bucket_stable(prepared, bucket, B, C_out, block_n):
         C_out.stride(0),
         C_out.stride(1),
         BLOCK_N=block_n,
-        BLOCK_NNZ=bucket["block_nnz"],
+        BLOCK_NNZ=int(bucket.get("block_nnz", bucket.get("block_k", 64))),
     )
 
 
