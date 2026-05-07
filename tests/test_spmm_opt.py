@@ -1,5 +1,6 @@
 """
 SpMM opt A/B test: compare base vs opt side-by-side with PyTorch and cuSPARSE timings.
+Opt(ms) is the runtime symbolic + compute total, not a prepared-only steady-state time.
 
 Usage:
     python tests/test_spmm_opt.py <dir/> --dense-cols 32
@@ -127,14 +128,21 @@ def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
     for _ in range(warmup):
         out = op()
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        out = op()
-    end.record()
-    torch.cuda.synchronize()
-    return out, start.elapsed_time(end) / iters
+    total_ms = 0.0
+    symbolic_ms = 0.0
+    compute_ms = 0.0
+    count = max(1, int(iters))
+    for _ in range(count):
+        out, elapsed_ms, meta = fs.flagsparse_spmm_csr_opt(
+            B=B,
+            prepared=prepared,
+            return_time=True,
+            return_meta=True,
+        )
+        total_ms += float(elapsed_ms)
+        symbolic_ms += float(meta["symbolic_ms"])
+        compute_ms += float(meta["compute_ms"])
+    return out, total_ms / count, symbolic_ms / count, compute_ms / count
 
 
 def _timed_pytorch(data, indices, indptr, B, shape, warmup, iters):
@@ -241,11 +249,11 @@ def _err(v):
 
 HEADER = (
     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8}  "
-    f"{'Base(ms)':>9} {'Opt(ms)':>9} {'PT(ms)':>9} {'CU(ms)':>9}  "
+    f"{'Base(ms)':>9} {'Opt(ms)':>9} {'Sym(ms)':>9} {'Comp(ms)':>9} {'PT(ms)':>9} {'CU(ms)':>9}  "
     f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
     f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
 )
-SEP = "-" * 182
+SEP = "-" * 204
 
 
 def _seeded_dense_matrix(shape, dtype, device, seed):
@@ -267,7 +275,9 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
     ref = _build_reference(data, indices, indptr, B, shape, dtype)
 
     y_base, base_ms = _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters)
-    y_opt, opt_ms = _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters)
+    y_opt, opt_ms, symbolic_ms, compute_ms = _timed_spmm_opt(
+        data, indices, indptr, B, shape, warmup, iters
+    )
 
     pt_ms = None
     try:
@@ -293,6 +303,9 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
         "dense_cols": dense_cols,
         "base_ms": base_ms,
         "opt_ms": opt_ms,
+        "symbolic_ms": symbolic_ms,
+        "compute_ms": compute_ms,
+        "op_total_ms": opt_ms,
         "pt_ms": pt_ms,
         "cu_ms": cu_ms,
         "err_base": err_base,
@@ -310,6 +323,7 @@ def print_row(row):
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {row['nnz']:>10} {row['dense_cols']:>8}  "
         f"{_fmt(row['base_ms']):>9} {_fmt(row['opt_ms']):>9} "
+        f"{_fmt(row['symbolic_ms']):>9} {_fmt(row['compute_ms']):>9} "
         f"{_fmt(row['pt_ms']):>9} {_fmt(row['cu_ms']):>9}  "
         f"{_spd(row['base_ms'], row['opt_ms']):>8} "
         f"{_spd(row['pt_ms'], row['opt_ms']):>8} "
@@ -341,7 +355,7 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None):
             print(f"Value dtype: {dname}  |  Index dtype: {iname}  |  Dense cols: {dense_cols}")
             print(
                 "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
-                "Opt = bucketed CSR SpMM native path. "
+                "Opt = bucketed CSR SpMM native path, including runtime symbolic + compute. "
                 "Speedup = Base/Opt or Ref/Opt."
             )
             print(SEP)
@@ -362,6 +376,9 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None):
                     "seed": row["seed"],
                     "base_ms": row["base_ms"],
                     "opt_ms": row["opt_ms"],
+                    "symbolic_ms": row["symbolic_ms"],
+                    "compute_ms": row["compute_ms"],
+                    "op_total_ms": row["op_total_ms"],
                     "pt_ms": row["pt_ms"],
                     "cu_ms": row["cu_ms"],
                     "opt_vs_base": (row["base_ms"] / row["opt_ms"] if row["opt_ms"] and row["opt_ms"] > 0 else None),
@@ -384,6 +401,9 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None):
         "seed",
         "base_ms",
         "opt_ms",
+        "symbolic_ms",
+        "compute_ms",
+        "op_total_ms",
         "pt_ms",
         "cu_ms",
         "opt_vs_base",
@@ -437,7 +457,7 @@ def main():
         print(f"Seed: {args.seed}")
     print(
         "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
-        "Opt = bucketed CSR SpMM native path. "
+        "Opt = bucketed CSR SpMM native path, including runtime symbolic + compute. "
         "Speedup = Base/Opt or Ref/Opt."
     )
     print(SEP)

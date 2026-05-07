@@ -406,30 +406,107 @@ def _select_spmm_opt_block_n(n_dense_cols):
     return 128
 
 
+def _normalize_spmm_opt_device_props(device):
+    props = torch.cuda.get_device_properties(device)
+    warp_size = int(getattr(props, "warp_size", 32) or 32)
+    max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
+    max_threads_per_mp = int(
+        getattr(props, "max_threads_per_multi_processor", 2048) or 2048
+    )
+    return {
+        "warp_size": max(1, warp_size),
+        "max_threads_per_block": max(32, max_threads_per_block),
+        "max_threads_per_mp": max(32, max_threads_per_mp),
+    }
+
+
+def _clip_spmm_opt_num_warps(desired, device_props):
+    warp_size = int(device_props["warp_size"])
+    max_by_block = max(1, int(device_props["max_threads_per_block"]) // warp_size)
+    max_by_mp = max(1, int(device_props["max_threads_per_mp"]) // warp_size)
+    max_supported = min(16, max_by_block, max_by_mp)
+    supported = [value for value in (1, 2, 4, 8, 16) if value <= max_supported]
+    if not supported:
+        return 1
+    desired = max(1, int(desired))
+    for value in reversed(supported):
+        if value <= desired:
+            return value
+    return supported[0]
+
+
+def _resolve_spmm_opt_launch(kind, block_n, block_nnz, batch_rows, dtype, device_props):
+    warp_size = int(device_props["warp_size"])
+    dense_lane_need = max(1, triton.cdiv(int(block_n), warp_size))
+    block_nnz = int(block_nnz)
+    batch_rows = int(batch_rows)
+
+    if kind == "batched":
+        desired_warps = max(dense_lane_need, 1)
+        if block_nnz >= 64 or int(block_n) >= 64:
+            desired_warps = max(desired_warps, 2)
+        if batch_rows >= 8 and block_n <= 32:
+            desired_warps = min(desired_warps, 2)
+    elif kind == "split_reduce":
+        desired_warps = max(dense_lane_need, 2 if block_n <= 32 else 4)
+    elif kind == "split_part":
+        desired_warps = max(dense_lane_need, 4)
+        if block_n >= 64:
+            desired_warps = max(desired_warps, 8)
+    else:
+        desired_warps = max(dense_lane_need, 2)
+        if block_nnz >= 128 or block_n >= 64:
+            desired_warps = max(desired_warps, 4)
+
+    if dtype == torch.float64:
+        desired_warps = min(desired_warps, 8)
+    num_warps = _clip_spmm_opt_num_warps(desired_warps, device_props)
+
+    if dtype == torch.float64:
+        num_stages = 1 if kind.startswith("split") or block_n >= 64 else 2
+    elif kind == "batched":
+        num_stages = 2
+    elif kind == "vector":
+        num_stages = 2 if block_n <= 64 else 1
+    else:
+        num_stages = 1 if num_warps >= 8 else 2
+    return {"num_warps": int(num_warps), "num_stages": int(num_stages)}
+
+
 def _build_spmm_opt_split_metadata(kernel_indptr, long_rows, part_block_nnz):
     device = kernel_indptr.device
-    row_values = []
-    part_starts = []
-    part_ends = []
-    row_part_ptr = [0]
-    long_rows_cpu = long_rows.to(torch.int64).cpu().tolist()
-    indptr_cpu = kernel_indptr.to(torch.int64).cpu().tolist()
-    for row in long_rows_cpu:
-        start = int(indptr_cpu[row])
-        end = int(indptr_cpu[row + 1])
-        cursor = start
-        while cursor < end:
-            row_values.append(row)
-            part_starts.append(cursor)
-            cursor = min(cursor + int(part_block_nnz), end)
-            part_ends.append(cursor)
-        row_part_ptr.append(len(row_values))
     row_dtype = long_rows.dtype if long_rows.numel() > 0 else torch.int32
+    if long_rows.numel() == 0:
+        return (
+            torch.empty((0,), dtype=row_dtype, device=device),
+            torch.empty((0,), dtype=torch.int64, device=device),
+            torch.empty((0,), dtype=torch.int64, device=device),
+            torch.zeros(1, dtype=torch.int64, device=device),
+        )
+
+    block = int(part_block_nnz)
+    long_rows_i64 = long_rows.to(torch.int64)
+    row_starts = kernel_indptr[long_rows_i64].to(torch.int64)
+    row_ends = kernel_indptr[long_rows_i64 + 1].to(torch.int64)
+    row_lengths = row_ends - row_starts
+    part_counts = torch.div(row_lengths + block - 1, block, rounding_mode="floor")
+    row_part_ptr = torch.empty((long_rows.numel() + 1,), dtype=torch.int64, device=device)
+    row_part_ptr[0] = 0
+    row_part_ptr[1:] = torch.cumsum(part_counts, dim=0)
+
+    long_part_rows = torch.repeat_interleave(long_rows.to(row_dtype), part_counts)
+    repeated_starts = torch.repeat_interleave(row_starts, part_counts)
+    repeated_ends = torch.repeat_interleave(row_ends, part_counts)
+    repeated_part_bases = torch.repeat_interleave(row_part_ptr[:-1], part_counts)
+    part_ids = torch.arange(long_part_rows.numel(), dtype=torch.int64, device=device)
+    in_row_part_offsets = part_ids - repeated_part_bases
+    part_starts = repeated_starts + in_row_part_offsets * block
+    part_ends = torch.minimum(part_starts + block, repeated_ends)
     return (
-        torch.tensor(row_values, dtype=row_dtype, device=device),
-        torch.tensor(part_starts, dtype=torch.int64, device=device),
-        torch.tensor(part_ends, dtype=torch.int64, device=device),
-        torch.tensor(row_part_ptr, dtype=torch.int64, device=device),
+        long_part_rows,
+        part_starts,
+        part_ends,
+        row_part_ptr,
     )
 
 
@@ -479,22 +556,13 @@ def prepare_spmm_csr_opt(data, indices, indptr, shape):
         row_lengths,
         max_row_nnz,
     ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
-    row_buckets, long_rows = _build_spmm_opt_buckets(row_lengths)
-    long_part_rows = torch.empty((0,), dtype=long_rows.dtype, device=data.device)
+    row_index_dtype = torch.int32 if n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+    row_buckets = []
+    long_rows = torch.empty((0,), dtype=row_index_dtype, device=data.device)
+    long_part_rows = torch.empty((0,), dtype=row_index_dtype, device=data.device)
     long_part_starts = torch.empty((0,), dtype=torch.int64, device=data.device)
     long_part_ends = torch.empty((0,), dtype=torch.int64, device=data.device)
     long_row_part_ptr = torch.zeros(1, dtype=torch.int64, device=data.device)
-    if long_rows.numel() > 0:
-        (
-            long_part_rows,
-            long_part_starts,
-            long_part_ends,
-            long_row_part_ptr,
-        ) = _build_spmm_opt_split_metadata(
-            kernel_indptr,
-            long_rows,
-            part_block_nnz=256,
-        )
     return PreparedCsrSpmmOpt(
         data=data,
         kernel_indices=kernel_indices,
@@ -504,6 +572,42 @@ def prepare_spmm_csr_opt(data, indices, indptr, shape):
         n_cols=n_cols,
         row_lengths=row_lengths,
         max_row_nnz=max_row_nnz,
+        row_buckets=row_buckets,
+        long_part_rows=long_part_rows,
+        long_part_starts=long_part_starts,
+        long_part_ends=long_part_ends,
+        long_row_ids=long_rows,
+        long_row_part_ptr=long_row_part_ptr,
+        long_row_fallback_only=False,
+    )
+
+
+def _build_spmm_csr_opt_runtime_symbolic(prepared):
+    row_buckets, long_rows = _build_spmm_opt_buckets(prepared.row_lengths)
+    long_part_rows = torch.empty((0,), dtype=long_rows.dtype, device=prepared.data.device)
+    long_part_starts = torch.empty((0,), dtype=torch.int64, device=prepared.data.device)
+    long_part_ends = torch.empty((0,), dtype=torch.int64, device=prepared.data.device)
+    long_row_part_ptr = torch.zeros(1, dtype=torch.int64, device=prepared.data.device)
+    if long_rows.numel() > 0:
+        (
+            long_part_rows,
+            long_part_starts,
+            long_part_ends,
+            long_row_part_ptr,
+        ) = _build_spmm_opt_split_metadata(
+            prepared.kernel_indptr,
+            long_rows,
+            part_block_nnz=256,
+        )
+    return PreparedCsrSpmmOpt(
+        data=prepared.data,
+        kernel_indices=prepared.kernel_indices,
+        kernel_indptr=prepared.kernel_indptr,
+        shape=prepared.shape,
+        n_rows=prepared.n_rows,
+        n_cols=prepared.n_cols,
+        row_lengths=prepared.row_lengths,
+        max_row_nnz=prepared.max_row_nnz,
         row_buckets=row_buckets,
         long_part_rows=long_part_rows,
         long_part_starts=long_part_starts,
@@ -1241,7 +1345,7 @@ def _spmm_csr_stable_split_reduce_f64_kernel(
     tl.store(out_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
 
 
-def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n):
+def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props):
     rows = bucket["rows"]
     if rows.numel() == 0:
         return
@@ -1252,6 +1356,14 @@ def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n):
         ("vector", torch.float32): _spmm_csr_vector_rows_f32_kernel,
         ("vector", torch.float64): _spmm_csr_vector_rows_f64_kernel,
     }
+    launch = _resolve_spmm_opt_launch(
+        bucket["kind"],
+        block_n,
+        bucket["block_nnz"],
+        bucket.get("batch_rows", 1),
+        dtype,
+        device_props,
+    )
     if bucket["kind"] == "batched":
         batch_rows = int(bucket["batch_rows"])
         grid = (triton.cdiv(rows.numel(), batch_rows), triton.cdiv(B.shape[1], block_n))
@@ -1272,6 +1384,8 @@ def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n):
             BATCH=batch_rows,
             BLOCK_N=block_n,
             BLOCK_NNZ=bucket["block_nnz"],
+            num_warps=launch["num_warps"],
+            num_stages=launch["num_stages"],
         )
         return
 
@@ -1292,10 +1406,12 @@ def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n):
         C_out.stride(1),
         BLOCK_N=block_n,
         BLOCK_NNZ=bucket["block_nnz"],
+        num_warps=launch["num_warps"],
+        num_stages=launch["num_stages"],
     )
 
 
-def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n):
+def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
     if prepared.long_part_rows.numel() == 0:
         return False
     workspace = torch.empty(
@@ -1312,6 +1428,12 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n):
         _spmm_csr_split_reduce_f64_kernel
         if B.dtype == torch.float64
         else _spmm_csr_split_reduce_f32_kernel
+    )
+    split_launch = _resolve_spmm_opt_launch(
+        "split_part", block_n, 256, 1, B.dtype, device_props
+    )
+    reduce_launch = _resolve_spmm_opt_launch(
+        "split_reduce", block_n, 1, 1, B.dtype, device_props
     )
     split_grid = (
         prepared.long_part_rows.numel(),
@@ -1331,6 +1453,8 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n):
         workspace.stride(0),
         workspace.stride(1),
         BLOCK_N=block_n,
+        num_warps=split_launch["num_warps"],
+        num_stages=split_launch["num_stages"],
     )
     reduce_grid = (
         prepared.long_row_ids.numel(),
@@ -1348,6 +1472,8 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n):
         C_out.stride(0),
         C_out.stride(1),
         BLOCK_N=block_n,
+        num_warps=reduce_launch["num_warps"],
+        num_stages=reduce_launch["num_stages"],
     )
     return False
 
@@ -2040,11 +2166,14 @@ def _triton_spmm_csr_impl_opt_prepared(prepared, B):
     block_n = _select_spmm_opt_block_n(int(B.shape[1]))
     C_out = torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
     long_row_fallback_used = False
+    device_props = _normalize_spmm_opt_device_props(prepared.data.device)
     for bucket in prepared.row_buckets:
         if bucket["kind"] == "split":
-            long_row_fallback_used = _run_spmm_opt_split_bucket(prepared, B, C_out, block_n)
+            long_row_fallback_used = _run_spmm_opt_split_bucket(
+                prepared, B, C_out, block_n, device_props
+            )
             continue
-        _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n)
+        _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props)
     return C_out, long_row_fallback_used
 
 
@@ -2160,6 +2289,7 @@ def flagsparse_spmm_csr_opt(
     prepared=None,
     out=None,
     return_time=False,
+    return_meta=False,
 ):
     """CSR SpMM-opt: native float32/float64 bucketed path for CSR @ dense."""
     if prepared is not None and not isinstance(prepared, PreparedCsrSpmmOpt):
@@ -2191,20 +2321,41 @@ def flagsparse_spmm_csr_opt(
             raise ValueError("out must be on the same CUDA device as sparse matrix data")
         if out.shape != (prepared.n_rows, int(B.shape[1])) or out.dtype != prepared.data.dtype:
             raise ValueError("out shape/dtype must match result")
-    t0 = None
-    if return_time:
+    do_timing = bool(return_time or return_meta)
+    symbolic_ms = None
+    compute_ms = None
+    op_total_ms = None
+    if do_timing:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    C, _long_row_fallback_used = _triton_spmm_csr_impl_opt_prepared(prepared, B)
-    elapsed_ms = None
-    if return_time:
+    runtime_prepared = _build_spmm_csr_opt_runtime_symbolic(prepared)
+    if do_timing:
         torch.cuda.synchronize()
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        t1 = time.perf_counter()
+        symbolic_ms = (t1 - t0) * 1000.0
+    C, _long_row_fallback_used = _triton_spmm_csr_impl_opt_prepared(runtime_prepared, B)
+    if do_timing:
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        compute_ms = (t2 - t1) * 1000.0
+        op_total_ms = symbolic_ms + compute_ms
     if out is not None:
         out.copy_(C)
         C = out
+    if return_meta:
+        meta = {
+            "symbolic_ms": symbolic_ms,
+            "compute_ms": compute_ms,
+            "op_total_ms": op_total_ms,
+            "long_part_count": int(runtime_prepared.long_part_rows.numel()),
+            "long_row_count": int(runtime_prepared.long_row_ids.numel()),
+            "bucket_count": int(len(runtime_prepared.row_buckets)),
+        }
+        if return_time:
+            return C, op_total_ms, meta
+        return C, meta
     if return_time:
-        return C, elapsed_ms
+        return C, op_total_ms
     return C
 
 
