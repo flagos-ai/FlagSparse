@@ -386,111 +386,18 @@ class PreparedCsrSpmmOpt:
 
 _SPMM_OPT_LONG_ROW_THRESHOLD = 2048
 _SPMM_OPT_SPLIT_BLOCK_NNZ = 256
-_SPMM_OPT_ALG2_MID_AVG_NNZ_LIMIT = 16.0
 
-_SPMM_OPT_BUCKET_SPECS_F32 = (
-    {
-        "label": "short_16",
-        "kind": "batched2d",
-        "min_row_nnz": 0,
-        "max_row_nnz": 16,
-        "batch_rows": 8,
-        "block_k": 16,
-        "block_n_cap": 32,
-    },
-    {
-        "label": "short_64",
-        "kind": "batched2d",
-        "min_row_nnz": 17,
-        "max_row_nnz": 64,
-        "batch_rows": 4,
-        "block_k": 32,
-        "block_n_cap": 64,
-    },
-    {
-        "label": "row_256",
-        "kind": "row2d",
-        "min_row_nnz": 65,
-        "max_row_nnz": 256,
-        "batch_rows": 1,
-        "block_k": 64,
-        "block_n_cap": 64,
-    },
-    {
-        "label": "seg_1024",
-        "kind": "row2d_segmented",
-        "min_row_nnz": 257,
-        "max_row_nnz": 1024,
-        "batch_rows": 1,
-        "block_k": 64,
-        "block_n_cap": 128,
-        "segments": 4,
-    },
-    {
-        "label": "seg_2048",
-        "kind": "row2d_segmented",
-        "min_row_nnz": 1025,
-        "max_row_nnz": _SPMM_OPT_LONG_ROW_THRESHOLD,
-        "batch_rows": 1,
-        "block_k": 128,
-        "block_n_cap": 128,
-        "segments": 8,
-    },
-)
-
-_SPMM_OPT_BUCKET_SPECS_F64 = (
-    {
-        "label": "short_16",
-        "kind": "batched2d",
-        "min_row_nnz": 0,
-        "max_row_nnz": 16,
-        "batch_rows": 4,
-        "block_k": 16,
-        "block_n_cap": 16,
-    },
-    {
-        "label": "short_64",
-        "kind": "batched2d",
-        "min_row_nnz": 17,
-        "max_row_nnz": 64,
-        "batch_rows": 2,
-        "block_k": 32,
-        "block_n_cap": 32,
-    },
-    {
-        "label": "row_256",
-        "kind": "row2d",
-        "min_row_nnz": 65,
-        "max_row_nnz": 256,
-        "batch_rows": 1,
-        "block_k": 32,
-        "block_n_cap": 32,
-    },
-    {
-        "label": "seg_1024",
-        "kind": "row2d_segmented",
-        "min_row_nnz": 257,
-        "max_row_nnz": 1024,
-        "batch_rows": 1,
-        "block_k": 32,
-        "block_n_cap": 64,
-        "segments": 4,
-    },
-    {
-        "label": "seg_2048",
-        "kind": "row2d_segmented",
-        "min_row_nnz": 1025,
-        "max_row_nnz": _SPMM_OPT_LONG_ROW_THRESHOLD,
-        "batch_rows": 1,
-        "block_k": 64,
-        "block_n_cap": 64,
-        "segments": 8,
-    },
+_SPMM_OPT_BUCKET_SPECS = (
+    {"max_row_nnz": 32, "kind": "batched", "batch_rows": 8, "block_nnz": 32},
+    {"max_row_nnz": 128, "kind": "batched", "batch_rows": 4, "block_nnz": 64},
+    {"max_row_nnz": 512, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
+    {"max_row_nnz": _SPMM_OPT_LONG_ROW_THRESHOLD, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
+    {"max_row_nnz": None, "kind": "split", "batch_rows": 1, "block_nnz": _SPMM_OPT_SPLIT_BLOCK_NNZ},
 )
 
 
 def _spmm_opt_bucket_specs(dtype):
-    return _SPMM_OPT_BUCKET_SPECS_F64 if dtype == torch.float64 else _SPMM_OPT_BUCKET_SPECS_F32
+    return _SPMM_OPT_BUCKET_SPECS
 
 
 def _spmm_opt_make_bucket(
@@ -717,105 +624,48 @@ def _build_spmm_opt_buckets(row_lengths, dtype, nnz=None):
     row_index_dtype = torch.int32 if row_count <= _INDEX_LIMIT_INT32 else torch.int64
     all_rows = torch.arange(row_count, device=device, dtype=row_index_dtype)
     buckets = []
-
-    normal_mask = row_lengths <= _SPMM_OPT_LONG_ROW_THRESHOLD
-    if dtype == torch.float32:
-        short_rows = all_rows[row_lengths <= 64]
-        if short_rows.numel() > 0:
-            buckets.append(
-                _spmm_opt_make_bucket(
-                    "short_64_alg2",
-                    "batched2d",
-                    short_rows,
-                    "alg2_2d",
-                    0,
-                    64,
-                    batch_rows=4,
-                    block_k=32,
-                    block_n_cap=64,
-                )
-            )
-        avg_nnz = (float(nnz) / float(row_count)) if row_count > 0 and nnz is not None else 0.0
-        use_mid_alg2 = avg_nnz <= _SPMM_OPT_ALG2_MID_AVG_NNZ_LIMIT
-        if use_mid_alg2:
-            mid_rows = all_rows[(row_lengths >= 65) & (row_lengths <= 256)]
-            if mid_rows.numel() > 0:
-                buckets.append(
-                    _spmm_opt_make_bucket(
-                        "row_256_alg2",
-                        "row2d",
-                        mid_rows,
-                        "alg2_2d",
-                        65,
-                        256,
-                        block_k=64,
-                        block_n_cap=64,
-                    )
-                )
-            legacy_mask = (row_lengths >= 257) & normal_mask
-            legacy_min = 257
+    long_rows = torch.empty((0,), dtype=row_index_dtype, device=device)
+    lower = 0
+    for spec in _SPMM_OPT_BUCKET_SPECS:
+        upper = spec["max_row_nnz"]
+        if upper is None:
+            mask = row_lengths > lower
+            max_row_nnz = _SPMM_OPT_LONG_ROW_THRESHOLD + 1
+            label = "split_long"
+            execution = "split"
+        elif lower == 0:
+            mask = row_lengths <= upper
+            max_row_nnz = upper
+            label = f"{spec['kind']}_{upper}"
+            execution = "legacy"
         else:
-            legacy_mask = (row_lengths >= 65) & normal_mask
-            legacy_min = 65
-        legacy_rows = all_rows[legacy_mask]
-        if legacy_rows.numel() > 0:
-            buckets.append(
-                _spmm_opt_make_bucket(
-                    "legacy_regular",
-                    "vector",
-                    legacy_rows,
-                    "legacy",
-                    legacy_min,
-                    _SPMM_OPT_LONG_ROW_THRESHOLD,
-                    block_nnz=64,
-                    block_n_cap=128,
-                )
-            )
-    else:
-        short_rows = all_rows[row_lengths <= 64]
-        if short_rows.numel() > 0:
-            buckets.append(
-                _spmm_opt_make_bucket(
-                    "legacy_short_64",
-                    "batched",
-                    short_rows,
-                    "legacy",
-                    0,
-                    64,
-                    batch_rows=4,
-                    block_nnz=64,
-                    block_n_cap=64,
-                )
-            )
-        regular_rows = all_rows[(row_lengths >= 65) & normal_mask]
-        if regular_rows.numel() > 0:
-            buckets.append(
-                _spmm_opt_make_bucket(
-                    "legacy_regular",
-                    "vector",
-                    regular_rows,
-                    "legacy",
-                    65,
-                    _SPMM_OPT_LONG_ROW_THRESHOLD,
-                    block_nnz=64,
-                    block_n_cap=128,
-                )
-            )
-    long_rows = all_rows[row_lengths > _SPMM_OPT_LONG_ROW_THRESHOLD]
-    if long_rows.numel() > 0:
+            mask = (row_lengths > lower) & (row_lengths <= upper)
+            max_row_nnz = upper
+            label = f"{spec['kind']}_{upper}"
+            execution = "legacy"
+        rows = all_rows[mask]
+        if rows.numel() == 0:
+            if upper is not None:
+                lower = upper
+            continue
         buckets.append(
             _spmm_opt_make_bucket(
-                "split_long",
-                "split",
-                long_rows,
-                "split",
-                _SPMM_OPT_LONG_ROW_THRESHOLD + 1,
-                _SPMM_OPT_LONG_ROW_THRESHOLD + 1,
-                block_k=_SPMM_OPT_SPLIT_BLOCK_NNZ,
-                block_nnz=_SPMM_OPT_SPLIT_BLOCK_NNZ,
+                label,
+                spec["kind"],
+                rows,
+                execution,
+                lower + 1 if lower > 0 else 0,
+                max_row_nnz,
+                batch_rows=spec["batch_rows"],
+                block_k=spec["block_nnz"],
+                block_nnz=spec["block_nnz"],
                 block_n_cap=128,
             )
         )
+        if spec["kind"] == "split":
+            long_rows = rows
+        if upper is not None:
+            lower = upper
     return buckets, long_rows
 
 
@@ -1912,22 +1762,21 @@ def _spmm_csr_stable_split_reduce_f64_kernel(
     tl.store(out_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
 
 
-def _run_spmm_opt_legacy_bucket(prepared, bucket, B, C_out, block_n, device_props):
+def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props):
     rows = bucket["rows"]
     if rows.numel() == 0:
         return
     dtype = prepared.data.dtype
-    kind = bucket["kind"]
-    block_nnz = int(bucket.get("block_nnz", bucket.get("block_k", 64)))
-    batch_rows = int(bucket.get("batch_rows", 1))
-    launch = _resolve_spmm_opt_launch(kind, block_n, block_nnz, batch_rows, dtype, device_props)
-    if kind == "batched":
-        kernel = (
-            _spmm_csr_stable_batched_f64_kernel
-            if dtype == torch.float64
-            else _spmm_csr_stable_batched_f32_kernel
-        )
+    kernel_map = {
+        ("batched", torch.float32): _spmm_csr_batched_rows_f32_kernel,
+        ("batched", torch.float64): _spmm_csr_batched_rows_f64_kernel,
+        ("vector", torch.float32): _spmm_csr_vector_rows_f32_kernel,
+        ("vector", torch.float64): _spmm_csr_vector_rows_f64_kernel,
+    }
+    if bucket["kind"] == "batched":
+        batch_rows = int(bucket["batch_rows"])
         grid = (triton.cdiv(rows.numel(), batch_rows), triton.cdiv(B.shape[1], block_n))
+        kernel = kernel_map[(bucket["kind"], dtype)]
         kernel[grid](
             prepared.data,
             prepared.kernel_indices,
@@ -1943,18 +1792,12 @@ def _run_spmm_opt_legacy_bucket(prepared, bucket, B, C_out, block_n, device_prop
             C_out.stride(1),
             BATCH=batch_rows,
             BLOCK_N=block_n,
-            BLOCK_NNZ=block_nnz,
-            num_warps=launch["num_warps"],
-            num_stages=launch["num_stages"],
+            BLOCK_NNZ=bucket["block_nnz"],
         )
         return
 
-    kernel = (
-        _spmm_csr_stable_vector_f64_kernel
-        if dtype == torch.float64
-        else _spmm_csr_stable_vector_f32_kernel
-    )
     grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
+    kernel = kernel_map[(bucket["kind"], dtype)]
     kernel[grid](
         prepared.data,
         prepared.kernel_indices,
@@ -1969,98 +1812,7 @@ def _run_spmm_opt_legacy_bucket(prepared, bucket, B, C_out, block_n, device_prop
         C_out.stride(0),
         C_out.stride(1),
         BLOCK_N=block_n,
-        BLOCK_NNZ=block_nnz,
-        num_warps=launch["num_warps"],
-        num_stages=launch["num_stages"],
-    )
-
-
-def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props):
-    rows = bucket["rows"]
-    if rows.numel() == 0:
-        return
-    if bucket.get("execution") != "alg2_2d":
-        _run_spmm_opt_legacy_bucket(prepared, bucket, B, C_out, block_n, device_props)
-        return
-    dtype = prepared.data.dtype
-    launch = _resolve_spmm_opt_2d_launch(bucket, int(B.shape[1]), dtype, device_props)
-    acc_dtype = tl.float64 if dtype == torch.float64 else tl.float32
-    out_dtype = tl.float64 if dtype == torch.float64 else tl.float32
-    common_kwargs = {
-        "num_warps": launch["num_warps"],
-        "num_stages": launch["num_stages"],
-    }
-
-    if bucket["kind"] == "batched2d":
-        grid = (
-            triton.cdiv(rows.numel(), launch["batch_rows"]),
-            triton.cdiv(B.shape[1], launch["block_n"]),
-        )
-        _spmm_csr_opt_batched2d_kernel[grid](
-            prepared.data,
-            prepared.kernel_indices,
-            prepared.kernel_indptr,
-            B,
-            C_out,
-            rows,
-            rows.numel(),
-            B.shape[1],
-            B.stride(0),
-            B.stride(1),
-            C_out.stride(0),
-            C_out.stride(1),
-            BATCH=launch["batch_rows"],
-            BLOCK_N=launch["block_n"],
-            BLOCK_K=launch["block_k"],
-            ACC_DTYPE=acc_dtype,
-            OUT_DTYPE=out_dtype,
-            **common_kwargs,
-        )
-        return
-
-    if bucket["kind"] == "row2d":
-        grid = (rows.numel(), triton.cdiv(B.shape[1], launch["block_n"]))
-        _spmm_csr_opt_row2d_kernel[grid](
-            prepared.data,
-            prepared.kernel_indices,
-            prepared.kernel_indptr,
-            B,
-            C_out,
-            rows,
-            rows.numel(),
-            B.shape[1],
-            B.stride(0),
-            B.stride(1),
-            C_out.stride(0),
-            C_out.stride(1),
-            BLOCK_N=launch["block_n"],
-            BLOCK_K=launch["block_k"],
-            ACC_DTYPE=acc_dtype,
-            OUT_DTYPE=out_dtype,
-            **common_kwargs,
-        )
-        return
-
-    grid = (rows.numel(), triton.cdiv(B.shape[1], launch["block_n"]))
-    _spmm_csr_opt_segmented2d_kernel[grid](
-        prepared.data,
-        prepared.kernel_indices,
-        prepared.kernel_indptr,
-        B,
-        C_out,
-        rows,
-        rows.numel(),
-        B.shape[1],
-        B.stride(0),
-        B.stride(1),
-        C_out.stride(0),
-        C_out.stride(1),
-        BLOCK_N=launch["block_n"],
-        BLOCK_K=launch["block_k"],
-        SEGMENTS=launch["segments"],
-        ACC_DTYPE=acc_dtype,
-        OUT_DTYPE=out_dtype,
-        **common_kwargs,
+        BLOCK_NNZ=bucket["block_nnz"],
     )
 
 
@@ -2082,12 +1834,6 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
         if B.dtype == torch.float64
         else _spmm_csr_split_reduce_f32_kernel
     )
-    split_launch = _resolve_spmm_opt_launch(
-        "split_part", block_n, 256, 1, B.dtype, device_props
-    )
-    reduce_launch = _resolve_spmm_opt_launch(
-        "split_reduce", block_n, 1, 1, B.dtype, device_props
-    )
     split_grid = (
         prepared.long_part_rows.numel(),
         triton.cdiv(B.shape[1], block_n),
@@ -2106,8 +1852,6 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
         workspace.stride(0),
         workspace.stride(1),
         BLOCK_N=block_n,
-        num_warps=split_launch["num_warps"],
-        num_stages=split_launch["num_stages"],
     )
     reduce_grid = (
         prepared.long_row_ids.numel(),
@@ -2125,8 +1869,6 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
         C_out.stride(0),
         C_out.stride(1),
         BLOCK_N=block_n,
-        num_warps=reduce_launch["num_warps"],
-        num_stages=reduce_launch["num_stages"],
     )
     return False
 
