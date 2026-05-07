@@ -459,17 +459,24 @@ def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs):
     if n_rows <= 0:
         return 1
     rhs_bucket = _cw_rhs_bucket(n_rhs)
-    target = max(256, min(n_rows, 4096))
+    if rhs_bucket == 1:
+        target = min(n_rows, 64)
+    else:
+        target = max(64, min(n_rows, 1024))
     if max_frontier > 0:
-        target = min(target, max(128, min(n_rows, max_frontier * 8)))
-    if avg_nnz_per_row > 2048:
-        target = max(128, target // 2)
+        target = min(target, max(8, min(n_rows, max_frontier * 4)))
+    if avg_nnz_per_row > 4096:
+        target = max(8, target // 4)
+    elif avg_nnz_per_row > 2048:
+        target = max(8, target // 2)
+    elif avg_nnz_per_row > 1024:
+        target = max(16, (target * 3) // 4)
     if rhs_bucket >= 16:
-        target = max(64, target // 4)
+        target = max(8, target // 4)
     elif rhs_bucket >= 8:
-        target = max(64, target // 2)
+        target = max(8, target // 2)
     elif rhs_bucket >= 4:
-        target = max(128, (target * 3) // 4)
+        target = max(8, (target * 3) // 4)
     return _snap_cw_worker_count(target, n_rows)
 
 
@@ -670,6 +677,9 @@ def _select_transpose_route(matrix_stats, n_rhs, complex_mode, trans_mode):
 
 def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, trans_mode, unit_diagonal):
     if trans_mode == "N":
+        data, indices64, indptr64 = _sort_csr_rows(
+            data, indices64, indptr64, n_rows, n_cols, lower=lower
+        )
         matrix_stats = _build_spsv_cw_matrix_stats(indptr64, n_rows)
         default_block_nnz, default_max_segments = _auto_spsv_launch_config(indptr64)
         cw_diag, cw_dep_start, cw_dep_end = _prepare_spsv_nontrans_cw_metadata(
@@ -705,6 +715,9 @@ def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, t
         n_rows,
         n_cols,
         conjugate=(trans_mode == "C"),
+    )
+    data_eff, indices_eff64, indptr_eff64 = _sort_csr_rows(
+        data_eff, indices_eff64, indptr_eff64, n_rows, n_cols, lower=lower_eff
     )
     matrix_stats = _build_spsv_cw_matrix_stats(indptr_eff64, n_rows)
     cw_diag, cw_dep_start, cw_dep_end = _prepare_spsv_nontrans_cw_metadata(
@@ -875,17 +888,18 @@ def _spsv_csr_level_kernel_complex(
     row = tl.load(rows_ptr + pid)
     start = tl.load(indptr_ptr + row)
     end = tl.load(indptr_ptr + row + 1)
+    lane2 = tl.arange(0, 2)
 
     if USE_FP64_ACC:
-        acc_re = tl.zeros((1,), dtype=tl.float64)
-        acc_im = tl.zeros((1,), dtype=tl.float64)
-        diag_re = tl.zeros((1,), dtype=tl.float64)
-        diag_im = tl.zeros((1,), dtype=tl.float64)
+        acc_re = tl.zeros((), dtype=tl.float64)
+        acc_im = tl.zeros((), dtype=tl.float64)
+        diag_re = tl.zeros((), dtype=tl.float64)
+        diag_im = tl.zeros((), dtype=tl.float64)
     else:
-        acc_re = tl.zeros((1,), dtype=tl.float32)
-        acc_im = tl.zeros((1,), dtype=tl.float32)
-        diag_re = tl.zeros((1,), dtype=tl.float32)
-        diag_im = tl.zeros((1,), dtype=tl.float32)
+        acc_re = tl.zeros((), dtype=tl.float32)
+        acc_im = tl.zeros((), dtype=tl.float32)
+        diag_re = tl.zeros((), dtype=tl.float32)
+        diag_im = tl.zeros((), dtype=tl.float32)
 
     if UNIT_DIAG:
         diag_re = diag_re + 1.0
@@ -946,9 +960,8 @@ def _spsv_csr_level_kernel_complex(
     x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
     x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
 
-    offs1 = tl.arange(0, 1)
-    tl.store(x_ri_ptr + row * 2 + offs1, x_re_out)
-    tl.store(x_ri_ptr + row * 2 + 1 + offs1, x_im_out)
+    out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
+    tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
 
 
 @triton.jit
@@ -1071,6 +1084,7 @@ def _spsv_csr_cw_kernel_complex(
     DIAG_EPS: tl.constexpr,
 ):
     logical_row = tl.atomic_add(row_counter_ptr, 1)
+    lane2 = tl.arange(0, 2)
     while logical_row < n_rows:
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         start = tl.load(dep_start_ptr + row)
@@ -1084,13 +1098,13 @@ def _spsv_csr_cw_kernel_complex(
         if USE_FP64_ACC:
             diag_re = diag_re.to(tl.float64)
             diag_im = diag_im.to(tl.float64)
-            acc_re = tl.zeros((1,), dtype=tl.float64)
-            acc_im = tl.zeros((1,), dtype=tl.float64)
+            acc_re = tl.zeros((), dtype=tl.float64)
+            acc_im = tl.zeros((), dtype=tl.float64)
         else:
             diag_re = diag_re.to(tl.float32)
             diag_im = diag_im.to(tl.float32)
-            acc_re = tl.zeros((1,), dtype=tl.float32)
-            acc_im = tl.zeros((1,), dtype=tl.float32)
+            acc_re = tl.zeros((), dtype=tl.float32)
+            acc_im = tl.zeros((), dtype=tl.float32)
 
         for seg in range(MAX_SEGMENTS):
             idx = start + seg * BLOCK_NNZ
@@ -1146,8 +1160,8 @@ def _spsv_csr_cw_kernel_complex(
         x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
         x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
 
-        tl.store(x_ri_ptr + row * 2, x_re_out)
-        tl.store(x_ri_ptr + row * 2 + 1, x_im_out)
+        out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
+        tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
         tl.atomic_add(ready_ptr + row, 1)
         logical_row = tl.atomic_add(row_counter_ptr, 1)
 
@@ -1230,13 +1244,14 @@ def _spsv_csr_transpose_push_kernel_complex(
     row = tl.load(rows_ptr + pid)
     start = tl.load(indptr_ptr + row)
     end = tl.load(indptr_ptr + row + 1)
+    lane2 = tl.arange(0, 2)
 
     if USE_FP64_ACC:
-        diag_re = tl.zeros((1,), dtype=tl.float64)
-        diag_im = tl.zeros((1,), dtype=tl.float64)
+        diag_re = tl.zeros((), dtype=tl.float64)
+        diag_im = tl.zeros((), dtype=tl.float64)
     else:
-        diag_re = tl.zeros((1,), dtype=tl.float32)
-        diag_im = tl.zeros((1,), dtype=tl.float32)
+        diag_re = tl.zeros((), dtype=tl.float32)
+        diag_im = tl.zeros((), dtype=tl.float32)
 
     if UNIT_DIAG:
         diag_re = diag_re + 1.0
@@ -1277,9 +1292,8 @@ def _spsv_csr_transpose_push_kernel_complex(
     x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
     x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
 
-    offs1 = tl.arange(0, 1)
-    tl.store(x_ri_ptr + row * 2 + offs1, x_re_out)
-    tl.store(x_ri_ptr + row * 2 + 1 + offs1, x_im_out)
+    out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
+    tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
 
     for seg in range(MAX_SEGMENTS):
         idx = start + seg * BLOCK_NNZ
@@ -1383,6 +1397,7 @@ def _spsv_csr_transpose_cw_kernel_complex(
     DIAG_EPS: tl.constexpr,
 ):
     logical_row = tl.atomic_add(row_counter_ptr, 1)
+    lane2 = tl.arange(0, 2)
     while logical_row < n_rows:
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         ready_value = 0 if UNIT_DIAG else 1
@@ -1420,9 +1435,8 @@ def _spsv_csr_transpose_cw_kernel_complex(
         x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
         x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
 
-        offs1 = tl.arange(0, 1)
-        tl.store(x_ri_ptr + row * 2 + offs1, x_re_out)
-        tl.store(x_ri_ptr + row * 2 + 1 + offs1, x_im_out)
+        out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
+        tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
 
         start = tl.load(dep_start_ptr + row)
         end = tl.load(dep_end_ptr + row)
@@ -1621,7 +1635,7 @@ def _triton_spsv_csr_vector_complex(
     data_ri = data_ri_in if data_ri_in is not None else _complex_interleaved_view(data)
     b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
     component_dtype = _component_dtype_for_complex(data.dtype)
-    use_fp64 = component_dtype == torch.float64
+    use_fp64 = True
     if component_dtype == torch.float16:
         x_ri_work = torch.zeros((n_rows, 2), dtype=torch.float32, device=b_vec.device)
         x_ri = x_ri_work.reshape(-1).contiguous()
@@ -1682,6 +1696,10 @@ def _triton_spsv_csr_cw_vector(
         block_nnz_use, max_segments_use = _auto_spsv_launch_config(
             indptr, block_nnz=block_nnz, max_segments=max_segments
         )
+    max_nnz_per_row = int((indptr[1:] - indptr[:-1]).max().item()) if indptr.numel() > 1 else 0
+    if data.dtype == torch.float64:
+        block_nnz_use = min(int(block_nnz_use), 256)
+        max_segments_use = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
     matrix_stats = matrix_stats or {}
     block_rhs = _choose_spsv_block_rhs(n_rhs, matrix_stats, complex_mode=False)
     if worker_count is None:
@@ -1744,12 +1762,19 @@ def _triton_spsv_csr_cw_vector_complex(
         block_nnz_use, max_segments_use = _auto_spsv_launch_config(
             indptr, block_nnz=block_nnz, max_segments=max_segments
         )
+    max_nnz_per_row = int((indptr[1:] - indptr[:-1]).max().item()) if indptr.numel() > 1 else 0
 
     data_ri = data_ri_in if data_ri_in is not None else _complex_interleaved_view(data)
     diag_ri = diag_ri_in if diag_ri_in is not None else _complex_interleaved_view(diag)
     b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
+    if data.dtype == torch.complex128:
+        block_nnz_use = min(int(block_nnz_use), 128)
+        max_segments_use = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
+    elif data.dtype == torch.complex64:
+        block_nnz_use = min(int(block_nnz_use), 256)
+        max_segments_use = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
     x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
 
     if worker_count is None:

@@ -30,8 +30,8 @@ except Exception:
 VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
 INDEX_DTYPES = [torch.int32, torch.int64]
 TEST_SIZES = [256, 512, 1024, 2048]
-WARMUP = 5
-ITERS = 20
+WARMUP = 1
+ITERS = 1
 
 SPSV_TRIANGULAR_DIAG_DOMINANCE = 4.0
 # CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
@@ -117,6 +117,11 @@ def _sum_ms(*values):
     if any(v is None for v in values):
         return None
     return sum(values)
+
+
+def _spsv_benchmark_schedule(nnz, op_mode, value_dtype, fmt="CSR"):
+    del nnz, op_mode, value_dtype, fmt
+    return int(WARMUP), int(ITERS)
 
 
 def _status_str(ok_flag, has_value):
@@ -527,19 +532,19 @@ def _solution_residual_metrics(data, indices, indptr, shape, x, b, value_dtype, 
     return err_res, ok_res
 
 
-def _benchmark_flagsparse(call):
+def _benchmark_flagsparse(call, *, warmup=WARMUP, iters=ITERS):
     x = None
-    for _ in range(WARMUP):
+    for _ in range(warmup):
         x = call()
     torch.cuda.synchronize()
     e0 = torch.cuda.Event(True)
     e1 = torch.cuda.Event(True)
     e0.record()
-    for _ in range(ITERS):
+    for _ in range(iters):
         x = call()
     e1.record()
     torch.cuda.synchronize()
-    return x, e0.elapsed_time(e1) / ITERS
+    return x, e0.elapsed_time(e1) / iters
 
 
 def _benchmark_flagsparse_spsv_csr(
@@ -551,6 +556,8 @@ def _benchmark_flagsparse_spsv_csr(
     *,
     lower=True,
     transpose=False,
+    warmup=WARMUP,
+    iters=ITERS,
 ):
     return _benchmark_flagsparse(
         lambda: fs.flagsparse_spsv_csr(
@@ -561,7 +568,9 @@ def _benchmark_flagsparse_spsv_csr(
             shape,
             lower=lower,
             transpose=transpose,
-        )
+        ),
+        warmup=warmup,
+        iters=iters,
     )
 
 
@@ -575,6 +584,13 @@ def _benchmark_flagsparse_spsv_csr_split(
     lower=True,
     transpose=False,
 ):
+    op_mode = fs_spsv_impl._normalize_spsv_transpose_mode(transpose)
+    warmup, iters = _spsv_benchmark_schedule(
+        int(data.numel()),
+        "NON" if op_mode == "N" else ("TRANS" if op_mode == "T" else "CONJ"),
+        data.dtype,
+        fmt="CSR",
+    )
     analysis_ms = fs_spsv_impl._analyze_spsv_csr(
         data,
         indices,
@@ -594,6 +610,8 @@ def _benchmark_flagsparse_spsv_csr_split(
         shape,
         lower=lower,
         transpose=transpose,
+        warmup=warmup,
+        iters=iters,
     )
     return x, analysis_ms, solve_ms
 
@@ -622,6 +640,12 @@ def _benchmark_flagsparse_spsv_coo_split(
     data_csr, indices_csr, indptr_csr = fs_spsv_impl._coo2csr_for_spsv(
         data_sorted, row_sorted, col_sorted, n_rows, n_cols, assume_ordered=True
     )
+    warmup, iters = _spsv_benchmark_schedule(
+        int(data_csr.numel()),
+        "NON" if trans_mode == "N" else ("TRANS" if trans_mode == "T" else "CONJ"),
+        data.dtype,
+        fmt="COO",
+    )
     analysis_ms = fs_spsv_impl._analyze_spsv_csr(
         data_csr,
         indices_csr,
@@ -641,6 +665,8 @@ def _benchmark_flagsparse_spsv_coo_split(
         (n_rows, n_cols),
         lower=lower,
         transpose=transpose,
+        warmup=warmup,
+        iters=iters,
     )
     return x, analysis_ms, solve_ms
 
@@ -714,6 +740,7 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
     ):
         return None, None
     try:
+        warmup, iters = _spsv_benchmark_schedule(int(data.numel()), op_mode, data.dtype, fmt="CSR")
         data_ref, b_ref = _cupy_ref_inputs(data, b)
         data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref.contiguous()))
         idx_cp = cp.from_dlpack(
@@ -734,7 +761,7 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
             A_eff = A_cp
             lower_eff = lower
 
-        for _ in range(WARMUP):
+        for _ in range(warmup):
             _ = cpx_spsolve_triangular(
                 A_eff, b_cp, lower=lower_eff, unit_diagonal=False
             )
@@ -742,13 +769,13 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
         c0 = cp.cuda.Event()
         c1 = cp.cuda.Event()
         c0.record()
-        for _ in range(ITERS):
+        for _ in range(iters):
             x_cp = cpx_spsolve_triangular(
                 A_eff, b_cp, lower=lower_eff, unit_diagonal=False
             )
         c1.record()
         c1.synchronize()
-        ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
+        ms = cp.cuda.get_elapsed_time(c0, c1) / iters
         x_t = torch.utils.dlpack.from_dlpack(x_cp.toDlpack()).to(b.dtype)
         return ms, x_t
     except Exception:
@@ -765,7 +792,10 @@ def run_spsv_synthetic_all(lower=True):
     print("FLAGSPARSE SpSV BENCHMARK (synthetic triangular systems, CSR + COO)")
     print(sep)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Warmup: {WARMUP} | Iters: {ITERS}")
+    print(
+        f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
+        "(Library-main style defaults; override with --warmup/--iters)"
+    )
     print(f"Triangle: {'LOWER' if lower else 'UPPER'}")
     print()
 
@@ -1252,6 +1282,10 @@ def run_all_supported_spsv_csr_csv(
                     "PyTorch(ms)=official sparse solve reference"
                 )
                 print(
+                    f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
+                    "(Library-main style defaults; override with --warmup/--iters)"
+                )
+                print(
                     "RHS is generated directly, matching Library-main's SpSV test style. "
                     "PT.total / CU.total are single official interface call times. "
                     "PT.spdS and CU.spdS compare against FS.solve; PT.spdT and CU.spdT compare against FS.total. "
@@ -1404,6 +1438,10 @@ def run_all_dtypes_spsv_coo_csv(
                     "Formats: FlagSparse=COO input routed through CSR SpSV, cuSPARSE=CSR ref, "
                     "PyTorch(ms)=official sparse solve reference. "
                     "RHS is generated directly, matching Library-main's SpSV test style."
+                )
+                print(
+                    f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
+                    "(Library-main style defaults; override with --warmup/--iters)"
                 )
                 print(
                     "PT.total / CU.total are single official interface call times. "
@@ -1716,6 +1754,7 @@ def run_csr_transpose_check(
 
 
 def main():
+    global WARMUP, ITERS
     parser = argparse.ArgumentParser(
         description="SpSV test: synthetic triangular systems and optional .mtx (CSR/COO), same baselines as CSR."
     )
@@ -1769,7 +1808,21 @@ def main():
         default=None,
         help="Comma-separated index dtype filter for CSR CSV, e.g. int32,int64",
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=WARMUP,
+        help="Benchmark warmup iterations (Library-main style default: 1)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=ITERS,
+        help="Benchmark timed iterations (Library-main style default: 1)",
+    )
     args = parser.parse_args()
+    WARMUP = max(0, int(args.warmup))
+    ITERS = max(1, int(args.iters))
     lower = not args.upper
 
     if args.synthetic:
