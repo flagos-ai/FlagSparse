@@ -262,6 +262,7 @@ def _clone_csr_prepared_for_timed_op(template, data, indices, indptr):
         n_cols=template.n_cols,
         block_nnz=template.block_nnz,
         max_segments=template.max_segments,
+        opt_max_segments=template.opt_max_segments,
         max_row_nnz=template.max_row_nnz,
         opt_buckets=template.opt_buckets,
         transpose=template.transpose,

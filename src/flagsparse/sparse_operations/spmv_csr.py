@@ -64,6 +64,7 @@ class PreparedCsrSpmv:
         "n_cols",
         "block_nnz",
         "max_segments",
+        "opt_max_segments",
         "row_lengths",
         "max_row_nnz",
         "opt_buckets",
@@ -89,6 +90,7 @@ class PreparedCsrSpmv:
         max_segments,
         max_row_nnz,
         opt_buckets=None,
+        opt_max_segments=None,
         row_lengths=None,
         transpose=False,
         op=None,
@@ -104,6 +106,7 @@ class PreparedCsrSpmv:
         self.n_cols = n_cols
         self.block_nnz = block_nnz
         self.max_segments = max_segments
+        self.opt_max_segments = opt_max_segments
         if row_lengths is None:
             row_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
         self.row_lengths = row_lengths
@@ -402,7 +405,7 @@ def _build_spmv_opt_runtime_buckets(prepared):
         prepared.row_lengths,
         max_row_nnz=prepared.max_row_nnz,
         row_index_dtype=row_index_dtype,
-        max_segments=prepared.max_segments,
+        max_segments=prepared.opt_max_segments,
         fp64=prepared.data.dtype == torch.float64,
     )
 
@@ -651,6 +654,7 @@ def prepare_spmv_csr(
         n_cols=n_cols,
         block_nnz=block_nnz_use,
         max_segments=max_segments_use,
+        opt_max_segments=max_segments,
         row_lengths=row_lengths,
         max_row_nnz=max_row_nnz,
         opt_buckets=None,
@@ -765,6 +769,7 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
         n_cols=prepared.n_cols,
         block_nnz=prepared.block_nnz,
         max_segments=prepared.max_segments,
+        opt_max_segments=prepared.opt_max_segments,
         row_lengths=row_lengths,
         max_row_nnz=max_row_nnz,
         opt_buckets=None,
