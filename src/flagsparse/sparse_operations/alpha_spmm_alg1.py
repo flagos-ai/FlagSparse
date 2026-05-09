@@ -301,12 +301,6 @@ def _run_alpha_spmm_alg1(prepared, B, meta):
     return C_out
 
 
-_alpha_spmm_alg1_tle_rowmajor_kernel = None
-
-if tle is not None:
-    try:
-        exec(
-            r'''
 @triton.jit
 def _alpha_spmm_alg1_tle_rowmajor_kernel(
     data_ptr,
@@ -411,16 +405,10 @@ def _alpha_spmm_alg1_tle_rowmajor_kernel(
                 tl.store(c_ptr + row * stride_cm + offs2 * stride_cn, acc2, mask=mask2)
             if FACTOR > 3:
                 tl.store(c_ptr + row * stride_cm + offs3 * stride_cn, acc3, mask=mask3)
-''',
-            globals(),
-        )
-    except Exception as exc:  # pragma: no cover - depends on FlagTree runtime.
-        _TLE_IMPORT_ERROR = exc
-        _alpha_spmm_alg1_tle_rowmajor_kernel = None
 
 
 def is_alpha_spmm_alg1_tle_available():
-    return _alpha_spmm_alg1_tle_rowmajor_kernel is not None
+    return tle is not None
 
 
 def alpha_spmm_alg1_tle_unavailable_reason():
@@ -430,7 +418,7 @@ def alpha_spmm_alg1_tle_unavailable_reason():
 
 
 def _run_alpha_spmm_alg1_tle(prepared, B, meta):
-    if _alpha_spmm_alg1_tle_rowmajor_kernel is None:
+    if tle is None:
         raise RuntimeError(
             "flagsparse_alpha_spmm_alg1_tle requires FlagTree/TLE-Struct runtime "
             f"support ({alpha_spmm_alg1_tle_unavailable_reason()})"
