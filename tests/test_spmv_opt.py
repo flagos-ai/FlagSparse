@@ -383,9 +383,9 @@ def main():
     )
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--csv", type=str, default=None, metavar="FILE",
-                        help="Export selected dtype to CSV")
-    parser.add_argument("--dtype", default="float32",
-                        choices=["float32", "float64"])
+                        help="Export selected dtype(s) to CSV")
+    parser.add_argument("--dtype", default="all",
+                        choices=["float32", "float64", "all"])
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     args = parser.parse_args()
@@ -406,28 +406,30 @@ def main():
         print("=" * 80)
         print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {args.csv}")
         dtype_map = {"float32": torch.float32, "float64": torch.float64}
-        run_all_csv(paths, args.csv, args.warmup, args.iters, dtype_map[args.dtype])
+        dtype_filter = None if args.dtype == "all" else dtype_map[args.dtype]
+        run_all_csv(paths, args.csv, args.warmup, args.iters, dtype_filter)
         return
 
     dtype_map = {"float32": torch.float32, "float64": torch.float64}
-    dtype = dtype_map[args.dtype]
-    dname = str(dtype).replace("torch.", "")
-    print("=" * 170)
-    print(f"FLAGSPARSE SpMV Optimisation A/B Test")
-    print(f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {dname}  |  Files: {len(paths)}")
-    print(
-        "Base = FlagSparse baseline (fp64-accum for fp32). "
-        "Opt = FlagSparse CSR-Vector (fp32/fp64 native accum, wide tiles, few launches). "
-        "Opt includes runtime symbolic bucket construction + compute. "
-        "Speedup = Base/Opt or Ref/Opt."
-    )
-    print(SEP)
-    print(HEADER)
-    print(SEP)
-    results = run_batch(paths, dtype, torch.int32, args.warmup, args.iters)
-    print(SEP)
-    passed = sum(1 for r in results if r["status"] == "PASS")
-    print(f"Passed: {passed} / {len(results)}")
+    dtypes = VALUE_DTYPES if args.dtype == "all" else [dtype_map[args.dtype]]
+    for dtype in dtypes:
+        dname = str(dtype).replace("torch.", "")
+        print("=" * 170)
+        print(f"FLAGSPARSE SpMV Optimisation A/B Test")
+        print(f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {dname}  |  Files: {len(paths)}")
+        print(
+            "Base = FlagSparse baseline (fp64-accum for fp32). "
+            "Opt = FlagSparse CSR-Vector (fp32/fp64 native accum, wide tiles, few launches). "
+            "Opt includes runtime symbolic bucket construction + compute. "
+            "Speedup = Base/Opt or Ref/Opt."
+        )
+        print(SEP)
+        print(HEADER)
+        print(SEP)
+        results = run_batch(paths, dtype, torch.int32, args.warmup, args.iters)
+        print(SEP)
+        passed = sum(1 for r in results if r["status"] == "PASS")
+        print(f"Passed: {passed} / {len(results)}")
 
 
 if __name__ == "__main__":
