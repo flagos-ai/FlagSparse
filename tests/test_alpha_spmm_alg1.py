@@ -487,6 +487,9 @@ def run_one_case(
 
 
 def _print_header():
+    tle_available = fs.is_alpha_spmm_alg1_tle_available()
+    tle_status = "available" if tle_available else f"unavailable ({fs.alpha_spmm_alg1_tle_unavailable_reason()})"
+    print(f"TLE alpha_spmm_alg1_tle: {tle_status}")
     print("-" * 168)
     print(
         f"{'Matrix':<24} {'dtype':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
@@ -521,6 +524,8 @@ def _print_summary_row(summary):
         f"{_fmt_err(summary['alpha_spmm_alg1_tle_vs_torch_err']):>10} "
         f"{summary['matrix_status']:>8}"
     )
+    if summary.get("alpha_spmm_alg1_tle_status") == "SKIP" and summary.get("alpha_spmm_alg1_tle_reason"):
+        print(f"  alpha_spmm_alg1_tle skipped: {summary['alpha_spmm_alg1_tle_reason']}")
 
 
 def _write_csv(path, rows, fieldnames):
@@ -607,11 +612,21 @@ def main():
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--with-cusparse", action="store_true")
+    parser.add_argument(
+        "--require-tle",
+        action="store_true",
+        help="Fail immediately if alpha_spmm_alg1_tle is unavailable or skipped.",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda")
     rows = []
     launch_rows = []
+    if args.require_tle and not fs.is_alpha_spmm_alg1_tle_available():
+        raise RuntimeError(
+            "alpha_spmm_alg1_tle is unavailable: "
+            + fs.alpha_spmm_alg1_tle_unavailable_reason()
+        )
     _print_header()
     if args.synthetic:
         synthetic_cases = [
@@ -649,6 +664,11 @@ def main():
                         summary = result
                     rows.append(summary)
                     _print_summary_row(summary)
+                    if args.require_tle and summary["alpha_spmm_alg1_tle_status"] == "SKIP":
+                        raise RuntimeError(
+                            "alpha_spmm_alg1_tle was skipped: "
+                            + str(summary.get("alpha_spmm_alg1_tle_reason") or "")
+                        )
     else:
         paths = _resolve_input_paths(args.input_path)
         for value_dtype in VALUE_DTYPES:
@@ -680,6 +700,11 @@ def main():
                         summary = result
                     rows.append(summary)
                     _print_summary_row(summary)
+                    if args.require_tle and summary["alpha_spmm_alg1_tle_status"] == "SKIP":
+                        raise RuntimeError(
+                            "alpha_spmm_alg1_tle was skipped: "
+                            + str(summary.get("alpha_spmm_alg1_tle_reason") or "")
+                        )
     print("-" * 168)
     if args.csv:
         csv_path = os.path.abspath(args.csv)
