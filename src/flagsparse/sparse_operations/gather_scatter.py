@@ -5,6 +5,21 @@ from ._common import *
 import triton
 import triton.language as tl
 
+SUPPORTED_SCATTER_VALUE_DTYPES = tuple(
+    dtype for dtype in SUPPORTED_VALUE_DTYPES if not _is_complex32_dtype(dtype)
+)
+
+
+def _scatter_dtype_error_message():
+    supported = ", ".join(
+        str(dtype).replace("torch.", "") for dtype in SUPPORTED_SCATTER_VALUE_DTYPES
+    )
+    return (
+        "Scatter benchmark supports value dtypes: "
+        f"{supported}. complex32/chalf is not supported."
+    )
+
+
 @triton.jit
 def _gather_real_kernel(
     sparse_values_ptr,

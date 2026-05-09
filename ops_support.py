@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Export the declared FlagSparse sparse-operator support matrix to CSV.
+"""Export the FlagSparse sparse-operator support matrix to CSV.
 
 The script is intentionally static: it does not import torch/triton/cupy or
 flagsparse, and it never launches kernels. It reads source files and reports the
-support declared by constants such as SUPPORTED_*_VALUE_DTYPES.
+public support declared by source constants plus API-specific rules where the
+runtime support is narrower than a shared ``SUPPORTED_*`` set.
 """
 
 from __future__ import annotations
@@ -191,17 +192,18 @@ def discover_modules(src_root: Path) -> dict[str, SourceModule]:
     return modules
 
 
-def collect_public_apis(src_root: Path) -> set[str]:
-    init_path = src_root / "__init__.py"
-    if not init_path.exists():
-        return set()
-    init_module = SourceModule(init_path)
-    values = normalize_dtype_values(init_module.get("__all__"))
-    return set(values)
+def collect_public_apis(*init_paths: Path) -> set[str]:
+    values: set[str] = set()
+    for init_path in init_paths:
+        if not init_path.exists():
+            continue
+        init_module = SourceModule(init_path)
+        values.update(normalize_dtype_values(init_module.get("__all__")))
+    return values
 
 
-def op_names(module: SourceModule) -> tuple[str, ...]:
-    names = module.get("SPMV_OP_NAMES")
+def op_names(module: SourceModule, const_name: str) -> tuple[str, ...]:
+    names = module.get(const_name)
     if isinstance(names, dict):
         values = [str(v) for _, v in sorted(names.items(), key=lambda item: item[0])]
         if values:
@@ -224,16 +226,47 @@ def normalize_op_label(op: Any) -> str:
 
 
 def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
-    spmv_ops = op_names(modules["spmv_csr"]) if "spmv_csr" in modules else ("non", "trans", "conj")
-    spmm_values = normalize_dtype_values(modules["spmm_csr"].get("SUPPORTED_SPMM_VALUE_DTYPES")) if "spmm_csr" in modules else None
+    spmv_ops = (
+        op_names(modules["spmv_csr"], "SPMV_OP_NAMES")
+        if "spmv_csr" in modules
+        else ("non", "trans", "conj")
+    )
+    spmv_coo_ops = (
+        op_names(modules["spmv_coo"], "SPMV_COO_OP_NAMES")
+        if "spmv_coo" in modules
+        else ("non", "trans", "conj")
+    )
+    spmm_values = (
+        normalize_dtype_values(modules["spmm_csr"].get("SUPPORTED_SPMM_VALUE_DTYPES"))
+        if "spmm_csr" in modules
+        else None
+    )
     return (
-        ApiSpec("gather", "flagsparse_gather", "gather_scatter", "index", "triton", values=DEFAULT_VALUE_DTYPES, indices=DEFAULT_INDEX_DTYPES),
-        ApiSpec("scatter", "flagsparse_scatter", "gather_scatter", "index", "triton", value_const="SUPPORTED_SCATTER_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES"),
+        ApiSpec(
+            "gather",
+            "flagsparse_gather",
+            "gather_scatter",
+            "index",
+            "triton",
+            value_const="SUPPORTED_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+        ),
+        ApiSpec(
+            "scatter",
+            "flagsparse_scatter",
+            "gather_scatter",
+            "index",
+            "triton",
+            value_const="SUPPORTED_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            notes="effective dtype may fall back for optional complex32 when unavailable in the local torch build",
+        ),
         ApiSpec("spmv", "flagsparse_spmv_csr", "spmv_csr", "CSR", "triton", value_const="SUPPORTED_SPMV_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_ops, notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent"),
-        ApiSpec("spmv", "flagsparse_spmv_coo", "spmv_coo", "COO", "triton", values=("float32", "float64"), indices=DEFAULT_INDEX_DTYPES, ops=("non",), notes="COO path casts kernel indices to int32 after range check"),
+        ApiSpec("spmv", "flagsparse_spmv_coo", "spmv_coo", "COO", "triton", value_const="SUPPORTED_SPMV_COO_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_coo_ops, notes="COO path stores canonical row/col tensors and supports non/trans/conj"),
         ApiSpec("spmv", "flagsparse_spmv_coo_tocsr", "spmv_csr", "COO->CSR", "triton", value_const="SUPPORTED_SPMV_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",), notes="COO input is converted to CSR before compute"),
         ApiSpec("spmm", "flagsparse_spmm_csr", "spmm_csr", "CSR", "triton", value_const="SUPPORTED_SPMM_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",)),
-        ApiSpec("spmm", "flagsparse_spmm_csr_opt", "spmm_csr", "CSR", "triton_opt", value_const="SUPPORTED_SPMM_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",)),
+        ApiSpec("spmm", "flagsparse_spmm_csr_opt", "spmm_csr", "CSR", "triton_opt", values=("float32", "float64"), index_const="SUPPORTED_INDEX_DTYPES", ops=("non",), notes="bucketed opt path only supports float32/float64"),
+        ApiSpec("spmm", "flagsparse_spmm_csr_opt_alg2", "spmm_csr_opt_alg2", "CSR", "triton_opt_alg2", value_const="SUPPORTED_SPMM_OPT_ALG2_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",), notes="hardware-aware alg2 opt path only supports float32/float64"),
         ApiSpec("spmm", "flagsparse_spmm_coo", "spmm_coo", "COO", "triton", values=spmm_values, index_const="SUPPORTED_INDEX_DTYPES", ops=("non",), notes="COO SpMM reuses CSR SpMM dtype declaration"),
         ApiSpec("spgemm", "flagsparse_spgemm_csr", "spgemm_csr", "CSR", "triton", value_const="SUPPORTED_SPGEMM_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",)),
         ApiSpec("sddmm", "flagsparse_sddmm_csr", "sddmm_csr", "CSR", "triton", value_const="SUPPORTED_SDDMM_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",)),
@@ -346,7 +379,7 @@ def _sort_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
 
 def build_rows(src_root: Path) -> list[dict[str, str]]:
     modules = discover_modules(src_root)
-    public_apis = collect_public_apis(src_root)
+    public_apis = collect_public_apis(src_root / "__init__.py", src_root.parent / "__init__.py")
     specs = registry(modules)
     rows: list[dict[str, str]] = []
     for spec in specs:

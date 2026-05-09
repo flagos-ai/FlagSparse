@@ -75,7 +75,68 @@ def _normalize_spmv_coo_index_fallback_policy(index_fallback_policy):
 
 
 class PreparedCoo:
-    """Sorted COO + optional row-run bounds ``seg_starts``; no CSR indptr."""
+    """Prepared COO structure metadata that can serve non/trans/conj at runtime."""
+
+    __slots__ = (
+        "data_non",
+        "row_non",
+        "col_non",
+        "seg_starts_non",
+        "data_trans",
+        "row_trans",
+        "col_trans",
+        "seg_starts_trans",
+        "shape",
+        "n_rows",
+        "n_cols",
+        "nnz",
+        "sort_by_row",
+        "op",
+        "transpose",
+        "index_fallback_policy",
+        "index_fallback_applied",
+        "index_fallback_reason",
+    )
+
+    def __init__(
+        self,
+        data_non,
+        row_non,
+        col_non,
+        shape,
+        seg_starts_non=None,
+        data_trans=None,
+        row_trans=None,
+        col_trans=None,
+        seg_starts_trans=None,
+        sort_by_row=True,
+        transpose=False,
+        op=None,
+        index_fallback_policy="auto",
+        index_fallback_applied=False,
+        index_fallback_reason=None,
+    ):
+        self.data_non = data_non
+        self.row_non = row_non
+        self.col_non = col_non
+        self.seg_starts_non = seg_starts_non
+        self.data_trans = data_trans if data_trans is not None else data_non
+        self.row_trans = row_trans if row_trans is not None else col_non
+        self.col_trans = col_trans if col_trans is not None else row_non
+        self.seg_starts_trans = seg_starts_trans
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.n_rows, self.n_cols = self.shape
+        self.nnz = int(data_non.numel())
+        self.sort_by_row = bool(sort_by_row)
+        self.op = _normalize_spmv_coo_op(op, transpose=transpose)
+        self.transpose = _spmv_coo_op_transposes(self.op)
+        self.index_fallback_policy = str(index_fallback_policy).lower()
+        self.index_fallback_applied = bool(index_fallback_applied)
+        self.index_fallback_reason = index_fallback_reason
+
+
+class _PreparedCooLaunch:
+    """Concrete launch view for one runtime op on top of structure-only prepare."""
 
     __slots__ = (
         "data",
@@ -102,8 +163,7 @@ class PreparedCoo:
         col,
         shape,
         seg_starts=None,
-        transpose=False,
-        op=None,
+        op=SPMV_COO_OP_NON,
         index_fallback_policy="auto",
         index_fallback_applied=False,
         index_fallback_reason=None,
@@ -121,7 +181,7 @@ class PreparedCoo:
         else:
             self.n_segs = int(seg_starts.numel()) - 1
             self.use_seg_kernel = self.n_segs > 0
-        self.op = _normalize_spmv_coo_op(op, transpose=transpose)
+        self.op = _normalize_spmv_coo_op(op)
         self.transpose = _spmv_coo_op_transposes(self.op)
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
@@ -379,26 +439,118 @@ def prepare_spmv_coo(
     op_code = _normalize_spmv_coo_op(op, transpose=transpose)
     if op is not None and bool(transpose) and op_code == SPMV_COO_OP_NON:
         raise ValueError("transpose=True conflicts with op=non")
-    transpose = _spmv_coo_op_transposes(op_code)
-    if transpose:
-        shape = (int(shape[1]), int(shape[0]))
-        row, col = col, row
-        if op_code == SPMV_COO_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
-            data = data.conj()
-            if hasattr(data, "resolve_conj"):
-                data = data.resolve_conj()
-    d, kr, kc, seg = _prepare_coo_tensors(
+    shape = (int(shape[0]), int(shape[1]))
+    data_non, row_non, col_non, seg_non = _prepare_coo_tensors(
         data, row, col, shape, sort_by_row
     )
+    trans_shape = (shape[1], shape[0])
+    if sort_by_row:
+        data_trans, row_trans, col_trans, seg_trans = _prepare_coo_tensors(
+            data,
+            col,
+            row,
+            trans_shape,
+            True,
+        )
+    else:
+        data_trans = data_non
+        row_trans = col_non
+        col_trans = row_non
+        seg_trans = None
     return PreparedCoo(
-        d,
-        kr,
-        kc,
+        data_non,
+        row_non,
+        col_non,
         shape,
-        seg_starts=seg,
+        seg_starts_non=seg_non,
+        data_trans=data_trans,
+        row_trans=row_trans,
+        col_trans=col_trans,
+        seg_starts_trans=seg_trans,
+        sort_by_row=sort_by_row,
         transpose=transpose,
         op=op_code,
         index_fallback_policy=index_fallback_policy,
+    )
+
+
+def _prepare_spmv_coo_launch_from_raw(
+    data,
+    row,
+    col,
+    shape,
+    sort_by_row=True,
+    transpose=False,
+    op=None,
+    index_fallback_policy="auto",
+):
+    """Build one runtime launch view from raw COO inputs for benchmark-only timing."""
+    index_fallback_policy = _normalize_spmv_coo_index_fallback_policy(
+        index_fallback_policy
+    )
+    op_code = _normalize_spmv_coo_op(op, transpose=transpose)
+    if op is not None and bool(transpose) and op_code == SPMV_COO_OP_NON:
+        raise ValueError("transpose=True conflicts with op=non")
+    shape = (int(shape[0]), int(shape[1]))
+    launch_shape = shape
+    launch_data = data
+    launch_row = row
+    launch_col = col
+    if _spmv_coo_op_transposes(op_code):
+        launch_shape = (shape[1], shape[0])
+        launch_row = col
+        launch_col = row
+        if op_code == SPMV_COO_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+            launch_data = data.conj()
+            if hasattr(launch_data, "resolve_conj"):
+                launch_data = launch_data.resolve_conj()
+    launch_data, launch_row, launch_col, launch_seg_starts = _prepare_coo_tensors(
+        launch_data,
+        launch_row,
+        launch_col,
+        launch_shape,
+        sort_by_row,
+    )
+    return _PreparedCooLaunch(
+        data=launch_data,
+        row=launch_row,
+        col=launch_col,
+        shape=launch_shape,
+        seg_starts=launch_seg_starts,
+        op=op_code,
+        index_fallback_policy=index_fallback_policy,
+    )
+
+
+def _resolve_spmv_coo_launch(prepared, op):
+    op_code = _normalize_spmv_coo_op(op)
+    if op_code == SPMV_COO_OP_NON:
+        return _PreparedCooLaunch(
+            data=prepared.data_non,
+            row=prepared.row_non,
+            col=prepared.col_non,
+            shape=prepared.shape,
+            seg_starts=prepared.seg_starts_non,
+            op=op_code,
+            index_fallback_policy=prepared.index_fallback_policy,
+            index_fallback_applied=prepared.index_fallback_applied,
+            index_fallback_reason=prepared.index_fallback_reason,
+        )
+    data = prepared.data_trans
+    if op_code == SPMV_COO_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+        data = data.conj()
+        if hasattr(data, "resolve_conj"):
+            data = data.resolve_conj()
+    return _PreparedCooLaunch(
+        data=data,
+        row=prepared.row_trans,
+        col=prepared.col_trans,
+        shape=(prepared.n_cols, prepared.n_rows),
+        seg_starts=prepared.seg_starts_trans,
+        op=op_code,
+        index_fallback_policy=prepared.index_fallback_policy,
+        index_fallback_applied=prepared.index_fallback_applied,
+        index_fallback_reason=prepared.index_fallback_reason,
     )
 
 
@@ -533,13 +685,12 @@ def _spmv_coo_prepared_with_int32_indices(prepared, reason):
         if prepared.seg_starts is None
         else prepared.seg_starts.to(torch.int32).contiguous()
     )
-    return PreparedCoo(
+    return _PreparedCooLaunch(
         data=prepared.data,
         row=prepared.row.to(torch.int32).contiguous(),
         col=prepared.col.to(torch.int32).contiguous(),
         shape=prepared.shape,
         seg_starts=seg_starts,
-        transpose=prepared.transpose,
         op=prepared.op,
         index_fallback_policy=prepared.index_fallback_policy,
         index_fallback_applied=True,
@@ -594,11 +745,9 @@ def flagsparse_spmv_coo(
     ``block_inner``: tile for the row-run kernel (``sort_by_row=True``).
     ``block_size`` / ``num_warps``: grid over NNZ when ``sort_by_row=False`` (atomics).
     """
+    transpose_flag = False if transpose is None else bool(transpose)
     op_explicit = op is not None
-    op_code = _normalize_spmv_coo_op(
-        op,
-        transpose=False if transpose is None else bool(transpose),
-    )
+    op_code = _normalize_spmv_coo_op(op, transpose=transpose_flag)
     if op_explicit and transpose is not None and bool(transpose) != _spmv_coo_op_transposes(op_code):
         raise ValueError("transpose conflicts with op")
     if prepared is None:
@@ -612,20 +761,13 @@ def flagsparse_spmv_coo(
             col,
             shape,
             sort_by_row=sort_by_row,
-            op=op_code,
+            transpose=transpose_flag,
+            op=op,
             index_fallback_policy=index_fallback_policy,
         )
     else:
         if x is None:
             raise TypeError("x is required when prepared is set")
-        if op_explicit and op_code != prepared.op:
-            raise ValueError(
-                f"op={_spmv_coo_op_to_name(op_code)} does not match prepared.op={_spmv_coo_op_to_name(prepared.op)}"
-            )
-        if not op_explicit and transpose is not None and bool(transpose) != prepared.transpose:
-            raise ValueError(
-                f"transpose={bool(transpose)} does not match prepared.transpose={prepared.transpose}"
-            )
         if shape is None:
             shape = prepared.shape
         sh = (int(shape[0]), int(shape[1]))
@@ -633,7 +775,12 @@ def flagsparse_spmv_coo(
             raise ValueError(
                 f"shape {sh} does not match prepared.shape {prepared.shape}"
             )
-    x = _validate_x_coo(x, prepared)
+        if not op_explicit and transpose is None:
+            op_code = prepared.op
+        elif not op_explicit and transpose is not None:
+            op_code = _normalize_spmv_coo_op(None, transpose=transpose_flag)
+    launch = _resolve_spmv_coo_launch(prepared, op_code)
+    x = _validate_x_coo(x, launch)
     if num_warps not in (1, 2, 4, 8, 16, 32):
         raise ValueError("num_warps must be a power of 2 in [1, 32]")
     if block_inner <= 0 or (block_inner & (block_inner - 1)) != 0:
@@ -643,7 +790,7 @@ def flagsparse_spmv_coo(
         torch.cuda.synchronize()
         t0 = time.perf_counter()
     y = _run_spmv_coo_prepared_with_fallback(
-        prepared,
+        launch,
         x,
         block_size=block_size,
         num_warps=num_warps,

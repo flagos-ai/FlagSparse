@@ -110,7 +110,62 @@ def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op):
 
 
 @pytest.mark.spmv_coo
-def test_spmv_coo_prepared_transpose_mismatch_rejected():
+def test_spmv_coo_prepared_reuses_structure_across_ops():
+    device = torch.device("cuda")
+    Asp, dense = _random_coo_mn(8, 10, torch.complex64, device)
+    data = Asp.values()
+    indices = Asp.indices()
+    row = indices[0].to(torch.int32).contiguous()
+    col = indices[1].to(torch.int32).contiguous()
+    prepared = prepare_spmv_coo(data, row, col, (8, 10))
+
+    x_non = _make_x(10, torch.complex64, device)
+    ref_non = dense.to(torch.complex128) @ x_non.to(torch.complex128)
+    out_non = flagsparse_spmv_coo(x=x_non, prepared=prepared, op="non")
+    _assert_close(out_non, ref_non.to(torch.complex64), torch.complex64)
+
+    x_trans = _make_x(8, torch.complex64, device)
+    ref_trans = dense.t().to(torch.complex128) @ x_trans.to(torch.complex128)
+    out_trans = flagsparse_spmv_coo(x=x_trans, prepared=prepared, op="trans")
+    _assert_close(out_trans, ref_trans.to(torch.complex64), torch.complex64)
+
+    ref_conj = dense.conj().t().to(torch.complex128) @ x_trans.to(torch.complex128)
+    out_conj = flagsparse_spmv_coo(x=x_trans, prepared=prepared, op="conj")
+    _assert_close(out_conj, ref_conj.to(torch.complex64), torch.complex64)
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("op", ["trans", "conj"], ids=["trans", "conj"])
+def test_spmv_coo_runtime_launch_matches_public_api_for_ops(op):
+    device = torch.device("cuda")
+    Asp, _dense = _random_coo_mn(7, 9, torch.complex64, device)
+    data = Asp.values()
+    indices = Asp.indices()
+    row = indices[0].to(torch.int32).contiguous()
+    col = indices[1].to(torch.int32).contiguous()
+    x = _make_x(7, torch.complex64, device)
+
+    expected = flagsparse_spmv_coo(data, row, col, x, shape=(7, 9), op=op)
+    launch = spmv_coo_mod._prepare_spmv_coo_launch_from_raw(
+        data=data,
+        row=row,
+        col=col,
+        shape=(7, 9),
+        sort_by_row=True,
+        op=op,
+    )
+    actual = spmv_coo_mod._run_spmv_coo_prepared_with_fallback(
+        launch,
+        x,
+        block_size=256,
+        num_warps=4,
+        block_inner=128,
+    )
+    _assert_close(actual, expected, torch.complex64)
+
+
+@pytest.mark.spmv_coo
+def test_spmv_coo_prepared_explicit_transpose_conflict_rejected():
     device = torch.device("cuda")
     Asp, _dense = _random_coo_mn(8, 10, torch.float32, device)
     data = Asp.values()
@@ -118,23 +173,9 @@ def test_spmv_coo_prepared_transpose_mismatch_rejected():
     row = indices[0].to(torch.int32).contiguous()
     col = indices[1].to(torch.int32).contiguous()
     prepared = prepare_spmv_coo(data, row, col, (8, 10), transpose=True)
-    x = torch.randn(8, dtype=torch.float32, device=device)
-    with pytest.raises(ValueError, match="does not match prepared.transpose"):
-        flagsparse_spmv_coo(x=x, prepared=prepared, transpose=False)
-
-
-@pytest.mark.spmv_coo
-def test_spmv_coo_prepared_op_mismatch_rejected():
-    device = torch.device("cuda")
-    Asp, _dense = _random_coo_mn(8, 10, torch.complex64, device)
-    data = Asp.values()
-    indices = Asp.indices()
-    row = indices[0].to(torch.int32).contiguous()
-    col = indices[1].to(torch.int32).contiguous()
-    prepared = prepare_spmv_coo(data, row, col, (8, 10), op="conj")
-    x = _make_x(8, torch.complex64, device)
-    with pytest.raises(ValueError, match="does not match prepared.op"):
-        flagsparse_spmv_coo(x=x, prepared=prepared, op="trans")
+    x = torch.randn(10, dtype=torch.float32, device=device)
+    with pytest.raises(ValueError, match="transpose conflicts with op"):
+        flagsparse_spmv_coo(x=x, prepared=prepared, op="non", transpose=True)
 
 
 @pytest.mark.spmv_coo

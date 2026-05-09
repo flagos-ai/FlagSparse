@@ -3,9 +3,10 @@ SpMM tests: load SuiteSparse .mtx, batch run, output error and performance.
 Supports: multi .mtx files, value_dtype / index_dtype, CSV export, synthetic cases,
 API validation checks, and PyTorch / CuPy comparison baselines.
 
-This test module targets the current FlagSparse CSR SpMM implementation, which maps
-AlphaSparse CSR ALG1 (row-balance / seq-reduce) onto Triton for the CSR + non-transpose
-+ row-major dense-B/C subset.
+This test module targets the current FlagSparse CSR SpMM base implementation, which is
+a Triton-native CSR path for the CSR + non-transpose + row-major dense-B/C subset.
+It borrows part of the AlphaSparse CSR ALG1 dense-N heuristic, but the dedicated
+experimental structural port lives in alpha_spmm_alg1.py.
 """
 import argparse
 import csv
@@ -592,7 +593,7 @@ def _print_spmm_csr_mtx_header(value_dtype, index_dtype):
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
     )
-    print("Formats: FlagSparse=CSR ALG1, cuSPARSE=CSR dense-mm, PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
     print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
     print("For float32, PT checks the float64-based correctness reference while CU checks consistency with native cuSPARSE float32, so PT and CU may differ.")
@@ -911,7 +912,7 @@ def run_comprehensive_synthetic(
         f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  "
         f"MAX_SEGMENTS: {_fmt_launch_value(max_segments)}"
     )
-    print("Formats: FlagSparse=CSR ALG1, cuSPARSE=CSR dense-mm (when supported), PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm (when supported), PyTorch=CSR or COO.")
     print("For float32, PT checks the float64-based correctness reference while CU reflects native cuSPARSE float32 consistency.")
     print()
 
