@@ -3,8 +3,12 @@
 from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES, cp, cpx_sparse
 from .alpha_spmm_alg1 import (
     PreparedAlphaSpmmAlg1,
+    alpha_spmm_alg1_tle_unavailable_reason,
     flagsparse_alpha_spmm_alg1,
+    flagsparse_alpha_spmm_alg1_tle,
+    is_alpha_spmm_alg1_tle_available,
     prepare_alpha_spmm_alg1,
+    prepare_alpha_spmm_alg1_tle,
 )
 from .gather_scatter import (
     cusparse_spmv_gather,
@@ -26,7 +30,11 @@ from .spmm_csr import (
     comprehensive_spmm_test,
     flagsparse_spmm_csr,
     flagsparse_spmm_csr_opt,
+    flagsparse_spmm_csr_opt_alg1,
+    flagsparse_spmm_csr_opt_alg1_symbolic,
     prepare_spmm_csr_opt,
+    prepare_spmm_csr_opt_alg1,
+    prepare_spmm_csr_opt_alg1_symbolic,
 )
 from .spmm_csr_opt_alg2 import (
     PreparedCsrSpmmOptAlg2,
@@ -90,6 +98,8 @@ __all__ = [
     "flagsparse_spmm_coo",
     "flagsparse_spmm_csr",
     "flagsparse_spmm_csr_opt",
+    "flagsparse_spmm_csr_opt_alg1",
+    "flagsparse_spmm_csr_opt_alg1_symbolic",
     "flagsparse_spmm_csr_opt_alg2",
     "flagsparse_spmm_csr_opt_alg2_symbolic",
     "flagsparse_spmv_coo",
@@ -103,6 +113,8 @@ __all__ = [
     "prepare_alpha_spmm_alg1",
     "prepare_spgemm_csr",
     "prepare_spmm_csr_opt",
+    "prepare_spmm_csr_opt_alg1",
+    "prepare_spmm_csr_opt_alg1_symbolic",
     "prepare_spmm_csr_opt_alg2",
     "prepare_spmm_csr_opt_alg2_symbolic",
     "prepare_spmv_coo",

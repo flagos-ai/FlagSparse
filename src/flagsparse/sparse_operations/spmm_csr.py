@@ -688,7 +688,137 @@ def _build_spmm_opt_buckets(row_lengths, dtype, nnz=None):
     return buckets, long_rows
 
 
-def prepare_spmm_csr_opt(data, indices, indptr, shape):
+@triton.jit
+def _spmm_opt_alg1_symbolic_count_kernel(
+    row_lengths_ptr,
+    bucket_counts_ptr,
+    n_rows,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask = offs < n_rows
+    lens = tl.load(row_lengths_ptr + offs, mask=mask, other=0)
+    bucket = tl.where(
+        lens <= 32,
+        0,
+        tl.where(lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))),
+    )
+    for bid in tl.static_range(0, 5):
+        hits = mask & (bucket == bid)
+        count = tl.sum(tl.where(hits, 1, 0), axis=0)
+        tl.atomic_add(bucket_counts_ptr + bid, count, sem="relaxed")
+
+
+@triton.jit
+def _spmm_opt_alg1_symbolic_compact_kernel(
+    row_lengths_ptr,
+    bucket_offsets_ptr,
+    bucket_write_counts_ptr,
+    rows_flat_ptr,
+    n_rows,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask = offs < n_rows
+    lens = tl.load(row_lengths_ptr + offs, mask=mask, other=0)
+    bucket = tl.where(
+        lens <= 32,
+        0,
+        tl.where(lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))),
+    )
+    for bid in tl.static_range(0, 5):
+        hits = mask & (bucket == bid)
+        ranks = tl.cumsum(tl.where(hits, 1, 0), axis=0) - 1
+        local_count = tl.sum(tl.where(hits, 1, 0), axis=0)
+        base = tl.atomic_add(bucket_write_counts_ptr + bid, local_count, sem="relaxed")
+        offset = tl.load(bucket_offsets_ptr + bid)
+        tl.store(rows_flat_ptr + offset + base + ranks, offs, mask=hits)
+
+
+def _build_spmm_opt_alg1_buckets_triton_symbolic(row_lengths, dtype, nnz=None):
+    device = row_lengths.device
+    row_count = int(row_lengths.numel())
+    row_index_dtype = torch.int32 if row_count <= _INDEX_LIMIT_INT32 else torch.int64
+    bucket_count = len(_SPMM_OPT_BUCKET_SPECS)
+    if bucket_count != 5:
+        raise RuntimeError("Alg1S symbolic builder expects five alg1 buckets")
+
+    counts = torch.zeros((bucket_count,), dtype=torch.int64, device=device)
+    block_m = 256
+    grid = (triton.cdiv(row_count, block_m),)
+    if row_count > 0:
+        _spmm_opt_alg1_symbolic_count_kernel[grid](
+            row_lengths,
+            counts,
+            row_count,
+            BLOCK_M=block_m,
+            num_warps=4,
+            num_stages=1,
+        )
+    offsets = torch.empty_like(counts)
+    offsets[0] = 0
+    if bucket_count > 1:
+        offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+
+    rows_flat = torch.empty((row_count,), dtype=row_index_dtype, device=device)
+    write_counts = torch.zeros_like(counts)
+    if row_count > 0:
+        _spmm_opt_alg1_symbolic_compact_kernel[grid](
+            row_lengths,
+            offsets,
+            write_counts,
+            rows_flat,
+            row_count,
+            BLOCK_M=block_m,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    counts_cpu = counts.to("cpu").tolist()
+    offsets_cpu = offsets.to("cpu").tolist()
+    buckets = []
+    long_rows = torch.empty((0,), dtype=row_index_dtype, device=device)
+    lower = 0
+    for spec, count, offset in zip(_SPMM_OPT_BUCKET_SPECS, counts_cpu, offsets_cpu):
+        upper = spec["max_row_nnz"]
+        count = int(count)
+        if count == 0:
+            if upper is not None:
+                lower = upper
+            continue
+        rows = rows_flat.narrow(0, int(offset), count)
+        if upper is None:
+            max_row_nnz = _SPMM_OPT_LONG_ROW_THRESHOLD + 1
+            label = "split_long"
+            execution = "split"
+        else:
+            max_row_nnz = upper
+            label = f"{spec['kind']}_{upper}"
+            execution = "legacy"
+        buckets.append(
+            _spmm_opt_make_bucket(
+                label,
+                spec["kind"],
+                rows,
+                execution,
+                lower + 1 if lower > 0 else 0,
+                max_row_nnz,
+                batch_rows=spec["batch_rows"],
+                block_k=spec["block_nnz"],
+                block_nnz=spec["block_nnz"],
+                block_n_cap=128,
+            )
+        )
+        if spec["kind"] == "split":
+            long_rows = rows
+        if upper is not None:
+            lower = upper
+    return buckets, long_rows
+
+
+def prepare_spmm_csr_opt_alg1(data, indices, indptr, shape):
     (
         data,
         kernel_indices,
@@ -724,8 +854,16 @@ def prepare_spmm_csr_opt(data, indices, indptr, shape):
     )
 
 
-def _build_spmm_csr_opt_runtime_symbolic(prepared):
-    row_buckets, long_rows = _build_spmm_opt_buckets(
+def prepare_spmm_csr_opt(data, indices, indptr, shape):
+    return prepare_spmm_csr_opt_alg1(data, indices, indptr, shape)
+
+
+def prepare_spmm_csr_opt_alg1_symbolic(data, indices, indptr, shape):
+    return prepare_spmm_csr_opt_alg1(data, indices, indptr, shape)
+
+
+def _build_spmm_csr_opt_runtime_symbolic_with_builder(prepared, bucket_builder):
+    row_buckets, long_rows = bucket_builder(
         prepared.row_lengths,
         prepared.data.dtype,
         nnz=prepared.data.numel(),
@@ -761,6 +899,20 @@ def _build_spmm_csr_opt_runtime_symbolic(prepared):
         long_row_ids=long_rows,
         long_row_part_ptr=long_row_part_ptr,
         long_row_fallback_only=False,
+    )
+
+
+def _build_spmm_csr_opt_runtime_symbolic(prepared):
+    return _build_spmm_csr_opt_runtime_symbolic_with_builder(
+        prepared,
+        _build_spmm_opt_buckets,
+    )
+
+
+def _build_spmm_csr_opt_runtime_symbolic_triton(prepared):
+    return _build_spmm_csr_opt_runtime_symbolic_with_builder(
+        prepared,
+        _build_spmm_opt_alg1_buckets_triton_symbolic,
     )
 
 
@@ -2443,7 +2595,7 @@ def flagsparse_spmm_csr(
     return C
 
 
-def flagsparse_spmm_csr_opt(
+def _flagsparse_spmm_csr_opt_alg1_impl(
     data=None,
     indices=None,
     indptr=None,
@@ -2453,8 +2605,9 @@ def flagsparse_spmm_csr_opt(
     out=None,
     return_time=False,
     return_meta=False,
+    runtime_symbolic_builder=_build_spmm_csr_opt_runtime_symbolic,
+    api_name="flagsparse_spmm_csr_opt_alg1",
 ):
-    """CSR SpMM-opt: native float32/float64 bucketed path for CSR @ dense."""
     if prepared is not None and not isinstance(prepared, PreparedCsrSpmmOpt):
         raise TypeError("prepared must be a PreparedCsrSpmmOpt instance")
     if prepared is None:
@@ -2462,7 +2615,7 @@ def flagsparse_spmm_csr_opt(
             raise ValueError(
                 "data, indices, indptr, and shape are required when prepared is not provided"
             )
-        prepared = prepare_spmm_csr_opt(data, indices, indptr, shape)
+        prepared = prepare_spmm_csr_opt_alg1(data, indices, indptr, shape)
     elif shape is not None:
         resolved_shape = (int(shape[0]), int(shape[1]))
         if resolved_shape != prepared.shape:
@@ -2472,7 +2625,7 @@ def flagsparse_spmm_csr_opt(
     if B is None:
         raise ValueError("B is required")
     if not prepared.supports_opt:
-        raise TypeError("flagsparse_spmm_csr_opt only supports float32 and float64")
+        raise TypeError(f"{api_name} only supports float32 and float64")
     if not B.is_cuda:
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
@@ -2491,7 +2644,7 @@ def flagsparse_spmm_csr_opt(
     if do_timing:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    runtime_prepared = _build_spmm_csr_opt_runtime_symbolic(prepared)
+    runtime_prepared = runtime_symbolic_builder(prepared)
     if do_timing:
         torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -2520,6 +2673,85 @@ def flagsparse_spmm_csr_opt(
     if return_time:
         return C, op_total_ms
     return C
+
+
+def flagsparse_spmm_csr_opt_alg1(
+    data=None,
+    indices=None,
+    indptr=None,
+    B=None,
+    shape=None,
+    prepared=None,
+    out=None,
+    return_time=False,
+    return_meta=False,
+):
+    """CSR SpMM-opt alg1: native float32/float64 bucketed path for CSR @ dense."""
+    return _flagsparse_spmm_csr_opt_alg1_impl(
+        data=data,
+        indices=indices,
+        indptr=indptr,
+        B=B,
+        shape=shape,
+        prepared=prepared,
+        out=out,
+        return_time=return_time,
+        return_meta=return_meta,
+        runtime_symbolic_builder=_build_spmm_csr_opt_runtime_symbolic,
+        api_name="flagsparse_spmm_csr_opt_alg1",
+    )
+
+
+def flagsparse_spmm_csr_opt_alg1_symbolic(
+    data=None,
+    indices=None,
+    indptr=None,
+    B=None,
+    shape=None,
+    prepared=None,
+    out=None,
+    return_time=False,
+    return_meta=False,
+):
+    """CSR SpMM-opt alg1 with Triton runtime symbolic bucket construction."""
+    return _flagsparse_spmm_csr_opt_alg1_impl(
+        data=data,
+        indices=indices,
+        indptr=indptr,
+        B=B,
+        shape=shape,
+        prepared=prepared,
+        out=out,
+        return_time=return_time,
+        return_meta=return_meta,
+        runtime_symbolic_builder=_build_spmm_csr_opt_runtime_symbolic_triton,
+        api_name="flagsparse_spmm_csr_opt_alg1_symbolic",
+    )
+
+
+def flagsparse_spmm_csr_opt(
+    data=None,
+    indices=None,
+    indptr=None,
+    B=None,
+    shape=None,
+    prepared=None,
+    out=None,
+    return_time=False,
+    return_meta=False,
+):
+    """Compatibility alias for CSR SpMM-opt alg1."""
+    return flagsparse_spmm_csr_opt_alg1(
+        data=data,
+        indices=indices,
+        indptr=indptr,
+        B=B,
+        shape=shape,
+        prepared=prepared,
+        out=out,
+        return_time=return_time,
+        return_meta=return_meta,
+    )
 
 
 def _spmm_opt_reference_error(candidate, reference, value_dtype):

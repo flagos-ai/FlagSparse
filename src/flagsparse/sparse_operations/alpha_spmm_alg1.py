@@ -7,6 +7,14 @@ from ._alpha_spmm_alg1_common import (
 )
 from .spmm_csr import _prepare_spmm_csr_matrix
 
+try:
+    import triton.language.extra as tle
+
+    _TLE_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - depends on FlagTree runtime.
+    tle = None
+    _TLE_IMPORT_ERROR = exc
+
 
 SUPPORTED_ALPHA_SPMM_ALG1_DTYPES = (torch.float32, torch.float64)
 _ALPHA_SPMM_ALG1_NUM_WARPS = 8
@@ -72,6 +80,11 @@ def prepare_alpha_spmm_alg1(data, indices, indptr, shape):
     )
 
 
+def prepare_alpha_spmm_alg1_tle(data, indices, indptr, shape):
+    """Prepare CSR metadata for the TLE-Struct ALG1 route."""
+    return prepare_alpha_spmm_alg1(data, indices, indptr, shape)
+
+
 def _alpha_spmm_alg1_acc_dtype(dtype):
     return tl.float64 if dtype == torch.float64 else tl.float32
 
@@ -132,6 +145,12 @@ def _build_alpha_spmm_alg1_runtime_meta(prepared, B):
         "beta": 0,
     }
     return meta
+
+
+def _with_alpha_spmm_alg1_route(meta, route):
+    out = dict(meta)
+    out["route"] = route
+    return out
 
 
 @triton.jit
@@ -267,6 +286,175 @@ def _run_alpha_spmm_alg1(prepared, B, meta):
     return C_out
 
 
+_alpha_spmm_alg1_tle_rowmajor_kernel = None
+
+if tle is not None:
+    try:
+        exec(
+            r'''
+@triton.jit
+def _alpha_spmm_alg1_tle_rowmajor_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    n_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    WARP_SIZE: tl.constexpr,
+    FACTOR: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    lane_offsets = tl.arange(0, WARP_SIZE)
+    block_row_start = pid_m * BLOCK_ROWS
+    block_col_start = pid_n * BLOCK_COLS
+    offs0 = block_col_start + lane_offsets
+    mask0 = offs0 < n_dense_cols
+    offs1 = block_col_start + WARP_SIZE + lane_offsets
+    mask1 = offs1 < n_dense_cols
+    offs2 = block_col_start + 2 * WARP_SIZE + lane_offsets
+    mask2 = offs2 < n_dense_cols
+    offs3 = block_col_start + 3 * WARP_SIZE + lane_offsets
+    mask3 = offs3 < n_dense_cols
+
+    s_val = tle.gpu.alloc(
+        (BLOCK_ROWS, WARP_SIZE),
+        dtype=ACC_DTYPE,
+        scope=tle.gpu.storage_kind.smem,
+    )
+    s_col = tle.gpu.alloc(
+        (BLOCK_ROWS, WARP_SIZE),
+        dtype=tl.int32,
+        scope=tle.gpu.storage_kind.smem,
+    )
+
+    for local_row in tl.static_range(0, BLOCK_ROWS):
+        row = block_row_start + local_row
+        if row < n_rows:
+            row_start = tl.load(indptr_ptr + row)
+            row_end = tl.load(indptr_ptr + row + 1)
+            acc0 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
+            acc1 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
+            acc2 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
+            acc3 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
+
+            for chunk_start in tl.range(row_start, row_end, WARP_SIZE):
+                elem_offsets = chunk_start + lane_offsets
+                valid_offsets = elem_offsets < row_end
+                staged_cols = tl.load(indices_ptr + elem_offsets, mask=valid_offsets, other=0)
+                staged_vals = tl.load(data_ptr + elem_offsets, mask=valid_offsets, other=0.0).to(ACC_DTYPE)
+                tl.store(tle.gpu.local_ptr(s_col, (local_row, lane_offsets)), staged_cols, mask=valid_offsets)
+                tl.store(tle.gpu.local_ptr(s_val, (local_row, lane_offsets)), staged_vals, mask=valid_offsets)
+
+                for jj in tl.static_range(0, WARP_SIZE):
+                    elem_idx = chunk_start + jj
+                    valid = elem_idx < row_end
+                    a_col = tl.load(tle.gpu.local_ptr(s_col, (local_row, jj)), mask=valid, other=0)
+                    a_val = tl.load(tle.gpu.local_ptr(s_val, (local_row, jj)), mask=valid, other=0.0).to(ACC_DTYPE)
+                    if FACTOR > 0:
+                        b0 = tl.load(
+                            b_ptr + a_col * stride_bk + offs0 * stride_bn,
+                            mask=mask0 & valid,
+                            other=0.0,
+                        )
+                        acc0 = acc0 + a_val * b0.to(ACC_DTYPE)
+                    if FACTOR > 1:
+                        b1 = tl.load(
+                            b_ptr + a_col * stride_bk + offs1 * stride_bn,
+                            mask=mask1 & valid,
+                            other=0.0,
+                        )
+                        acc1 = acc1 + a_val * b1.to(ACC_DTYPE)
+                    if FACTOR > 2:
+                        b2 = tl.load(
+                            b_ptr + a_col * stride_bk + offs2 * stride_bn,
+                            mask=mask2 & valid,
+                            other=0.0,
+                        )
+                        acc2 = acc2 + a_val * b2.to(ACC_DTYPE)
+                    if FACTOR > 3:
+                        b3 = tl.load(
+                            b_ptr + a_col * stride_bk + offs3 * stride_bn,
+                            mask=mask3 & valid,
+                            other=0.0,
+                        )
+                        acc3 = acc3 + a_val * b3.to(ACC_DTYPE)
+
+            tl.store(c_ptr + row * stride_cm + offs0 * stride_cn, acc0, mask=mask0)
+            if FACTOR > 1:
+                tl.store(c_ptr + row * stride_cm + offs1 * stride_cn, acc1, mask=mask1)
+            if FACTOR > 2:
+                tl.store(c_ptr + row * stride_cm + offs2 * stride_cn, acc2, mask=mask2)
+            if FACTOR > 3:
+                tl.store(c_ptr + row * stride_cm + offs3 * stride_cn, acc3, mask=mask3)
+''',
+            globals(),
+        )
+    except Exception as exc:  # pragma: no cover - depends on FlagTree runtime.
+        _TLE_IMPORT_ERROR = exc
+        _alpha_spmm_alg1_tle_rowmajor_kernel = None
+
+
+def is_alpha_spmm_alg1_tle_available():
+    return _alpha_spmm_alg1_tle_rowmajor_kernel is not None
+
+
+def alpha_spmm_alg1_tle_unavailable_reason():
+    if _TLE_IMPORT_ERROR is None:
+        return "TLE kernel is not available in this runtime"
+    return f"{type(_TLE_IMPORT_ERROR).__name__}: {_TLE_IMPORT_ERROR}"
+
+
+def _run_alpha_spmm_alg1_tle(prepared, B, meta):
+    if _alpha_spmm_alg1_tle_rowmajor_kernel is None:
+        raise RuntimeError(
+            "flagsparse_alpha_spmm_alg1_tle requires FlagTree/TLE-Struct runtime "
+            f"support ({alpha_spmm_alg1_tle_unavailable_reason()})"
+        )
+    if prepared.n_rows == 0 or int(B.shape[1]) == 0:
+        return torch.zeros(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
+
+    C_out = torch.empty(
+        (prepared.n_rows, int(B.shape[1])),
+        dtype=prepared.data.dtype,
+        device=prepared.data.device,
+    )
+    grid = (meta["grid_m"], meta["grid_n"])
+    _alpha_spmm_alg1_tle_rowmajor_kernel[grid](
+        prepared.data,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        B,
+        C_out,
+        prepared.n_rows,
+        int(B.shape[1]),
+        B.stride(0),
+        B.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        WARP_SIZE=meta["warp_size"],
+        FACTOR=meta["factor"],
+        BLOCK_ROWS=meta["block_rows"],
+        BLOCK_COLS=meta["block_cols"],
+        ACC_DTYPE=_alpha_spmm_alg1_acc_dtype(prepared.data.dtype),
+        num_warps=meta["num_warps"],
+        num_stages=meta["num_stages"],
+    )
+    return C_out
+
+
 def flagsparse_alpha_spmm_alg1(
     data=None,
     indices=None,
@@ -291,8 +479,48 @@ def flagsparse_alpha_spmm_alg1(
         prepared = prepare_alpha_spmm_alg1(data, indices, indptr, shape)
 
     B = _validate_alpha_spmm_alg1_runtime_inputs(prepared, B, out)
-    meta = _build_alpha_spmm_alg1_runtime_meta(prepared, B)
+    meta = _with_alpha_spmm_alg1_route(
+        _build_alpha_spmm_alg1_runtime_meta(prepared, B),
+        "alpha_spmm_alg1",
+    )
     C = _run_alpha_spmm_alg1(prepared, B, meta)
+    if out is not None:
+        out.copy_(C)
+        C = out
+    if return_meta:
+        return C, meta
+    return C
+
+
+def flagsparse_alpha_spmm_alg1_tle(
+    data=None,
+    indices=None,
+    indptr=None,
+    B=None,
+    shape=None,
+    prepared=None,
+    out=None,
+    return_meta=False,
+):
+    """Experimental TLE-Struct port of AlphaSparse CUDA CSR ALG1."""
+    if prepared is not None and not isinstance(prepared, PreparedAlphaSpmmAlg1):
+        raise TypeError("prepared must be a PreparedAlphaSpmmAlg1 instance")
+    raw_inputs_provided = any(arg is not None for arg in (data, indices, indptr, shape))
+    if prepared is not None and raw_inputs_provided:
+        raise ValueError("Pass either raw CSR inputs or prepared, not both")
+    if prepared is None:
+        if any(arg is None for arg in (data, indices, indptr, shape)):
+            raise ValueError(
+                "data, indices, indptr, and shape are required when prepared is not provided"
+            )
+        prepared = prepare_alpha_spmm_alg1_tle(data, indices, indptr, shape)
+
+    B = _validate_alpha_spmm_alg1_runtime_inputs(prepared, B, out)
+    meta = _with_alpha_spmm_alg1_route(
+        _build_alpha_spmm_alg1_runtime_meta(prepared, B),
+        "alpha_spmm_alg1_tle",
+    )
+    C = _run_alpha_spmm_alg1_tle(prepared, B, meta)
     if out is not None:
         out.copy_(C)
         C = out

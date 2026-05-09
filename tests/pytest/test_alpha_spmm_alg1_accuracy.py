@@ -2,7 +2,10 @@ import pytest
 import torch
 
 from flagsparse import (
+    flagsparse_alpha_spmm_alg1_tle,
     flagsparse_alpha_spmm_alg1,
+    is_alpha_spmm_alg1_tle_available,
+    prepare_alpha_spmm_alg1_tle,
     prepare_alpha_spmm_alg1,
 )
 
@@ -57,6 +60,23 @@ def test_alpha_spmm_alg1_matches_torch(dtype):
 
 
 @pytest.mark.alpha_spmm_alg1
+@pytest.mark.skipif(not is_alpha_spmm_alg1_tle_available(), reason="TLE runtime unavailable")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["float32", "float64"])
+def test_alpha_spmm_alg1_tle_matches_torch(dtype):
+    device = torch.device("cuda")
+    M, K, N = 96, 80, 48
+    Asp = _random_csr_mk(M, K, dtype, device)
+    data = Asp.values()
+    indices = Asp.col_indices()
+    indptr = Asp.crow_indices()
+    B = torch.randn(K, N, dtype=dtype, device=device)
+    out = flagsparse_alpha_spmm_alg1_tle(data, indices, indptr, B, (M, K))
+    ref = _reference(Asp, B, dtype)
+    atol, rtol = _tol(dtype)
+    assert torch.allclose(out, ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.alpha_spmm_alg1
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["float32", "float64"])
 def test_alpha_spmm_alg1_prepare_matches_raw(dtype):
     device = torch.device("cuda")
@@ -69,6 +89,24 @@ def test_alpha_spmm_alg1_prepare_matches_raw(dtype):
     prepared = prepare_alpha_spmm_alg1(data, indices, indptr, (M, K))
     raw_out = flagsparse_alpha_spmm_alg1(data, indices, indptr, B, (M, K))
     prepared_out = flagsparse_alpha_spmm_alg1(B=B, prepared=prepared)
+    atol, rtol = _tol(dtype)
+    assert torch.allclose(raw_out, prepared_out, atol=atol, rtol=rtol)
+
+
+@pytest.mark.alpha_spmm_alg1
+@pytest.mark.skipif(not is_alpha_spmm_alg1_tle_available(), reason="TLE runtime unavailable")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["float32", "float64"])
+def test_alpha_spmm_alg1_tle_prepare_matches_raw(dtype):
+    device = torch.device("cuda")
+    M, K, N = 72, 64, 33
+    Asp = _random_csr_mk(M, K, dtype, device)
+    data = Asp.values()
+    indices = Asp.col_indices()
+    indptr = Asp.crow_indices()
+    B = torch.randn(K, N, dtype=dtype, device=device)
+    prepared = prepare_alpha_spmm_alg1_tle(data, indices, indptr, (M, K))
+    raw_out = flagsparse_alpha_spmm_alg1_tle(data, indices, indptr, B, (M, K))
+    prepared_out = flagsparse_alpha_spmm_alg1_tle(B=B, prepared=prepared)
     atol, rtol = _tol(dtype)
     assert torch.allclose(raw_out, prepared_out, atol=atol, rtol=rtol)
 
@@ -114,6 +152,7 @@ def test_alpha_spmm_alg1_launch_heuristics_match_alphasparse(
     assert meta["warp_size"] == expected_warp_size
     assert meta["factor"] == expected_factor
     assert meta["block_cols"] == expected_warp_size * expected_factor
+    assert meta["route"] == "alpha_spmm_alg1"
 
 
 @pytest.mark.alpha_spmm_alg1
@@ -127,6 +166,23 @@ def test_alpha_spmm_alg1_handles_empty_rows_and_tail_columns(dtype):
     B = torch.randn(n_cols, dense_cols, dtype=dtype, device=device)
     Asp = torch.sparse_csr_tensor(indptr, indices.to(torch.int64), data, size=(n_rows, n_cols), device=device)
     out = flagsparse_alpha_spmm_alg1(data, indices, indptr, B, (n_rows, n_cols))
+    ref = _reference(Asp, B, dtype)
+    atol, rtol = _tol(dtype)
+    assert torch.allclose(out, ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.alpha_spmm_alg1
+@pytest.mark.skipif(not is_alpha_spmm_alg1_tle_available(), reason="TLE runtime unavailable")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["float32", "float64"])
+def test_alpha_spmm_alg1_tle_handles_empty_rows_and_tail_columns(dtype):
+    device = torch.device("cuda")
+    n_rows, n_cols, dense_cols = 5, 9, 17
+    data = torch.tensor([1.5, -2.0, 3.0, 4.0], dtype=dtype, device=device)
+    indices = torch.tensor([0, 4, 2, 8], dtype=torch.int32, device=device)
+    indptr = torch.tensor([0, 2, 2, 3, 3, 4], dtype=torch.int64, device=device)
+    B = torch.randn(n_cols, dense_cols, dtype=dtype, device=device)
+    Asp = torch.sparse_csr_tensor(indptr, indices.to(torch.int64), data, size=(n_rows, n_cols), device=device)
+    out = flagsparse_alpha_spmm_alg1_tle(data, indices, indptr, B, (n_rows, n_cols))
     ref = _reference(Asp, B, dtype)
     atol, rtol = _tol(dtype)
     assert torch.allclose(out, ref, atol=atol, rtol=rtol)

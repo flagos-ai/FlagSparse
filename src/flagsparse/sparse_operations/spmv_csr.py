@@ -64,6 +64,7 @@ class PreparedCsrSpmv:
         "n_cols",
         "block_nnz",
         "max_segments",
+        "row_lengths",
         "max_row_nnz",
         "opt_buckets",
         "supports_opt",
@@ -87,7 +88,8 @@ class PreparedCsrSpmv:
         block_nnz,
         max_segments,
         max_row_nnz,
-        opt_buckets,
+        opt_buckets=None,
+        row_lengths=None,
         transpose=False,
         op=None,
         index_fallback_policy="auto",
@@ -102,8 +104,11 @@ class PreparedCsrSpmv:
         self.n_cols = n_cols
         self.block_nnz = block_nnz
         self.max_segments = max_segments
+        if row_lengths is None:
+            row_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
+        self.row_lengths = row_lengths
         self.max_row_nnz = max_row_nnz
-        self.opt_buckets = opt_buckets
+        self.opt_buckets = [] if opt_buckets is None else opt_buckets
         self.supports_opt = (
             data.dtype in (torch.float32, torch.float64)
             and kernel_indices.dtype == torch.int32
@@ -390,17 +395,30 @@ def _build_spmv_opt_buckets(
             lower_bound = upper_bound
     return buckets
 
-def _triton_spmv_csr_impl_opt_prepared(prepared, x):
+
+def _build_spmv_opt_runtime_buckets(prepared):
+    row_index_dtype = torch.int32 if prepared.n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+    return _build_spmv_opt_buckets(
+        prepared.row_lengths,
+        max_row_nnz=prepared.max_row_nnz,
+        row_index_dtype=row_index_dtype,
+        max_segments=prepared.max_segments,
+        fp64=prepared.data.dtype == torch.float64,
+    )
+
+def _triton_spmv_csr_impl_opt_prepared(prepared, x, opt_buckets=None):
     # First bucket includes nnz==0 rows; every row gets exactly one store.
     dtype = prepared.data.dtype
     y = torch.empty(prepared.n_rows, dtype=dtype, device=prepared.data.device)
     if prepared.n_rows == 0:
         return y
+    if opt_buckets is None:
+        opt_buckets = prepared.opt_buckets
     vec_f32 = _spmv_csr_vector_rows_f32
     vec_f64 = _spmv_csr_vector_rows_f64
     bat_f32 = _spmv_csr_batched_short_f32
     bat_f64 = _spmv_csr_batched_short_f64
-    for bucket in prepared.opt_buckets:
+    for bucket in opt_buckets:
         rows = bucket["rows"]
         br = max(1, int(bucket.get("batch_rows", 1)))
         n_r = rows.numel()
@@ -624,14 +642,6 @@ def prepare_spmv_csr(
             )
     else:
         max_segments_use = max_segments
-    row_index_dtype = torch.int32 if n_rows <= _INDEX_LIMIT_INT32 else torch.int64
-    opt_buckets = _build_spmv_opt_buckets(
-        row_lengths,
-        max_row_nnz=max_row_nnz,
-        row_index_dtype=row_index_dtype,
-        max_segments=max_segments,
-        fp64=data.dtype == torch.float64,
-    )
     return PreparedCsrSpmv(
         data=data,
         kernel_indices=kernel_indices,
@@ -641,8 +651,9 @@ def prepare_spmv_csr(
         n_cols=n_cols,
         block_nnz=block_nnz_use,
         max_segments=max_segments_use,
+        row_lengths=row_lengths,
         max_row_nnz=max_row_nnz,
-        opt_buckets=opt_buckets,
+        opt_buckets=None,
         transpose=transpose,
         op=op_code,
         index_fallback_policy=index_fallback_policy,
@@ -745,16 +756,6 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
     kernel_indptr = prepared.kernel_indptr.to(torch.int32)
     row_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
     max_row_nnz = int(row_lengths.max().item()) if prepared.n_rows > 0 else 0
-    row_index_dtype = (
-        torch.int32 if prepared.n_rows <= _INDEX_LIMIT_INT32 else torch.int64
-    )
-    opt_buckets = _build_spmv_opt_buckets(
-        row_lengths,
-        max_row_nnz=max_row_nnz,
-        row_index_dtype=row_index_dtype,
-        max_segments=prepared.max_segments,
-        fp64=prepared.data.dtype == torch.float64,
-    )
     return PreparedCsrSpmv(
         data=prepared.data,
         kernel_indices=kernel_indices,
@@ -764,8 +765,9 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
         n_cols=prepared.n_cols,
         block_nnz=prepared.block_nnz,
         max_segments=prepared.max_segments,
+        row_lengths=row_lengths,
         max_row_nnz=max_row_nnz,
-        opt_buckets=opt_buckets,
+        opt_buckets=None,
         transpose=prepared.transpose,
         op=prepared.op,
         index_fallback_policy=prepared.index_fallback_policy,
@@ -774,15 +776,17 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
     )
 
 
-def _run_spmv_prepared(prepared, x, use_opt=False):
+def _run_spmv_prepared(prepared, x, use_opt=False, opt_buckets=None):
     if use_opt and prepared.supports_opt:
-        return _triton_spmv_csr_impl_opt_prepared(prepared, x)
+        return _triton_spmv_csr_impl_opt_prepared(prepared, x, opt_buckets=opt_buckets)
     return _triton_spmv_csr_impl_prepared(prepared, x)
 
 
-def _run_spmv_prepared_with_fallback(prepared, x, use_opt=False):
+def _run_spmv_prepared_with_fallback(prepared, x, use_opt=False, opt_buckets=None):
     try:
-        return _run_spmv_prepared(prepared, x, use_opt=use_opt)
+        return _run_spmv_prepared(
+            prepared, x, use_opt=use_opt, opt_buckets=opt_buckets
+        )
     except Exception as exc:
         if (
             prepared.index_fallback_policy != "auto"
@@ -790,7 +794,15 @@ def _run_spmv_prepared_with_fallback(prepared, x, use_opt=False):
         ):
             raise
         fallback_prepared = _spmv_prepared_with_int32_indices(prepared, exc)
-        return _run_spmv_prepared(fallback_prepared, x, use_opt=use_opt)
+        fallback_buckets = None
+        if use_opt and fallback_prepared.supports_opt:
+            fallback_buckets = _build_spmv_opt_runtime_buckets(fallback_prepared)
+        return _run_spmv_prepared(
+            fallback_prepared,
+            x,
+            use_opt=use_opt,
+            opt_buckets=fallback_buckets,
+        )
 
 
 def flagsparse_spmv_csr(
@@ -803,6 +815,7 @@ def flagsparse_spmv_csr(
     max_segments=None,
     out=None,
     return_time=False,
+    return_meta=False,
     use_opt=False,
     prepared=None,
     transpose=None,
@@ -849,15 +862,28 @@ def flagsparse_spmv_csr(
                 f"transpose={bool(transpose)} does not match prepared.transpose={prepared.transpose}"
             )
     x = _validate_spmv_x(x, prepared)
-    t0 = None
-    if return_time:
+    do_timing = bool(return_time or return_meta)
+    symbolic_ms = 0.0 if do_timing else None
+    compute_ms = None
+    op_total_ms = None
+    opt_buckets = None
+    if do_timing:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    y = _run_spmv_prepared_with_fallback(prepared, x, use_opt=use_opt)
-    elapsed_ms = None
-    if return_time:
+    if use_opt and prepared.supports_opt:
+        opt_buckets = _build_spmv_opt_runtime_buckets(prepared)
+    if do_timing:
         torch.cuda.synchronize()
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        t1 = time.perf_counter()
+        symbolic_ms = (t1 - t0) * 1000.0 if use_opt and prepared.supports_opt else 0.0
+    y = _run_spmv_prepared_with_fallback(
+        prepared, x, use_opt=use_opt, opt_buckets=opt_buckets
+    )
+    if do_timing:
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        compute_ms = (t2 - t1) * 1000.0
+        op_total_ms = symbolic_ms + compute_ms
     if out is not None:
         if not out.is_cuda:
             raise ValueError("out must be a CUDA tensor")
@@ -867,8 +893,18 @@ def flagsparse_spmv_csr(
             raise ValueError("out shape/dtype must match result")
         out.copy_(y)
         y = out
+    if return_meta:
+        meta = {
+            "symbolic_ms": symbolic_ms,
+            "compute_ms": compute_ms,
+            "op_total_ms": op_total_ms,
+            "bucket_count": int(len(opt_buckets)) if opt_buckets is not None else 0,
+        }
+        if return_time:
+            return y, op_total_ms, meta
+        return y, meta
     if return_time:
-        return y, elapsed_ms
+        return y, op_total_ms
     return y
 
 
