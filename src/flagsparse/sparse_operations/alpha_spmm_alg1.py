@@ -1,5 +1,7 @@
 """Experimental Triton port of AlphaSparse CUDA CSR ALG1 for SpMM."""
 
+import importlib
+
 from ._common import *
 from ._alpha_spmm_alg1_common import (
     _build_alpha_spmm_alg1_launch_meta,
@@ -7,13 +9,26 @@ from ._alpha_spmm_alg1_common import (
 )
 from .spmm_csr import _prepare_spmm_csr_matrix
 
-try:
-    import triton.language.extra as tle
 
-    _TLE_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - depends on FlagTree runtime.
-    tle = None
-    _TLE_IMPORT_ERROR = exc
+def _load_tle_language():
+    errors = []
+    for module_name in (
+        "triton.experimental.tle.language",
+        "triton.experimental.tle",
+        "triton.language.extra",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # pragma: no cover - depends on FlagTree runtime.
+            errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
+            continue
+        if hasattr(module, "gpu"):
+            return module, None
+        errors.append(f"{module_name}: imported, but has no gpu namespace")
+    return None, RuntimeError("No FlagTree TLE module with a gpu namespace was found: " + "; ".join(errors))
+
+
+tle, _TLE_IMPORT_ERROR = _load_tle_language()
 
 
 SUPPORTED_ALPHA_SPMM_ALG1_DTYPES = (torch.float32, torch.float64)
@@ -328,12 +343,12 @@ def _alpha_spmm_alg1_tle_rowmajor_kernel(
     s_val = tle.gpu.alloc(
         (BLOCK_ROWS, WARP_SIZE),
         dtype=ACC_DTYPE,
-        scope=tle.gpu.storage_kind.smem,
+        scope=tle.gpu.smem,
     )
     s_col = tle.gpu.alloc(
         (BLOCK_ROWS, WARP_SIZE),
         dtype=tl.int32,
-        scope=tle.gpu.storage_kind.smem,
+        scope=tle.gpu.smem,
     )
 
     for local_row in tl.static_range(0, BLOCK_ROWS):
@@ -351,14 +366,15 @@ def _alpha_spmm_alg1_tle_rowmajor_kernel(
                 valid_offsets = elem_offsets < row_end
                 staged_cols = tl.load(indices_ptr + elem_offsets, mask=valid_offsets, other=0)
                 staged_vals = tl.load(data_ptr + elem_offsets, mask=valid_offsets, other=0.0).to(ACC_DTYPE)
-                tl.store(tle.gpu.local_ptr(s_col, (local_row, lane_offsets)), staged_cols, mask=valid_offsets)
-                tl.store(tle.gpu.local_ptr(s_val, (local_row, lane_offsets)), staged_vals, mask=valid_offsets)
+                local_rows = tl.full([WARP_SIZE], local_row, dtype=tl.int32)
+                tl.store(tle.gpu.local_ptr(s_col, indices=(local_rows, lane_offsets)), staged_cols, mask=valid_offsets)
+                tl.store(tle.gpu.local_ptr(s_val, indices=(local_rows, lane_offsets)), staged_vals, mask=valid_offsets)
 
                 for jj in tl.static_range(0, WARP_SIZE):
                     elem_idx = chunk_start + jj
                     valid = elem_idx < row_end
-                    a_col = tl.load(tle.gpu.local_ptr(s_col, (local_row, jj)), mask=valid, other=0)
-                    a_val = tl.load(tle.gpu.local_ptr(s_val, (local_row, jj)), mask=valid, other=0.0).to(ACC_DTYPE)
+                    a_col = tl.load(tle.gpu.local_ptr(s_col, indices=(local_row, jj)), mask=valid, other=0)
+                    a_val = tl.load(tle.gpu.local_ptr(s_val, indices=(local_row, jj)), mask=valid, other=0.0).to(ACC_DTYPE)
                     if FACTOR > 0:
                         b0 = tl.load(
                             b_ptr + a_col * stride_bk + offs0 * stride_bn,
