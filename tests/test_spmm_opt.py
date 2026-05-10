@@ -1,6 +1,6 @@
 """
 SpMM alg1 test: compare base vs optimised path with PyTorch and cuSPARSE timings.
-Alg1 timings include runtime symbolic + numeric compute, not prepared-only steady-state time.
+Alg1 timings include runtime preprocessing + compute, not prepared-only steady-state time.
 
 Usage:
     python tests/test_spmm_opt.py <dir/> --dense-cols 32
@@ -130,8 +130,8 @@ def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
         out = op()
     torch.cuda.synchronize()
     total_ms = 0.0
-    symbolic_ms = 0.0
-    num_ms = 0.0
+    preprocess_ms = 0.0
+    compute_ms = 0.0
     count = max(1, int(iters))
     for _ in range(count):
         out, elapsed_ms, meta = run(
@@ -141,16 +141,16 @@ def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
             return_meta=True,
         )
         total_ms += float(elapsed_ms)
-        symbolic_ms += float(meta["symbolic_ms"])
-        num_ms += float(meta["compute_ms"])
-    return out, total_ms / count, symbolic_ms / count, num_ms / count
+        preprocess_ms += float(meta["symbolic_ms"])
+        compute_ms += float(meta["compute_ms"])
+    return out, total_ms / count, preprocess_ms / count, compute_ms / count
 
 
 def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
     return _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters)
 
 
-def _timed_spmm_opt_alg1_symbolic(data, indices, indptr, B, shape, warmup, iters):
+def _timed_spmm_opt_alg1_preprocess(data, indices, indptr, B, shape, warmup, iters):
     return _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters)
 
 
@@ -258,7 +258,7 @@ def _err(v):
 
 HEADER = (
     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8}  "
-    f"{'Base(ms)':>9} {'Alg1(ms)':>9} {'A1Sym':>9} {'A1Num':>9} "
+    f"{'Base(ms)':>9} {'Alg1(ms)':>9} {'A1Prep':>9} {'A1Comp':>9} "
     f"{'PT(ms)':>9} {'CU(ms)':>9}  "
     f"{'Base/A1':>8} {'PT/A1':>8} {'CU/A1':>8}  "
     f"{'Err(Base)':>10} {'Err(A1)':>10} {'Status':>6}"
@@ -285,7 +285,7 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
     ref = _build_reference(data, indices, indptr, B, shape, dtype)
 
     y_base, base_ms = _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters)
-    y_opt, opt_ms, symbolic_ms, num_ms = _timed_spmm_opt(
+    y_opt, opt_ms, preprocess_ms, compute_ms = _timed_spmm_opt(
         data, indices, indptr, B, shape, warmup, iters
     )
 
@@ -314,8 +314,8 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
         "base_ms": base_ms,
         "opt_ms": opt_ms,
         "alg1_ms": opt_ms,
-        "alg1_sym_ms": symbolic_ms,
-        "alg1_num_ms": num_ms,
+        "alg1_preprocess_ms": preprocess_ms,
+        "alg1_compute_ms": compute_ms,
         "pt_ms": pt_ms,
         "cu_ms": cu_ms,
         "err_base": err_base,
@@ -335,7 +335,7 @@ def print_row(row):
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {row['nnz']:>10} {row['dense_cols']:>8}  "
         f"{_fmt(row['base_ms']):>9} {_fmt(row['alg1_ms']):>9} "
-        f"{_fmt(row['alg1_sym_ms']):>9} {_fmt(row['alg1_num_ms']):>9} "
+        f"{_fmt(row['alg1_preprocess_ms']):>9} {_fmt(row['alg1_compute_ms']):>9} "
         f"{_fmt(row['pt_ms']):>9} {_fmt(row['cu_ms']):>9}  "
         f"{_spd(row['base_ms'], row['alg1_ms']):>8} "
         f"{_spd(row['pt_ms'], row['alg1_ms']):>8} "
@@ -369,8 +369,8 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
             print(f"Value dtype: {dname}  |  Index dtype: {iname}  |  Dense cols: {dense_cols}")
             print(
                 "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
-                "Alg1 = bucketed CSR SpMM native path with Triton symbolic bucket construction. "
-                "Alg1(ms) = A1Sym + A1Num. Speedup = reference / Alg1."
+                "Alg1 = bucketed CSR SpMM native path with Triton runtime preprocessing. "
+                "Alg1(ms) = A1Prep + A1Comp. Speedup = reference / Alg1."
             )
             print(SEP)
             print(HEADER)
@@ -391,8 +391,8 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
                     "base_ms": row["base_ms"],
                     "opt_ms": row["opt_ms"],
                     "alg1_ms": row["alg1_ms"],
-                    "alg1_sym_ms": row["alg1_sym_ms"],
-                    "alg1_num_ms": row["alg1_num_ms"],
+                    "alg1_preprocess_ms": row["alg1_preprocess_ms"],
+                    "alg1_compute_ms": row["alg1_compute_ms"],
                     "pt_ms": row["pt_ms"],
                     "cu_ms": row["cu_ms"],
                     "opt_vs_base": (row["base_ms"] / row["opt_ms"] if row["opt_ms"] and row["opt_ms"] > 0 else None),
@@ -419,8 +419,8 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
         "base_ms",
         "opt_ms",
         "alg1_ms",
-        "alg1_sym_ms",
-        "alg1_num_ms",
+        "alg1_preprocess_ms",
+        "alg1_compute_ms",
         "pt_ms",
         "cu_ms",
         "opt_vs_base",
@@ -477,8 +477,8 @@ def main():
         print(f"Seed: {args.seed}")
     print(
         "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
-        "Alg1 = bucketed CSR SpMM native path with Triton symbolic bucket construction. "
-        "Alg1(ms) = A1Sym + A1Num. Speedup = reference / Alg1."
+        "Alg1 = bucketed CSR SpMM native path with Triton runtime preprocessing. "
+        "Alg1(ms) = A1Prep + A1Comp. Speedup = reference / Alg1."
     )
     print(SEP)
     print(HEADER)

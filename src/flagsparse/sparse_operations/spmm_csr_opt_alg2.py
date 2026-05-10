@@ -752,7 +752,7 @@ def prepare_spmm_csr_opt_alg2(data, indices, indptr, shape):
     )
 
 
-def prepare_spmm_csr_opt_alg2_symbolic(data, indices, indptr, shape):
+def prepare_spmm_csr_opt_alg2_preprocess(data, indices, indptr, shape):
     return prepare_spmm_csr_opt_alg2(data, indices, indptr, shape)
 
 
@@ -985,7 +985,7 @@ def flagsparse_spmm_csr_opt_alg2(
     return C
 
 
-def flagsparse_spmm_csr_opt_alg2_symbolic(
+def flagsparse_spmm_csr_opt_alg2_preprocess(
     data=None,
     indices=None,
     indptr=None,
@@ -996,7 +996,7 @@ def flagsparse_spmm_csr_opt_alg2_symbolic(
     return_time=False,
     return_meta=False,
 ):
-    """Compatibility alias for CSR SpMM opt-alg2 with Triton runtime symbolic."""
+    """Compatibility alias for CSR SpMM opt-alg2 with runtime preprocessing."""
     return flagsparse_spmm_csr_opt_alg2(
         data=data,
         indices=indices,
@@ -1008,6 +1008,8 @@ def flagsparse_spmm_csr_opt_alg2_symbolic(
         return_time=return_time,
         return_meta=return_meta,
     )
+
+
 
 
 def _spmm_opt_alg2_reference_error(candidate, reference, value_dtype):
