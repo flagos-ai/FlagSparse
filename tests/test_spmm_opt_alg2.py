@@ -1,5 +1,5 @@
 """
-Protected four-way CSR SpMM benchmark: base vs opt vs opt_alg2 vs references.
+Protected CSR SpMM benchmark: base vs alg1 vs alg2 vs references.
 
 Usage:
     python tests/test_spmm_opt_alg2.py --synthetic --dense-cols 32 --with-cusparse
@@ -44,37 +44,33 @@ SUMMARY_FIELDS = [
     "max_row_nnz",
     "base_ms",
     "opt_ms",
-    "opt_alg2_ms",
-    "opt_alg2_symbolic_ms",
-    "opt_alg2_compute_ms",
-    "opt_alg2_op_total_ms",
-    "opt_alg2_sym_symbolic_ms",
-    "opt_alg2_sym_compute_ms",
-    "opt_alg2_sym_total_ms",
+    "alg1_ms",
+    "alg1_sym_ms",
+    "alg1_num_ms",
+    "alg2_ms",
+    "alg2_sym_ms",
+    "alg2_num_ms",
     "torch_ms",
     "cusparse_ms",
-    "base_vs_opt_alg2_speedup",
-    "torch_vs_opt_alg2_speedup",
-    "cusparse_vs_opt_alg2_speedup",
-    "base_vs_opt_alg2_sym_speedup",
-    "torch_vs_opt_alg2_sym_speedup",
-    "cusparse_vs_opt_alg2_sym_speedup",
+    "base_vs_alg1_speedup",
+    "torch_vs_alg1_speedup",
+    "cusparse_vs_alg1_speedup",
+    "base_vs_alg2_speedup",
+    "torch_vs_alg2_speedup",
+    "cusparse_vs_alg2_speedup",
+    "alg1_vs_alg2_speedup",
     "base_vs_torch_err",
     "base_vs_cusparse_err",
     "opt_vs_torch_err",
     "opt_vs_cusparse_err",
     "opt_alg2_vs_torch_err",
     "opt_alg2_vs_cusparse_err",
-    "opt_alg2_sym_vs_torch_err",
-    "opt_alg2_sym_vs_cusparse_err",
     "base_status_vs_torch",
     "base_status_vs_cusparse",
     "opt_status_vs_torch",
     "opt_status_vs_cusparse",
     "opt_alg2_status_vs_torch",
     "opt_alg2_status_vs_cusparse",
-    "opt_alg2_sym_status_vs_torch",
-    "opt_alg2_sym_status_vs_cusparse",
     "matrix_status",
 ]
 
@@ -144,13 +140,29 @@ def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
 
 def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
     prepared = fs.prepare_spmm_csr_opt(data, indices, indptr, shape)
-    out = fs.flagsparse_spmm_csr_opt(B=B, prepared=prepared)
-    _, elapsed = _benchmark(
-        lambda: fs.flagsparse_spmm_csr_opt(B=B, prepared=prepared),
-        warmup,
-        iters,
-    )
-    return out, elapsed
+    out, meta = fs.flagsparse_spmm_csr_opt(B=B, prepared=prepared, return_meta=True)
+    torch.cuda.synchronize()
+    for _ in range(max(0, int(warmup))):
+        _ = fs.flagsparse_spmm_csr_opt(B=B, prepared=prepared)
+    torch.cuda.synchronize()
+
+    total_ms = 0.0
+    symbolic_ms = 0.0
+    num_ms = 0.0
+    measured_meta = meta
+    measured_value = out
+    count = max(1, int(iters))
+    for _ in range(count):
+        measured_value, elapsed_ms, measured_meta = fs.flagsparse_spmm_csr_opt(
+            B=B,
+            prepared=prepared,
+            return_time=True,
+            return_meta=True,
+        )
+        symbolic_ms += float(measured_meta["symbolic_ms"])
+        num_ms += float(measured_meta["compute_ms"])
+        total_ms += float(elapsed_ms)
+    return measured_value, total_ms / count, symbolic_ms / count, num_ms / count
 
 
 def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
@@ -163,7 +175,7 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
 
     total_ms = 0.0
     symbolic_ms = 0.0
-    compute_ms = 0.0
+    num_ms = 0.0
     measured_prepared = prepared
     measured_meta = meta
     measured_value = first
@@ -176,7 +188,7 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
             return_meta=True,
         )
         symbolic_ms += float(measured_meta["symbolic_ms"])
-        compute_ms += float(measured_meta["compute_ms"])
+        num_ms += float(measured_meta["compute_ms"])
         total_ms += float(elapsed_ms)
     return (
         measured_value,
@@ -184,42 +196,7 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
         measured_prepared,
         measured_meta,
         symbolic_ms / count,
-        compute_ms / count,
-    )
-
-
-def _timed_spmm_opt_alg2_symbolic(data, indices, indptr, B, shape, warmup, iters):
-    prepared = fs.prepare_spmm_csr_opt_alg2_symbolic(data, indices, indptr, shape)
-    first, meta = fs.flagsparse_spmm_csr_opt_alg2_symbolic(B=B, prepared=prepared, return_meta=True)
-    torch.cuda.synchronize()
-    for _ in range(max(0, int(warmup))):
-        _ = fs.flagsparse_spmm_csr_opt_alg2_symbolic(B=B, prepared=prepared)
-    torch.cuda.synchronize()
-
-    total_ms = 0.0
-    symbolic_ms = 0.0
-    compute_ms = 0.0
-    measured_prepared = prepared
-    measured_meta = meta
-    measured_value = first
-    count = max(1, int(iters))
-    for _ in range(count):
-        measured_value, elapsed_ms, measured_meta = fs.flagsparse_spmm_csr_opt_alg2_symbolic(
-            B=B,
-            prepared=measured_prepared,
-            return_time=True,
-            return_meta=True,
-        )
-        symbolic_ms += float(measured_meta["symbolic_ms"])
-        compute_ms += float(measured_meta["compute_ms"])
-        total_ms += float(elapsed_ms)
-    return (
-        measured_value,
-        total_ms / count,
-        measured_prepared,
-        measured_meta,
-        symbolic_ms / count,
-        compute_ms / count,
+        num_ms / count,
     )
 
 
@@ -392,15 +369,7 @@ def run_one_case(
     n_rows, n_cols = shape
     B = _seeded_dense_matrix((n_cols, dense_cols), dtype, device, seed)
     base_out, base_ms = _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters)
-    opt_out, opt_ms = _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters)
-    (
-        alg2_out,
-        alg2_ms,
-        prepared_alg2,
-        alg2_meta,
-        alg2_symbolic_ms,
-        alg2_compute_ms,
-    ) = _timed_spmm_opt_alg2(
+    opt_out, opt_ms, alg1_sym_ms, alg1_num_ms = _timed_spmm_opt(
         data,
         indices,
         indptr,
@@ -410,13 +379,13 @@ def run_one_case(
         iters,
     )
     (
-        alg2_sym_out,
-        alg2_sym_ms,
-        prepared_alg2_sym,
-        alg2_sym_meta,
-        alg2_sym_symbolic_ms,
-        alg2_sym_compute_ms,
-    ) = _timed_spmm_opt_alg2_symbolic(
+        alg2_out,
+        alg2_ms,
+        prepared_alg2,
+        alg2_meta,
+        alg2_symbolic_ms,
+        alg2_compute_ms,
+    ) = _timed_spmm_opt_alg2(
         data,
         indices,
         indptr,
@@ -440,11 +409,9 @@ def run_one_case(
     base_vs_torch = _error_profile(base_out, torch_ref, dtype)
     opt_vs_torch = _error_profile(opt_out, torch_ref, dtype)
     alg2_vs_torch = _error_profile(alg2_out, torch_ref, dtype)
-    alg2_sym_vs_torch = _error_profile(alg2_sym_out, torch_ref, dtype)
     base_vs_cusparse = _error_profile(base_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(base_out, None, dtype)
     opt_vs_cusparse = _error_profile(opt_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(opt_out, None, dtype)
     alg2_vs_cusparse = _error_profile(alg2_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(alg2_out, None, dtype)
-    alg2_sym_vs_cusparse = _error_profile(alg2_sym_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(alg2_sym_out, None, dtype)
     row_lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
     max_row_nnz = int(row_lengths.max().item()) if row_lengths.numel() > 0 else 0
 
@@ -460,15 +427,35 @@ def run_one_case(
         "max_row_nnz": max_row_nnz,
         "base_ms": base_ms,
         "opt_ms": opt_ms,
-        "opt_alg2_ms": alg2_ms,
-        "opt_alg2_symbolic_ms": alg2_symbolic_ms,
-        "opt_alg2_compute_ms": alg2_compute_ms,
-        "opt_alg2_op_total_ms": alg2_ms,
-        "opt_alg2_sym_symbolic_ms": alg2_sym_symbolic_ms,
-        "opt_alg2_sym_compute_ms": alg2_sym_compute_ms,
-        "opt_alg2_sym_total_ms": alg2_sym_ms,
+        "alg1_ms": opt_ms,
+        "alg1_sym_ms": alg1_sym_ms,
+        "alg1_num_ms": alg1_num_ms,
+        "alg2_ms": alg2_ms,
+        "alg2_sym_ms": alg2_symbolic_ms,
+        "alg2_num_ms": alg2_compute_ms,
         "torch_ms": torch_ms,
         "cusparse_ms": cusparse_ms,
+        "base_vs_alg1_speedup": (
+            base_ms / opt_ms if opt_ms is not None and opt_ms > 0 else None
+        ),
+        "torch_vs_alg1_speedup": (
+            torch_ms / opt_ms if torch_ms is not None and opt_ms is not None and opt_ms > 0 else None
+        ),
+        "cusparse_vs_alg1_speedup": (
+            cusparse_ms / opt_ms if cusparse_ms is not None and opt_ms is not None and opt_ms > 0 else None
+        ),
+        "base_vs_alg2_speedup": (
+            base_ms / alg2_ms if alg2_ms is not None and alg2_ms > 0 else None
+        ),
+        "torch_vs_alg2_speedup": (
+            torch_ms / alg2_ms if torch_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+        ),
+        "cusparse_vs_alg2_speedup": (
+            cusparse_ms / alg2_ms if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+        ),
+        "alg1_vs_alg2_speedup": (
+            opt_ms / alg2_ms if opt_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+        ),
         "base_vs_opt_alg2_speedup": (
             base_ms / alg2_ms if alg2_ms is not None and alg2_ms > 0 else None
         ),
@@ -478,32 +465,19 @@ def run_one_case(
         "cusparse_vs_opt_alg2_speedup": (
             cusparse_ms / alg2_ms if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
         ),
-        "base_vs_opt_alg2_sym_speedup": (
-            base_ms / alg2_sym_ms if alg2_sym_ms is not None and alg2_sym_ms > 0 else None
-        ),
-        "torch_vs_opt_alg2_sym_speedup": (
-            torch_ms / alg2_sym_ms if torch_ms is not None and alg2_sym_ms is not None and alg2_sym_ms > 0 else None
-        ),
-        "cusparse_vs_opt_alg2_sym_speedup": (
-            cusparse_ms / alg2_sym_ms if cusparse_ms is not None and alg2_sym_ms is not None and alg2_sym_ms > 0 else None
-        ),
         "base_vs_torch_err": base_vs_torch["global_err"],
         "base_vs_cusparse_err": base_vs_cusparse["global_err"],
         "opt_vs_torch_err": opt_vs_torch["global_err"],
         "opt_vs_cusparse_err": opt_vs_cusparse["global_err"],
         "opt_alg2_vs_torch_err": alg2_vs_torch["global_err"],
         "opt_alg2_vs_cusparse_err": alg2_vs_cusparse["global_err"],
-        "opt_alg2_sym_vs_torch_err": alg2_sym_vs_torch["global_err"],
-        "opt_alg2_sym_vs_cusparse_err": alg2_sym_vs_cusparse["global_err"],
         "base_status_vs_torch": base_vs_torch["status"],
         "base_status_vs_cusparse": base_vs_cusparse["status"],
         "opt_status_vs_torch": opt_vs_torch["status"],
         "opt_status_vs_cusparse": opt_vs_cusparse["status"],
         "opt_alg2_status_vs_torch": alg2_vs_torch["status"],
         "opt_alg2_status_vs_cusparse": alg2_vs_cusparse["status"],
-        "opt_alg2_sym_status_vs_torch": alg2_sym_vs_torch["status"],
-        "opt_alg2_sym_status_vs_cusparse": alg2_sym_vs_cusparse["status"],
-        "matrix_status": alg2_vs_torch["status"] if alg2_sym_vs_torch["status"] == "PASS" else "FAIL",
+        "matrix_status": alg2_vs_torch["status"],
     }
 
     if not return_details:
@@ -511,14 +485,11 @@ def run_one_case(
     return {
         "summary": summary,
         "prepared_alg2": prepared_alg2,
-        "prepared_alg2_sym": prepared_alg2_sym,
         "alg2_meta": alg2_meta,
-        "alg2_sym_meta": alg2_sym_meta,
         "outputs": {
             "base_triton": base_out,
             "opt_triton": opt_out,
             "opt_alg2_triton": alg2_out,
-            "opt_alg2_sym_triton": alg2_sym_out,
             "torch_ref": torch_ref,
             "cusparse_ref": cusparse_ref,
         },
@@ -529,8 +500,6 @@ def run_one_case(
             "opt_vs_cusparse": opt_vs_cusparse,
             "opt_alg2_vs_torch": alg2_vs_torch,
             "opt_alg2_vs_cusparse": alg2_vs_cusparse,
-            "opt_alg2_sym_vs_torch": alg2_sym_vs_torch,
-            "opt_alg2_sym_vs_cusparse": alg2_sym_vs_cusparse,
         },
         "sparse_backend_name": sparse_backend_name,
         "sparse_backend_reason": sparse_backend_reason,
@@ -553,12 +522,15 @@ def print_row(row):
     name = os.path.basename(row["matrix"])[:27]
     print(
         f"{name:<28} {row['n_rows']:>7} {row['n_cols']:>7} {row['nnz']:>10} {row['dense_cols']:>8}  "
-        f"{_fmt(row['base_ms']):>9} {_fmt(row['opt_ms']):>9} {_fmt(row['opt_alg2_ms']):>9} "
-        f"{_fmt(row['opt_alg2_symbolic_ms']):>9} {_fmt(row['opt_alg2_compute_ms']):>9} "
+        f"{_fmt(row['base_ms']):>9} {_fmt(row['alg1_ms']):>9} "
+        f"{_fmt(row['alg1_sym_ms']):>9} {_fmt(row['alg1_num_ms']):>9} "
+        f"{_fmt(row['alg2_ms']):>9} {_fmt(row['alg2_sym_ms']):>9} {_fmt(row['alg2_num_ms']):>9} "
         f"{_fmt(row['torch_ms']):>9} {_fmt(row['cusparse_ms']):>9}  "
-        f"{_speed(row['base_vs_opt_alg2_speedup']):>8} "
-        f"{_speed(row['torch_vs_opt_alg2_speedup']):>8} "
-        f"{_speed(row['cusparse_vs_opt_alg2_speedup']):>8}  "
+        f"{_speed(row['base_vs_alg1_speedup']):>8} "
+        f"{_speed(row['base_vs_alg2_speedup']):>8} "
+        f"{_speed(row['alg1_vs_alg2_speedup']):>8} "
+        f"{_speed(row['torch_vs_alg2_speedup']):>8} "
+        f"{_speed(row['cusparse_vs_alg2_speedup']):>8}  "
         f"{_err(row['opt_vs_torch_err']):>10} {_err(row['opt_vs_cusparse_err']):>10} "
         f"{_err(row['opt_alg2_vs_torch_err']):>10} {_err(row['opt_alg2_vs_cusparse_err']):>10} "
         f"{row['matrix_status']:>6}"
@@ -629,7 +601,7 @@ def _write_csv(csv_path, rows):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Protected CSR SpMM four-way benchmark with opt_alg2.")
+    parser = argparse.ArgumentParser(description="Protected CSR SpMM benchmark with alg1 and alg2.")
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--synthetic", action="store_true", help="Run built-in synthetic cases")
     parser.add_argument(
@@ -650,16 +622,17 @@ def main():
     dtype = {"float32": torch.float32, "float64": torch.float64}[args.dtype]
     index_dtype = torch.int32
     print("=" * 220)
-    print("FLAGSPARSE SpMM opt_alg2 Protected Benchmark")
+    print("FLAGSPARSE SpMM Alg1 / Alg2 Protected Benchmark")
     print(
         f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {args.dtype}  |  dense_cols: {args.dense_cols}  "
         f"|  with_cusparse: {args.with_cusparse}"
     )
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8}  "
-        f"{'Base(ms)':>9} {'Opt(ms)':>9} {'Alg2(ms)':>9} {'A2Sym':>9} {'A2Comp':>9} "
-        f"{'Torch(ms)':>9} {'CU(ms)':>9}  {'B/A2':>8} {'T/A2':>8} {'CU/A2':>8}  "
-        f"{'Opt/Torch':>10} {'Opt/CU':>10} {'Alg2/T':>10} {'Alg2/CU':>10} {'Status':>6}"
+        f"{'Base(ms)':>9} {'Alg1(ms)':>9} {'A1Sym':>9} {'A1Num':>9} "
+        f"{'Alg2(ms)':>9} {'A2Sym':>9} {'A2Num':>9} {'Torch(ms)':>9} {'CU(ms)':>9}  "
+        f"{'B/A1':>8} {'B/A2':>8} {'A1/A2':>8} {'T/A2':>8} {'CU/A2':>8}  "
+        f"{'Err(A1/T)':>10} {'Err(A1/CU)':>10} {'Err(A2/T)':>10} {'Err(A2/CU)':>10} {'Status':>6}"
     )
     print("=" * 220)
 

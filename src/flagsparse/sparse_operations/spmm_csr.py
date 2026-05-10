@@ -743,7 +743,7 @@ def _build_spmm_opt_alg1_buckets_triton_symbolic(row_lengths, dtype, nnz=None):
     row_index_dtype = torch.int32 if row_count <= _INDEX_LIMIT_INT32 else torch.int64
     bucket_count = len(_SPMM_OPT_BUCKET_SPECS)
     if bucket_count != 5:
-        raise RuntimeError("Alg1S symbolic builder expects five alg1 buckets")
+        raise RuntimeError("Alg1 Triton symbolic builder expects five alg1 buckets")
 
     counts = torch.zeros((bucket_count,), dtype=torch.int64, device=device)
     block_m = 256
@@ -2605,7 +2605,7 @@ def _flagsparse_spmm_csr_opt_alg1_impl(
     out=None,
     return_time=False,
     return_meta=False,
-    runtime_symbolic_builder=_build_spmm_csr_opt_runtime_symbolic,
+    runtime_symbolic_builder=_build_spmm_csr_opt_runtime_symbolic_triton,
     api_name="flagsparse_spmm_csr_opt_alg1",
 ):
     if prepared is not None and not isinstance(prepared, PreparedCsrSpmmOpt):
@@ -2697,7 +2697,7 @@ def flagsparse_spmm_csr_opt_alg1(
         out=out,
         return_time=return_time,
         return_meta=return_meta,
-        runtime_symbolic_builder=_build_spmm_csr_opt_runtime_symbolic,
+        runtime_symbolic_builder=_build_spmm_csr_opt_runtime_symbolic_triton,
         api_name="flagsparse_spmm_csr_opt_alg1",
     )
 
@@ -2713,7 +2713,7 @@ def flagsparse_spmm_csr_opt_alg1_symbolic(
     return_time=False,
     return_meta=False,
 ):
-    """CSR SpMM-opt alg1 with Triton runtime symbolic bucket construction."""
+    """Compatibility alias for CSR SpMM-opt alg1 with Triton runtime symbolic."""
     return _flagsparse_spmm_csr_opt_alg1_impl(
         data=data,
         indices=indices,
