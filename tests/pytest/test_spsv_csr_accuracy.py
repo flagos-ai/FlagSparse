@@ -1,7 +1,25 @@
 import pytest
 import torch
 
-from flagsparse import flagsparse_spsv_csr
+from flagsparse import (
+    FlagSparseDnVecDescr,
+    FlagSparseSpMatDescr,
+    FlagSparseSpSVDescr,
+    FlagSparseSpSVHandle,
+    FlagSparseSpSVWorkspace,
+    flagsparse_create_dnvec,
+    flagsparse_create_spmat_csr,
+    flagsparse_create_spsv_handle,
+    flagsparse_spsv_analysis_csr,
+    flagsparse_spsv_analysis_ex,
+    flagsparse_spsv_buffer_size,
+    flagsparse_spsv_buffer_size_ex,
+    flagsparse_spsv_create_workspace,
+    flagsparse_spsv_csr,
+    flagsparse_spsv_preprocess_csr,
+    flagsparse_spsv_solve_ex,
+    flagsparse_spsv_solve_csr,
+)
 import flagsparse.sparse_operations.spsv as fs_spsv_impl
 
 from tests.pytest.param_shapes import SPSV_N
@@ -290,9 +308,7 @@ def test_spsv_csr_complex_non_trans_defaults_to_cw_route():
     _, _, _, trans_mode, _, _, solve_plan = fs_spsv_impl._resolve_spsv_csr_runtime(
         data, indices, indptr, b, (n, n), True, False, False
     )
-    selected = fs_spsv_impl._select_spsv_runtime_plan(
-        solve_plan, 1, data.dtype, trans_mode
-    )
+    selected = fs_spsv_impl._select_spsv_runtime_plan(solve_plan, trans_mode)
     assert selected["solve_kind"] == "csr_cw"
 
 
@@ -312,10 +328,284 @@ def test_spsv_csr_transpose_family_defaults_to_cw_route(op_mode):
     _, _, _, trans_mode, _, _, solve_plan = fs_spsv_impl._resolve_spsv_csr_runtime(
         data, indices, indptr, b, (n, n), True, _transpose_arg(op_mode), False
     )
-    selected = fs_spsv_impl._select_spsv_runtime_plan(
-        solve_plan, 1, data.dtype, trans_mode
-    )
+    selected = fs_spsv_impl._select_spsv_runtime_plan(solve_plan, trans_mode)
     assert selected["solve_kind"] == "transpose_cw"
+
+
+@pytest.mark.spsv
+def test_spsv_internal_cw_worker_count_limits_narrow_frontier():
+    matrix_stats = {
+        "max_frontier": 3,
+        "avg_frontier": 2.5,
+        "frontier_ratio": 0.006,
+        "num_levels": 4096,
+        "avg_nnz_per_row": 4096.0,
+    }
+    worker_count = fs_spsv_impl._resolve_cw_worker_count(4096, matrix_stats, 1)
+    assert worker_count <= 4
+
+
+@pytest.mark.spsv
+def test_spsv_csr_transpose_descriptor_keeps_preprocess_metadata():
+    device = torch.device("cuda")
+    dtype = torch.float64
+    n = SPSV_N[0]
+    A = _build_triangular(n, dtype, device, lower=True)
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(torch.int32)
+    indptr = Asp.crow_indices().to(torch.int32)
+
+    descr = flagsparse_spsv_analysis_csr(
+        data,
+        indices,
+        indptr,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        transpose="TRANS",
+    )
+    assert descr.solve_kind == "transpose_cw"
+    assert descr.storage_view == "csr_as_csc"
+    assert descr.solve_plan.get("transpose_indegree_init") is None
+    assert descr.solve_plan.get("transpose_diag") is None
+    assert descr.solve_plan.get("transpose_dep_start") is None
+    assert descr.solve_plan.get("transpose_dep_end") is None
+
+
+@pytest.mark.spsv
+@pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
+def test_spsv_csr_transpose_public_solve_uses_transpose_kernel(monkeypatch, op_mode):
+    device = torch.device("cuda")
+    dtype = torch.complex128
+    n = SPSV_N[0]
+    A = _build_triangular(n, dtype, device, lower=True)
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(torch.int32)
+    indptr = Asp.crow_indices().to(torch.int32)
+    b = _rand_like(dtype, (n,), device)
+
+    called = {"transpose_complex": False}
+    real_impl = fs_spsv_impl._triton_spsv_csr_transpose_cw_vector_complex
+
+    def _wrapped(*args, **kwargs):
+        called["transpose_complex"] = True
+        return real_impl(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fs_spsv_impl,
+        "_triton_spsv_csr_transpose_cw_vector_complex",
+        _wrapped,
+    )
+
+    x = flagsparse_spsv_csr(
+        data,
+        indices,
+        indptr,
+        b,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        transpose=_transpose_arg(op_mode),
+    )
+    x_ref = _dense_ref_spsv(
+        A.to(dtype),
+        b.to(dtype),
+        lower=True,
+        op_mode=op_mode,
+        unit_diagonal=False,
+    )
+    rtol, atol = _tol(dtype)
+    assert called["transpose_complex"]
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+def test_spsv_csr_analysis_workspace_solve_matches_direct():
+    device = torch.device("cuda")
+    dtype = torch.float64
+    n = SPSV_N[0]
+    A = _build_triangular(n, dtype, device, lower=True)
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(torch.int32)
+    indptr = Asp.crow_indices().to(torch.int32)
+    b = _rand_like(dtype, (n,), device)
+
+    descr = flagsparse_spsv_analysis_csr(
+        data,
+        indices,
+        indptr,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        transpose=False,
+    )
+    assert isinstance(descr, FlagSparseSpSVDescr)
+    assert descr.solve_kind == "csr_cw"
+    assert descr.buffer_size == flagsparse_spsv_buffer_size((n, n), dtype, format="csr")
+
+    workspace = flagsparse_spsv_create_workspace(descr)
+    assert isinstance(workspace, FlagSparseSpSVWorkspace)
+    assert workspace.buffer_size == descr.buffer_size
+
+    x_direct = flagsparse_spsv_csr(
+        data, indices, indptr, b, (n, n), lower=True, unit_diagonal=False
+    )
+    x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(x_via_descr, x_direct, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+@pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
+def test_spsv_csr_transpose_analysis_workspace_route(op_mode):
+    device = torch.device("cuda")
+    dtype = torch.complex128
+    n = SPSV_N[0]
+    A = _build_triangular(n, dtype, device, lower=True)
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(torch.int32)
+    indptr = Asp.crow_indices().to(torch.int32)
+    b = _rand_like(dtype, (n,), device)
+
+    descr = flagsparse_spsv_analysis_csr(
+        data,
+        indices,
+        indptr,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        transpose=_transpose_arg(op_mode),
+    )
+    assert descr.solve_kind == "transpose_cw"
+    assert descr.route_name == "transpose_cw"
+    assert descr.solve_plan.get("transpose_lower") is True
+    layout_names = [entry["name"] for entry in descr.workspace_layout]
+    assert layout_names == ["residual", "indegree", "row_counter"]
+
+    workspace = flagsparse_spsv_create_workspace(descr)
+    x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
+    x_direct = flagsparse_spsv_csr(
+        data,
+        indices,
+        indptr,
+        b,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        transpose=_transpose_arg(op_mode),
+    )
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(x_via_descr, x_direct, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+def test_spsv_csr_descriptor_exposes_cuda_style_fields():
+    device = torch.device("cuda")
+    dtype = torch.float64
+    n = SPSV_N[0]
+    A = _build_triangular(n, dtype, device, lower=True)
+    Asp = A.to_sparse_csr()
+    descr = flagsparse_spsv_analysis_csr(
+        Asp.values(),
+        Asp.col_indices().to(torch.int32),
+        Asp.crow_indices().to(torch.int32),
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        transpose=False,
+    )
+    assert descr.fill_mode == "lower"
+    assert descr.diag_type == "non_unit"
+    assert descr.matrix_type == "triangular"
+    assert descr.index_base == 0
+    assert descr.storage_view == "csr"
+
+
+@pytest.mark.spsv
+def test_spsv_csr_preprocess_initializes_workspace():
+    device = torch.device("cuda")
+    dtype = torch.float64
+    n = SPSV_N[0]
+    A = _build_triangular(n, dtype, device, lower=True)
+    Asp = A.to_sparse_csr()
+    descr = flagsparse_spsv_analysis_csr(
+        Asp.values(),
+        Asp.col_indices().to(torch.int32),
+        Asp.crow_indices().to(torch.int32),
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        transpose="TRANS",
+        solve_kind="transpose_cw",
+    )
+    workspace = flagsparse_spsv_create_workspace(descr)
+    workspace = flagsparse_spsv_preprocess_csr(descr, workspace=workspace)
+    assert isinstance(workspace, FlagSparseSpSVWorkspace)
+    indegree_expected = torch.zeros(n, dtype=torch.int32, device=device)
+    row_ids = torch.repeat_interleave(
+        torch.arange(n, device=device, dtype=torch.int64),
+        Asp.crow_indices().to(torch.int64)[1:] - Asp.crow_indices().to(torch.int64)[:-1],
+    )
+    mask = Asp.col_indices().to(torch.int64) <= row_ids
+    if bool(torch.any(mask).item()):
+        counts = torch.bincount(
+            Asp.col_indices().to(torch.int64)[mask], minlength=n
+        ).to(torch.int32)
+        indegree_expected.copy_(counts)
+    assert torch.equal(workspace.buffers["indegree"], indegree_expected)
+
+
+@pytest.mark.spsv
+def test_spsv_ex_interfaces_match_direct_route():
+    device = torch.device("cuda")
+    dtype = torch.float64
+    n = SPSV_N[0]
+    A = _build_triangular(n, dtype, device, lower=True)
+    Asp = A.to_sparse_csr()
+    b = _rand_like(dtype, (n,), device)
+
+    handle = flagsparse_create_spsv_handle(device=device)
+    mat = flagsparse_create_spmat_csr(
+        Asp.values(),
+        Asp.col_indices().to(torch.int32),
+        Asp.crow_indices().to(torch.int32),
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+    )
+    vec = flagsparse_create_dnvec(b)
+    assert isinstance(handle, FlagSparseSpSVHandle)
+    assert isinstance(mat, FlagSparseSpMatDescr)
+    assert isinstance(vec, FlagSparseDnVecDescr)
+
+    descr = flagsparse_spsv_analysis_ex(
+        handle,
+        False,
+        1,
+        mat,
+        vec,
+        compute_dtype=torch.float64,
+    )
+    workspace = flagsparse_spsv_preprocess_csr(
+        descr, workspace=flagsparse_spsv_create_workspace(descr)
+    )
+    x_ex = flagsparse_spsv_solve_ex(handle, False, 1, mat, vec, descr=descr, workspace=workspace)
+    x_direct = flagsparse_spsv_csr(
+        Asp.values(),
+        Asp.col_indices().to(torch.int32),
+        Asp.crow_indices().to(torch.int32),
+        b,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+    )
+    assert flagsparse_spsv_buffer_size_ex(handle, False, 1, mat, vec) == descr.buffer_size
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(x_ex, x_direct, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv

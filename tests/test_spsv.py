@@ -634,11 +634,8 @@ def _benchmark_flagsparse_spsv_coo_split(
         fs_spsv_impl._validate_spsv_non_trans_combo(data.dtype, input_index_dtype, "COO")
     else:
         fs_spsv_impl._validate_spsv_trans_combo(data.dtype, input_index_dtype, "COO")
-    data_sorted, row_sorted, col_sorted = fs_spsv_impl._coo_order_for_spsv(
-        data, row64, col64, n_cols
-    )
     data_csr, indices_csr, indptr_csr = fs_spsv_impl._coo2csr_for_spsv(
-        data_sorted, row_sorted, col_sorted, n_rows, n_cols, assume_ordered=True
+        data, row64, col64, n_rows, assume_ordered=False
     )
     warmup, iters = _spsv_benchmark_schedule(
         int(data_csr.numel()),

@@ -19,12 +19,12 @@ import flagsparse.sparse_operations.spsm as fs_spsm_impl
 
 try:
     import cupy as cp
+    import cupyx.cusparse as cpx_cusparse
     import cupyx.scipy.sparse as cpx_sparse
-    from cupyx.scipy.sparse.linalg import spsolve_triangular as cpx_spsolve_triangular
 except Exception:
     cp = None
+    cpx_cusparse = None
     cpx_sparse = None
-    cpx_spsolve_triangular = None
 
 
 FORMATS = ("csr", "coo")
@@ -186,7 +186,7 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
 
 
 def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup, iters):
-    if cp is None or cpx_sparse is None or cpx_spsolve_triangular is None:
+    if cp is None or cpx_sparse is None or cpx_cusparse is None:
         return None, None, "cusparse unavailable"
     try:
         data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data.contiguous()))
@@ -199,14 +199,15 @@ def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup,
             idx_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.contiguous()))
             ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr.contiguous()))
             A_cp = cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
+        A_cp.sum_duplicates()
         for _ in range(warmup):
-            _ = cpx_spsolve_triangular(A_cp, B_cp, lower=True, unit_diagonal=False)
+            _ = cpx_cusparse.spsm(A_cp, B_cp, lower=True, unit_diag=False, transa=False)
         cp.cuda.runtime.deviceSynchronize()
         c0 = cp.cuda.Event()
         c1 = cp.cuda.Event()
         c0.record()
         for _ in range(iters):
-            X_cp = cpx_spsolve_triangular(A_cp, B_cp, lower=True, unit_diagonal=False)
+            X_cp = cpx_cusparse.spsm(A_cp, B_cp, lower=True, unit_diag=False, transa=False)
         c1.record()
         c1.synchronize()
         ms = cp.cuda.get_elapsed_time(c0, c1) / iters
