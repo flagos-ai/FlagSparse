@@ -1319,6 +1319,158 @@ def _spmm_csr_split_reduce_f64_kernel(
     tl.store(out_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
 
 
+def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props):
+    rows = bucket["rows"]
+    if rows.numel() == 0:
+        return
+    dtype = prepared.data.dtype
+    kind = bucket["kind"]
+    kernel_map = {
+        ("batched", torch.float32): _spmm_csr_batched_rows_f32_kernel,
+        ("batched", torch.float64): _spmm_csr_batched_rows_f64_kernel,
+        ("vector", torch.float32): _spmm_csr_vector_rows_f32_kernel,
+        ("vector", torch.float64): _spmm_csr_vector_rows_f64_kernel,
+    }
+    if (kind, dtype) not in kernel_map:
+        raise TypeError(f"unsupported SpMM opt bucket kind/dtype: {kind}/{dtype}")
+
+    batch_rows = int(bucket.get("batch_rows", 1))
+    block_n = _select_spmm_opt_block_n_for_bucket(
+        int(B.shape[1]), bucket.get("block_n_cap", block_n)
+    )
+    block_nnz = int(bucket["block_nnz"])
+    launch = _resolve_spmm_opt_launch(
+        kind,
+        block_n,
+        block_nnz,
+        batch_rows,
+        dtype,
+        device_props,
+    )
+    kernel = kernel_map[(kind, dtype)]
+
+    if kind == "batched":
+        grid = (triton.cdiv(rows.numel(), batch_rows), triton.cdiv(B.shape[1], block_n))
+        kernel[grid](
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            B,
+            C_out,
+            rows,
+            rows.numel(),
+            B.shape[1],
+            B.stride(0),
+            B.stride(1),
+            C_out.stride(0),
+            C_out.stride(1),
+            BATCH=batch_rows,
+            BLOCK_N=block_n,
+            BLOCK_NNZ=block_nnz,
+            num_warps=launch["num_warps"],
+            num_stages=launch["num_stages"],
+        )
+        return
+
+    grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
+    kernel[grid](
+        prepared.data,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        B,
+        C_out,
+        rows,
+        rows.numel(),
+        B.shape[1],
+        B.stride(0),
+        B.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        BLOCK_N=block_n,
+        BLOCK_NNZ=block_nnz,
+        num_warps=launch["num_warps"],
+        num_stages=launch["num_stages"],
+    )
+
+
+def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
+    if prepared.long_part_rows.numel() == 0:
+        return False
+    block_n = _select_spmm_opt_block_n_for_bucket(int(B.shape[1]), block_n)
+    workspace = torch.empty(
+        (prepared.long_part_rows.numel(), B.shape[1]),
+        dtype=B.dtype,
+        device=B.device,
+    )
+    split_kernel = (
+        _spmm_csr_split_part_f64_kernel
+        if B.dtype == torch.float64
+        else _spmm_csr_split_part_f32_kernel
+    )
+    reduce_kernel = (
+        _spmm_csr_split_reduce_f64_kernel
+        if B.dtype == torch.float64
+        else _spmm_csr_split_reduce_f32_kernel
+    )
+    split_launch = _resolve_spmm_opt_launch(
+        "split_part",
+        block_n,
+        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        1,
+        B.dtype,
+        device_props,
+    )
+    reduce_launch = _resolve_spmm_opt_launch(
+        "split_reduce",
+        block_n,
+        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        1,
+        B.dtype,
+        device_props,
+    )
+    split_grid = (
+        prepared.long_part_rows.numel(),
+        triton.cdiv(B.shape[1], block_n),
+    )
+    split_kernel[split_grid](
+        prepared.data,
+        prepared.kernel_indices,
+        B,
+        workspace,
+        prepared.long_part_starts,
+        prepared.long_part_ends,
+        prepared.long_part_rows.numel(),
+        B.shape[1],
+        B.stride(0),
+        B.stride(1),
+        workspace.stride(0),
+        workspace.stride(1),
+        BLOCK_N=block_n,
+        num_warps=split_launch["num_warps"],
+        num_stages=split_launch["num_stages"],
+    )
+    reduce_grid = (
+        prepared.long_row_ids.numel(),
+        triton.cdiv(B.shape[1], block_n),
+    )
+    reduce_kernel[reduce_grid](
+        workspace,
+        C_out,
+        prepared.long_row_ids,
+        prepared.long_row_part_ptr,
+        prepared.long_row_ids.numel(),
+        B.shape[1],
+        workspace.stride(0),
+        workspace.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        BLOCK_N=block_n,
+        num_warps=reduce_launch["num_warps"],
+        num_stages=reduce_launch["num_stages"],
+    )
+    return False
+
+
 def _triton_spmm_csr_impl_opt_prepared(prepared, B):
     if not prepared.supports_opt:
         raise TypeError("spmm opt only supports float32 and float64")
