@@ -1,6 +1,15 @@
 """FlagSparse sparse operations (gather, scatter, SpMV, SpMM, SpGEMM, SDDMM, SpSM)."""
 
 from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES, cp, cpx_sparse
+from .alpha_spmm_alg1 import (
+    PreparedAlphaSpmmAlg1,
+    alpha_spmm_alg1_tle_unavailable_reason,
+    flagsparse_alpha_spmm_alg1,
+    flagsparse_alpha_spmm_alg1_tle,
+    is_alpha_spmm_alg1_tle_available,
+    prepare_alpha_spmm_alg1,
+    prepare_alpha_spmm_alg1_tle,
+)
 from .benchmarks import (
     benchmark_gather_case,
     benchmark_performance,
@@ -47,13 +56,19 @@ from .spmm_csr import (
     benchmark_spmm_opt_case,
     flagsparse_spmm_csr,
     flagsparse_spmm_csr_opt,
+    flagsparse_spmm_csr_opt_alg1,
+    flagsparse_spmm_csr_opt_alg1_preprocess,
     prepare_spmm_csr_opt,
+    prepare_spmm_csr_opt_alg1,
+    prepare_spmm_csr_opt_alg1_preprocess,
 )
 from .spmm_csr_opt_alg2 import (
     PreparedCsrSpmmOptAlg2,
     benchmark_spmm_opt_alg2_case,
     flagsparse_spmm_csr_opt_alg2,
+    flagsparse_spmm_csr_opt_alg2_preprocess,
     prepare_spmm_csr_opt_alg2,
+    prepare_spmm_csr_opt_alg2_preprocess,
 )
 from .spmm_coo import flagsparse_spmm_coo
 from .spgemm_csr import SpGEMMPrepared, flagsparse_spgemm_csr, prepare_spgemm_csr
@@ -63,6 +78,7 @@ from .spsm import flagsparse_spsm_coo, flagsparse_spsm_csr
 
 __all__ = [
     "PreparedCoo",
+    "PreparedAlphaSpmmAlg1",
     "PreparedCsrSpmv",
     "PreparedCsrSpmmOpt",
     "PreparedCsrSpmmOptAlg2",
@@ -91,12 +107,19 @@ __all__ = [
     "cusparse_spmv_scatter",
     "flagsparse_gather",
     "flagsparse_gather_cupy",
+    "flagsparse_alpha_spmm_alg1",
+    "flagsparse_alpha_spmm_alg1_tle",
+    "is_alpha_spmm_alg1_tle_available",
+    "alpha_spmm_alg1_tle_unavailable_reason",
     "flagsparse_sddmm_csr",
     "flagsparse_spgemm_csr",
     "flagsparse_spmm_coo",
     "flagsparse_spmm_csr",
     "flagsparse_spmm_csr_opt",
+    "flagsparse_spmm_csr_opt_alg1",
+    "flagsparse_spmm_csr_opt_alg1_preprocess",
     "flagsparse_spmm_csr_opt_alg2",
+    "flagsparse_spmm_csr_opt_alg2_preprocess",
     "flagsparse_spmv_coo",
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spmv_csr",
@@ -105,9 +128,14 @@ __all__ = [
     "flagsparse_spsv_coo",
     "flagsparse_spsv_csr",
     "prepare_sddmm_csr",
+    "prepare_alpha_spmm_alg1",
+    "prepare_alpha_spmm_alg1_tle",
     "prepare_spgemm_csr",
     "prepare_spmm_csr_opt",
+    "prepare_spmm_csr_opt_alg1",
+    "prepare_spmm_csr_opt_alg1_preprocess",
     "prepare_spmm_csr_opt_alg2",
+    "prepare_spmm_csr_opt_alg2_preprocess",
     "prepare_spmv_coo",
     "prepare_spmv_coo_tocsr",
     "prepare_spmv_csr",

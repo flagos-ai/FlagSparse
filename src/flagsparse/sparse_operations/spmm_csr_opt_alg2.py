@@ -5,7 +5,6 @@ from ._common import *
 import math
 
 from .spmm_csr import (
-    _benchmark_spmm_csr_sparse_ref,
     _prepare_spmm_csr_matrix,
     _spmm_coo_reference_tolerance,
     _spmm_validation_metrics,
@@ -177,13 +176,9 @@ def _normalize_spmm_opt_alg2_device_props(device):
     props = torch.cuda.get_device_properties(device)
     warp_size = int(getattr(props, "warp_size", 32) or 32)
     sm_count = int(getattr(props, "multi_processor_count", 0) or 0)
-    max_threads_per_mp = int(
-        getattr(props, "max_threads_per_multi_processor", 2048) or 2048
-    )
+    max_threads_per_mp = int(getattr(props, "max_threads_per_multi_processor", 2048) or 2048)
     max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
-    shared_memory_per_block = int(
-        getattr(props, "shared_memory_per_block", 0) or 0
-    )
+    shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     name = str(getattr(props, "name", "cuda"))
     capability = (
         int(getattr(props, "major", 0) or 0),
@@ -217,9 +212,7 @@ def _select_spmm_opt_alg2_block_n(n_dense_cols, block_n_cap):
 def _select_spmm_opt_alg2_num_warps(bucket, block_n, device_props, dtype):
     warp_size = max(1, int(device_props["warp_size"]))
     max_threads_per_block = max(32, int(device_props["max_threads_per_block"]))
-    max_threads_per_mp = max(
-        max_threads_per_block, int(device_props["max_threads_per_mp"])
-    )
+    max_threads_per_mp = max(max_threads_per_block, int(device_props["max_threads_per_mp"]))
     lane_need = max(1, math.ceil(int(block_n) / warp_size))
     kind = bucket["kind"]
     block_k = int(bucket["block_k"])
@@ -237,9 +230,7 @@ def _select_spmm_opt_alg2_num_warps(bucket, block_n, device_props, dtype):
         if segments >= 4:
             desired = max(desired, 8 if block_k >= 64 else 4)
         if segments >= 8:
-            desired = max(
-                desired, 16 if dtype == torch.float32 and block_n >= 64 else 8
-            )
+            desired = max(desired, 16 if dtype == torch.float32 and block_n >= 64 else 8)
 
     if dtype == torch.float64 and desired > 8:
         desired = 8
@@ -299,7 +290,7 @@ def _resolve_spmm_opt_alg2_launch(bucket, n_dense_cols, dtype, device_props):
         device_props,
         dtype,
     )
-    return {
+    launch = {
         "bucket_label": bucket["label"],
         "kind": bucket["kind"],
         "block_k": int(bucket["block_k"]),
@@ -310,6 +301,7 @@ def _resolve_spmm_opt_alg2_launch(bucket, n_dense_cols, dtype, device_props):
         "segments": int(bucket.get("segments", 1)),
         "row_count": int(bucket["rows"].numel()),
     }
+    return launch
 
 
 def _build_spmm_opt_alg2_buckets(row_lengths, dtype):
@@ -330,17 +322,116 @@ def _build_spmm_opt_alg2_buckets(row_lengths, dtype):
         rows = all_rows[mask]
         if rows.numel() == 0:
             continue
-        buckets.append(
-            {
-                "label": spec["label"],
-                "kind": spec["kind"],
-                "rows": rows,
-                "batch_rows": int(spec["batch_rows"]),
-                "block_k": int(spec["block_k"]),
-                "block_n_cap": int(spec["block_n_cap"]),
-                "segments": int(spec.get("segments", 1)),
-            }
+        bucket = {
+            "label": spec["label"],
+            "kind": spec["kind"],
+            "rows": rows,
+            "batch_rows": int(spec["batch_rows"]),
+            "block_k": int(spec["block_k"]),
+            "block_n_cap": int(spec["block_n_cap"]),
+            "segments": int(spec.get("segments", 1)),
+        }
+        buckets.append(bucket)
+    return buckets
+
+
+@triton.jit
+def _spmm_opt_alg2_symbolic_count_kernel(
+    row_lengths_ptr,
+    bucket_counts_ptr,
+    n_rows,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask = offs < n_rows
+    lens = tl.load(row_lengths_ptr + offs, mask=mask, other=0)
+    bucket = tl.where(lens <= 16, 0, tl.where(lens <= 64, 1, tl.where(lens <= 256, 2, tl.where(lens <= 1024, 3, 4))))
+    for bid in tl.static_range(0, 5):
+        hits = mask & (bucket == bid)
+        count = tl.sum(tl.where(hits, 1, 0), axis=0)
+        tl.atomic_add(bucket_counts_ptr + bid, count, sem="relaxed")
+
+
+@triton.jit
+def _spmm_opt_alg2_symbolic_compact_kernel(
+    row_lengths_ptr,
+    bucket_offsets_ptr,
+    bucket_write_counts_ptr,
+    rows_flat_ptr,
+    n_rows,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask = offs < n_rows
+    lens = tl.load(row_lengths_ptr + offs, mask=mask, other=0)
+    bucket = tl.where(lens <= 16, 0, tl.where(lens <= 64, 1, tl.where(lens <= 256, 2, tl.where(lens <= 1024, 3, 4))))
+    for bid in tl.static_range(0, 5):
+        hits = mask & (bucket == bid)
+        ranks = tl.cumsum(tl.where(hits, 1, 0), axis=0) - 1
+        local_count = tl.sum(tl.where(hits, 1, 0), axis=0)
+        base = tl.atomic_add(bucket_write_counts_ptr + bid, local_count, sem="relaxed")
+        offset = tl.load(bucket_offsets_ptr + bid)
+        tl.store(rows_flat_ptr + offset + base + ranks, offs, mask=hits)
+
+
+def _build_spmm_opt_alg2_buckets_triton_symbolic(row_lengths, dtype):
+    device = row_lengths.device
+    row_count = int(row_lengths.numel())
+    row_index_dtype = torch.int32 if row_count <= _INDEX_LIMIT_INT32 else torch.int64
+    bucket_count = len(_spmm_opt_alg2_bucket_specs(dtype))
+    if bucket_count != 5:
+        raise RuntimeError("Alg2 Triton symbolic builder expects five alg2 buckets")
+
+    counts = torch.zeros((bucket_count,), dtype=torch.int64, device=device)
+    block_m = 256
+    grid = (triton.cdiv(row_count, block_m),)
+    if row_count > 0:
+        _spmm_opt_alg2_symbolic_count_kernel[grid](
+            row_lengths,
+            counts,
+            row_count,
+            BLOCK_M=block_m,
+            num_warps=4,
+            num_stages=1,
         )
+    offsets = torch.empty_like(counts)
+    offsets[0] = 0
+    if bucket_count > 1:
+        offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+
+    rows_flat = torch.empty((row_count,), dtype=row_index_dtype, device=device)
+    write_counts = torch.zeros_like(counts)
+    if row_count > 0:
+        _spmm_opt_alg2_symbolic_compact_kernel[grid](
+            row_lengths,
+            offsets,
+            write_counts,
+            rows_flat,
+            row_count,
+            BLOCK_M=block_m,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    counts_cpu = counts.to("cpu").tolist()
+    offsets_cpu = offsets.to("cpu").tolist()
+    buckets = []
+    for spec, count, offset in zip(_spmm_opt_alg2_bucket_specs(dtype), counts_cpu, offsets_cpu):
+        count = int(count)
+        if count == 0:
+            continue
+        bucket = {
+            "label": spec["label"],
+            "kind": spec["kind"],
+            "rows": rows_flat.narrow(0, int(offset), count),
+            "batch_rows": int(spec["batch_rows"]),
+            "block_k": int(spec["block_k"]),
+            "block_n_cap": int(spec["block_n_cap"]),
+            "segments": int(spec.get("segments", 1)),
+        }
+        buckets.append(bucket)
     return buckets
 
 
@@ -635,9 +726,7 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         acc = (acc0 + acc1) + (acc2 + acc3)
     else:
         acc = ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))
-    tl.store(
-        c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n
-    )
+    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n)
 
 
 def prepare_spmm_csr_opt_alg2(data, indices, indptr, shape):
@@ -650,7 +739,6 @@ def prepare_spmm_csr_opt_alg2(data, indices, indptr, shape):
         row_lengths,
         max_row_nnz,
     ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
-    opt_buckets = _build_spmm_opt_alg2_buckets(row_lengths, data.dtype)
     return PreparedCsrSpmmOptAlg2(
         data=data,
         kernel_indices=kernel_indices,
@@ -660,15 +748,17 @@ def prepare_spmm_csr_opt_alg2(data, indices, indptr, shape):
         n_cols=n_cols,
         row_lengths=row_lengths,
         max_row_nnz=max_row_nnz,
-        opt_buckets=opt_buckets,
+        opt_buckets=[],
     )
+
+
+def prepare_spmm_csr_opt_alg2_preprocess(data, indices, indptr, shape):
+    return prepare_spmm_csr_opt_alg2(data, indices, indptr, shape)
 
 
 def _validate_spmm_opt_alg2_runtime_inputs(prepared, B, out):
     if not prepared.supports_opt:
-        raise TypeError(
-            "flagsparse_spmm_csr_opt_alg2 only supports float32 and float64"
-        )
+        raise TypeError("flagsparse_spmm_csr_opt_alg2 only supports float32 and float64")
     if B is None:
         raise ValueError("B is required")
     if B.ndim != 2:
@@ -686,10 +776,7 @@ def _validate_spmm_opt_alg2_runtime_inputs(prepared, B, out):
             raise ValueError("out must be a CUDA tensor")
         if out.device != prepared.data.device:
             raise ValueError("out must be on the same CUDA device as sparse matrix data")
-        if (
-            out.shape != (prepared.n_rows, int(B.shape[1]))
-            or out.dtype != prepared.data.dtype
-        ):
+        if out.shape != (prepared.n_rows, int(B.shape[1])) or out.dtype != prepared.data.dtype:
             raise ValueError("out shape/dtype must match result")
 
 
@@ -698,9 +785,7 @@ def _spmm_opt_alg2_acc_dtype(dtype):
 
 
 def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
-    launch = _resolve_spmm_opt_alg2_launch(
-        bucket, int(B.shape[1]), prepared.data.dtype, device_props
-    )
+    launch = _resolve_spmm_opt_alg2_launch(bucket, int(B.shape[1]), prepared.data.dtype, device_props)
     rows = bucket["rows"]
     if rows.numel() == 0:
         return launch
@@ -786,14 +871,14 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
     return launch
 
 
-def _triton_spmm_csr_impl_opt_alg2_prepared(prepared, B, return_meta=False):
+def _triton_spmm_csr_impl_opt_alg2_prepared(prepared, B, opt_buckets=None, return_meta=False):
     device_props = _normalize_spmm_opt_alg2_device_props(prepared.data.device)
-    C_out = torch.zeros(
-        (prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device
-    )
+    C_out = torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
     launch_configs = []
     bucket_hits = []
-    for bucket in prepared.opt_buckets:
+    if opt_buckets is None:
+        opt_buckets = prepared.opt_buckets
+    for bucket in opt_buckets:
         launch = _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props)
         launch_configs.append(launch)
         bucket_hits.append(
@@ -849,27 +934,82 @@ def flagsparse_spmm_csr_opt_alg2(
     _validate_spmm_opt_alg2_runtime_inputs(prepared, B, out)
     B = B.contiguous()
 
-    t0 = None
-    if return_time:
+    do_timing = bool(return_time or return_meta)
+    symbolic_ms = None
+    compute_ms = None
+    op_total_ms = None
+
+    if do_timing:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    C, meta = _triton_spmm_csr_impl_opt_alg2_prepared(
-        prepared, B, return_meta=return_meta
+    opt_buckets = _build_spmm_opt_alg2_buckets_triton_symbolic(
+        prepared.row_lengths,
+        prepared.data.dtype,
     )
-    elapsed_ms = None
-    if return_time:
+    prepared.opt_buckets = opt_buckets
+    if do_timing:
         torch.cuda.synchronize()
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        t1 = time.perf_counter()
+        symbolic_ms = (t1 - t0) * 1000.0
+
+    C, meta = _triton_spmm_csr_impl_opt_alg2_prepared(
+        prepared,
+        B,
+        opt_buckets=opt_buckets,
+        return_meta=return_meta,
+    )
+    if do_timing:
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        compute_ms = (t2 - t1) * 1000.0
+        op_total_ms = symbolic_ms + compute_ms
     if out is not None:
         out.copy_(C)
         C = out
+    if return_meta:
+        if meta is None:
+            meta = {}
+        meta.update(
+            {
+                "symbolic_ms": symbolic_ms,
+                "compute_ms": compute_ms,
+                "op_total_ms": op_total_ms,
+            }
+        )
     if return_time and return_meta:
-        return C, elapsed_ms, meta
+        return C, op_total_ms, meta
     if return_time:
-        return C, elapsed_ms
+        return C, op_total_ms
     if return_meta:
         return C, meta
     return C
+
+
+def flagsparse_spmm_csr_opt_alg2_preprocess(
+    data=None,
+    indices=None,
+    indptr=None,
+    B=None,
+    shape=None,
+    prepared=None,
+    out=None,
+    return_time=False,
+    return_meta=False,
+):
+    """Compatibility alias for CSR SpMM opt-alg2 with runtime preprocessing."""
+    return flagsparse_spmm_csr_opt_alg2(
+        data=data,
+        indices=indices,
+        indptr=indptr,
+        B=B,
+        shape=shape,
+        prepared=prepared,
+        out=out,
+        return_time=return_time,
+        return_meta=return_meta,
+    )
+
+
 
 
 def _spmm_opt_alg2_reference_error(candidate, reference, value_dtype):
@@ -895,9 +1035,7 @@ def benchmark_spmm_opt_alg2_case(
     """Benchmark CSR SpMM base, opt, and opt-alg2 against torch / sparse backend references."""
 
     if value_dtype not in SUPPORTED_SPMM_OPT_ALG2_DTYPES:
-        raise TypeError(
-            "benchmark_spmm_opt_alg2_case only supports float32 and float64"
-        )
+        raise TypeError("benchmark_spmm_opt_alg2_case only supports float32 and float64")
 
     device = torch.device("cuda")
     data, indices, indptr = _build_random_csr(
@@ -939,37 +1077,28 @@ def benchmark_spmm_opt_alg2_case(
 
     torch_ms = None
     try:
-        pt_sparse = torch.sparse_csr_tensor(
-            indptr64, indices64, data, size=shape, device=device
-        )
-        _, torch_ms = _benchmark_cuda_op(
-            lambda: torch.sparse.mm(pt_sparse, B),
-            warmup=warmup,
-            iters=iters,
-        )
+        pt_sparse = torch.sparse_csr_tensor(indptr64, indices64, data, size=shape, device=device)
+        _, torch_ms = _benchmark_cuda_op(lambda: torch.sparse.mm(pt_sparse, B), warmup=warmup, iters=iters)
     except Exception:
         torch_ms = None
 
-    sparse_values = None
+    sparse_backend = None
     sparse_ms = None
     sparse_reason = None
-    sparse_ref_backend = None
     if run_cusparse:
-        sparse_ref = _benchmark_spmm_csr_sparse_ref(
-            data,
-            indices,
-            indptr,
-            B,
-            shape,
-            warmup=warmup,
-            iters=iters,
-        )
-        sparse_ref_backend = sparse_ref["backend"]
-        if sparse_ref_backend is not None:
-            sparse_values = sparse_ref["values"]
-            sparse_ms = sparse_ref["ms"]
+        if cp is None or cpx_sparse is None:
+            sparse_reason = "CuPy/cuSPARSE is not available"
         else:
-            sparse_reason = sparse_ref["reason"]
+            try:
+                data_cp = _cupy_from_torch(data)
+                indices_cp = _cupy_from_torch(indices.to(torch.int64))
+                indptr_cp = _cupy_from_torch(indptr)
+                B_cp = _cupy_from_torch(B)
+                A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
+                sparse_backend, sparse_ms = _benchmark_cuda_op(lambda: A_csr @ B_cp, warmup=warmup, iters=iters)
+                sparse_backend = _torch_from_cupy(sparse_backend)
+            except Exception as exc:
+                sparse_reason = str(exc)
 
     return {
         "parameters": {
@@ -988,40 +1117,33 @@ def benchmark_spmm_opt_alg2_case(
             "cusparse_ms": sparse_ms,
         },
         "verification": {
-            "base_vs_torch_err": _spmm_opt_alg2_reference_error(
-                base_values, torch_ref, value_dtype
-            ),
-            "opt_vs_torch_err": _spmm_opt_alg2_reference_error(
-                opt_values, torch_ref, value_dtype
-            ),
-            "opt_alg2_vs_torch_err": _spmm_opt_alg2_reference_error(
-                alg2_values, torch_ref, value_dtype
-            ),
+            "base_vs_torch_err": _spmm_opt_alg2_reference_error(base_values, torch_ref, value_dtype),
+            "opt_vs_torch_err": _spmm_opt_alg2_reference_error(opt_values, torch_ref, value_dtype),
+            "opt_alg2_vs_torch_err": _spmm_opt_alg2_reference_error(alg2_values, torch_ref, value_dtype),
             "base_vs_cusparse_err": (
-                _spmm_opt_alg2_reference_error(base_values, sparse_values, value_dtype)
-                if sparse_values is not None
+                _spmm_opt_alg2_reference_error(base_values, sparse_backend, value_dtype)
+                if sparse_backend is not None
                 else None
             ),
             "opt_vs_cusparse_err": (
-                _spmm_opt_alg2_reference_error(opt_values, sparse_values, value_dtype)
-                if sparse_values is not None
+                _spmm_opt_alg2_reference_error(opt_values, sparse_backend, value_dtype)
+                if sparse_backend is not None
                 else None
             ),
             "opt_alg2_vs_cusparse_err": (
-                _spmm_opt_alg2_reference_error(alg2_values, sparse_values, value_dtype)
-                if sparse_values is not None
+                _spmm_opt_alg2_reference_error(alg2_values, sparse_backend, value_dtype)
+                if sparse_backend is not None
                 else None
             ),
         },
         "backend_status": {
             "cusparse_unavailable_reason": sparse_reason,
-            "sparse_ref_backend": sparse_ref_backend,
         },
         "samples": {
             "base_triton": base_values,
             "opt_triton": opt_values,
             "opt_alg2_triton": alg2_values,
             "torch_ref": torch_ref,
-            "cusparse_ref": sparse_values,
+            "cusparse_ref": sparse_backend,
         },
     }

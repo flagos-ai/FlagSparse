@@ -3,9 +3,10 @@ SpMM tests: load SuiteSparse .mtx, batch run, output error and performance.
 Supports: multi .mtx files, value_dtype / index_dtype, CSV export, synthetic cases,
 API validation checks, and PyTorch / CuPy comparison baselines.
 
-This test module targets the current FlagSparse CSR SpMM implementation, which maps
-AlphaSparse CSR ALG1 (row-balance / seq-reduce) onto Triton for the CSR + non-transpose
-+ row-major dense-B/C subset.
+This test module targets the current FlagSparse CSR SpMM base implementation, which is
+a Triton-native CSR path for the CSR + non-transpose + row-major dense-B/C subset.
+It borrows part of the AlphaSparse CSR ALG1 dense-N heuristic, but the dedicated
+experimental structural port lives in alpha_spmm_alg1.py.
 """
 import argparse
 import csv
@@ -76,6 +77,24 @@ def _fmt_speedup(other_ms, triton_ms):
     if other_ms is None or triton_ms is None or triton_ms <= 0:
         return "N/A"
     return f"{other_ms / triton_ms:.2f}x"
+
+
+def _speedup_ratio(other_ms, triton_ms):
+    if other_ms is None or triton_ms is None or triton_ms <= 0:
+        return None
+    return other_ms / triton_ms
+
+
+def _parse_csv_tokens(value, mapping, option_name):
+    tokens = [token.strip().lower() for token in str(value).split(",") if token.strip()]
+    if not tokens:
+        raise ValueError(f"{option_name} must not be empty")
+    invalid = [token for token in tokens if token not in mapping]
+    if invalid:
+        raise ValueError(
+            f"unsupported {option_name}: {', '.join(invalid)}; allowed: {', '.join(mapping)}"
+        )
+    return [mapping[token] for token in tokens]
 
 
 def _fmt_err(value):
@@ -486,40 +505,54 @@ def run_one_mtx(
     except Exception as exc:
         result["pytorch_reason"] = str(exc)
 
+    _cupy_supported_dtypes = (
+        torch.float32,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    )
     if run_cusparse:
-        try:
-            sparse_ref = ast_ops._benchmark_spmm_csr_sparse_ref(
-                data,
-                indices,
-                indptr,
-                B,
-                shape,
-                warmup=warmup,
-                iters=iters,
-            )
-            if sparse_ref["backend"] is None:
-                result["cusparse_reason"] = sparse_ref["reason"]
-            else:
-                cs_C_t = sparse_ref["values"]
-                result["cusparse_ms"] = sparse_ref["ms"]
+        if value_dtype not in _cupy_supported_dtypes:
+            result["cusparse_reason"] = "float16/bfloat16 not supported by CuPy sparse; skipped"
+        else:
+            try:
+                import cupy as cp
+                import cupyx.scipy.sparse as cpx
+
+                data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
+                ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
+                ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
+                B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
+                A_csr = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+
+                torch.cuda.synchronize()
+                for _ in range(warmup):
+                    _ = A_csr @ B_cp
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(iters):
+                    _ = A_csr @ B_cp
+                end.record()
+                torch.cuda.synchronize()
+                result["cusparse_ms"] = start.elapsed_time(end) / iters
+
+                cs_C = A_csr @ B_cp
+                cs_C_t = torch.utils.dlpack.from_dlpack(cs_C.toDlpack())
                 cusparse_metrics = ast_ops._spmm_validation_metrics(cs_C_t, ref_C)
                 result["cusparse_abs_err"] = cusparse_metrics["max_abs_error"]
                 result["cusparse_relative_error_diag"] = cusparse_metrics["max_relative_error"]
                 if triton_C is not None:
                     result["err_cu"] = _scaled_allclose_error(triton_C, cs_C_t, value_dtype)
-                    result["triton_ok_cu"] = torch.allclose(
-                        triton_C,
-                        cs_C_t,
-                        atol=atol,
-                        rtol=rtol,
-                    )
-        except Exception as exc:
-            result["cusparse_ms"] = None
-            result["err_cu"] = None
-            result["cusparse_abs_err"] = None
-            result["cusparse_relative_error_diag"] = None
-            result["triton_ok_cu"] = None
-            result["cusparse_reason"] = str(exc)
+                    result["triton_ok_cu"] = torch.allclose(triton_C, cs_C_t, atol=atol, rtol=rtol)
+            except Exception as exc:
+                result["cusparse_ms"] = None
+                result["err_cu"] = None
+                result["cusparse_abs_err"] = None
+                result["cusparse_relative_error_diag"] = None
+                result["triton_ok_cu"] = None
+                result["cusparse_reason"] = str(exc)
 
     result["status"] = "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
     return result
@@ -560,15 +593,14 @@ def _print_spmm_csr_mtx_header(value_dtype, index_dtype):
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
     )
-    print("Formats: FlagSparse=CSR ALG1, sparse ref=hipSPARSE/cuSPARSE direct CSR SpMM, PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
-    print("CU(ms) reports steady-state direct sparse backend time only; setup, preprocess, and workspace management are excluded.")
     print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
-    print("For float32, PT checks the float64-based correctness reference while CU checks consistency with the native sparse backend in float32, so PT and CU may differ.")
+    print("For float32, PT checks the float64-based correctness reference while CU checks consistency with native cuSPARSE float32, so PT and CU may differ.")
     print("-" * 186)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
-        f"{'FlagSparse(ms)':>14} {'CU(ms)':>13} {'PyTorch(ms)':>11} "
+        f"{'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
         f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
     )
     print("-" * 186)
@@ -593,11 +625,6 @@ def _print_spmm_csr_mtx_row(entry):
         if len(msg) > 200:
             msg = msg[:197] + "..."
         print(f"  NOTE: {msg}")
-    if entry.get("cusparse_ms") is None and entry.get("cusparse_reason"):
-        reason = str(entry["cusparse_reason"]).replace("\n", " ")
-        if len(reason) > 240:
-            reason = reason[:237] + "..."
-        print(f"  CU: {reason}")
 
 
 def print_mtx_results(results, value_dtype, index_dtype):
@@ -618,11 +645,15 @@ def run_all_dtypes_export_csv(
     block_n=DEFAULT_BLOCK_N,
     block_nnz=DEFAULT_BLOCK_NNZ,
     max_segments=DEFAULT_MAX_SEGMENTS,
+    value_dtypes=None,
+    index_dtypes=None,
 ):
     csv_path = _normalize_csv_path(csv_path)
     rows = []
-    for value_dtype in CSV_VALUE_DTYPES:
-        for index_dtype in CSV_INDEX_DTYPES:
+    value_dtypes = CSV_VALUE_DTYPES if value_dtypes is None else value_dtypes
+    index_dtypes = CSV_INDEX_DTYPES if index_dtypes is None else index_dtypes
+    for value_dtype in value_dtypes:
+        for index_dtype in index_dtypes:
             print("=" * 150)
             _print_spmm_csr_mtx_header(value_dtype, index_dtype)
             results = run_mtx_batch(
@@ -651,6 +682,12 @@ def run_all_dtypes_export_csv(
                     "triton_ms": entry.get("triton_ms"),
                     "cusparse_ms": entry.get("cusparse_ms"),
                     "pytorch_ms": entry.get("pytorch_ms"),
+                    "triton_speedup_vs_cusparse": _speedup_ratio(
+                        entry.get("cusparse_ms"), entry.get("triton_ms")
+                    ),
+                    "triton_speedup_vs_pytorch": _speedup_ratio(
+                        entry.get("pytorch_ms"), entry.get("triton_ms")
+                    ),
                     "pt_status": _status_label(entry.get("triton_ok_pt")),
                     "cu_status": _status_label(entry.get("triton_ok_cu")),
                     "status": (
@@ -660,13 +697,13 @@ def run_all_dtypes_export_csv(
                     ),
                     "err_pt": entry.get("err_pt"),
                     "err_cu": entry.get("err_cu"),
-                    "cusparse_reason": entry.get("cusparse_reason"),
                     "error": entry.get("error"),
                 })
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
         "triton_ms", "cusparse_ms", "pytorch_ms",
-        "pt_status", "cu_status", "status", "err_pt", "err_cu", "cusparse_reason", "error",
+        "triton_speedup_vs_cusparse", "triton_speedup_vs_pytorch",
+        "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -875,7 +912,7 @@ def run_comprehensive_synthetic(
         f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  "
         f"MAX_SEGMENTS: {_fmt_launch_value(max_segments)}"
     )
-    print("Formats: FlagSparse=CSR ALG1, cuSPARSE/hipSPARSE=CSR dense-mm steady-state direct backend (when supported), PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm (when supported), PyTorch=CSR or COO.")
     print("For float32, PT checks the float64-based correctness reference while CU reflects native cuSPARSE float32 consistency.")
     print()
 
@@ -972,6 +1009,16 @@ def main():
         choices=["int32", "int64"],
         help="Index dtype (default: int32)",
     )
+    parser.add_argument(
+        "--dtypes",
+        default="float32,float64,complex64,complex128",
+        help="Comma-separated value dtype grid for CSV export: float32,float64,complex64,complex128",
+    )
+    parser.add_argument(
+        "--index-dtypes",
+        default="int32,int64",
+        help="Comma-separated index dtype grid for CSV export: int32,int64",
+    )
     parser.add_argument("--dense-cols", type=int, default=32, help="Dense RHS column count")
     parser.add_argument(
         "--block-n",
@@ -1001,7 +1048,7 @@ def main():
         type=str,
         default=None,
         metavar="FILE",
-        help="Run float32/float64 with int32 indices on all .mtx and write results to one CSV",
+        help="Run selected dtype/index grids on all .mtx and write results to one CSV",
     )
     args = parser.parse_args()
 
@@ -1055,13 +1102,17 @@ def main():
             return
         csv_path = _normalize_csv_path(args.csv)
         print("=" * 100)
-        print("FLAGSPARSE SpMM - f32/f64 with int32, export to CSV")
+        print("FLAGSPARSE SpMM - selected dtype/index grid, export to CSV")
         print("=" * 100)
+        try:
+            csv_value_dtypes = _parse_csv_tokens(args.dtypes, dtype_map, "--dtypes")
+            csv_index_dtypes = _parse_csv_tokens(args.index_dtypes, index_map, "--index-dtypes")
+        except ValueError as exc:
+            parser.error(str(exc))
         print(
             f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  DenseN: {args.dense_cols}  |  CSV: {csv_path}"
         )
-        if args.dtype != "float32" or args.index_dtype != "int32":
-            print("Note: --csv export ignores --dtype/--index-dtype and always writes float32/float64 with int32 indices.")
+        print(f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}")
         run_all_dtypes_export_csv(
             paths,
             csv_path,
@@ -1072,6 +1123,8 @@ def main():
             block_n=args.block_n,
             block_nnz=args.block_nnz,
             max_segments=args.max_segments,
+            value_dtypes=csv_value_dtypes,
+            index_dtypes=csv_index_dtypes,
         )
         return
 
