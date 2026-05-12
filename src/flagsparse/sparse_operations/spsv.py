@@ -740,6 +740,10 @@ def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs):
         target = max(4, (target * 3) // 4)
     return _snap_cw_worker_count(target, n_rows)
 
+    num_re = rhs_re - acc_re
+    num_im = rhs_im - acc_im
+    den = diag_re * diag_re + diag_im * diag_im
+    den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
 
 def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=None):
     rhs_bucket = _cw_rhs_bucket(n_rhs)
@@ -772,6 +776,67 @@ def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=No
         n_rows,
     )
 
+@triton.jit
+def _spsv_csr_cw_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    diag_ptr,
+    b_ptr,
+    x_ptr,
+    ready_ptr,
+    row_counter_ptr,
+    n_rows,
+    n_rhs,
+    stride_b0,
+    stride_x0,
+    BLOCK_RHS: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
+    LOWER: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+):
+    row = tl.atomic_add(row_counter_ptr, 1)
+    while row < n_rows:
+        start = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        diag = tl.load(diag_ptr + row)
+        diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
+
+        for rhs_base in range(0, n_rhs, BLOCK_RHS):
+            rhs_offsets = rhs_base + tl.arange(0, BLOCK_RHS)
+            rhs_mask = rhs_offsets < n_rhs
+            acc = tl.zeros((BLOCK_RHS,), dtype=tl.float32)
+            for seg in range(MAX_SEGMENTS):
+                idx = start + seg * BLOCK_NNZ
+                nnz_offsets = idx + tl.arange(0, BLOCK_NNZ)
+                nnz_mask = nnz_offsets < end
+                a = tl.load(data_ptr + nnz_offsets, mask=nnz_mask, other=0.0)
+                col = tl.load(indices_ptr + nnz_offsets, mask=nnz_mask, other=0)
+                if LOWER:
+                    dep_mask = nnz_mask & (col < row)
+                else:
+                    dep_mask = nnz_mask & (col > row)
+
+                for k in range(BLOCK_NNZ):
+                    if dep_mask[k]:
+                        dep_col = col[k]
+                        while tl.load(ready_ptr + dep_col) == 0:
+                            pass
+                        x_ptrs = x_ptr + dep_col * stride_x0 + rhs_offsets
+                        x_vals = tl.load(x_ptrs, mask=rhs_mask, other=0.0)
+                        acc += a[k] * x_vals
+
+            rhs_ptrs = b_ptr + row * stride_b0 + rhs_offsets
+            rhs = tl.load(rhs_ptrs, mask=rhs_mask, other=0.0)
+            x_row = (rhs - acc) / diag_safe
+            x_row = tl.where(x_row == x_row, x_row, 0.0)
+            out_ptrs = x_ptr + row * stride_x0 + rhs_offsets
+            tl.store(out_ptrs, x_row, mask=rhs_mask)
+
+        tl.debug_barrier()
+        tl.store(ready_ptr + row, 1)
+        row = tl.atomic_add(row_counter_ptr, 1)
 
 def _build_spsv_cw_matrix_stats(indptr64, n_rows):
     if indptr64.numel() <= 1:

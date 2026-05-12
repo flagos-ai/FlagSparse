@@ -53,6 +53,11 @@ SUMMARY_FIELDS = [
     "candidate_worst_col",
     "legacy_worst_native_ratio",
     "candidate_worst_native_ratio",
+    "candidate_worst_abs_diff",
+    "candidate_worst_abs_ref",
+    "candidate_worst_denom",
+    "candidate_worst_ref_is_small",
+    "candidate_worst_bucket_kind",
     "legacy_status",
     "candidate_status",
     "status",
@@ -80,6 +85,13 @@ ROW_FIELDS = [
     "candidate_worst_hp_ref",
     "legacy_worst_opt",
     "candidate_worst_opt",
+    "candidate_worst_abs_ref",
+    "candidate_worst_abs_opt",
+    "candidate_worst_abs_diff",
+    "candidate_worst_denom",
+    "candidate_worst_atol_term",
+    "candidate_worst_rtol_term",
+    "candidate_ref_near_zero_flag",
 ]
 
 BUCKET_FIELDS = [
@@ -90,10 +102,14 @@ BUCKET_FIELDS = [
     "row_nnz_max",
     "legacy_bad_rows_native_gt_1",
     "candidate_bad_rows_native_gt_1",
+    "candidate_rows_ref_near_zero_gt_1",
+    "candidate_rows_large_abs_diff_gt_1",
     "legacy_bad_rows_native_gt_0_5",
     "candidate_bad_rows_native_gt_0_5",
     "legacy_worst_native_ratio",
     "candidate_worst_native_ratio",
+    "candidate_worst_abs_diff",
+    "candidate_worst_abs_ref",
     "legacy_p50_native_ratio",
     "candidate_p50_native_ratio",
     "legacy_p90_native_ratio",
@@ -221,20 +237,50 @@ def _describe_quantiles(values):
 def _compute_error_metrics(candidate, reference, dtype):
     atol, rtol = _reference_tolerance(dtype)
     diff = torch.abs(candidate - reference).to(torch.float64)
-    denom = (atol + rtol * torch.abs(reference)).to(torch.float64)
+    abs_ref = torch.abs(reference).to(torch.float64)
+    abs_opt = torch.abs(candidate).to(torch.float64)
+    atol_term = torch.full_like(diff, float(atol))
+    rtol_term = (rtol * torch.abs(reference)).to(torch.float64)
+    denom = atol_term + rtol_term
     ratio = diff / denom
     row_max_ratio = torch.max(ratio, dim=1).values
     row_mean_ratio = torch.mean(ratio, dim=1)
     row_max_abs = torch.max(diff, dim=1).values
     row_worst_col = torch.argmax(ratio, dim=1)
+    if row_worst_col.numel() > 0:
+        row_index = torch.arange(row_worst_col.numel(), device=row_worst_col.device)
+        row_worst_abs_ref = abs_ref[row_index, row_worst_col]
+        row_worst_abs_opt = abs_opt[row_index, row_worst_col]
+        row_worst_abs_diff = diff[row_index, row_worst_col]
+        row_worst_atol_term = atol_term[row_index, row_worst_col]
+        row_worst_rtol_term = rtol_term[row_index, row_worst_col]
+        row_worst_denom = denom[row_index, row_worst_col]
+        near_zero_threshold = float("inf") if rtol <= 0.0 else float(atol / rtol)
+        row_ref_near_zero_flag = row_worst_abs_ref <= near_zero_threshold
+    else:
+        row_worst_abs_ref = torch.empty((0,), dtype=torch.float64, device=ratio.device)
+        row_worst_abs_opt = torch.empty((0,), dtype=torch.float64, device=ratio.device)
+        row_worst_abs_diff = torch.empty((0,), dtype=torch.float64, device=ratio.device)
+        row_worst_atol_term = torch.empty((0,), dtype=torch.float64, device=ratio.device)
+        row_worst_rtol_term = torch.empty((0,), dtype=torch.float64, device=ratio.device)
+        row_worst_denom = torch.empty((0,), dtype=torch.float64, device=ratio.device)
+        row_ref_near_zero_flag = torch.empty((0,), dtype=torch.bool, device=ratio.device)
     if row_max_ratio.numel() == 0:
         worst_row = 0
         worst_col = 0
         worst_ratio = 0.0
+        worst_abs_diff = 0.0
+        worst_abs_ref = 0.0
+        worst_denom = 0.0
+        worst_ref_is_small = False
     else:
         worst_row = int(torch.argmax(row_max_ratio).item())
         worst_col = int(row_worst_col[worst_row].item())
         worst_ratio = float(row_max_ratio[worst_row].item())
+        worst_abs_diff = float(row_worst_abs_diff[worst_row].item())
+        worst_abs_ref = float(row_worst_abs_ref[worst_row].item())
+        worst_denom = float(row_worst_denom[worst_row].item())
+        worst_ref_is_small = bool(row_ref_near_zero_flag[worst_row].item())
     return {
         "global_err": float(torch.max(ratio).item()) if ratio.numel() > 0 else 0.0,
         "ratio": ratio,
@@ -242,11 +288,22 @@ def _compute_error_metrics(candidate, reference, dtype):
         "row_mean_ratio": row_mean_ratio,
         "row_max_abs": row_max_abs,
         "row_worst_col": row_worst_col,
+        "row_worst_abs_ref": row_worst_abs_ref,
+        "row_worst_abs_opt": row_worst_abs_opt,
+        "row_worst_abs_diff": row_worst_abs_diff,
+        "row_worst_atol_term": row_worst_atol_term,
+        "row_worst_rtol_term": row_worst_rtol_term,
+        "row_worst_denom": row_worst_denom,
+        "row_ref_near_zero_flag": row_ref_near_zero_flag,
         "rows_err_gt_1": int(torch.count_nonzero(row_max_ratio > 1.0).item()),
         "rows_err_gt_0_5": int(torch.count_nonzero(row_max_ratio > 0.5).item()),
         "worst_row": worst_row,
         "worst_col": worst_col,
         "worst_ratio": worst_ratio,
+        "worst_abs_diff": worst_abs_diff,
+        "worst_abs_ref": worst_abs_ref,
+        "worst_denom": worst_denom,
+        "worst_ref_is_small": worst_ref_is_small,
         "status": "PASS" if (worst_ratio <= 1.0) else "FAIL",
     }
 
@@ -283,6 +340,15 @@ def _build_bucket_rows(prepared, legacy_native, candidate_native, legacy_hp, can
         candidate_native_ratio = candidate_native["row_max_ratio"].index_select(0, rows_device)
         legacy_hp_ratio = legacy_hp["row_max_ratio"].index_select(0, rows_device)
         candidate_hp_ratio = candidate_hp["row_max_ratio"].index_select(0, rows_device)
+        candidate_ref_small = candidate_native["row_ref_near_zero_flag"].index_select(0, rows_device)
+        candidate_fail_rows = candidate_native_ratio > 1.0
+        candidate_bucket_worst_rel = int(torch.argmax(candidate_native_ratio).item())
+        candidate_bucket_worst_abs_diff = float(
+            candidate_native["row_worst_abs_diff"].index_select(0, rows_device)[candidate_bucket_worst_rel].item()
+        )
+        candidate_bucket_worst_abs_ref = float(
+            candidate_native["row_worst_abs_ref"].index_select(0, rows_device)[candidate_bucket_worst_rel].item()
+        )
         legacy_p50_native, legacy_p90_native, legacy_p99_native = _quantiles(legacy_native_ratio)
         candidate_p50_native, candidate_p90_native, candidate_p99_native = _quantiles(candidate_native_ratio)
         _, _, legacy_p99_hp = _quantiles(legacy_hp_ratio)
@@ -296,10 +362,14 @@ def _build_bucket_rows(prepared, legacy_native, candidate_native, legacy_hp, can
                 "row_nnz_max": int(bucket_row_nnz.max().item()),
                 "legacy_bad_rows_native_gt_1": int(torch.count_nonzero(legacy_native_ratio > 1.0).item()),
                 "candidate_bad_rows_native_gt_1": int(torch.count_nonzero(candidate_native_ratio > 1.0).item()),
+                "candidate_rows_ref_near_zero_gt_1": int(torch.count_nonzero(candidate_fail_rows & candidate_ref_small).item()),
+                "candidate_rows_large_abs_diff_gt_1": int(torch.count_nonzero(candidate_fail_rows & ~candidate_ref_small).item()),
                 "legacy_bad_rows_native_gt_0_5": int(torch.count_nonzero(legacy_native_ratio > 0.5).item()),
                 "candidate_bad_rows_native_gt_0_5": int(torch.count_nonzero(candidate_native_ratio > 0.5).item()),
                 "legacy_worst_native_ratio": float(legacy_native_ratio.max().item()),
                 "candidate_worst_native_ratio": float(candidate_native_ratio.max().item()),
+                "candidate_worst_abs_diff": candidate_bucket_worst_abs_diff,
+                "candidate_worst_abs_ref": candidate_bucket_worst_abs_ref,
                 "legacy_p50_native_ratio": legacy_p50_native,
                 "candidate_p50_native_ratio": candidate_p50_native,
                 "legacy_p90_native_ratio": legacy_p90_native,
@@ -352,6 +422,13 @@ def _build_row_rows(
                 "candidate_worst_hp_ref": float(hp_ref[row_id, candidate_col].item()),
                 "legacy_worst_opt": float(legacy_out[row_id, legacy_col].item()),
                 "candidate_worst_opt": float(candidate_out[row_id, candidate_col].item()),
+                "candidate_worst_abs_ref": float(candidate_native["row_worst_abs_ref"][row_id].item()),
+                "candidate_worst_abs_opt": float(candidate_native["row_worst_abs_opt"][row_id].item()),
+                "candidate_worst_abs_diff": float(candidate_native["row_worst_abs_diff"][row_id].item()),
+                "candidate_worst_denom": float(candidate_native["row_worst_denom"][row_id].item()),
+                "candidate_worst_atol_term": float(candidate_native["row_worst_atol_term"][row_id].item()),
+                "candidate_worst_rtol_term": float(candidate_native["row_worst_rtol_term"][row_id].item()),
+                "candidate_ref_near_zero_flag": bool(candidate_native["row_ref_near_zero_flag"][row_id].item()),
             }
         )
     return rows
@@ -379,6 +456,13 @@ def _print_matrix_summary(summary_row, prepared, legacy_native, candidate_native
         f"candidate_err_hp={summary_row['candidate_err_hp']:.6f}  "
         f"status={summary_row['status']}"
     )
+    print(
+        f"candidate_worst bucket={summary_row['candidate_worst_bucket_kind']}  "
+        f"abs_diff={summary_row['candidate_worst_abs_diff']:.6e}  "
+        f"abs_ref={summary_row['candidate_worst_abs_ref']:.6e}  "
+        f"denom={summary_row['candidate_worst_denom']:.6e}  "
+        f"ref_small={summary_row['candidate_worst_ref_is_small']}"
+    )
     print(f"row_nnz_quantiles: {_describe_quantiles(prepared.row_lengths)}")
     print(f"legacy_native_row_err_quantiles: {_describe_quantiles(legacy_native['row_max_ratio'])}")
     print(f"candidate_native_row_err_quantiles: {_describe_quantiles(candidate_native['row_max_ratio'])}")
@@ -396,8 +480,12 @@ def _print_matrix_summary(summary_row, prepared, legacy_native, candidate_native
             f"{bucket_row['row_nnz_max']:>4} "
             f"legacy_bad_gt_1={bucket_row['legacy_bad_rows_native_gt_1']:>6} "
             f"candidate_bad_gt_1={bucket_row['candidate_bad_rows_native_gt_1']:>6} "
+            f"candidate_small_ref_gt_1={bucket_row['candidate_rows_ref_near_zero_gt_1']:>6} "
+            f"candidate_large_diff_gt_1={bucket_row['candidate_rows_large_abs_diff_gt_1']:>6} "
             f"legacy_worst={bucket_row['legacy_worst_native_ratio']:>10.4f} "
-            f"candidate_worst={bucket_row['candidate_worst_native_ratio']:>10.4f}"
+            f"candidate_worst={bucket_row['candidate_worst_native_ratio']:>10.4f} "
+            f"candidate_abs_diff={bucket_row['candidate_worst_abs_diff']:>10.3e} "
+            f"candidate_abs_ref={bucket_row['candidate_worst_abs_ref']:>10.3e}"
         )
 
 
@@ -409,18 +497,23 @@ def _print_top_rows(row_rows, topk):
     )[:topk]
     print("-" * 120)
     print(f"Top-{len(top_rows)} rows by candidate native ratio")
+    if not top_rows:
+        return
     for rank, row in enumerate(top_rows, start=1):
         print(
             f"{rank:>2}. row={row['row']:>8} row_nnz={row['row_nnz']:>6} "
             f"bucket={row['bucket_kind']:<11} "
             f"legacy_native={row['legacy_max_native_ratio']:>10.4f} "
             f"candidate_native={row['candidate_max_native_ratio']:>10.4f} "
+            f"candidate_abs_diff={row['candidate_worst_abs_diff']:>10.3e} "
+            f"candidate_abs_ref={row['candidate_worst_abs_ref']:>10.3e} "
+            f"candidate_denom={row['candidate_worst_denom']:>10.3e} "
             f"legacy_hp={row['legacy_max_hp_ratio']:>10.4f} "
             f"candidate_hp={row['candidate_max_hp_ratio']:>10.4f}"
         )
 
 
-def diagnose_one(path, dense_cols, dtype, seed, topk):
+def diagnose_one(path, dense_cols, dtype, seed, topk, dump_fail_rows_only=False):
     device = torch.device("cuda")
     data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
     n_rows, n_cols = shape
@@ -468,6 +561,11 @@ def diagnose_one(path, dense_cols, dtype, seed, topk):
         "candidate_worst_col": candidate_native["worst_col"],
         "legacy_worst_native_ratio": legacy_native["worst_ratio"],
         "candidate_worst_native_ratio": candidate_native["worst_ratio"],
+        "candidate_worst_abs_diff": candidate_native["worst_abs_diff"],
+        "candidate_worst_abs_ref": candidate_native["worst_abs_ref"],
+        "candidate_worst_denom": candidate_native["worst_denom"],
+        "candidate_worst_ref_is_small": candidate_native["worst_ref_is_small"],
+        "candidate_worst_bucket_kind": bucket_names[candidate_native["worst_row"]] if n_rows > 0 else "unassigned",
         "legacy_status": legacy_native["status"],
         "candidate_status": candidate_native["status"],
         "status": candidate_native["status"],
@@ -486,10 +584,15 @@ def diagnose_one(path, dense_cols, dtype, seed, topk):
         bucket_names,
     )
     bucket_rows = _build_bucket_rows(prepared, legacy_native, candidate_native, legacy_hp, candidate_hp)
+    output_row_rows = (
+        [row for row in row_rows if float(row["candidate_max_native_ratio"]) > 1.0]
+        if dump_fail_rows_only
+        else row_rows
+    )
 
     _print_matrix_summary(summary_row, prepared, legacy_native, candidate_native, bucket_rows)
-    _print_top_rows(row_rows, max(1, min(int(topk), len(row_rows))))
-    return summary_row, row_rows, bucket_rows
+    _print_top_rows(output_row_rows, max(1, min(int(topk), len(output_row_rows))) if output_row_rows else 0)
+    return summary_row, output_row_rows, bucket_rows
 
 
 def _collect_selected_paths(all_paths, csv_metadata, only_status, only_matrices):
@@ -531,7 +634,18 @@ def _default_output_paths(out_dir):
     return summary_csv, rows_dir, buckets_dir
 
 
-def run_batch(input_path, dtype, dense_cols, seed, topk, csv_path=None, out_dir="spmm_diag", only_status="all", only_matrices=None):
+def run_batch(
+    input_path,
+    dtype,
+    dense_cols,
+    seed,
+    topk,
+    csv_path=None,
+    out_dir="spmm_diag",
+    only_status="all",
+    only_matrices=None,
+    dump_fail_rows_only=False,
+):
     all_paths = _resolve_input_paths(input_path)
     csv_metadata = _load_status_metadata(csv_path)
     selected_paths = _collect_selected_paths(all_paths, csv_metadata, only_status, only_matrices)
@@ -548,6 +662,7 @@ def run_batch(input_path, dtype, dense_cols, seed, topk, csv_path=None, out_dir=
             dtype=dtype,
             seed=seed,
             topk=topk,
+            dump_fail_rows_only=dump_fail_rows_only,
         )
         results.append({"path": path, "summary": summary_row, "rows": row_rows, "buckets": bucket_rows})
 
@@ -579,6 +694,7 @@ def main():
     parser.add_argument("--only-status", choices=["all", "fail", "pass"], default="all", help="If CSV metadata is provided, prefilter by CSV status; otherwise filter final outputs by diagnosed status")
     parser.add_argument("--only-matrices", type=str, default=None, help="Comma-separated matrix basenames to include, with or without .mtx suffix")
     parser.add_argument("--row-csv", type=str, default=None, help="Single-file mode only: explicit output path for row diagnostics CSV")
+    parser.add_argument("--dump-fail-rows-only", action="store_true", help="Only write/print rows whose candidate native ratio exceeds 1")
     args = parser.parse_args()
 
     dtype = _dtype_from_name(args.dtype)
@@ -591,6 +707,7 @@ def main():
             dtype=dtype,
             seed=args.seed,
             topk=args.topk,
+            dump_fail_rows_only=args.dump_fail_rows_only,
         )
         summary_csv, rows_dir, buckets_dir = _default_output_paths(args.out_dir)
         stem = _safe_stem(args.input_path)
@@ -621,6 +738,7 @@ def main():
         out_dir=args.out_dir,
         only_status=args.only_status,
         only_matrices=args.only_matrices,
+        dump_fail_rows_only=args.dump_fail_rows_only,
     )
 
 

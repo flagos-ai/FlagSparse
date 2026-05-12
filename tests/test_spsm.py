@@ -739,6 +739,10 @@ def main():
     if any(op != "NON" for op in ops):
         raise ValueError("SpSM test currently supports only --ops NON/NON_TRANS")
 
+    ops = _parse_ops_filter(args.ops)
+    if any(op != "NON" for op in ops):
+        raise ValueError("SpSM test currently supports only --ops NON/NON_TRANS")
+
     if args.synthetic:
         run_spsm_synthetic_all(n=args.n, n_rhs=args.rhs)
         return

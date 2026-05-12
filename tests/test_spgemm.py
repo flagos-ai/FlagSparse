@@ -55,6 +55,12 @@ def _fmt_speedup(other_ms, triton_ms):
     return f"{other_ms / triton_ms:.2f}x"
 
 
+def _speedup_ratio(other_ms, triton_ms):
+    if other_ms is None or triton_ms is None or triton_ms <= 0:
+        return None
+    return other_ms / triton_ms
+
+
 def _fmt_err(value):
     return "N/A" if value is None else f"{value:.2e}"
 
@@ -1330,6 +1336,12 @@ def run_all_dtypes_export_csv(
                         "triton_ms": entry.get("triton_ms"),
                         "cusparse_ms": entry.get("cusparse_ms"),
                         "pytorch_ms": entry.get("pytorch_ms"),
+                        "triton_speedup_vs_cusparse": _speedup_ratio(
+                            entry.get("cusparse_ms"), entry.get("triton_ms")
+                        ),
+                        "triton_speedup_vs_pytorch": _speedup_ratio(
+                            entry.get("pytorch_ms"), entry.get("triton_ms")
+                        ),
                         "pt_status": _status_label(entry.get("triton_ok_pt")),
                         "cu_status": _status_label(entry.get("triton_ok_cu")),
                         "status": entry.get("status"),
@@ -1378,6 +1390,7 @@ def run_all_dtypes_export_csv(
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
         "triton_ms", "cusparse_ms", "pytorch_ms",
+        "triton_speedup_vs_cusparse", "triton_speedup_vs_pytorch",
         "pt_status", "cu_status", "status", "ref_reason_code", "err_pt", "err_cu",
         "max_abs_err_pt", "max_rel_err_pt", "max_abs_err_cu", "max_rel_err_cu",
         "pytorch_reason", "cusparse_reason", "error",

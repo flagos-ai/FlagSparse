@@ -26,6 +26,17 @@ pip install torch triton cupy-cuda12x
 
 Run from project root, or `cd tests` then run scripts (paths like `../matrix` for .mtx dir).
 
+**pytest accuracy suite** - small synthetic CUDA cases, selectable by operator marker:
+
+```bash
+pytest tests/pytest --mode quick
+pytest tests/pytest --mode normal -m "spmv_csr or spmm_csr"
+python run_flagsparse_pytest.py --mode quick --ops gather,spmv_csr,spmm_csr --gpus 0
+python run_flagsparse_pytest.py --op-list ops.txt --gpus 0,1 --results-dir pytest_results
+```
+
+The runner writes per-operator `accuracy.log` files plus `summary.json`, `summary.csv`, and `summary.xlsx` when `openpyxl` is installed.
+
 **test_spmv.py** - CSR SpMV (SuiteSparse `.mtx`, synthetic, or CSR CSV export):
 
 ```bash
@@ -96,7 +107,7 @@ python tests/test_spgemm.py <dir/> --csv results.csv     # optional: --dtype flo
 ```bash
 python tests/test_spsv.py --synthetic
 python tests/test_spsv.py <dir/> --csv-csr spsv.csv
-python tests/test_spsv.py <dir/> --csv-coo out.csv      # same CSV columns as CSR; optional --coo-mode auto|direct|csr (default auto)
+python tests/test_spsv.py <dir/> --csv-coo out.csv      # same CSV columns as CSR
 ```
 
 **test_spsm.py** - SpSM (triangular matrix-matrix solve; **square** matrices only):

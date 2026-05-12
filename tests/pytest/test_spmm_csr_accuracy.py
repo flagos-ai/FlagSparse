@@ -1,9 +1,15 @@
 import pytest
 import torch
 
-from flagsparse import flagsparse_spmm_csr
+from flagsparse import flagsparse_spmm_csr, flagsparse_spmm_csr_opt, prepare_spmm_csr_opt
 
-from tests.pytest.param_shapes import MNK_SHAPES, SPMM_FLOAT_DTYPES, SPMM_FLOAT_DTYPE_IDS
+from tests.pytest.param_shapes import (
+    MNK_SHAPES,
+    SPMM_FLOAT_DTYPES,
+    SPMM_FLOAT_DTYPE_IDS,
+    SPMM_OPT_DTYPES,
+    SPMM_OPT_DTYPE_IDS,
+)
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -54,5 +60,33 @@ def test_spmm_csr_matches_torch(M, N, K, dtype):
     else:
         ref = torch.sparse.mm(Asp, B)
     out = flagsparse_spmm_csr(data, indices, indptr, B, (M, K))
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spmm_csr_opt
+@pytest.mark.parametrize("M, N, K", MNK_SHAPES)
+@pytest.mark.parametrize("dtype", SPMM_OPT_DTYPES, ids=SPMM_OPT_DTYPE_IDS)
+def test_spmm_csr_opt_matches_torch(M, N, K, dtype):
+    device = torch.device("cuda")
+    Asp = _random_csr_mk(M, K, dtype, device)
+    data = Asp.values()
+    indices = Asp.col_indices()
+    indptr = Asp.crow_indices()
+    B = torch.randn(K, N, dtype=dtype, device=device)
+    if dtype == torch.float32:
+        Asp64 = torch.sparse_csr_tensor(
+            crow_indices=indptr,
+            col_indices=indices,
+            values=data.double(),
+            size=(M, K),
+            dtype=torch.float64,
+            device=device,
+        )
+        ref = torch.sparse.mm(Asp64, B.double()).float()
+    else:
+        ref = torch.sparse.mm(Asp, B)
+    prepared = prepare_spmm_csr_opt(data, indices, indptr, (M, K))
+    out = flagsparse_spmm_csr_opt(B=B, prepared=prepared)
     rtol, atol = _tol(dtype)
     assert torch.allclose(out, ref, rtol=rtol, atol=atol)
