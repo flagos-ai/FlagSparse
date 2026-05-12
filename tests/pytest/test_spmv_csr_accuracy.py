@@ -156,6 +156,89 @@ def test_spmv_csr_prepared_op_mismatch_rejected():
         flagsparse_spmv_csr(x=x, prepared=prepared, op="trans")
 
 
+@CUDA_REQUIRED
+@pytest.mark.spmv_csr
+def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
+    device = torch.device("cuda")
+    data, indices, indptr, dense = _random_csr_mn(12, 9, torch.float32, torch.int64, device)
+    x = torch.randn(9, dtype=torch.float32, device=device)
+    ref = dense.to(torch.float64) @ x.to(torch.float64)
+    state = {"forced_once": False}
+    original = spmv_mod._triton_spmv_csr_impl_prepared
+
+    def fail_int64_once(prepared, x_in):
+        if prepared.kernel_indices.dtype == torch.int64 and not state["forced_once"]:
+            state["forced_once"] = True
+            raise RuntimeError("forced int64 launch failure")
+        return original(prepared, x_in)
+
+    monkeypatch.setattr(spmv_mod, "_triton_spmv_csr_impl_prepared", fail_int64_once)
+    out = flagsparse_spmv_csr(
+        data,
+        indices,
+        indptr,
+        x,
+        shape=(12, 9),
+        index_fallback_policy="auto",
+    )
+    assert state["forced_once"]
+    assert torch.allclose(out.to(torch.float64), ref, rtol=1e-4, atol=1e-4)
+
+
+@CUDA_REQUIRED
+@pytest.mark.spmv_csr
+def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
+    device = torch.device("cuda")
+    data, indices, indptr, _dense = _random_csr_mn(12, 9, torch.float32, torch.int64, device)
+    x = torch.randn(9, dtype=torch.float32, device=device)
+
+    def fail_int64(prepared, x_in):
+        if prepared.kernel_indices.dtype == torch.int64:
+            raise RuntimeError("forced int64 launch failure")
+        return spmv_mod._triton_spmv_csr_impl_prepared(prepared, x_in)
+
+    monkeypatch.setattr(spmv_mod, "_triton_spmv_csr_impl_prepared", fail_int64)
+    with pytest.raises(RuntimeError, match="forced int64 launch failure"):
+        flagsparse_spmv_csr(
+            data,
+            indices,
+            indptr,
+            x,
+            shape=(12, 9),
+            index_fallback_policy="strict",
+        )
+
+
+@CUDA_REQUIRED
+@pytest.mark.spmv_csr
+def test_spmv_csr_int64_auto_does_not_fallback_when_index_exceeds_int32(monkeypatch):
+    device = torch.device("cuda")
+    limit = spmv_mod._INDEX_LIMIT_INT32
+    data = torch.ones(1, dtype=torch.float32, device=device)
+    prepared = spmv_mod.PreparedCsrSpmv(
+        data=data,
+        kernel_indices=torch.tensor([limit + 1], dtype=torch.int64, device=device),
+        kernel_indptr=torch.tensor([0, 1], dtype=torch.int64, device=device),
+        shape=(1, limit + 2),
+        n_rows=1,
+        n_cols=limit + 2,
+        block_nnz=256,
+        max_segments=1,
+        max_row_nnz=1,
+        opt_buckets=[],
+        transpose=False,
+        index_fallback_policy="auto",
+    )
+
+    def fail_launch(_prepared, _x, use_opt=False):
+        raise RuntimeError("forced native int64 failure")
+
+    monkeypatch.setattr(spmv_mod, "_run_spmv_prepared", fail_launch)
+    x = torch.empty(0, dtype=torch.float32, device=device)
+    with pytest.raises(RuntimeError, match="int32 fallback is unsafe"):
+        spmv_mod._run_spmv_prepared_with_fallback(prepared, x, use_opt=False)
+
+
 def _hipsparse_minimal_ready():
     backend, reason = common_mod._spmv_csr_sparse_ref_backend(
         torch.float32, torch.int32, op="non"

@@ -77,6 +77,13 @@ python tests/test_spmm_opt.py <目录/> --csv spmm_opt.csv  # 可选：--dtype f
 # 常用选项：--dtype、--dense-cols、--warmup、--iters
 ```
 
+**test_spmm_opt_alg2.py / diagnose_spmm_opt_alg2.py** - CSR SpMM Alg2 benchmark and diagnosis:
+
+```bash
+python tests/test_spmm_opt_alg2.py <dir_or_file.mtx> --dense-cols 32
+python tests/diagnose_spmm_opt_alg2.py <dir_or_file.mtx> --dense-cols 32 --out-dir diag_out
+```
+
 **test_spmm_coo.py** - 原生 COO SpMM：
 
 ```bash

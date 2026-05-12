@@ -223,9 +223,85 @@ def test_scatter_matches_index_copy(
         indices,
         vals,
         reset_output=reset_output,
-        dtype_policy="strict",
+        dtype_policy="auto",
     )
     assert torch.equal(dense, dense_ref)
+
+
+@pytest.mark.scatter
+def test_scatter_int64_auto_fallback_to_int32(monkeypatch):
+    device = torch.device("cuda")
+    dense_size = 257
+    nnz = 129
+    vals = torch.randn(nnz, dtype=torch.float32, device=device)
+    indices = torch.randperm(dense_size, device=device)[:nnz].to(torch.int64)
+    dense = torch.randn(dense_size, dtype=torch.float32, device=device)
+    dense_ref = dense.clone()
+    dense_ref.zero_()
+    dense_ref.index_copy_(0, indices.to(torch.int64), vals)
+
+    original_launch = gather_scatter_ops._launch_triton_scatter_kernel
+    state = {"forced_once": False}
+
+    def fake_launch(dense_values, sparse_values, kernel_indices, nnz, block_size=1024):
+        if kernel_indices.dtype == torch.int64 and not state["forced_once"]:
+            state["forced_once"] = True
+            raise RuntimeError("forced int64 launch failure")
+        return original_launch(
+            dense_values,
+            sparse_values,
+            kernel_indices,
+            nnz,
+            block_size=block_size,
+        )
+
+    monkeypatch.setattr(gather_scatter_ops, "_launch_triton_scatter_kernel", fake_launch)
+
+    flagsparse_scatter(
+        dense,
+        indices,
+        vals,
+        reset_output=True,
+        dtype_policy="auto",
+        index_fallback_policy="auto",
+    )
+    assert state["forced_once"]
+    assert torch.equal(dense, dense_ref)
+
+
+@pytest.mark.scatter
+def test_scatter_int64_strict_no_fallback(monkeypatch):
+    device = torch.device("cuda")
+    dense_size = 257
+    nnz = 129
+    vals = torch.randn(nnz, dtype=torch.float32, device=device)
+    indices = torch.randperm(dense_size, device=device)[:nnz].to(torch.int64)
+    dense = torch.randn(dense_size, dtype=torch.float32, device=device)
+
+    original_launch = gather_scatter_ops._launch_triton_scatter_kernel
+
+    def fake_launch(dense_values, sparse_values, kernel_indices, nnz, block_size=1024):
+        if kernel_indices.dtype == torch.int64:
+            raise RuntimeError("forced int64 launch failure")
+        return original_launch(
+            dense_values,
+            sparse_values,
+            kernel_indices,
+            nnz,
+            block_size=block_size,
+        )
+
+    monkeypatch.setattr(gather_scatter_ops, "_launch_triton_scatter_kernel", fake_launch)
+
+    with pytest.raises(RuntimeError, match="Triton scatter failed for index dtype"):
+        flagsparse_scatter(
+            dense,
+            indices,
+            vals,
+            reset_output=True,
+            dtype_policy="auto",
+            index_fallback_policy="strict",
+        )
 
 
 @pytest.mark.gather

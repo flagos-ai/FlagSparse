@@ -13,16 +13,7 @@ DEFAULT_CASES = [
     (524_288, 16_384),
     (1_048_576, 65_536),
 ]
-ALL_VALUE_DTYPE_TOKENS = [
-    "float16",
-    "bfloat16",
-    "float32",
-    "float64",
-    "complex32",
-    "complex64",
-    "complex128",
-]
-DEFAULT_VALUE_DTYPES = ",".join(ALL_VALUE_DTYPE_TOKENS)
+DEFAULT_VALUE_DTYPES = "float16,float32,float64"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
@@ -48,13 +39,6 @@ def _fmt_err(value):
     return f"{value:.2e}"
 
 
-def _fmt_reason(value, width=32):
-    if not value:
-        return ""
-    text = str(value).replace("\n", " ")
-    return text[: width - 3] + "..." if len(text) > width else text
-
-
 def _parse_bool_token(raw, name):
     token = str(raw).strip().lower()
     if token in ("1", "true", "yes", "y", "on"):
@@ -65,36 +49,21 @@ def _parse_bool_token(raw, name):
 
 
 def _parse_value_dtypes(raw):
-    allowed = set(ALL_VALUE_DTYPE_TOKENS + ["all"])
+    allowed = {
+        "float16",
+        "bfloat16",
+        "float32",
+        "float64",
+        "complex64",
+        "complex128",
+    }
     tokens = [tok.strip().lower() for tok in str(raw).split(",") if tok.strip()]
     if not tokens:
         raise ValueError("value dtypes list is empty")
     invalid = [tok for tok in tokens if tok not in allowed]
     if invalid:
         raise ValueError(f"unsupported value dtypes: {invalid}")
-    expanded = []
-    for tok in tokens:
-        if tok == "all":
-            expanded.extend(ALL_VALUE_DTYPE_TOKENS)
-        else:
-            expanded.append(tok)
-    return list(dict.fromkeys(expanded))
-
-
-def _torch_complex32_dtype():
-    dtype = getattr(torch, "complex32", None)
-    if dtype is None:
-        dtype = getattr(torch, "chalf", None)
-    return dtype
-
-
-def _precheck_case_support(value_dtype):
-    token = str(value_dtype).strip().lower()
-    if token == "bfloat16" and not torch.cuda.is_bf16_supported():
-        return "bfloat16 is not supported on this GPU"
-    if token == "complex32":
-        return "complex32 is not supported by scatter without dtype fallback"
-    return None
+    return tokens
 
 
 def _parse_index_dtypes(raw):
@@ -195,24 +164,24 @@ def _write_csv(path, rows, fieldnames):
 
 
 def _print_header():
-    print("-" * 232)
+    print("-" * 196)
     print(
         f"{'ValueReq':>10} {'ValueEff':>10} {'Index':>6} {'Dense':>10} {'NNZ':>10} "
-        f"{'Reset':>6} {'PT(ms)':>10} {'FS(ms)':>10} {'CS(ms)':>10} "
-        f"{'FS/PT':>8} {'FS/CS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(CS)':>12} {'Reason':<32}"
+        f"{'Reset':>6} {'FB':>4} {'IFB':>4} {'PT(ms)':>10} {'FS(ms)':>10} {'CS(ms)':>10} "
+        f"{'FS/PT':>8} {'FS/CS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(CS)':>12}"
     )
-    print("-" * 232)
+    print("-" * 196)
 
 
 def _print_row(row):
     print(
         f"{row['value_dtype_req']:>10} {row['value_dtype_compute']:>10} {row['index_dtype']:>6} "
         f"{row['dense_size']:>10,d} {row['nnz']:>10,d} "
-        f"{str(row['reset_output']):>6} "
+        f"{str(row['reset_output']):>6} {str(row['fallback_applied']):>4} "
+        f"{str(row['index_fallback_applied']):>4} "
         f"{_fmt_ms(row['pytorch_ms']):>10} {_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['cusparse_ms']):>10} "
         f"{_fmt_speedup(row['triton_speedup_vs_pytorch']):>8} {_fmt_speedup(row['triton_speedup_vs_cusparse']):>8} "
-        f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['cusparse_max_error']):>12} "
-        f"{_fmt_reason(row.get('error_reason')):<32}"
+        f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['cusparse_max_error']):>12}"
     )
 
 
@@ -234,7 +203,8 @@ def run_cli(args):
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
-        f"unique_indices: {unique_indices} | CU(ms): direct sparse backend steady-state time"
+        f"dtype_policy: {args.dtype_policy} | index_fallback_policy: {args.index_fallback_policy} | "
+        f"unique_indices: {unique_indices}"
     )
     print()
     _print_header()
@@ -243,7 +213,6 @@ def run_cli(args):
     sample_rows = []
     total_cases = 0
     failed_cases = 0
-    skipped_cases = 0
 
     for value_dtype in value_dtype_tokens:
         for index_name, index_dtype in index_dtype_pairs:
@@ -253,38 +222,8 @@ def run_cli(args):
                     case_id = (
                         f"{value_dtype}|{index_name}|dense={dense_size}|nnz={nnz}|"
                         f"reset={str(reset_output).lower()}|unique={str(unique_indices).lower()}|"
-                        "policy=strict"
+                        f"policy={args.dtype_policy}|ifb_policy={args.index_fallback_policy}"
                     )
-                    precheck_reason = _precheck_case_support(value_dtype)
-                    if precheck_reason:
-                        skipped_cases += 1
-                        row = {
-                            "case_id": case_id,
-                            "gpu": torch.cuda.get_device_name(0),
-                            "value_dtype_req": value_dtype,
-                            "value_dtype_compute": "N/A",
-                            "index_dtype": index_name,
-                            "dense_size": dense_size,
-                            "nnz": nnz,
-                            "unique_indices": unique_indices,
-                            "reset_output": reset_output,
-                            "triton_ms": None,
-                            "pytorch_ms": None,
-                            "cusparse_ms": None,
-                            "triton_speedup_vs_pytorch": None,
-                            "triton_speedup_vs_cusparse": None,
-                            "triton_match_pytorch": None,
-                            "cusparse_match_pytorch": None,
-                            "triton_max_error": None,
-                            "cusparse_max_error": None,
-                            "cusparse_unavailable_reason": None,
-                            "status_reason": precheck_reason,
-                            "error_reason": precheck_reason,
-                            "status": "SKIP",
-                        }
-                        summary_rows.append(row)
-                        _print_row(row)
-                        continue
                     try:
                         result = ast.benchmark_scatter_case(
                             dense_size=dense_size,
@@ -296,8 +235,8 @@ def run_cli(args):
                             run_cusparse=run_cusparse,
                             unique_indices=unique_indices,
                             reset_output=reset_output,
-                            dtype_policy="strict",
-                            index_fallback_policy="strict",
+                            dtype_policy=args.dtype_policy,
+                            index_fallback_policy=args.index_fallback_policy,
                         )
                         perf = result["performance"]
                         verify = result["verification"]
@@ -306,12 +245,6 @@ def run_cli(args):
                         status = _status_from_result(verify)
                         if status != "PASS":
                             failed_cases += 1
-                        error_reason = None
-                        if status != "PASS":
-                            error_reason = (
-                                backend.get("cusparse_unavailable_reason")
-                                or "validation failed"
-                            )
                         row = {
                             "case_id": case_id,
                             "gpu": torch.cuda.get_device_name(0),
@@ -322,6 +255,11 @@ def run_cli(args):
                             "nnz": int(params.get("nnz")),
                             "unique_indices": bool(params.get("unique_indices")),
                             "reset_output": bool(params.get("reset_output")),
+                            "dtype_policy": params.get("dtype_policy"),
+                            "fallback_applied": bool(params.get("fallback_applied")),
+                            "index_fallback_applied": bool(
+                                backend.get("index_fallback_applied")
+                            ),
                             "triton_ms": perf.get("triton_ms"),
                             "pytorch_ms": perf.get("pytorch_ms"),
                             "cusparse_ms": perf.get("cusparse_ms"),
@@ -332,7 +270,8 @@ def run_cli(args):
                             "triton_max_error": verify.get("triton_max_error"),
                             "cusparse_max_error": verify.get("cusparse_max_error"),
                             "cusparse_unavailable_reason": backend.get("cusparse_unavailable_reason"),
-                            "error_reason": error_reason,
+                            "fallback_reason": backend.get("fallback_reason"),
+                            "index_fallback_reason": backend.get("index_fallback_reason"),
                             "status": status,
                         }
                         summary_rows.append(row)
@@ -359,6 +298,9 @@ def run_cli(args):
                             "nnz": nnz,
                             "unique_indices": unique_indices,
                             "reset_output": reset_output,
+                            "dtype_policy": args.dtype_policy,
+                            "fallback_applied": False,
+                            "index_fallback_applied": False,
                             "triton_ms": None,
                             "pytorch_ms": None,
                             "cusparse_ms": None,
@@ -369,17 +311,17 @@ def run_cli(args):
                             "triton_max_error": None,
                             "cusparse_max_error": None,
                             "cusparse_unavailable_reason": str(exc),
-                            "error_reason": str(exc),
+                            "fallback_reason": None,
+                            "index_fallback_reason": str(exc),
                             "status": "ERROR",
                         }
                         summary_rows.append(row)
                         _print_row(row)
 
-    print("-" * 232)
+    print("-" * 196)
     print(f"Total cases: {total_cases}")
     print(f"Failed cases: {failed_cases}")
-    print(f"Skipped cases: {skipped_cases}")
-    print(f"Passed cases: {total_cases - failed_cases - skipped_cases}")
+    print(f"Passed cases: {total_cases - failed_cases}")
 
     if args.csv_summary:
         summary_fields = [
@@ -392,6 +334,9 @@ def run_cli(args):
             "nnz",
             "unique_indices",
             "reset_output",
+            "dtype_policy",
+            "fallback_applied",
+            "index_fallback_applied",
             "triton_ms",
             "pytorch_ms",
             "cusparse_ms",
@@ -402,7 +347,8 @@ def run_cli(args):
             "triton_max_error",
             "cusparse_max_error",
             "cusparse_unavailable_reason",
-            "error_reason",
+            "fallback_reason",
+            "index_fallback_reason",
             "status",
         ]
         _write_csv(args.csv_summary, summary_rows, summary_fields)
@@ -424,7 +370,7 @@ def run_cli(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Scatter benchmark/validation with direct sparse reference steady-state timing and CSV export."
+        description="Scatter benchmark/validation with dtype fallback and CSV export."
     )
     parser.add_argument("--value-dtypes", default=DEFAULT_VALUE_DTYPES)
     parser.add_argument("--index-dtypes", default=DEFAULT_INDEX_DTYPES)
@@ -438,6 +384,8 @@ def build_parser():
     parser.add_argument("--no-cusparse", action="store_true")
     parser.add_argument("--unique-indices", default="true")
     parser.add_argument("--reset-output", choices=["true", "false", "both"], default="true")
+    parser.add_argument("--dtype-policy", choices=["auto", "strict"], default="auto")
+    parser.add_argument("--index-fallback-policy", choices=["auto", "strict"], default="auto")
     parser.add_argument("--csv-summary", default=None)
     parser.add_argument("--csv-samples", default=None)
     parser.add_argument("--sample-limit", type=int, default=32)

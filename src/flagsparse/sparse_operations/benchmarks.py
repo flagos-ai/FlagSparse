@@ -27,6 +27,7 @@ from .spmm_csr import (
     benchmark_spmm_opt_case,
     comprehensive_spmm_test,
 )
+from .spmm_csr_opt_alg2 import benchmark_spmm_opt_alg2_case
 from .spgemm_csr import benchmark_spgemm_case
 from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
@@ -222,7 +223,7 @@ def benchmark_scatter_case(
 ):
     """Benchmark Triton scatter vs PyTorch index_copy vs the active sparse reference backend."""
     device = torch.device("cuda")
-    requested_value_dtype, requested_effective_dtype, _, _ = (
+    requested_value_dtype, requested_effective_dtype, fallback_applied, fallback_reason = (
         _resolve_scatter_benchmark_dtype(value_dtype, dtype_policy)
     )
     sparse_values = _build_random_dense(nnz, requested_effective_dtype, device)
@@ -237,6 +238,8 @@ def benchmark_scatter_case(
         return_metadata=True,
     )
     effective_value_dtype = prep_meta["effective_value_dtype"]
+    fallback_applied = fallback_applied or prep_meta["fallback_applied"]
+    fallback_reason = fallback_reason or prep_meta["fallback_reason"]
 
     base_out = _build_random_dense(dense_size, sparse_values.dtype, device)
     expected = _pytorch_scatter_impl(
@@ -383,6 +386,10 @@ def benchmark_scatter_case(
             "iters": iters,
             "unique_indices": unique_indices,
             "reset_output": bool(reset_output),
+            "dtype_policy": str(dtype_policy).lower(),
+            "fallback_applied": bool(fallback_applied),
+            "index_fallback_policy": str(index_fallback_policy).lower(),
+            "kernel_index_dtype": triton_index_meta["kernel_index_dtype"],
         },
         "performance": {
             "pytorch_ms": pytorch_ms,
@@ -400,6 +407,9 @@ def benchmark_scatter_case(
         "backend_status": {
             "cusparse_unavailable_reason": cusparse_reason,
             "sparse_ref_backend": sparse_ref_backend,
+            "fallback_reason": fallback_reason,
+            "index_fallback_applied": bool(triton_index_meta["index_fallback_applied"]),
+            "index_fallback_reason": triton_index_meta["index_fallback_reason"],
         },
         "samples": {
             "pytorch": pytorch_values,
