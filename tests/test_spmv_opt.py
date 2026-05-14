@@ -1,6 +1,6 @@
 """
 SpMV optimisation A/B test: compare _impl (baseline) vs _impl_opt (optimised)
-side-by-side, together with PyTorch and cuSPARSE baselines.
+side-by-side, together with PyTorch and hipSPARSE reference timings.
 
 Usage:
     python tests/test_spmv_opt.py <dir/>                # batch run, default float32
@@ -160,28 +160,19 @@ def _timed_pytorch(data, indices, indptr, x, shape, warmup, iters):
     return y, e0.elapsed_time(e1) / iters
 
 
-def _timed_cusparse(data, indices, indptr, x, shape, warmup, iters):
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
-    A = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    torch.cuda.synchronize()
-    for _ in range(warmup):
-        _ = A @ x_cp
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(enable_timing=True)
-    e1 = torch.cuda.Event(enable_timing=True)
-    e0.record()
-    for _ in range(iters):
-        _ = A @ x_cp
-    e1.record()
-    torch.cuda.synchronize()
-    y_cp = A @ x_cp
-    y = torch.utils.dlpack.from_dlpack(y_cp.toDlpack())
-    return y, e0.elapsed_time(e1) / iters
+def _timed_sparse_ref(data, indices, indptr, x, shape, warmup, iters):
+    sparse_ref = spmv_csr_mod._benchmark_spmv_csr_sparse_ref(
+        data,
+        indices,
+        indptr,
+        x,
+        shape,
+        warmup=warmup,
+        iters=iters,
+    )
+    if sparse_ref["backend"] is None:
+        raise RuntimeError(sparse_ref["reason"])
+    return sparse_ref["values"], sparse_ref["ms"]
 
 
 def _fmt(v):
@@ -201,7 +192,7 @@ def _err(v):
 HEADER = (
     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
     f"{'Base(ms)':>9} {'Opt(ms)':>9} {'Sym(ms)':>9} {'Comp(ms)':>9} "
-    f"{'PT(ms)':>9} {'CU(ms)':>9}  "
+    f"{'PT(ms)':>9} {'HS(ms)':>9}  "
     f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
     f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
 )
@@ -263,10 +254,10 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters):
     except Exception:
         pass
 
-    # ── cuSPARSE ──
+    # Sparse backend reference (direct hipSPARSE on DCU).
     cu_ms = None
     try:
-        _, cu_ms = _timed_cusparse(data, indices, indptr, x, shape, warmup, iters)
+        _, cu_ms = _timed_sparse_ref(data, indices, indptr, x, shape, warmup, iters)
     except Exception:
         pass
 
@@ -385,7 +376,7 @@ def run_all_csv(paths, csv_path, warmup, iters, dtype_filter=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SpMV opt A/B: baseline vs optimised, with PyTorch/cuSPARSE."
+        description="SpMV opt A/B: baseline vs optimised, with PyTorch/hipSPARSE."
     )
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--csv", type=str, default=None, metavar="FILE",

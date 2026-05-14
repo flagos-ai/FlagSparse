@@ -1838,16 +1838,17 @@ def benchmark_spmm_opt_case(
         pt_ms = None
 
     cu_ms = None
-    if run_cusparse and cp is not None and cpx_sparse is not None:
-        try:
-            data_cp = _cupy_from_torch(data)
-            indices_cp = _cupy_from_torch(indices.to(torch.int64))
-            indptr_cp = _cupy_from_torch(indptr)
-            B_cp = _cupy_from_torch(B)
-            A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-            _, cu_ms = _benchmark_cuda_op(lambda: A_csr @ B_cp, warmup=warmup, iters=iters)
-        except Exception:
-            cu_ms = None
+    if run_cusparse:
+        sparse_ref = _benchmark_spmm_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            B,
+            shape,
+            warmup=warmup,
+            iters=iters,
+        )
+        cu_ms = sparse_ref["ms"]
 
     err_base = _spmm_opt_reference_error(base_values, ref, value_dtype)
     err_opt = _spmm_opt_reference_error(opt_values, ref, value_dtype)

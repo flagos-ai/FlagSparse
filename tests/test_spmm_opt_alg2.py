@@ -260,23 +260,18 @@ def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enable
     backend_name = "hipsparse_ref" if getattr(torch.version, "hip", None) else "cusparse_ref"
     if not enabled:
         return None, None, backend_name, "disabled"
-    try:
-        import cupy as cp
-        import cupyx.scipy.sparse as cpx
-    except Exception as exc:
-        return None, None, backend_name, str(exc)
-
-    try:
-        data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-        ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-        ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-        B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
-        sparse = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-        out_cp, elapsed = _benchmark(lambda: sparse @ B_cp, warmup, iters)
-        out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
-        return out, elapsed, backend_name, None
-    except Exception as exc:
-        return None, None, backend_name, str(exc)
+    sparse_ref = spmm_csr_mod._benchmark_spmm_csr_sparse_ref(
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        warmup=warmup,
+        iters=iters,
+    )
+    if sparse_ref["backend"] is None:
+        return None, None, backend_name, sparse_ref["reason"]
+    return sparse_ref["values"], sparse_ref["ms"], sparse_ref["backend"], None
 
 
 def _benchmark(op, warmup, iters):
@@ -666,7 +661,7 @@ def main():
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8}  "
         f"{'Base(ms)':>9} {'Alg1(ms)':>9} {'A1Prep':>9} {'A1Comp':>9} "
-        f"{'Alg2(ms)':>9} {'A2Prep':>9} {'A2Comp':>9} {'Torch(ms)':>9} {'CU(ms)':>9}  "
+        f"{'Alg2(ms)':>9} {'A2Prep':>9} {'A2Comp':>9} {'Torch(ms)':>9} {'HS(ms)':>9}  "
         f"{'B/A1':>8} {'B/A2':>8} {'A1/A2':>8} {'T/A2':>8} {'CU/A2':>8}  "
         f"{'Err(A1/T)':>10} {'Err(A1/CU)':>10} {'Err(A2/T)':>10} {'Err(A2/CU)':>10} {'Status':>6}"
     )

@@ -1,5 +1,5 @@
 """
-SpMM alg1 test: compare base vs optimised path with PyTorch and cuSPARSE timings.
+SpMM alg1 test: compare base vs optimised path with PyTorch and hipSPARSE timings.
 Alg1 timings report CPU-wall runtime preprocessing plus CUDA-event compute time.
 
 Usage:
@@ -205,29 +205,19 @@ def _timed_pytorch(data, indices, indptr, B, shape, warmup, iters):
     return out, start.elapsed_time(end) / iters
 
 
-def _timed_cusparse(data, indices, indptr, B, shape, warmup, iters):
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx
-
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-    B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
-    sparse = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    torch.cuda.synchronize()
-    for _ in range(warmup):
-        _ = sparse @ B_cp
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        _ = sparse @ B_cp
-    end.record()
-    torch.cuda.synchronize()
-    out_cp = sparse @ B_cp
-    out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
-    return out, start.elapsed_time(end) / iters
+def _timed_sparse_ref(data, indices, indptr, B, shape, warmup, iters):
+    sparse_ref = spmm_csr_mod._benchmark_spmm_csr_sparse_ref(
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        warmup=warmup,
+        iters=iters,
+    )
+    if sparse_ref["backend"] is None:
+        raise RuntimeError(sparse_ref["reason"])
+    return sparse_ref["values"], sparse_ref["ms"]
 
 
 def _build_reference(data, indices, indptr, B, shape, dtype):
@@ -272,7 +262,7 @@ def _err(v):
 HEADER = (
     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8}  "
     f"{'Base(ms)':>9} {'Alg1(ms)':>9} {'A1Prep':>9} {'A1Comp':>9} "
-    f"{'PT(ms)':>9} {'CU(ms)':>9}  "
+    f"{'PT(ms)':>9} {'HS(ms)':>9}  "
     f"{'Base/A1':>8} {'PT/A1':>8} {'CU/A1':>8}  "
     f"{'Err(Base)':>10} {'Err(A1)':>10} {'Status':>6}"
 )
@@ -310,7 +300,7 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
 
     cu_ms = None
     try:
-        _, cu_ms = _timed_cusparse(data, indices, indptr, B, shape, warmup, iters)
+        _, cu_ms = _timed_sparse_ref(data, indices, indptr, B, shape, warmup, iters)
     except Exception:
         pass
 
@@ -458,7 +448,7 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SpMM alg1: baseline vs optimised, with PyTorch/cuSPARSE timings.")
+    parser = argparse.ArgumentParser(description="SpMM alg1: baseline vs optimised, with PyTorch/hipSPARSE timings.")
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--csv", type=str, default=None, metavar="FILE", help="Export selected dtype to CSV")
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
