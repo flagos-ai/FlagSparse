@@ -28,16 +28,10 @@ from .benchmarks import (
 from .gather_scatter import (
     benchmark_hipsparse_gather,
     benchmark_hipsparse_scatter,
-    cusparse_spmv_gather,
-    cusparse_spmv_gather_cupy,
-    cusparse_spmv_scatter,
     flagsparse_gather,
-    flagsparse_gather_cupy,
     flagsparse_scatter,
     pytorch_index_gather,
     pytorch_index_scatter,
-    triton_cusparse_gather,
-    triton_cusparse_scatter,
 )
 from .spmv_csr import (
     PreparedCsrSpmv,
@@ -102,11 +96,7 @@ __all__ = [
     "comprehensive_scatter_test",
     "comprehensive_spmm_test",
     "comprehensive_spsm_test",
-    "cusparse_spmv_gather",
-    "cusparse_spmv_gather_cupy",
-    "cusparse_spmv_scatter",
     "flagsparse_gather",
-    "flagsparse_gather_cupy",
     "flagsparse_alpha_spmm_alg1",
     "flagsparse_alpha_spmm_alg1_tle",
     "is_alpha_spmm_alg1_tle_available",
@@ -141,6 +131,4 @@ __all__ = [
     "prepare_spmv_csr",
     "pytorch_index_gather",
     "pytorch_index_scatter",
-    "triton_cusparse_gather",
-    "triton_cusparse_scatter",
 ]

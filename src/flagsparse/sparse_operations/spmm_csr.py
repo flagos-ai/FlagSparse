@@ -1939,11 +1939,7 @@ def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
         if reason is None:
             return "hipsparse", None
         return None, reason
-    if cp is None or cpx_sparse is None:
-        return None, "CuPy/cuSPARSE is not available"
-    if value_dtype in (torch.float16, torch.bfloat16):
-        return None, "float16/bfloat16 not supported by CuPy sparse; skipped"
-    return "cupy_cusparse", None
+    return None, "direct hipSPARSE CSR SpMM reference requires a ROCm runtime"
 
 
 def _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None):
@@ -2367,7 +2363,7 @@ def benchmark_spmm_case(
     max_segments=None,
     run_cusparse=True,
 ):
-    """Benchmark Triton CSR SpMM vs PyTorch sparse.mm and CuPy/cuSPARSE CSR @ dense."""
+    """Benchmark Triton CSR SpMM vs PyTorch sparse.mm and direct hipSPARSE CSR @ dense."""
     device = torch.device("cuda")
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device

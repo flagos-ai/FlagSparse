@@ -164,11 +164,7 @@ def _spmm_coo_sparse_ref_backend(value_dtype, index_dtype):
         if reason is None:
             return "hipsparse", None
         return None, reason
-    if cp is None or cpx_sparse is None:
-        return None, "CuPy/cuSPARSE is not available"
-    if value_dtype in (torch.float16, torch.bfloat16):
-        return None, "float16/bfloat16 not supported by CuPy sparse; skipped"
-    return "cupy_cusparse", None
+    return None, "direct hipSPARSE COO SpMM reference requires a ROCm runtime"
 
 
 def _hipsparse_spmm_coo_skip_reason(value_dtype, index_dtype):
@@ -1290,7 +1286,7 @@ def benchmark_spmm_coo_case(
     route="rowrun",
     compare_routes=False,
 ):
-    """Benchmark native COO SpMM vs PyTorch COO sparse.mm and CuPy/cuSPARSE COO @ dense."""
+    """Benchmark native COO SpMM vs PyTorch COO sparse.mm and direct hipSPARSE COO @ dense."""
     selected_route = _normalize_spmm_coo_route(route)
     device = torch.device("cuda")
     data, row, col = _build_random_coo(

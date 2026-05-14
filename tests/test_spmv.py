@@ -11,6 +11,7 @@ import os
 
 import torch
 import flagsparse as ast
+import flagsparse.sparse_operations._common as ast_common
 import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
 
 
@@ -64,20 +65,6 @@ def _apply_torch_sparse_op(matrix, x_2d, op):
     if op == "trans":
         return torch.sparse.mm(matrix.transpose(0, 1), x_2d).squeeze(1)
     return torch.sparse.mm(matrix.conj().transpose(0, 1), x_2d).squeeze(1)
-
-
-def _cupy_sparse_op_matrix(matrix, op):
-    op = _normalize_op(op)
-    if op == "non":
-        return matrix
-    if op == "trans":
-        return matrix.T
-    matrix_conj = matrix.conj() if hasattr(matrix, "conj") else matrix.conjugate()
-    return matrix_conj.T
-
-
-def _apply_cupy_sparse_op(matrix, x, op):
-    return _cupy_sparse_op_matrix(matrix, op) @ x
 
 
 def _random_vector(size, dtype, device):
@@ -415,64 +402,6 @@ def _time_pytorch_spmv(data, indices, indptr, x, shape, warmup, iters, op="non")
     return start_ev.elapsed_time(end_ev) / iters
 
 
-def _cupy_csr_reference(data, indices, indptr, x, shape, out_dtype, op="non"):
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx
-
-    op = _normalize_op(op)
-    ref_dtype = _reference_dtype(out_dtype)
-    data_ref = data.to(ref_dtype)
-    x_ref = x.to(ref_dtype)
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref))
-    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x_ref))
-    A_csr_ref = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    y_ref = _apply_cupy_sparse_op(A_csr_ref, x_cp, op)
-    y_ref_t = torch.utils.dlpack.from_dlpack(y_ref.toDlpack())
-    return _cast_reference_output(y_ref_t, out_dtype)
-
-
-def _run_cupy_spmv_runtime_op(data, indices, indptr, x, shape, op, fmt="csr"):
-    import cupyx.scipy.sparse as cpx
-
-    matrix = cpx.csr_matrix((data, indices, indptr), shape=shape)
-    if fmt == "csc":
-        matrix = matrix.tocsc()
-    return _apply_cupy_sparse_op(matrix, x, op)
-
-
-def _time_cupy_spmv(data, indices, indptr, x, shape, warmup, iters, op="non", fmt="csr"):
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx
-
-    op = _normalize_op(op)
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
-    if op == "non":
-        matrix = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-        if fmt == "csc":
-            matrix = matrix.tocsc()
-        spmv_op = lambda: matrix @ x_cp
-    else:
-        spmv_op = lambda: _run_cupy_spmv_runtime_op(
-            data_cp, ind_cp, ptr_cp, x_cp, shape, op, fmt=fmt
-        )
-    for _ in range(warmup):
-        _ = spmv_op()
-    cp.cuda.runtime.deviceSynchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        _ = spmv_op()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
 def _tolerance(value_dtype):
     if value_dtype in (torch.float16, torch.bfloat16):
         return 2e-3, 2e-3
@@ -565,55 +494,46 @@ def run_one_mtx(
     triton_ok_cu = False
     cu_error_reason = None
     csc_ms = None
-    if run_cusparse and value_dtype not in (torch.bfloat16,):
+    if run_cusparse:
         try:
-            cusparse_ms = _time_cupy_spmv(
+            sparse_ref = ast_common._benchmark_spmv_csr_sparse_ref(
                 data,
                 indices,
                 indptr,
                 x,
                 shape,
-                warmup,
-                iters,
+                warmup=warmup,
+                iters=iters,
                 op=op,
-                fmt="csr",
+                include_csc=True,
             )
-            cs_ref_t = _cupy_csr_reference(
-                data, indices, indptr, x, shape, value_dtype, op=op
-            )
-            if y_size:
-                cu_error_reason = _non_finite_error_reason(
-                    triton_y, cs_ref_t, "cuSPARSE reference"
-                )
-                if cu_error_reason is None:
-                    err_cu = _allclose_error_ratio(triton_y, cs_ref_t, atol, rtol)
-                    triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
-                else:
-                    err_cu = float("nan")
-
-            csc_ms = _time_cupy_spmv(
-                data,
-                indices,
-                indptr,
-                x,
-                shape,
-                warmup,
-                iters,
-                op=op,
-                fmt="csc",
-            )
+            if sparse_ref["backend"] is None:
+                cu_error_reason = sparse_ref["reason"]
+            else:
+                cusparse_ms = sparse_ref["ms"]
+                csc_ms = sparse_ref.get("csc_ms")
+                cs_ref_t = sparse_ref["values"]
+                if y_size:
+                    cu_error_reason = _non_finite_error_reason(
+                        triton_y, cs_ref_t, "sparse backend reference"
+                    )
+                    if cu_error_reason is None:
+                        err_cu = _allclose_error_ratio(triton_y, cs_ref_t, atol, rtol)
+                        triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
+                    else:
+                        err_cu = float("nan")
         except Exception as exc:
             cusparse_ms = None
             err_cu = None
             csc_ms = None
-            cu_error_reason = f"cuSPARSE reference error: {exc}"
+            cu_error_reason = f"sparse reference error: {exc}"
 
     if pt_ref_y is None and err_cu is None:
         triton_non_finite = _has_non_finite(triton_y)
         error_reason = "non-finite FlagSparse output" if triton_non_finite else (
             pt_error_reason
             or cu_error_reason
-            or "ref: no PyTorch or cuSPARSE result"
+            or "ref: no PyTorch or sparse backend result"
         )
         return {
             "path": mtx_path,
@@ -760,7 +680,7 @@ def _print_mtx_header(value_dtype, index_dtype, op="non"):
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  op: {op}  |  transpose: {bool(transpose)}"
     )
-    print("Formats: FlagSparse=CSR, cuSPARSE=CSR/CSC, PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR, hipSPARSE=CSR/CSC, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
     print("Timing policy: non = compute only; trans/conj = raw op materialization + compute.")
     print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
@@ -898,7 +818,7 @@ def run_comprehensive_synthetic(op="non"):
     print("FLAGSPARSE SpMV BENCHMARK (synthetic CSR)")
     print("=" * 110)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {WARMUP}  Iters: {ITERS}  |  op: {op}  |  transpose: {bool(transpose)}")
-    print("Formats: FlagSparse=CSR, cuSPARSE=CSR (when supported), Reference=CuPy CSR or PyTorch COO")
+    print("Formats: FlagSparse=CSR, hipSPARSE=CSR (when supported), Reference=direct hipSPARSE or PyTorch COO")
     print("When CuPy does not support dtype (e.g. bfloat16/float16), reference = PyTorch (float32 then cast).")
     print()
     total = 0
@@ -912,7 +832,7 @@ def run_comprehensive_synthetic(op="non"):
             print("-" * 110)
             print(
                 f"{'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-                f"{'FlagSparse(ms)':>11} {'cuSPARSE(ms)':>12} {'FS/CS':>8} "
+                f"{'FlagSparse(ms)':>11} {'hipSPARSE(ms)':>13} {'FS/HS':>8} "
                 f"{'Status':>6} {'Err(FS)':>10} {'Err(CS)':>10}"
             )
             print("-" * 110)
@@ -995,7 +915,7 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs")
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
-    parser.add_argument("--no-cusparse", action="store_true", help="Skip cuSPARSE baseline")
+    parser.add_argument("--no-cusparse", action="store_true", help="Skip direct hipSPARSE reference")
     parser.add_argument(
         "--csv-csr",
         type=str,

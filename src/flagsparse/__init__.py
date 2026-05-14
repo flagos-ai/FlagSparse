@@ -4,13 +4,9 @@ __version__ = "1.0.0"
 
 __all__ = [
     "flagsparse_gather",
-    "flagsparse_gather_cupy",
     "flagsparse_scatter",
     "pytorch_index_gather",
     "pytorch_index_scatter",
-    "cusparse_spmv_gather",
-    "cusparse_spmv_gather_cupy",
-    "cusparse_spmv_scatter",
     "benchmark_gather_case",
     "benchmark_hipsparse_gather",
     "benchmark_hipsparse_scatter",
@@ -89,13 +85,9 @@ __all__ = [
 
 _OPS_EXPORTS = {
     "flagsparse_gather",
-    "flagsparse_gather_cupy",
     "flagsparse_scatter",
     "pytorch_index_gather",
     "pytorch_index_scatter",
-    "cusparse_spmv_gather",
-    "cusparse_spmv_gather_cupy",
-    "cusparse_spmv_scatter",
     "benchmark_gather_case",
     "benchmark_hipsparse_gather",
     "benchmark_hipsparse_scatter",

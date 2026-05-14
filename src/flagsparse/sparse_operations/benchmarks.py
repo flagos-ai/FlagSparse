@@ -329,7 +329,7 @@ def benchmark_scatter_case(
             except Exception as exc:
                 cusparse_reason = str(exc)
         elif not reset_output:
-            skip_reason = "cuSPARSE scatter baseline only matches reset_output=True semantics"
+            skip_reason = "direct hipSPARSE scatter reference only matches reset_output=True semantics"
         else:
             selector_data, selector_indices, selector_indptr, selector_shape = (
                 _build_scatter_selector_csr(indices, dense_size, sparse_values.dtype)

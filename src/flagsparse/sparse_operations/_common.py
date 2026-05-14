@@ -362,6 +362,43 @@ def _hip_check_result(result, call_name):
     return payload
 
 
+def _hip_runtime_event_available():
+    if hip is None:
+        return False
+    required_symbols = (
+        "hipEventCreate",
+        "hipEventRecord",
+        "hipEventSynchronize",
+        "hipEventElapsedTime",
+        "hipEventDestroy",
+    )
+    return all(hasattr(hip, symbol) for symbol in required_symbols)
+
+
+def _hip_event_elapsed_ms(start_evt, stop_evt):
+    raw = hip.hipEventElapsedTime(start_evt, stop_evt)
+    if not isinstance(raw, tuple) or len(raw) != 2:
+        raise RuntimeError(f"hipEventElapsedTime returned unexpected result: {raw!r}")
+    status, elapsed_ms = raw
+    if not _hipsparse_status_success(status):
+        raise RuntimeError(f"hipEventElapsedTime failed: {status}")
+    try:
+        return float(elapsed_ms)
+    except Exception as exc:
+        raise RuntimeError(
+            f"hipEventElapsedTime returned a non-numeric elapsed value: {raw!r}"
+        ) from exc
+
+
+def _destroy_hip_event(evt):
+    if evt is None or hip is None or not hasattr(hip, "hipEventDestroy"):
+        return
+    try:
+        _hip_check_result(hip.hipEventDestroy(evt), "hipEventDestroy")
+    except Exception:
+        pass
+
+
 def _hipsparse_lookup(container_name, attr_names):
     container = getattr(hipsparse, container_name, None) if hipsparse is not None else None
     search_spaces = [container, hipsparse]
@@ -465,13 +502,13 @@ def _hipsparse_spmm_algorithm(format_name):
     format_name = str(format_name).lower()
     mapping = {
         "csr": (
-            "HIPSPARSE_SPMM_ALG_DEFAULT",
             "HIPSPARSE_SPMM_CSR_ALG1",
+            "HIPSPARSE_SPMM_ALG_DEFAULT",
         ),
         "coo": (
-            "HIPSPARSE_SPMM_ALG_DEFAULT",
             "HIPSPARSE_SPMM_COO_ALG1",
             "HIPSPARSE_COOMM_ALG1",
+            "HIPSPARSE_SPMM_ALG_DEFAULT",
         ),
     }
     if format_name not in mapping:
@@ -649,14 +686,7 @@ def _spmv_csr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
         if skip_reason is None:
             return "hipsparse", None
         return None, skip_reason
-    skip_reason = _cusparse_baseline_skip_reason(value_dtype)
-    if skip_reason is not None:
-        return None, skip_reason
-    if cp is None or cpx_sparse is None:
-        return None, "CuPy/cuSPARSE is unavailable"
-    if value_dtype not in _CUPY_SPMV_SUPPORTED_VALUE_DTYPES:
-        return None, f"{value_dtype} is not supported by the CuPy sparse SpMV reference"
-    return "cupy_cusparse", None
+    return None, "direct hipSPARSE CSR SpMV reference requires a ROCm runtime"
 
 
 def _spmv_csr_reference_backend(value_dtype, index_dtype, op="non"):
@@ -753,14 +783,7 @@ def _spmv_coo_sparse_ref_backend(value_dtype, index_dtype, op="non"):
         if direct_reason is None:
             return "hipsparse", None
         return None, direct_reason
-    skip_reason = _cusparse_baseline_skip_reason(value_dtype)
-    if skip_reason is not None:
-        return None, skip_reason
-    if cp is None or cpx_sparse is None:
-        return None, "CuPy/cuSPARSE is unavailable"
-    if value_dtype not in _CUPY_SPMV_SUPPORTED_VALUE_DTYPES:
-        return None, f"{value_dtype} is not supported by the CuPy sparse SpMV reference"
-    return "cupy_cusparse", None
+    return None, "direct hipSPARSE COO SpMV reference requires a ROCm runtime"
 
 
 def _spmv_coo_reference_backend(value_dtype, index_dtype, op="non"):
@@ -1799,20 +1822,38 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
     state = None
+    start_ev = None
+    stop_ev = None
     try:
         state = prepare_fn()
         output = None
         for _ in range(warmup):
             output = run_fn(state)
+
+        if _is_rocm_runtime() and _hip_runtime_event_available():
+            torch.cuda.synchronize()
+            start_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+            stop_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+            _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
+            for _ in range(iters):
+                output = run_fn(state)
+            _hip_check_result(hip.hipEventRecord(stop_ev, 0), "hipEventRecord(stop)")
+            _hip_check_result(
+                hip.hipEventSynchronize(stop_ev), "hipEventSynchronize(stop)"
+            )
+            return output, _hip_event_elapsed_ms(start_ev, stop_ev) / iters
+
         torch.cuda.synchronize()
-        start_ev = torch.cuda.Event(enable_timing=True)
-        end_ev = torch.cuda.Event(enable_timing=True)
-        start_ev.record()
+        start_ev_torch = torch.cuda.Event(enable_timing=True)
+        end_ev_torch = torch.cuda.Event(enable_timing=True)
+        start_ev_torch.record()
         for _ in range(iters):
             output = run_fn(state)
-        end_ev.record()
+        end_ev_torch.record()
         torch.cuda.synchronize()
-        return output, start_ev.elapsed_time(end_ev) / iters
+        return output, start_ev_torch.elapsed_time(end_ev_torch) / iters
     finally:
+        _destroy_hip_event(stop_ev)
+        _destroy_hip_event(start_ev)
         if state is not None:
             destroy_fn(state)

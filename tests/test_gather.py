@@ -7,7 +7,6 @@ import time
 import torch
 
 import flagsparse as ast
-from flagsparse.sparse_operations._common import cp
 
 
 DEFAULT_CASES = [
@@ -16,7 +15,7 @@ DEFAULT_CASES = [
     (524_288, 16_384),
     (1_048_576, 65_536),
 ]
-DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex32,complex64,complex128"
+DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex64,complex128"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
@@ -48,7 +47,6 @@ def _parse_value_dtypes(raw):
         "bfloat16",
         "float32",
         "float64",
-        "complex32",
         "complex64",
         "complex128",
     }
@@ -110,8 +108,6 @@ def _write_csv(path, rows, fieldnames):
 
 def _sync_all():
     torch.cuda.synchronize()
-    if cp is not None:
-        cp.cuda.runtime.deviceSynchronize()
 
 
 def _bench_cuda_op(op, warmup, iters):
@@ -164,15 +160,10 @@ def _collect_samples(case_id, expected, flagsparse_out, limit):
 
 
 def _dtype_mode(value_dtype_req):
-    if value_dtype_req in ("float16", "bfloat16", "complex32", "complex64"):
-        return "gather_cupy"
     return "gather_triton"
 
 
 def _select_mode(value_dtype_req, index_dtype):
-    # Keep original gather path for half+int32 while retaining cupy path for new combos.
-    if value_dtype_req == "float16" and index_dtype == torch.int32:
-        return "gather_triton"
     return _dtype_mode(value_dtype_req)
 
 
@@ -259,16 +250,7 @@ def _benchmark_gather_case(
     expected = dense_vector.index_select(0, indices.to(torch.int64))
 
     mode = _select_mode(value_dtype_req, index_dtype)
-    if mode == "gather_cupy":
-        flagsparse_op = lambda: ast.flagsparse_gather_cupy(
-            dense_vector,
-            indices,
-            index_fallback_policy="strict",
-        )
-        cusparse_op = lambda: ast.cusparse_spmv_gather_cupy(dense_vector, indices)[0]
-    else:
-        flagsparse_op = lambda: ast.flagsparse_gather(dense_vector, indices)
-        cusparse_op = lambda: ast.cusparse_spmv_gather(dense_vector, indices)[0]
+    flagsparse_op = lambda: ast.flagsparse_gather(dense_vector, indices)
 
     pytorch_op = lambda: dense_vector.index_select(0, indices.to(torch.int64))
     pytorch_values, pytorch_ms = _bench_cuda_op(pytorch_op, warmup=warmup, iters=iters)
@@ -289,18 +271,9 @@ def _benchmark_gather_case(
     cusparse_reason = None
     if run_cusparse:
         try:
-            if getattr(torch.version, "hip", None) is not None:
-                cusparse_values, cusparse_ms = ast.benchmark_hipsparse_gather(
-                    dense_vector, indices, warmup=warmup, iters=iters
-                )
-            elif mode == "gather_cupy":
-                cusparse_values, cusparse_ms = _bench_cuda_op(
-                    cusparse_op, warmup=warmup, iters=iters
-                )
-            else:
-                cusparse_values, cusparse_ms = _bench_cuda_op(
-                    cusparse_op, warmup=warmup, iters=iters
-                )
+            cusparse_values, cusparse_ms = ast.benchmark_hipsparse_gather(
+                dense_vector, indices, warmup=warmup, iters=iters
+            )
             cusparse_match = torch.allclose(cusparse_values, expected, atol=atol, rtol=rtol)
             cusparse_max_error = (
                 float(torch.max(torch.abs(cusparse_values - expected)).item())

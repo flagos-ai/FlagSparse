@@ -505,54 +505,35 @@ def run_one_mtx(
     except Exception as exc:
         result["pytorch_reason"] = str(exc)
 
-    _cupy_supported_dtypes = (
-        torch.float32,
-        torch.float64,
-        torch.complex64,
-        torch.complex128,
-    )
     if run_cusparse:
-        if value_dtype not in _cupy_supported_dtypes:
-            result["cusparse_reason"] = "float16/bfloat16 not supported by CuPy sparse; skipped"
-        else:
-            try:
-                import cupy as cp
-                import cupyx.scipy.sparse as cpx
-
-                data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-                ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-                ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-                B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
-                A_csr = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-
-                torch.cuda.synchronize()
-                for _ in range(warmup):
-                    _ = A_csr @ B_cp
-                torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                for _ in range(iters):
-                    _ = A_csr @ B_cp
-                end.record()
-                torch.cuda.synchronize()
-                result["cusparse_ms"] = start.elapsed_time(end) / iters
-
-                cs_C = A_csr @ B_cp
-                cs_C_t = torch.utils.dlpack.from_dlpack(cs_C.toDlpack())
+        try:
+            sparse_ref = ast_ops._benchmark_spmm_csr_sparse_ref(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                warmup=warmup,
+                iters=iters,
+            )
+            if sparse_ref["backend"] is None:
+                result["cusparse_reason"] = sparse_ref["reason"]
+            else:
+                cs_C_t = sparse_ref["values"]
+                result["cusparse_ms"] = sparse_ref["ms"]
                 cusparse_metrics = ast_ops._spmm_validation_metrics(cs_C_t, ref_C)
                 result["cusparse_abs_err"] = cusparse_metrics["max_abs_error"]
                 result["cusparse_relative_error_diag"] = cusparse_metrics["max_relative_error"]
                 if triton_C is not None:
                     result["err_cu"] = _scaled_allclose_error(triton_C, cs_C_t, value_dtype)
                     result["triton_ok_cu"] = torch.allclose(triton_C, cs_C_t, atol=atol, rtol=rtol)
-            except Exception as exc:
-                result["cusparse_ms"] = None
-                result["err_cu"] = None
-                result["cusparse_abs_err"] = None
-                result["cusparse_relative_error_diag"] = None
-                result["triton_ok_cu"] = None
-                result["cusparse_reason"] = str(exc)
+        except Exception as exc:
+            result["cusparse_ms"] = None
+            result["err_cu"] = None
+            result["cusparse_abs_err"] = None
+            result["cusparse_relative_error_diag"] = None
+            result["triton_ok_cu"] = None
+            result["cusparse_reason"] = str(exc)
 
     result["status"] = "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
     return result
@@ -593,15 +574,15 @@ def _print_spmm_csr_mtx_header(value_dtype, index_dtype):
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
     )
-    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm, PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), hipSPARSE=CSR dense-mm, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
-    print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
-    print("For float32, PT checks the float64-based correctness reference while CU checks consistency with native cuSPARSE float32, so PT and CU may differ.")
+    print("PT/HS show per-reference correctness. Err(PT)/Err(HS)=max(|diff| / (atol + rtol*|ref|)).")
+    print("For float32, PT checks the float64-based correctness reference while HS checks consistency with native hipSPARSE float32, so PT and HS may differ.")
     print("-" * 186)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
-        f"{'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
-        f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
+        f"{'FlagSparse(ms)':>14} {'hipSPARSE(ms)':>14} {'PyTorch(ms)':>11} "
+        f"{'FS/HS':>7} {'FS/PT':>7} {'PT':>6} {'HS':>6} {'Err(PT)':>10} {'Err(HS)':>10}"
     )
     print("-" * 186)
 
@@ -847,7 +828,7 @@ def run_alg1_tile_branch_coverage(warmup=WARMUP, iters=ITERS, run_cusparse=True)
     print("=" * 132)
     print(
         f"{'DenseN':>8} {'BLOCK_N':>8} {'NNZTile':>8} {'ReqSeg':>7} {'Warp':>6} {'Factor':>7} "
-        f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>12} {'PT':>6} {'CU':>6} {'Err(FS)':>11}"
+        f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>14} {'hipSPARSE(ms)':>13} {'PT':>6} {'HS':>6} {'Err(FS)':>11}"
     )
     print("-" * 132)
 
@@ -886,7 +867,7 @@ def run_alg1_tile_branch_coverage(warmup=WARMUP, iters=ITERS, run_cusparse=True)
         )
     print("-" * 132)
     if note:
-        print(f"cuSPARSE note: {note}")
+        print(f"hipSPARSE note: {note}")
     print()
     return failed
 
@@ -912,8 +893,8 @@ def run_comprehensive_synthetic(
         f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  "
         f"MAX_SEGMENTS: {_fmt_launch_value(max_segments)}"
     )
-    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm (when supported), PyTorch=CSR or COO.")
-    print("For float32, PT checks the float64-based correctness reference while CU reflects native cuSPARSE float32 consistency.")
+    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), hipSPARSE=CSR dense-mm (when supported), PyTorch=CSR or COO.")
+    print("For float32, PT checks the float64-based correctness reference while HS reflects native hipSPARSE float32 consistency.")
     print()
 
     total = 0
@@ -927,7 +908,7 @@ def run_comprehensive_synthetic(
             print("-" * 144)
             print(
                 f"{'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} {'BN':>4} {'BNNZ':>6} {'Seg':>4} "
-                f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>12} {'FS/PT':>8} {'FS/CU':>8} {'PT':>6} {'CU':>6} {'Err(FS)':>11} {'Err(CU)':>12}"
+                f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>14} {'hipSPARSE(ms)':>13} {'FS/PT':>8} {'FS/HS':>8} {'PT':>6} {'HS':>6} {'Err(FS)':>11} {'Err(HS)':>12}"
             )
             print("-" * 144)
             combo_reason = None
@@ -971,7 +952,7 @@ def run_comprehensive_synthetic(
                 )
             print("-" * 144)
             if combo_reason:
-                print(f"  cuSPARSE: {combo_reason}")
+                print(f"  hipSPARSE: {combo_reason}")
             print()
 
     alg1_failed = run_alg1_tile_branch_coverage(warmup=warmup, iters=iters, run_cusparse=run_cusparse) if run_alg1_coverage else 0
@@ -1040,7 +1021,7 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs")
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
-    parser.add_argument("--no-cusparse", action="store_true", help="Skip cuSPARSE baseline")
+    parser.add_argument("--no-cusparse", action="store_true", help="Skip direct hipSPARSE reference")
     parser.add_argument("--skip-api-checks", action="store_true", help="Skip API validation checks in synthetic mode")
     parser.add_argument("--skip-alg1-coverage", action="store_true", help="Skip dense-column ALG1 heuristic coverage in synthetic mode")
     parser.add_argument(
