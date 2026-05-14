@@ -161,18 +161,21 @@ def _timed_pytorch(data, indices, indptr, x, shape, warmup, iters):
 
 
 def _timed_sparse_ref(data, indices, indptr, x, shape, warmup, iters):
-    sparse_ref = spmv_csr_mod._benchmark_spmv_csr_sparse_ref(
-        data,
-        indices,
-        indptr,
-        x,
-        shape,
-        warmup=warmup,
-        iters=iters,
-    )
+    try:
+        sparse_ref = spmv_csr_mod._benchmark_spmv_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            x,
+            shape,
+            warmup=warmup,
+            iters=iters,
+        )
+    except Exception as exc:
+        return None, None, f"exception: {exc}"
     if sparse_ref["backend"] is None:
-        raise RuntimeError(sparse_ref["reason"])
-    return sparse_ref["values"], sparse_ref["ms"]
+        return None, None, sparse_ref.get("reason", "backend unavailable")
+    return sparse_ref["values"], sparse_ref["ms"], None
 
 
 def _fmt(v):
@@ -193,7 +196,7 @@ HEADER = (
     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
     f"{'Base(ms)':>9} {'Opt(ms)':>9} {'Sym(ms)':>9} {'Comp(ms)':>9} "
     f"{'PT(ms)':>9} {'HS(ms)':>9}  "
-    f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
+    f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/HS':>8}  "
     f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
 )
 SEP = "-" * 170
@@ -255,11 +258,9 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters):
         pass
 
     # Sparse backend reference (direct hipSPARSE on DCU).
-    cu_ms = None
-    try:
-        _, cu_ms = _timed_sparse_ref(data, indices, indptr, x, shape, warmup, iters)
-    except Exception:
-        pass
+    hs_ms = None
+    hs_reason = None
+    _, hs_ms, hs_reason = _timed_sparse_ref(data, indices, indptr, x, shape, warmup, iters)
 
     # ── Correctness vs reference ──
     err_base = None
@@ -283,7 +284,10 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters):
         "symbolic_ms": symbolic_ms,
         "compute_ms": compute_ms,
         "op_total_ms": opt_ms,
-        "pt_ms": pt_ms, "cu_ms": cu_ms,
+        "pt_ms": pt_ms,
+        "hs_ms": hs_ms,
+        "hs_reason": hs_reason,
+        "cu_ms": hs_ms,
         "err_base": err_base, "err_opt": err_opt,
         "base_ok": base_ok, "opt_ok": opt_ok,
         "status": status,
@@ -293,15 +297,16 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters):
 def print_row(r):
     name = os.path.basename(r["path"])[:27]
     n_rows, n_cols = r["shape"]
+    hs_note = "" if r.get("hs_reason") is None else f"  HS:{r['hs_reason']}"
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {r['nnz']:>10}  "
         f"{_fmt(r['base_ms']):>9} {_fmt(r['opt_ms']):>9} "
         f"{_fmt(r['symbolic_ms']):>9} {_fmt(r['compute_ms']):>9} "
-        f"{_fmt(r['pt_ms']):>9} {_fmt(r['cu_ms']):>9}  "
+        f"{_fmt(r['pt_ms']):>9} {_fmt(r['hs_ms']):>9}  "
         f"{_spd(r['base_ms'], r['op_total_ms']):>8} "
         f"{_spd(r['pt_ms'], r['op_total_ms']):>8} "
-        f"{_spd(r['cu_ms'], r['op_total_ms']):>8}  "
-        f"{_err(r['err_base']):>10} {_err(r['err_opt']):>10} {r['status']:>6}"
+        f"{_spd(r['hs_ms'], r['op_total_ms']):>8}  "
+        f"{_err(r['err_base']):>10} {_err(r['err_opt']):>10} {r['status']:>6}{hs_note}"
     )
 
 
@@ -349,19 +354,23 @@ def run_all_csv(paths, csv_path, warmup, iters, dtype_filter=None):
                     "symbolic_ms": r["symbolic_ms"],
                     "compute_ms": r["compute_ms"],
                     "op_total_ms": r["op_total_ms"],
-                    "pt_ms": r["pt_ms"], "cu_ms": r["cu_ms"],
+                    "pt_ms": r["pt_ms"],
+                    "hipsparse_ms": r["hs_ms"],
+                    "hipsparse_reason": r["hs_reason"],
+                    "cu_ms": r["hs_ms"],
                     "opt_vs_base": r["base_ms"] / r["op_total_ms"] if r["op_total_ms"] and r["op_total_ms"] > 0 else None,
                     "opt_vs_pt": r["pt_ms"] / r["op_total_ms"] if r["pt_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
-                    "opt_vs_cu": r["cu_ms"] / r["op_total_ms"] if r["cu_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
+                    "opt_vs_cu": r["hs_ms"] / r["op_total_ms"] if r["hs_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
                     "triton_speedup_vs_pytorch": r["pt_ms"] / r["op_total_ms"] if r["pt_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
-                    "triton_speedup_vs_cusparse": r["cu_ms"] / r["op_total_ms"] if r["cu_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
+                    "triton_speedup_vs_cusparse": r["hs_ms"] / r["op_total_ms"] if r["hs_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
                     "err_base": r["err_base"], "err_opt": r["err_opt"],
                     "status": r["status"],
                 })
     fields = [
         "matrix", "value_dtype", "index_dtype",
         "n_rows", "n_cols", "nnz",
-        "base_ms", "opt_ms", "symbolic_ms", "compute_ms", "op_total_ms", "pt_ms", "cu_ms",
+        "base_ms", "opt_ms", "symbolic_ms", "compute_ms", "op_total_ms", "pt_ms",
+        "hipsparse_ms", "hipsparse_reason", "cu_ms",
         "opt_vs_base", "opt_vs_pt", "opt_vs_cu",
         "triton_speedup_vs_pytorch", "triton_speedup_vs_cusparse",
         "err_base", "err_opt", "status",

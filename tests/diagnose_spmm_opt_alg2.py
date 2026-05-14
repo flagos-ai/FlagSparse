@@ -5,7 +5,7 @@ time, compute is CUDA event time.
 
 Usage:
     python tests/diagnose_spmm_opt_alg2.py path/to/matrix.mtx --dense-cols 32 --out-dir diag_out
-    python tests/diagnose_spmm_opt_alg2.py path/to/mtx_dir --dense-cols 32 --out-dir diag_out --no-cusparse
+    python tests/diagnose_spmm_opt_alg2.py path/to/mtx_dir --dense-cols 32 --out-dir diag_out --no-hipsparse
 """
 
 import argparse
@@ -224,7 +224,8 @@ def _run_diagnose_for_dtype(args, paths, dtype_name, with_cusparse):
             f"Base/Alg2={result['summary']['base_vs_alg2_speedup']:.2f}x  "
             f"Alg1/Alg2={result['summary']['alg1_vs_alg2_speedup']:.2f}x  "
             f"Torch/Alg2={result['summary']['torch_vs_alg2_speedup']:.2f}x  "
-            f"CU/Alg2={_fmt_speed(result['summary']['cusparse_vs_alg2_speedup'])}  "
+            f"HS/Alg2={_fmt_speed(result['summary']['cusparse_vs_alg2_speedup'])}  "
+            f"HS_reason={result['summary'].get('hipsparse_reason')}  "
             f"opt_alg2_vs_torch_err={result['summary']['opt_alg2_vs_torch_err']}"
         )
 
@@ -244,7 +245,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no-cusparse", action="store_true", help="Disable cuSPARSE reference timing")
+    parser.add_argument("--no-hipsparse", action="store_true", help="Disable direct hipSPARSE sparse reference timing")
+    parser.add_argument("--no-cusparse", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--with-cusparse", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--top-rows", type=int, default=512, help="Top rows by opt_alg2_vs_torch error")
     args = parser.parse_args()
@@ -254,7 +256,7 @@ def main():
         raise ValueError(f"No .mtx files found from input: {args.input_path}")
 
     dtype_names = ["float32", "float64"] if args.dtype == "all" else [args.dtype]
-    with_cusparse = not args.no_cusparse
+    with_cusparse = not (args.no_hipsparse or args.no_cusparse)
     for dtype_name in dtype_names:
         _run_diagnose_for_dtype(args, paths, dtype_name, with_cusparse)
 

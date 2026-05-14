@@ -3,8 +3,8 @@ Protected CSR SpMM benchmark: base vs alg1 vs alg2 vs references.
 Alg1/Alg2 totals report CPU-wall preprocessing plus CUDA-event compute time.
 
 Usage:
-    python tests/test_spmm_opt_alg2.py --synthetic --dense-cols 32 --with-cusparse
-    python tests/test_spmm_opt_alg2.py path/to/mtx_dir --csv spmm_opt_alg2.csv --with-cusparse
+    python tests/test_spmm_opt_alg2.py --synthetic --dense-cols 32
+    python tests/test_spmm_opt_alg2.py path/to/mtx_dir --csv spmm_opt_alg2.csv
 """
 
 import argparse
@@ -55,6 +55,9 @@ SUMMARY_FIELDS = [
     "alg2_preprocess_ms",
     "alg2_compute_ms",
     "torch_ms",
+    "hipsparse_ms",
+    "hipsparse_backend",
+    "hipsparse_reason",
     "cusparse_ms",
     "base_vs_alg1_speedup",
     "torch_vs_alg1_speedup",
@@ -257,21 +260,25 @@ def _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters
 
 
 def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enabled):
-    backend_name = "hipsparse_ref" if getattr(torch.version, "hip", None) else "cusparse_ref"
+    backend_name = "hipsparse_ref" if getattr(torch.version, "hip", None) else "sparse_ref"
     if not enabled:
         return None, None, backend_name, "disabled"
-    sparse_ref = spmm_csr_mod._benchmark_spmm_csr_sparse_ref(
-        data,
-        indices,
-        indptr,
-        B,
-        shape,
-        warmup=warmup,
-        iters=iters,
-    )
-    if sparse_ref["backend"] is None:
-        return None, None, backend_name, sparse_ref["reason"]
-    return sparse_ref["values"], sparse_ref["ms"], sparse_ref["backend"], None
+    try:
+        sparse_ref = spmm_csr_mod._benchmark_spmm_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            B,
+            shape,
+            warmup=warmup,
+            iters=iters,
+        )
+    except Exception as exc:
+        return None, None, backend_name, f"exception: {exc}"
+    backend = sparse_ref.get("backend")
+    if backend is None:
+        return None, None, backend_name, sparse_ref.get("reason", "backend unavailable")
+    return sparse_ref["values"], sparse_ref["ms"], backend, None
 
 
 def _benchmark(op, warmup, iters):
@@ -393,7 +400,7 @@ def run_one_case(
     warmup,
     iters,
     seed,
-    with_cusparse,
+    with_hipsparse,
     return_details=False,
 ):
     device = data.device
@@ -426,7 +433,7 @@ def run_one_case(
         iters,
     )
     torch_ref, torch_ms = _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters)
-    cusparse_ref, cusparse_ms, sparse_backend_name, sparse_backend_reason = _timed_sparse_backend(
+    hipsparse_ref, hipsparse_ms, sparse_backend_name, sparse_backend_reason = _timed_sparse_backend(
         data,
         indices,
         indptr,
@@ -434,15 +441,15 @@ def run_one_case(
         shape,
         warmup,
         iters,
-        with_cusparse,
+        with_hipsparse,
     )
 
     base_vs_torch = _error_profile(base_out, torch_ref, dtype)
     opt_vs_torch = _error_profile(opt_out, torch_ref, dtype)
     alg2_vs_torch = _error_profile(alg2_out, torch_ref, dtype)
-    base_vs_cusparse = _error_profile(base_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(base_out, None, dtype)
-    opt_vs_cusparse = _error_profile(opt_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(opt_out, None, dtype)
-    alg2_vs_cusparse = _error_profile(alg2_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(alg2_out, None, dtype)
+    base_vs_cusparse = _error_profile(base_out, hipsparse_ref, dtype) if hipsparse_ref is not None else _error_profile(base_out, None, dtype)
+    opt_vs_cusparse = _error_profile(opt_out, hipsparse_ref, dtype) if hipsparse_ref is not None else _error_profile(opt_out, None, dtype)
+    alg2_vs_cusparse = _error_profile(alg2_out, hipsparse_ref, dtype) if hipsparse_ref is not None else _error_profile(alg2_out, None, dtype)
     row_lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
     max_row_nnz = int(row_lengths.max().item()) if row_lengths.numel() > 0 else 0
 
@@ -465,7 +472,10 @@ def run_one_case(
         "alg2_preprocess_ms": alg2_preprocess_ms,
         "alg2_compute_ms": alg2_compute_ms,
         "torch_ms": torch_ms,
-        "cusparse_ms": cusparse_ms,
+        "hipsparse_ms": hipsparse_ms,
+        "hipsparse_backend": sparse_backend_name,
+        "hipsparse_reason": sparse_backend_reason,
+        "cusparse_ms": hipsparse_ms,
         "base_vs_alg1_speedup": (
             base_ms / opt_ms if opt_ms is not None and opt_ms > 0 else None
         ),
@@ -473,7 +483,7 @@ def run_one_case(
             torch_ms / opt_ms if torch_ms is not None and opt_ms is not None and opt_ms > 0 else None
         ),
         "cusparse_vs_alg1_speedup": (
-            cusparse_ms / opt_ms if cusparse_ms is not None and opt_ms is not None and opt_ms > 0 else None
+            hipsparse_ms / opt_ms if hipsparse_ms is not None and opt_ms is not None and opt_ms > 0 else None
         ),
         "base_vs_alg2_speedup": (
             base_ms / alg2_ms if alg2_ms is not None and alg2_ms > 0 else None
@@ -482,7 +492,7 @@ def run_one_case(
             torch_ms / alg2_ms if torch_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
         ),
         "cusparse_vs_alg2_speedup": (
-            cusparse_ms / alg2_ms if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+            hipsparse_ms / alg2_ms if hipsparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
         ),
         "alg1_vs_alg2_speedup": (
             opt_ms / alg2_ms if opt_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
@@ -494,7 +504,7 @@ def run_one_case(
             torch_ms / alg2_ms if torch_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
         ),
         "cusparse_vs_opt_alg2_speedup": (
-            cusparse_ms / alg2_ms if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+            hipsparse_ms / alg2_ms if hipsparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
         ),
         "base_vs_torch_err": base_vs_torch["global_err"],
         "base_vs_cusparse_err": base_vs_cusparse["global_err"],
@@ -522,7 +532,7 @@ def run_one_case(
             "opt_triton": opt_out,
             "opt_alg2_triton": alg2_out,
             "torch_ref": torch_ref,
-            "cusparse_ref": cusparse_ref,
+            "cusparse_ref": hipsparse_ref,
         },
         "profiles": {
             "base_vs_torch": base_vs_torch,
@@ -551,12 +561,13 @@ def _err(value):
 
 def print_row(row):
     name = os.path.basename(row["matrix"])[:27]
+    hs_note = "" if row.get("hipsparse_reason") is None else f"  HS:{row['hipsparse_reason']}"
     print(
         f"{name:<28} {row['n_rows']:>7} {row['n_cols']:>7} {row['nnz']:>10} {row['dense_cols']:>8}  "
         f"{_fmt(row['base_ms']):>9} {_fmt(row['alg1_ms']):>9} "
         f"{_fmt(row['alg1_preprocess_ms']):>9} {_fmt(row['alg1_compute_ms']):>9} "
         f"{_fmt(row['alg2_ms']):>9} {_fmt(row['alg2_preprocess_ms']):>9} {_fmt(row['alg2_compute_ms']):>9} "
-        f"{_fmt(row['torch_ms']):>9} {_fmt(row['cusparse_ms']):>9}  "
+        f"{_fmt(row['torch_ms']):>9} {_fmt(row['hipsparse_ms']):>9}  "
         f"{_speed(row['base_vs_alg1_speedup']):>8} "
         f"{_speed(row['base_vs_alg2_speedup']):>8} "
         f"{_speed(row['alg1_vs_alg2_speedup']):>8} "
@@ -564,11 +575,11 @@ def print_row(row):
         f"{_speed(row['cusparse_vs_alg2_speedup']):>8}  "
         f"{_err(row['opt_vs_torch_err']):>10} {_err(row['opt_vs_cusparse_err']):>10} "
         f"{_err(row['opt_alg2_vs_torch_err']):>10} {_err(row['opt_alg2_vs_cusparse_err']):>10} "
-        f"{row['matrix_status']:>6}"
+        f"{row['matrix_status']:>6}{hs_note}"
     )
 
 
-def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed, with_cusparse):
+def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed, with_hipsparse):
     device = torch.device("cuda")
     results = []
     for path in paths:
@@ -587,7 +598,7 @@ def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed, with_c
                 warmup,
                 iters,
                 seed,
-                with_cusparse,
+                with_hipsparse,
                 return_details=False,
             )
         except Exception as exc:
@@ -598,7 +609,7 @@ def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed, with_c
     return results
 
 
-def run_synthetic(case_names, dtype, index_dtype, dense_cols, warmup, iters, seed, with_cusparse):
+def run_synthetic(case_names, dtype, index_dtype, dense_cols, warmup, iters, seed, with_hipsparse):
     device = torch.device("cuda")
     results = []
     for case_name in case_names:
@@ -615,7 +626,7 @@ def run_synthetic(case_names, dtype, index_dtype, dense_cols, warmup, iters, see
             warmup,
             iters,
             seed,
-            with_cusparse,
+            with_hipsparse,
             return_details=False,
         )
         results.append(result)
@@ -647,8 +658,10 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--with-cusparse", action="store_true")
+    parser.add_argument("--no-hipsparse", action="store_true", help="Disable direct hipSPARSE sparse reference timing")
+    parser.add_argument("--with-cusparse", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    with_hipsparse = not args.no_hipsparse
 
     dtype = {"float32": torch.float32, "float64": torch.float64}[args.dtype]
     index_dtype = torch.int32
@@ -656,14 +669,14 @@ def main():
     print("FLAGSPARSE SpMM Alg1 / Alg2 Protected Benchmark")
     print(
         f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {args.dtype}  |  dense_cols: {args.dense_cols}  "
-        f"|  with_cusparse: {args.with_cusparse}"
+        f"|  with_hipsparse: {with_hipsparse}"
     )
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8}  "
         f"{'Base(ms)':>9} {'Alg1(ms)':>9} {'A1Prep':>9} {'A1Comp':>9} "
         f"{'Alg2(ms)':>9} {'A2Prep':>9} {'A2Comp':>9} {'Torch(ms)':>9} {'HS(ms)':>9}  "
-        f"{'B/A1':>8} {'B/A2':>8} {'A1/A2':>8} {'T/A2':>8} {'CU/A2':>8}  "
-        f"{'Err(A1/T)':>10} {'Err(A1/CU)':>10} {'Err(A2/T)':>10} {'Err(A2/CU)':>10} {'Status':>6}"
+        f"{'B/A1':>8} {'B/A2':>8} {'A1/A2':>8} {'T/A2':>8} {'HS/A2':>8}  "
+        f"{'Err(A1/T)':>10} {'Err(A1/HS)':>10} {'Err(A2/T)':>10} {'Err(A2/HS)':>10} {'Status':>6}"
     )
     print("A*Prep columns are CPU wall time; A*Comp columns are CUDA event compute time.")
     print("=" * 220)
@@ -679,7 +692,7 @@ def main():
                 args.warmup,
                 args.iters,
                 args.seed,
-                args.with_cusparse,
+                with_hipsparse,
             )
         )
 
@@ -694,7 +707,7 @@ def main():
                 args.warmup,
                 args.iters,
                 args.seed,
-                args.with_cusparse,
+                with_hipsparse,
             )
         )
 

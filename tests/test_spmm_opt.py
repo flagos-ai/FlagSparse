@@ -206,18 +206,21 @@ def _timed_pytorch(data, indices, indptr, B, shape, warmup, iters):
 
 
 def _timed_sparse_ref(data, indices, indptr, B, shape, warmup, iters):
-    sparse_ref = spmm_csr_mod._benchmark_spmm_csr_sparse_ref(
-        data,
-        indices,
-        indptr,
-        B,
-        shape,
-        warmup=warmup,
-        iters=iters,
-    )
+    try:
+        sparse_ref = spmm_csr_mod._benchmark_spmm_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            B,
+            shape,
+            warmup=warmup,
+            iters=iters,
+        )
+    except Exception as exc:
+        return None, None, f"exception: {exc}"
     if sparse_ref["backend"] is None:
-        raise RuntimeError(sparse_ref["reason"])
-    return sparse_ref["values"], sparse_ref["ms"]
+        return None, None, sparse_ref.get("reason", "backend unavailable")
+    return sparse_ref["values"], sparse_ref["ms"], None
 
 
 def _build_reference(data, indices, indptr, B, shape, dtype):
@@ -263,7 +266,7 @@ HEADER = (
     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8}  "
     f"{'Base(ms)':>9} {'Alg1(ms)':>9} {'A1Prep':>9} {'A1Comp':>9} "
     f"{'PT(ms)':>9} {'HS(ms)':>9}  "
-    f"{'Base/A1':>8} {'PT/A1':>8} {'CU/A1':>8}  "
+    f"{'Base/A1':>8} {'PT/A1':>8} {'HS/A1':>8}  "
     f"{'Err(Base)':>10} {'Err(A1)':>10} {'Status':>6}"
 )
 SEP = "-" * 205
@@ -298,11 +301,9 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
     except Exception:
         pass
 
-    cu_ms = None
-    try:
-        _, cu_ms = _timed_sparse_ref(data, indices, indptr, B, shape, warmup, iters)
-    except Exception:
-        pass
+    hs_ms = None
+    hs_reason = None
+    _, hs_ms, hs_reason = _timed_sparse_ref(data, indices, indptr, B, shape, warmup, iters)
 
     err_base = _error_ratio(y_base, ref, dtype)
     err_opt = _error_ratio(y_opt, ref, dtype)
@@ -320,7 +321,9 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
         "alg1_preprocess_ms": preprocess_ms,
         "alg1_compute_ms": compute_ms,
         "pt_ms": pt_ms,
-        "cu_ms": cu_ms,
+        "hs_ms": hs_ms,
+        "hs_reason": hs_reason,
+        "cu_ms": hs_ms,
         "err_base": err_base,
         "err_opt": err_opt,
         "err_alg1": err_opt,
@@ -335,15 +338,16 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
 def print_row(row):
     name = os.path.basename(row["path"])[:27]
     n_rows, n_cols = row["shape"]
+    hs_note = "" if row.get("hs_reason") is None else f"  HS:{row['hs_reason']}"
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {row['nnz']:>10} {row['dense_cols']:>8}  "
         f"{_fmt(row['base_ms']):>9} {_fmt(row['alg1_ms']):>9} "
         f"{_fmt(row['alg1_preprocess_ms']):>9} {_fmt(row['alg1_compute_ms']):>9} "
-        f"{_fmt(row['pt_ms']):>9} {_fmt(row['cu_ms']):>9}  "
+        f"{_fmt(row['pt_ms']):>9} {_fmt(row['hs_ms']):>9}  "
         f"{_spd(row['base_ms'], row['alg1_ms']):>8} "
         f"{_spd(row['pt_ms'], row['alg1_ms']):>8} "
-        f"{_spd(row['cu_ms'], row['alg1_ms']):>8}  "
-        f"{_err(row['err_base']):>10} {_err(row['err_alg1']):>10} {row['status']:>6}"
+        f"{_spd(row['hs_ms'], row['alg1_ms']):>8}  "
+        f"{_err(row['err_base']):>10} {_err(row['err_alg1']):>10} {row['status']:>6}{hs_note}"
     )
 
 
@@ -398,13 +402,15 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
                     "alg1_preprocess_ms": row["alg1_preprocess_ms"],
                     "alg1_compute_ms": row["alg1_compute_ms"],
                     "pt_ms": row["pt_ms"],
-                    "cu_ms": row["cu_ms"],
+                    "hipsparse_ms": row["hs_ms"],
+                    "hipsparse_reason": row["hs_reason"],
+                    "cu_ms": row["hs_ms"],
                     "opt_vs_base": (row["base_ms"] / row["opt_ms"] if row["opt_ms"] and row["opt_ms"] > 0 else None),
                     "opt_vs_pt": (row["pt_ms"] / row["opt_ms"] if row["pt_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
-                    "opt_vs_cu": (row["cu_ms"] / row["opt_ms"] if row["cu_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
+                    "opt_vs_cu": (row["hs_ms"] / row["opt_ms"] if row["hs_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
                     "base_vs_alg1_speedup": (row["base_ms"] / row["alg1_ms"] if row["alg1_ms"] and row["alg1_ms"] > 0 else None),
                     "torch_vs_alg1_speedup": (row["pt_ms"] / row["alg1_ms"] if row["pt_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0 else None),
-                    "cusparse_vs_alg1_speedup": (row["cu_ms"] / row["alg1_ms"] if row["cu_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0 else None),
+                    "cusparse_vs_alg1_speedup": (row["hs_ms"] / row["alg1_ms"] if row["hs_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0 else None),
                     "err_base": row["err_base"],
                     "err_opt": row["err_opt"],
                     "err_alg1": row["err_alg1"],
@@ -426,6 +432,8 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
         "alg1_preprocess_ms",
         "alg1_compute_ms",
         "pt_ms",
+        "hipsparse_ms",
+        "hipsparse_reason",
         "cu_ms",
         "opt_vs_base",
         "opt_vs_pt",
