@@ -123,8 +123,12 @@ python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 32
 ## CI/CD
 
 - `.github/workflows/ci.yml` 是默认 CPU CI，在 GitHub-hosted runner 上执行编译检查、格式检查、静态检查、源码严重错误检查、构建、安装校验和 smoke 测试。
+<<<<<<< HEAD
 - smoke 测试覆盖已安装 wheel 校验、打包元数据、公开 API、算子接口注册表一致性、共享运行时策略、CLI `--help` 和 README 命令片段。
 - `conf/operators.yaml` 是参考 FlagGems 风格维护的算子接口注册表，覆盖公开的 FlagSparse 稀疏算子和稀疏格式辅助接口。
+=======
+- smoke 测试覆盖已安装 wheel 校验、打包元数据、公开 API、共享运行时策略、CLI `--help` 和 README 命令片段。
+>>>>>>> 38ac0c827d3c462d0171243f651619883d110c98
 - `.github/workflows/nightly-cpu.yml` 是 main 分支夜间 CPU 检查，复用默认 CI 流程。
 - `.github/workflows/release.yml` 在 `v*` tag 上构建源码包和 wheel，校验发布产物并上传 GitHub Release。
 - `.github/workflows/triton-smoke.yml` 是手动触发的 Triton smoke 检查。

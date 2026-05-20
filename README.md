@@ -125,8 +125,12 @@ python tests/test_spsm.py <dir/> --csv-coo spsm_coo.csv --rhs 32
 ## CI/CD
 
 - `.github/workflows/ci.yml` is CPU-only and runs compile, format checks, lint, source-critical static checks, build, install, and smoke tests on GitHub-hosted runners.
+<<<<<<< HEAD
 - The smoke set now covers installed-wheel validation, packaging metadata, public API surface, operator registry consistency, shared runtime policy helpers, CLI `--help`, and README command snippets.
 - `conf/operators.yaml` is the FlagGems-style operator interface registry for public FlagSparse sparse operators and sparse-format helpers.
+=======
+- The smoke set now covers installed-wheel validation, packaging metadata, public API surface, shared runtime policy helpers, CLI `--help`, and README command snippets.
+>>>>>>> 38ac0c827d3c462d0171243f651619883d110c98
 - `.github/workflows/nightly-cpu.yml` is a `main`-branch-only nightly CPU check that repeats the package, lint, and shared-runtime smoke tests.
 - `.github/workflows/release.yml` builds source and wheel artifacts, then attaches them to GitHub Releases on `v*` tags.
 - `.github/workflows/triton-smoke.yml` is a manual opt-in job for triton-dependent smoke checks.
