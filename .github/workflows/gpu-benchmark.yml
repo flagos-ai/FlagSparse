@@ -55,11 +55,15 @@ jobs:
           cache: pip
           cache-dependency-path: tools/ci/requirements-triton-smoke.lock.txt
 
-      - name: Show GPU inventory
-        run: nvidia-smi
-
       - name: Install benchmark dependencies
         run: python -m pip install --upgrade -r tools/ci/requirements-triton-smoke.lock.txt
+
+      - name: Validate CUDA environment
+        run: |
+          nvidia-smi
+          python tools/ci/check_gpu_environment.py \
+            --require-cuda \
+            --metadata benchmark_results/gpu_metadata.json
 
       - name: Build source and wheel distributions
         run: python -m build

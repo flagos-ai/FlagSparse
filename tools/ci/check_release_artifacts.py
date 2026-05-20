@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Pattern, Tuple
 
-
 WHEEL_RE = re.compile(r"^flagsparse-(?P<version>[^-]+)-py3-none-any\.whl$")
 SDIST_RE = re.compile(r"^flagsparse-(?P<version>[^-]+)\.tar\.gz$")
 

@@ -2,7 +2,6 @@
 
 import flagsparse
 
-
 EXPECTED_TOP_LEVEL = {
     "flagsparse_gather",
     "flagsparse_scatter",

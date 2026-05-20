@@ -11,10 +11,12 @@ if os.environ.get("FLAGSPARSE_TRITON_SMOKE") != "1":
 
 torch = pytest.importorskip("torch")
 
-from flagsparse.sparse_operations import gather_scatter as gather_scatter_ops  # noqa: E402
+from flagsparse.sparse_operations import _common  # noqa: E402
+from flagsparse.sparse_operations import (  # noqa: E402
+    gather_scatter as gather_scatter_ops,
+)
 from flagsparse.sparse_operations import spmv_coo as spmv_coo_ops  # noqa: E402
 from flagsparse.sparse_operations import spmv_csr as spmv_csr_ops  # noqa: E402
-from flagsparse.sparse_operations import _common  # noqa: E402
 
 
 def test_scatter_dtype_policy_fallback_is_explicit():

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import flagsparse
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = PROJECT_ROOT / "conf" / "operators.yaml"
 
