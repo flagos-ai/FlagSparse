@@ -26,6 +26,8 @@ pip install torch triton cupy-cuda12x
 
 Run from project root, or `cd tests` then run scripts (paths like `../matrix` for .mtx dir).
 
+The commands below are the repository's documented invocation standard. CPU-only install, build, help-text, and smoke paths are checked in CI; GPU-specific examples are documented but not executed there unless you opt into the triton smoke job locally.
+
 **pytest accuracy suite** - small synthetic CUDA cases, selectable by operator marker:
 
 ```bash
@@ -119,6 +121,48 @@ python tests/test_spsm.py <dir/> --csv-coo spsm_coo.csv --rhs 32
 ```
 
 **test_gather.py** / **test_scatter.py** - gather/scatter benchmarks (pytest or `python tests/test_gather.py`).
+
+Accuracy suites should use `tests/pytest/accuracy_utils.py` for FlagGems-style
+golden reference and tolerance policy. Numeric compute operators compare against
+CPU-FP64 golden references cast back to the dtype under test, while exact/logical
+outputs compare against CPU int32 references.
+
+## CI/CD
+
+- `.github/workflows/ci.yml` is CPU-only and runs compile, format checks, lint, source-critical static checks, build, install, and smoke tests on GitHub-hosted runners.
+- The smoke set now covers installed-wheel validation, packaging metadata, public API surface, operator registry consistency, shared runtime policy helpers, CLI `--help`, and README command snippets.
+- `conf/operators.yaml` is the FlagGems-style operator interface registry for public FlagSparse sparse operators and sparse-format helpers.
+- `.github/workflows/nightly-cpu.yml` is a `main`-branch-only nightly CPU check that repeats the package, lint, and shared-runtime smoke tests.
+- `.github/workflows/release.yml` builds source and wheel artifacts, then attaches them to GitHub Releases on `v*` tags.
+- `.github/workflows/triton-smoke.yml` is a manual opt-in job for triton-dependent smoke checks.
+- `.github/workflows/gpu-ci.yml` is a manual GPU accuracy smoke workflow for a self-hosted runner labeled `self-hosted`, `linux`, and `gpu`.
+- `.github/workflows/gpu-benchmark.yml` adds an Actions button for synthetic GPU benchmark runs on a self-hosted runner labeled `self-hosted`, `linux`, and `gpu`.
+- `.github/workflows/release-drafter.yml` keeps draft release notes current from merged PRs.
+- `make help` lists the local entry points.
+- `make ci` / `make check` run the same CPU-only pipeline used by CI.
+- `make format-check`, `make lint`, and `make lint-src` are the non-GPU quality gates for CI formatting, CI helper lint, and critical package-source static checks.
+- `make smoke` is the CPU smoke stage alias.
+- `make release-check` / `make release` build, validate, and checksum release artifacts.
+- `make triton-smoke` and `make triton-deps` are opt-in local targets for the triton-dependent runtime checks.
+- `make gpu-env-check` validates CUDA visibility through `tools/ci/check_gpu_environment.py` on a GPU runner.
+- `make gpu-benchmark` runs the quick synthetic benchmark suite on a CUDA machine.
+- `python tools/ci/run_gpu_benchmark.py --suite quick` mirrors the manual GPU benchmark workflow locally on a CUDA machine.
+- `python tools/ci/run_gpu_benchmark.py --suite full --matrix-dir tests/data` runs the full benchmark matrix, including `.mtx`-backed SpGEMM and SDDMM suites against the repository test matrices.
+- `tools/ci/requirements-ci.lock.txt` and `tools/ci/requirements-triton-smoke.lock.txt` are the pinned local dependency bundles behind those make targets.
+- `.github/dependabot.yml` keeps GitHub Actions and Python dependency updates visible.
+- `.github/ISSUE_TEMPLATE/` keeps issue entry points structured for bugs and feature requests.
+- The CI dependency bundle now stays on packaging and test tooling only; triton-dependent smoke is opt-in through `FLAGSPARSE_TRITON_SMOKE=1`.
+- Release artifacts now ship with a generated `SHA256SUMS` manifest and a matching checksum verification step in CI.
+- PR quality gates are implemented through the default CPU CI workflow; configure branch protection in GitHub to require the `CI / Build and smoke test` check before merge.
+- GPU accuracy and benchmark scripts still require CUDA hardware; the GPU workflows are manual and only run on a self-hosted GPU runner.
+
+## Performance
+
+- `benchmark/performance_utils.py` defines the pytest-style performance base class, default metrics (`latency_base`, `latency`, `speedup`), median timing, warmup/iteration controls, CUDA synchronization, CSV record helpers, and the two-level average speedup rule.
+- `benchmark/attri_util.py` and `benchmark/core_shapes.yaml` keep default and special shape grids centralized.
+- `benchmark/summary_for_plot.py` reads recorded benchmark CSV files and reports the two-level speedup summary.
+- `benchmark/test_sparse_perf.py` is an opt-in pytest entry point; real GPU runs remain manual or self-hosted because GitHub-hosted runners do not provide CUDA GPUs.
+- `tests/data/*.mtx` can be used as the default MatrixMarket smoke dataset for mtx-backed GPU benchmark suites.
 
 ## License
 
