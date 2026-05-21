@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ACCURACY_UTILS = PROJECT_ROOT / "tests" / "pytest" / "accuracy_utils.py"
 

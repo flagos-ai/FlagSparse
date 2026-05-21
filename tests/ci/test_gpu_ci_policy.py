@@ -6,7 +6,6 @@ itself still requires a self-hosted CUDA runner to execute.
 
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS_DIR = PROJECT_ROOT / ".github" / "workflows"
 TOOLS_DIR = PROJECT_ROOT / "tools" / "ci"
