@@ -4,6 +4,44 @@ from ._common import *
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 
 SUPPORTED_SPMM_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
+
+SPMM_OP_NON = 0
+SPMM_OP_TRANS = 1
+SPMM_OP_CONJ_TRANS = 2
+SPMM_OP_NAMES = {
+    SPMM_OP_NON: "non",
+    SPMM_OP_TRANS: "trans",
+    SPMM_OP_CONJ_TRANS: "conj",
+}
+_SPMM_OP_NAME_TO_CODE = {name: code for code, name in SPMM_OP_NAMES.items()}
+
+
+def _normalize_spmm_op(op=None, transpose=False):
+    if op is None:
+        return SPMM_OP_TRANS if bool(transpose) else SPMM_OP_NON
+    if isinstance(op, str):
+        token = op.strip().lower()
+        if token not in _SPMM_OP_NAME_TO_CODE:
+            raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+        return _SPMM_OP_NAME_TO_CODE[token]
+    try:
+        op_code = int(op)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj") from exc
+    if op_code not in SPMM_OP_NAMES:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+    return op_code
+
+
+def _spmm_op_to_name(op):
+    op_code = _normalize_spmm_op(op)
+    return SPMM_OP_NAMES[op_code]
+
+
+def _spmm_op_transposes(op):
+    return _normalize_spmm_op(op) in (SPMM_OP_TRANS, SPMM_OP_CONJ_TRANS)
+
+
 def _spmm_relative_threshold(value_dtype):
     if value_dtype == torch.float16:
         return 5e-3
@@ -254,6 +292,58 @@ def _prepare_spmm_csr_matrix(data, indices, indptr, shape):
     )
     max_row_nnz = int(row_lengths.max().item()) if n_rows > 0 else 0
     return data, kernel_indices, kernel_indptr, n_rows, n_cols, row_lengths, max_row_nnz
+
+
+def _transpose_csr_for_spmm(data, indices, indptr, shape):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    nnz = data.numel()
+    device = data.device
+    if nnz == 0:
+        out_index_dtype = indices.dtype if n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+        out_indptr_dtype = indptr.dtype if nnz <= _INDEX_LIMIT_INT32 else torch.int64
+        return (
+            data,
+            torch.empty(0, dtype=out_index_dtype, device=device),
+            torch.zeros(n_cols + 1, dtype=out_indptr_dtype, device=device),
+            (n_cols, n_rows),
+        )
+
+    row_counts = indptr[1:] - indptr[:-1]
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, dtype=torch.int64, device=device),
+        row_counts.to(torch.int64),
+    )
+    col_ids = indices.to(torch.int64)
+    try:
+        order = torch.argsort(col_ids, stable=True)
+    except TypeError:
+        order = torch.argsort(col_ids)
+    sorted_cols = col_ids[order]
+    sorted_rows = row_ids[order]
+    transposed_data = data[order].contiguous()
+
+    nnz_per_transposed_row = torch.bincount(sorted_cols, minlength=n_cols)
+    transposed_indptr64 = torch.zeros(n_cols + 1, dtype=torch.int64, device=device)
+    transposed_indptr64[1:] = torch.cumsum(nnz_per_transposed_row, dim=0)
+    out_index_dtype = indices.dtype if n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+    out_indptr_dtype = indptr.dtype if nnz <= _INDEX_LIMIT_INT32 else torch.int64
+    return (
+        transposed_data,
+        sorted_rows.to(out_index_dtype).contiguous(),
+        transposed_indptr64.to(out_indptr_dtype).contiguous(),
+        (n_cols, n_rows),
+    )
+
+
+def _materialize_spmm_csr_op(data, indices, indptr, shape, op_code):
+    if op_code == SPMM_OP_NON:
+        return data, indices, indptr, shape
+    data_op = data
+    if op_code == SPMM_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+        data_op = data.conj()
+        if hasattr(data_op, "resolve_conj"):
+            data_op = data_op.resolve_conj()
+    return _transpose_csr_for_spmm(data_op, indices, indptr, shape)
 
 
 def _prepare_spmm_csr_inputs(data, indices, indptr, B, shape):
@@ -1510,15 +1600,26 @@ def flagsparse_spmm_csr(
     max_segments=None,
     out=None,
     return_time=False,
+    transpose=None,
+    op=None,
+    return_meta=False,
 ):
-    """CSR SpMM: C = A @ B using Triton.
+    """CSR SpMM using Triton.
 
-    A is provided as CSR arrays; B is a dense CUDA tensor with shape (n_cols, n_dense_cols).
-    This is the current Triton-native CSR base path for the row-major,
-    non-transpose subset. It borrows the dense-N launch heuristic from
-    AlphaSparse CSR ALG1 (`csrspmm_rb_sr`) but is not a direct structural
-    port of the CUDA kernel.
+    op: 0/'non' for A @ B, 1/'trans' for A.T @ B,
+    2/'conj' for A.conj().T @ B.
     """
+    op_explicit = op is not None
+    op_code = _normalize_spmm_op(
+        op,
+        transpose=False if transpose is None else bool(transpose),
+    )
+    if (
+        op_explicit
+        and transpose is not None
+        and bool(transpose) != _spmm_op_transposes(op_code)
+    ):
+        raise ValueError("transpose conflicts with op")
     if block_n is not None and block_n <= 0:
         raise ValueError("block_n must be positive when provided")
     if block_nnz is not None and block_nnz <= 0:
@@ -1526,9 +1627,72 @@ def flagsparse_spmm_csr(
     if max_segments is not None and max_segments <= 0:
         raise ValueError("max_segments must be positive when provided")
 
-    data, kernel_indices, kernel_indptr, B, n_rows, _, n_dense_cols = _prepare_spmm_csr_inputs(
-        data, indices, indptr, B, shape
-    )
+    (
+        data,
+        kernel_indices,
+        kernel_indptr,
+        n_rows,
+        n_cols,
+        _row_lengths,
+        _max_row_nnz,
+    ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
+    if B.ndim != 2:
+        raise ValueError("B must be a 2D dense tensor")
+    effective_n_rows = n_rows
+    effective_n_cols = n_cols
+    if _spmm_op_transposes(op_code):
+        effective_n_rows, effective_n_cols = n_cols, n_rows
+    if B.shape[0] != effective_n_cols:
+        raise ValueError(
+            f"B.shape[0] must be n_cols={effective_n_cols}, got {B.shape[0]}"
+        )
+    if not B.is_cuda:
+        raise ValueError("B must be a CUDA tensor")
+    if B.device != data.device:
+        raise ValueError("B must be on the same CUDA device as the sparse matrix")
+    if B.dtype != data.dtype:
+        raise TypeError("B dtype must match data dtype")
+    B = B.contiguous()
+    n_dense_cols = int(B.shape[1])
+
+    if out is not None:
+        if not out.is_cuda:
+            raise ValueError("out must be a CUDA tensor")
+        if out.device != data.device:
+            raise ValueError("out must be on the same CUDA device as the inputs")
+        if out.shape != (effective_n_rows, n_dense_cols) or out.dtype != data.dtype:
+            raise ValueError("out shape/dtype must match result")
+
+    do_timing = bool(return_time or return_meta)
+    symbolic_ms = 0.0 if do_timing else None
+    compute_ms = None
+    op_total_ms = None
+
+    if do_timing:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+    if _spmm_op_transposes(op_code):
+        data, indices, indptr, shape = _materialize_spmm_csr_op(
+            data,
+            indices,
+            indptr,
+            shape,
+            op_code,
+        )
+        (
+            data,
+            kernel_indices,
+            kernel_indptr,
+            n_rows,
+            n_cols,
+            _row_lengths,
+            _max_row_nnz,
+        ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
+    if do_timing:
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        symbolic_ms = (t1 - t0) * 1000.0 if _spmm_op_transposes(op_code) else 0.0
+
     max_row_nnz = (
         int(torch.max(kernel_indptr[1:] - kernel_indptr[:-1]).item())
         if n_rows > 0
@@ -1545,16 +1709,9 @@ def flagsparse_spmm_csr(
         device_props=device_props,
     )
 
-    if out is not None:
-        if not out.is_cuda:
-            raise ValueError("out must be a CUDA tensor")
-        if out.device != data.device:
-            raise ValueError("out must be on the same CUDA device as the inputs")
-        if out.shape != (n_rows, n_dense_cols) or out.dtype != data.dtype:
-            raise ValueError("out shape/dtype must match result")
-
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    if do_timing:
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
     C = _triton_spmm_csr_impl(
         data,
         kernel_indices,
@@ -1567,14 +1724,27 @@ def flagsparse_spmm_csr(
         num_warps=launch["num_warps"],
         num_stages=launch["num_stages"],
     )
-    torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if do_timing:
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        compute_ms = (t2 - t1) * 1000.0
+        op_total_ms = symbolic_ms + compute_ms
 
     if out is not None:
         out.copy_(C)
         C = out
+    if return_meta:
+        meta = {
+            "symbolic_ms": symbolic_ms,
+            "compute_ms": compute_ms,
+            "op_total_ms": op_total_ms,
+            "op": _spmm_op_to_name(op_code),
+        }
+        if return_time:
+            return C, op_total_ms, meta
+        return C, meta
     if return_time:
-        return C, elapsed_ms
+        return C, op_total_ms
     return C
 
 
@@ -1884,15 +2054,27 @@ def benchmark_spmm_case(
     block_nnz=None,
     max_segments=None,
     run_cusparse=True,
+    op="non",
 ):
     """Benchmark Triton CSR SpMM vs PyTorch sparse.mm and CuPy/cuSPARSE CSR @ dense."""
+    op_code = _normalize_spmm_op(op)
+    op_name = _spmm_op_to_name(op_code)
     device = torch.device("cuda")
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
-    B = _build_random_dense((n_cols, n_dense_cols), value_dtype, device)
+    b_rows = n_rows if _spmm_op_transposes(op_code) else n_cols
+    B = _build_random_dense((b_rows, n_dense_cols), value_dtype, device)
     shape = (n_rows, n_cols)
-    max_row_nnz = int(torch.max(indptr[1:] - indptr[:-1]).item()) if n_rows > 0 else 0
+    materialized = _materialize_spmm_csr_op(data, indices, indptr, shape, op_code)
+    launch_indptr = materialized[2]
+    launch_shape = materialized[3]
+    launch_n_rows, _launch_n_cols = int(launch_shape[0]), int(launch_shape[1])
+    max_row_nnz = (
+        int(torch.max(launch_indptr[1:] - launch_indptr[:-1]).item())
+        if launch_n_rows > 0
+        else 0
+    )
     launch = _resolve_spmm_base_triton_launch(
         value_dtype,
         n_dense_cols,
@@ -1913,6 +2095,7 @@ def benchmark_spmm_case(
         "block_nnz": launch["block_nnz"],
         "max_segments": launch["max_segments"],
         "return_time": False,
+        "op": op_name,
     }
 
     torch.cuda.synchronize()
@@ -1939,18 +2122,50 @@ def benchmark_spmm_case(
     pytorch_format = "CSR"
     try:
         csr_pt = torch.sparse_csr_tensor(indptr64, indices64, data, size=shape, device=device)
-        pytorch_op = lambda: torch.sparse.mm(csr_pt, B)
+        if op_code == SPMM_OP_NON:
+            pytorch_op = lambda: torch.sparse.mm(csr_pt, B)
+        elif op_code == SPMM_OP_TRANS:
+            pytorch_op = lambda: torch.sparse.mm(csr_pt.transpose(0, 1), B)
+        else:
+            pytorch_op = lambda: torch.sparse.mm(csr_pt.conj().transpose(0, 1), B)
         if value_dtype in (torch.float16, torch.bfloat16):
             csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float32), size=shape, device=device)
-            expected = torch.sparse.mm(csr_ref, B.to(torch.float32)).to(value_dtype)
+            expected = (
+                torch.sparse.mm(csr_ref, B.to(torch.float32))
+                if op_code == SPMM_OP_NON
+                else torch.sparse.mm(
+                    csr_ref.transpose(0, 1)
+                    if op_code == SPMM_OP_TRANS
+                    else csr_ref.conj().transpose(0, 1),
+                    B.to(torch.float32),
+                )
+            ).to(value_dtype)
         elif value_dtype == torch.float32:
             csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float64), size=shape, device=device)
-            expected = torch.sparse.mm(csr_ref, B.to(torch.float64)).to(value_dtype)
+            expected = (
+                torch.sparse.mm(csr_ref, B.to(torch.float64))
+                if op_code == SPMM_OP_NON
+                else torch.sparse.mm(
+                    csr_ref.transpose(0, 1)
+                    if op_code == SPMM_OP_TRANS
+                    else csr_ref.conj().transpose(0, 1),
+                    B.to(torch.float64),
+                )
+            ).to(value_dtype)
         elif value_dtype == torch.complex64:
             csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.complex128), size=shape, device=device)
-            expected = torch.sparse.mm(csr_ref, B.to(torch.complex128)).to(value_dtype)
+            expected = (
+                torch.sparse.mm(csr_ref, B.to(torch.complex128))
+                if op_code == SPMM_OP_NON
+                else torch.sparse.mm(
+                    csr_ref.transpose(0, 1)
+                    if op_code == SPMM_OP_TRANS
+                    else csr_ref.conj().transpose(0, 1),
+                    B.to(torch.complex128),
+                )
+            ).to(value_dtype)
         else:
-            expected = torch.sparse.mm(csr_pt, B)
+            expected = pytorch_op()
     except Exception as exc:
         pytorch_format = "COO"
         pytorch_reason = f"CSR fallback: {exc}"
@@ -1960,15 +2175,50 @@ def benchmark_spmm_case(
             shape,
             device=device,
         ).coalesce()
-        pytorch_op = lambda: torch.sparse.mm(coo, B)
-        if value_dtype in (torch.float16, torch.bfloat16):
-            expected = torch.sparse.mm(coo.to(torch.float32), B.to(torch.float32)).to(value_dtype)
-        elif value_dtype == torch.float32:
-            expected = torch.sparse.mm(coo.to(torch.float64), B.to(torch.float64)).to(value_dtype)
-        elif value_dtype == torch.complex64:
-            expected = torch.sparse.mm(coo.to(torch.complex128), B.to(torch.complex128)).to(value_dtype)
+        if op_code == SPMM_OP_NON:
+            pytorch_op = lambda: torch.sparse.mm(coo, B)
+        elif op_code == SPMM_OP_TRANS:
+            pytorch_op = lambda: torch.sparse.mm(coo.transpose(0, 1), B)
         else:
-            expected = torch.sparse.mm(coo, B)
+            pytorch_op = lambda: torch.sparse.mm(coo.conj().transpose(0, 1), B)
+        if value_dtype in (torch.float16, torch.bfloat16):
+            coo_ref = coo.to(torch.float32)
+            expected = (
+                torch.sparse.mm(coo_ref, B.to(torch.float32))
+                if op_code == SPMM_OP_NON
+                else torch.sparse.mm(
+                    coo_ref.transpose(0, 1)
+                    if op_code == SPMM_OP_TRANS
+                    else coo_ref.conj().transpose(0, 1),
+                    B.to(torch.float32),
+                )
+            ).to(value_dtype)
+        elif value_dtype == torch.float32:
+            coo_ref = coo.to(torch.float64)
+            expected = (
+                torch.sparse.mm(coo_ref, B.to(torch.float64))
+                if op_code == SPMM_OP_NON
+                else torch.sparse.mm(
+                    coo_ref.transpose(0, 1)
+                    if op_code == SPMM_OP_TRANS
+                    else coo_ref.conj().transpose(0, 1),
+                    B.to(torch.float64),
+                )
+            ).to(value_dtype)
+        elif value_dtype == torch.complex64:
+            coo_ref = coo.to(torch.complex128)
+            expected = (
+                torch.sparse.mm(coo_ref, B.to(torch.complex128))
+                if op_code == SPMM_OP_NON
+                else torch.sparse.mm(
+                    coo_ref.transpose(0, 1)
+                    if op_code == SPMM_OP_TRANS
+                    else coo_ref.conj().transpose(0, 1),
+                    B.to(torch.complex128),
+                )
+            ).to(value_dtype)
+        else:
+            expected = pytorch_op()
 
     pytorch_values = expected
     try:
@@ -2006,8 +2256,13 @@ def benchmark_spmm_case(
                 A_csr = cpx_sparse.csr_matrix(
                     (data_cp, indices_cp, indptr_cp), shape=shape
                 )
+                A_eff = A_csr
+                if op_code == SPMM_OP_TRANS:
+                    A_eff = A_csr.transpose().tocsr()
+                elif op_code == SPMM_OP_CONJ_TRANS:
+                    A_eff = A_csr.transpose().conj().tocsr()
                 cusparse_values_cp, cusparse_ms = _benchmark_cuda_op(
-                    lambda: A_csr @ B_cp, warmup=warmup, iters=iters
+                    lambda: A_eff @ B_cp, warmup=warmup, iters=iters
                 )
                 cusparse_values = _torch_from_cupy(cusparse_values_cp)
                 cusparse_metrics = _spmm_validation_metrics(cusparse_values, expected)
@@ -2031,6 +2286,7 @@ def benchmark_spmm_case(
             "n_dense_cols": n_dense_cols,
             "value_dtype": str(value_dtype),
             "index_dtype": str(index_dtype),
+            "op": op_name,
             "warmup": warmup,
             "iters": iters,
             "block_n": launch["block_n"],
@@ -2102,6 +2358,7 @@ def comprehensive_spmm_test(
     block_nnz=None,
     max_segments=None,
     run_cusparse=True,
+    op="non",
 ):
     """Full SpMM benchmark entry for one configuration."""
     return benchmark_spmm_case(
@@ -2117,4 +2374,5 @@ def comprehensive_spmm_test(
         block_nnz=block_nnz,
         max_segments=max_segments,
         run_cusparse=run_cusparse,
+        op=op,
     )
