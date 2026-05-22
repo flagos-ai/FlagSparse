@@ -16,6 +16,6 @@ Rules-Requires-Root: no
 
 Package: python3-flagsparse
 Architecture: all
-Depends: ${python3:Depends}, ${misc:Depends}
+Depends: python3:any, ${misc:Depends}
 Description: FlagSparse — sparse compute kernels for FlagOS
  Sparse-matrix operators (SpMM, SpMV, sampled dense-dense) for FlagOS-supported accelerators.
