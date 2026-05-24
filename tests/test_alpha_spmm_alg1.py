@@ -9,7 +9,6 @@ import glob
 import math
 import os
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -59,7 +58,7 @@ SUMMARY_FIELDS = [
 for _route in ROUTES:
     SUMMARY_FIELDS.extend(
         [
-            f"{_route}_preprocess_ms",
+            f"{_route}_symbolic_ms",
             f"{_route}_compute_ms",
             f"{_route}_total_ms",
         ]
@@ -182,14 +181,6 @@ def _benchmark(op, warmup, iters):
     return out, start.elapsed_time(end) / max(1, int(iters))
 
 
-def _time_preprocess(op):
-    torch.cuda.synchronize()
-    start = time.perf_counter()
-    result = op()
-    torch.cuda.synchronize()
-    return result, (time.perf_counter() - start) * 1000.0
-
-
 def _prepare_base_inputs(data, indices, indptr, B, shape):
     prepared_inputs = _prepare_spmm_csr_inputs(data, indices, indptr, B, shape)
     data_p, indices_p, indptr_p, B_p, n_rows, _n_cols, n_dense_cols = prepared_inputs
@@ -213,7 +204,7 @@ def _prepare_base_inputs(data, indices, indptr, B, shape):
 
 
 def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
-    prepared, preprocess_ms = _time_preprocess(lambda: _prepare_base_inputs(data, indices, indptr, B, shape))
+    prepared = _prepare_base_inputs(data, indices, indptr, B, shape)
     out, compute_ms = _benchmark(
         lambda: _triton_spmm_csr_impl(
             prepared["data"],
@@ -230,18 +221,16 @@ def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
         warmup,
         iters,
     )
-    return out, preprocess_ms, compute_ms, preprocess_ms + compute_ms, prepared
+    symbolic_ms = 0.0
+    return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, prepared
 
 
 def _timed_alpha_spmm_alg1_tle_opt(data, indices, indptr, B, shape, warmup, iters):
     if not fs.is_alpha_spmm_alg1_tle_opt_available():
         return None, None, None, None, None, None, fs.alpha_spmm_alg1_tle_opt_unavailable_reason()
     try:
-        (prepared, meta), preprocess_ms = _time_preprocess(
-            lambda: (
-                lambda prepared: (prepared, fs.build_alpha_spmm_alg1_tle_opt_meta(prepared, B))
-            )(fs.prepare_alpha_spmm_alg1_tle_opt(data, indices, indptr, shape))
-        )
+        prepared = fs.prepare_alpha_spmm_alg1_tle_opt(data, indices, indptr, shape)
+        meta = fs.build_alpha_spmm_alg1_tle_opt_meta(prepared, B)
         out, compute_ms = _benchmark(
             lambda: fs.flagsparse_alpha_spmm_alg1_tle_opt(B=B, prepared=prepared, meta=meta),
             warmup,
@@ -249,18 +238,16 @@ def _timed_alpha_spmm_alg1_tle_opt(data, indices, indptr, B, shape, warmup, iter
         )
     except Exception as exc:
         return None, None, None, None, None, None, f"{type(exc).__name__}: {exc}"
-    return out, preprocess_ms, compute_ms, preprocess_ms + compute_ms, prepared, meta, None
+    symbolic_ms = 0.0
+    return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, prepared, meta, None
 
 
 def _timed_alpha_spmm_alg1_tle_opt2(data, indices, indptr, B, shape, warmup, iters):
     if not fs.is_alpha_spmm_alg1_tle_opt2_available():
         return None, None, None, None, None, None, fs.alpha_spmm_alg1_tle_opt2_unavailable_reason()
     try:
-        (prepared, meta), preprocess_ms = _time_preprocess(
-            lambda: (
-                lambda prepared: (prepared, fs.build_alpha_spmm_alg1_tle_opt2_meta(prepared, B))
-            )(fs.prepare_alpha_spmm_alg1_tle_opt2(data, indices, indptr, shape))
-        )
+        prepared = fs.prepare_alpha_spmm_alg1_tle_opt2(data, indices, indptr, shape)
+        meta = fs.build_alpha_spmm_alg1_tle_opt2_meta(prepared, B)
         out, compute_ms = _benchmark(
             lambda: fs.flagsparse_alpha_spmm_alg1_tle_opt2(B=B, prepared=prepared, meta=meta),
             warmup,
@@ -268,20 +255,19 @@ def _timed_alpha_spmm_alg1_tle_opt2(data, indices, indptr, B, shape, warmup, ite
         )
     except Exception as exc:
         return None, None, None, None, None, None, f"{type(exc).__name__}: {exc}"
-    return out, preprocess_ms, compute_ms, preprocess_ms + compute_ms, prepared, meta, None
+    symbolic_ms = 0.0
+    return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, prepared, meta, None
 
 
 def _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters):
     device = data.device
     try:
-        sparse, preprocess_ms = _time_preprocess(
-            lambda: torch.sparse_csr_tensor(
-                indptr.to(torch.int64),
-                indices.to(torch.int64),
-                data,
-                size=shape,
-                device=device,
-            )
+        sparse = torch.sparse_csr_tensor(
+            indptr.to(torch.int64),
+            indices.to(torch.int64),
+            data,
+            size=shape,
+            device=device,
         )
         out, compute_ms = _benchmark(lambda: torch.sparse.mm(sparse, B), warmup, iters)
         if dtype == torch.float32:
@@ -295,7 +281,8 @@ def _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters
             out = torch.sparse.mm(ref_sparse, B.double()).float()
     except Exception as exc:
         return None, None, None, None, f"{type(exc).__name__}: {exc}"
-    return out, preprocess_ms, compute_ms, preprocess_ms + compute_ms, None
+    symbolic_ms = 0.0
+    return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, None
 
 
 def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enabled):
@@ -315,12 +302,13 @@ def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enable
             B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
             return cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape), B_cp
 
-        (sparse, B_cp), preprocess_ms = _time_preprocess(prepare)
+        sparse, B_cp = prepare()
         out_cp, compute_ms = _benchmark(lambda: sparse @ B_cp, warmup, iters)
         out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
     except Exception as exc:
         return None, None, None, None, str(exc)
-    return out, preprocess_ms, compute_ms, preprocess_ms + compute_ms, None
+    symbolic_ms = 0.0
+    return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, None
 
 
 def _build_csr_from_row_lengths(row_lengths, n_cols, dtype, index_dtype, device, pattern="random"):
@@ -416,9 +404,9 @@ def _build_summary_status(profiles):
     return "PASS"
 
 
-def _timing_dict(prefix, preprocess_ms, compute_ms, total_ms):
+def _timing_dict(prefix, symbolic_ms, compute_ms, total_ms):
     return {
-        f"{prefix}_preprocess_ms": preprocess_ms,
+        f"{prefix}_symbolic_ms": symbolic_ms,
         f"{prefix}_compute_ms": compute_ms,
         f"{prefix}_total_ms": total_ms,
     }
@@ -443,12 +431,12 @@ def run_one_case(
     device = data.device
     n_rows, n_cols = shape
     B = _seeded_dense_matrix((n_cols, dense_cols), dtype, device, seed)
-    base_out, base_pre_ms, base_compute_ms, base_total_ms, prepared_base = _timed_spmm_base(
+    base_out, base_symbolic_ms, base_compute_ms, base_total_ms, prepared_base = _timed_spmm_base(
         data, indices, indptr, B, shape, warmup, iters
     )
     (
         opt_out,
-        opt_pre_ms,
+        opt_symbolic_ms,
         opt_compute_ms,
         opt_total_ms,
         prepared_opt,
@@ -457,17 +445,17 @@ def run_one_case(
     ) = _timed_alpha_spmm_alg1_tle_opt(data, indices, indptr, B, shape, warmup, iters)
     (
         opt2_out,
-        opt2_pre_ms,
+        opt2_symbolic_ms,
         opt2_compute_ms,
         opt2_total_ms,
         prepared_opt2,
         opt2_meta,
         opt2_reason,
     ) = _timed_alpha_spmm_alg1_tle_opt2(data, indices, indptr, B, shape, warmup, iters)
-    torch_out, torch_pre_ms, torch_compute_ms, torch_total_ms, torch_reason = _timed_torch_reference(
+    torch_out, torch_symbolic_ms, torch_compute_ms, torch_total_ms, torch_reason = _timed_torch_reference(
         data, indices, indptr, B, shape, dtype, warmup, iters
     )
-    cupy_out, cupy_pre_ms, cupy_compute_ms, cupy_total_ms, cupy_reason = _timed_sparse_backend(
+    cupy_out, cupy_symbolic_ms, cupy_compute_ms, cupy_total_ms, cupy_reason = _timed_sparse_backend(
         data, indices, indptr, B, shape, warmup, iters, with_cusparse
     )
 
@@ -490,11 +478,11 @@ def run_one_case(
         "nnz": int(data.numel()),
         "avg_nnz_per_row": float(data.numel()) / float(max(1, n_rows)),
         "max_row_nnz": max_row_nnz,
-        **_timing_dict("base", base_pre_ms, base_compute_ms, base_total_ms),
-        **_timing_dict("alpha_spmm_alg1_tle_opt", opt_pre_ms, opt_compute_ms, opt_total_ms),
-        **_timing_dict("alpha_spmm_alg1_tle_opt2", opt2_pre_ms, opt2_compute_ms, opt2_total_ms),
-        **_timing_dict("torch_ref", torch_pre_ms, torch_compute_ms, torch_total_ms),
-        **_timing_dict("cupy_cusparse_ref", cupy_pre_ms, cupy_compute_ms, cupy_total_ms),
+        **_timing_dict("base", base_symbolic_ms, base_compute_ms, base_total_ms),
+        **_timing_dict("alpha_spmm_alg1_tle_opt", opt_symbolic_ms, opt_compute_ms, opt_total_ms),
+        **_timing_dict("alpha_spmm_alg1_tle_opt2", opt2_symbolic_ms, opt2_compute_ms, opt2_total_ms),
+        **_timing_dict("torch_ref", torch_symbolic_ms, torch_compute_ms, torch_total_ms),
+        **_timing_dict("cupy_cusparse_ref", cupy_symbolic_ms, cupy_compute_ms, cupy_total_ms),
         "torch_ref_compute_speedup_vs_base": _ratio(torch_compute_ms, base_compute_ms),
         "torch_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(torch_compute_ms, opt_compute_ms),
         "torch_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt2": _ratio(torch_compute_ms, opt2_compute_ms),
@@ -680,7 +668,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--with-cusparse", action="store_true")
+    parser.add_argument("--with-cusparse", action="store_true", default=True, help="Run CuPy/cuSPARSE reference timing (default).")
+    parser.add_argument("--no-cusparse", action="store_false", dest="with_cusparse", help="Disable CuPy/cuSPARSE reference timing.")
     parser.add_argument("--require-tle-opt", action="store_true")
     parser.add_argument("--require-tle-opt2", action="store_true")
     args = parser.parse_args()
