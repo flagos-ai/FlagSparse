@@ -573,6 +573,8 @@ def _normalize_spmm_csr_alg(alg):
         return "csr_base"
     if token in ("alg1", "csr_alg1", "spmm_csr_alg1"):
         return "spmm_csr_alg1"
+    if token in ("alg2", "csr_alg2", "spmm_csr_alg2"):
+        return "spmm_csr_alg2"
     if token == "auto":
         return "auto"
     return token
@@ -1291,6 +1293,604 @@ def _run_spmm_csr_alg1_route(prepared, B, *, timing=False, diagnostics=False):
     return C, meta
 
 
+_SPMM_CSR_ALG2_BUCKET_SPECS_F32 = (
+    {
+        "label": "short_16",
+        "kind": "batched2d",
+        "min_row_nnz": 0,
+        "max_row_nnz": 16,
+        "batch_rows": 8,
+        "block_k": 16,
+        "block_n_cap": 32,
+    },
+    {
+        "label": "short_64",
+        "kind": "batched2d",
+        "min_row_nnz": 17,
+        "max_row_nnz": 64,
+        "batch_rows": 4,
+        "block_k": 32,
+        "block_n_cap": 64,
+    },
+    {
+        "label": "row_256",
+        "kind": "row2d",
+        "min_row_nnz": 65,
+        "max_row_nnz": 256,
+        "batch_rows": 1,
+        "block_k": 64,
+        "block_n_cap": 64,
+    },
+    {
+        "label": "seg_1024",
+        "kind": "row2d_segmented",
+        "min_row_nnz": 257,
+        "max_row_nnz": 1024,
+        "batch_rows": 1,
+        "block_k": 64,
+        "block_n_cap": 128,
+        "segments": 4,
+    },
+    {
+        "label": "seg_long",
+        "kind": "row2d_segmented",
+        "min_row_nnz": 1025,
+        "max_row_nnz": None,
+        "batch_rows": 1,
+        "block_k": 128,
+        "block_n_cap": 128,
+        "segments": 8,
+    },
+)
+
+_SPMM_CSR_ALG2_BUCKET_SPECS_F64 = (
+    {
+        "label": "short_16",
+        "kind": "batched2d",
+        "min_row_nnz": 0,
+        "max_row_nnz": 16,
+        "batch_rows": 4,
+        "block_k": 16,
+        "block_n_cap": 16,
+    },
+    {
+        "label": "short_64",
+        "kind": "batched2d",
+        "min_row_nnz": 17,
+        "max_row_nnz": 64,
+        "batch_rows": 2,
+        "block_k": 32,
+        "block_n_cap": 32,
+    },
+    {
+        "label": "row_256",
+        "kind": "row2d",
+        "min_row_nnz": 65,
+        "max_row_nnz": 256,
+        "batch_rows": 1,
+        "block_k": 32,
+        "block_n_cap": 32,
+    },
+    {
+        "label": "seg_1024",
+        "kind": "row2d_segmented",
+        "min_row_nnz": 257,
+        "max_row_nnz": 1024,
+        "batch_rows": 1,
+        "block_k": 32,
+        "block_n_cap": 64,
+        "segments": 4,
+    },
+    {
+        "label": "seg_long",
+        "kind": "row2d_segmented",
+        "min_row_nnz": 1025,
+        "max_row_nnz": None,
+        "batch_rows": 1,
+        "block_k": 64,
+        "block_n_cap": 64,
+        "segments": 8,
+    },
+)
+
+
+def _spmm_csr_alg2_bucket_specs(dtype):
+    return (
+        _SPMM_CSR_ALG2_BUCKET_SPECS_F64
+        if dtype == torch.float64
+        else _SPMM_CSR_ALG2_BUCKET_SPECS_F32
+    )
+
+
+def _normalize_spmm_csr_alg2_device_props(device):
+    props = torch.cuda.get_device_properties(device)
+    warp_size = int(getattr(props, "warp_size", 32) or 32)
+    sm_count = int(getattr(props, "multi_processor_count", 0) or 0)
+    max_threads_per_mp = int(getattr(props, "max_threads_per_multi_processor", 2048) or 2048)
+    max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
+    shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
+    return {
+        "device_name": str(getattr(props, "name", "cuda")),
+        "warp_size": max(1, warp_size),
+        "sm_count": max(0, sm_count),
+        "max_threads_per_mp": max(32, max_threads_per_mp),
+        "max_threads_per_block": max(32, max_threads_per_block),
+        "shared_memory_per_block": max(0, shared_memory_per_block),
+        "capability": (
+            int(getattr(props, "major", 0) or 0),
+            int(getattr(props, "minor", 0) or 0),
+        ),
+    }
+
+
+def _select_spmm_csr_alg2_block_n(n_dense_cols, block_n_cap):
+    if n_dense_cols <= 8:
+        block_n = 8
+    elif n_dense_cols <= 16:
+        block_n = 16
+    elif n_dense_cols <= 32:
+        block_n = 32
+    elif n_dense_cols <= 64:
+        block_n = 64
+    else:
+        block_n = 128
+    return max(8, min(int(block_n), int(block_n_cap)))
+
+
+def _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype):
+    warp_size = max(1, int(device_props["warp_size"]))
+    max_threads_per_block = max(32, int(device_props["max_threads_per_block"]))
+    max_threads_per_mp = max(max_threads_per_block, int(device_props["max_threads_per_mp"]))
+    lane_need = max(1, math.ceil(int(block_n) / warp_size))
+    kind = bucket["kind"]
+    block_k = int(bucket["block_k"])
+    segments = int(bucket.get("segments", 1))
+    batch_rows = int(bucket.get("batch_rows", 1))
+
+    if kind == "batched2d":
+        desired = max(lane_need, 1 if block_k <= 16 else 2)
+        if batch_rows >= 8 and block_n >= 64:
+            desired = max(desired, 2)
+    elif kind == "row2d":
+        desired = max(lane_need, 2 if block_k <= 32 else 4)
+    else:
+        desired = max(lane_need, 4)
+        if segments >= 4:
+            desired = max(desired, 8 if block_k >= 64 else 4)
+        if segments >= 8:
+            desired = max(desired, 16 if dtype == torch.float32 and block_n >= 64 else 8)
+
+    if dtype == torch.float64 and desired > 8:
+        desired = 8
+    if max_threads_per_mp < 1536 and desired > 8:
+        desired = 8
+
+    max_warps_by_block = max(1, max_threads_per_block // warp_size)
+    max_warps_by_mp = max(1, max_threads_per_mp // warp_size)
+    max_supported = min(16, max_warps_by_block, max_warps_by_mp)
+    supported = [value for value in (1, 2, 4, 8, 16) if value <= max_supported]
+    if not supported:
+        return 1
+    clipped = min(desired, supported[-1])
+    for value in reversed(supported):
+        if value <= clipped:
+            return value
+    return supported[0]
+
+
+def _select_spmm_csr_alg2_num_stages(bucket, block_n, num_warps, device_props, dtype):
+    kind = bucket["kind"]
+    segments = int(bucket.get("segments", 1))
+    shared_memory_per_block = int(device_props["shared_memory_per_block"])
+
+    if dtype == torch.float64:
+        if kind == "row2d_segmented":
+            stages = 1
+        else:
+            stages = 2 if block_n <= 32 and num_warps <= 4 else 1
+    else:
+        if kind == "batched2d":
+            stages = 2
+        elif kind == "row2d":
+            stages = 2 if block_n <= 64 else 1
+        else:
+            stages = 1 if segments >= 8 or num_warps >= 16 else 2
+
+    if shared_memory_per_block and shared_memory_per_block < 65536:
+        stages = min(stages, 2)
+    if kind == "row2d_segmented" and block_n >= 128:
+        stages = min(stages, 2)
+    return max(1, min(int(stages), 4))
+
+
+def _resolve_spmm_csr_alg2_launch(bucket, n_dense_cols, dtype, device_props):
+    block_n = _select_spmm_csr_alg2_block_n(n_dense_cols, bucket["block_n_cap"])
+    num_warps = _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype)
+    num_stages = _select_spmm_csr_alg2_num_stages(
+        bucket,
+        block_n,
+        num_warps,
+        device_props,
+        dtype,
+    )
+    return {
+        "bucket_label": bucket["label"],
+        "kind": bucket["kind"],
+        "block_k": int(bucket["block_k"]),
+        "block_n": int(block_n),
+        "num_warps": int(num_warps),
+        "num_stages": int(num_stages),
+        "batch_rows": int(bucket.get("batch_rows", 1)),
+        "segments": int(bucket.get("segments", 1)),
+        "row_count": int(bucket["rows"].numel()),
+    }
+
+
+class PreparedSpmmCsrAlg2Plan:
+    """Runtime execution plan for the route-native SpMM CSR Alg2 path."""
+
+    __slots__ = (
+        "data",
+        "kernel_indices",
+        "kernel_indptr",
+        "shape",
+        "n_rows",
+        "n_cols",
+        "row_buckets",
+        "process_cpu_ms",
+        "process_gpu_ms",
+        "bucket_count",
+        "long_row_count",
+        "launch_configs",
+    )
+
+    def __init__(
+        self,
+        data,
+        kernel_indices,
+        kernel_indptr,
+        shape,
+        row_buckets,
+        process_cpu_ms,
+        process_gpu_ms,
+        long_row_count,
+    ):
+        self.data = data
+        self.kernel_indices = kernel_indices
+        self.kernel_indptr = kernel_indptr
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.n_rows = int(shape[0])
+        self.n_cols = int(shape[1])
+        self.row_buckets = row_buckets
+        self.process_cpu_ms = float(process_cpu_ms)
+        self.process_gpu_ms = process_gpu_ms
+        self.bucket_count = int(len(row_buckets))
+        self.long_row_count = int(long_row_count)
+        self.launch_configs = []
+
+
+@triton.jit
+def _spmm_csr_alg2_process_count_kernel(
+    row_lengths_ptr,
+    bucket_counts_ptr,
+    n_rows,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask = offs < n_rows
+    lens = tl.load(row_lengths_ptr + offs, mask=mask, other=0)
+    bucket = tl.where(
+        lens <= 16,
+        0,
+        tl.where(lens <= 64, 1, tl.where(lens <= 256, 2, tl.where(lens <= 1024, 3, 4))),
+    )
+    for bid in tl.static_range(0, 5):
+        hits = mask & (bucket == bid)
+        count = tl.sum(tl.where(hits, 1, 0), axis=0)
+        tl.atomic_add(bucket_counts_ptr + bid, count, sem="relaxed")
+
+
+@triton.jit
+def _spmm_csr_alg2_process_compact_kernel(
+    row_lengths_ptr,
+    bucket_offsets_ptr,
+    bucket_write_counts_ptr,
+    rows_flat_ptr,
+    n_rows,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask = offs < n_rows
+    lens = tl.load(row_lengths_ptr + offs, mask=mask, other=0)
+    bucket = tl.where(
+        lens <= 16,
+        0,
+        tl.where(lens <= 64, 1, tl.where(lens <= 256, 2, tl.where(lens <= 1024, 3, 4))),
+    )
+    for bid in tl.static_range(0, 5):
+        hits = mask & (bucket == bid)
+        ranks = tl.cumsum(tl.where(hits, 1, 0), axis=0) - 1
+        local_count = tl.sum(tl.where(hits, 1, 0), axis=0)
+        base = tl.atomic_add(bucket_write_counts_ptr + bid, local_count, sem="relaxed")
+        offset = tl.load(bucket_offsets_ptr + bid)
+        tl.store(rows_flat_ptr + offset + base + ranks, offs, mask=hits)
+
+
+def _spmm_csr_alg2_build_bucket_descriptors(rows_flat, counts, offsets, dtype):
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    counts_cpu = counts.cpu().tolist()
+    offsets_cpu = offsets.cpu().tolist()
+    buckets = []
+    long_row_count = 0
+    for spec, count, offset in zip(_spmm_csr_alg2_bucket_specs(dtype), counts_cpu, offsets_cpu):
+        count = int(count)
+        if count == 0:
+            continue
+        rows = rows_flat.narrow(0, int(offset), count)
+        if spec["label"] == "seg_long":
+            long_row_count = count
+        buckets.append(
+            {
+                "label": spec["label"],
+                "kind": spec["kind"],
+                "rows": rows,
+                "batch_rows": int(spec["batch_rows"]),
+                "block_k": int(spec["block_k"]),
+                "block_n_cap": int(spec["block_n_cap"]),
+                "segments": int(spec.get("segments", 1)),
+            }
+        )
+    process_cpu_ms = (time.perf_counter() - t0) * 1000.0
+    return buckets, long_row_count, process_cpu_ms
+
+
+def _spmm_csr_alg2_build_process_plan(prepared, *, timing=False):
+    if prepared.data.dtype not in (torch.float32, torch.float64):
+        raise TypeError("spmm_csr_alg2 only supports float32 and float64")
+    device = prepared.data.device
+    row_count = int(prepared.row_lengths.numel())
+    row_index_dtype = torch.int32 if row_count <= _INDEX_LIMIT_INT32 else torch.int64
+    bucket_count = len(_spmm_csr_alg2_bucket_specs(prepared.data.dtype))
+    if bucket_count != 5:
+        raise RuntimeError("spmm_csr_alg2 expects five bucket specs")
+
+    counts = torch.zeros((bucket_count,), dtype=torch.int64, device=device)
+    offsets = torch.empty_like(counts)
+    rows_flat = torch.empty((row_count,), dtype=row_index_dtype, device=device)
+    write_counts = torch.zeros_like(counts)
+    block_m = 256
+    grid = (triton.cdiv(row_count, block_m),)
+
+    start = torch.cuda.Event(enable_timing=True) if timing else None
+    end = torch.cuda.Event(enable_timing=True) if timing else None
+    if start is not None:
+        start.record()
+    if row_count > 0:
+        _spmm_csr_alg2_process_count_kernel[grid](
+            prepared.row_lengths,
+            counts,
+            row_count,
+            BLOCK_M=block_m,
+            num_warps=4,
+            num_stages=1,
+        )
+    offsets[0] = 0
+    if bucket_count > 1:
+        offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+    if row_count > 0:
+        _spmm_csr_alg2_process_compact_kernel[grid](
+            prepared.row_lengths,
+            offsets,
+            write_counts,
+            rows_flat,
+            row_count,
+            BLOCK_M=block_m,
+            num_warps=4,
+            num_stages=1,
+        )
+    if end is not None:
+        end.record()
+        torch.cuda.synchronize()
+        process_gpu_ms = start.elapsed_time(end)
+    else:
+        torch.cuda.synchronize()
+        process_gpu_ms = None
+
+    row_buckets, long_row_count, process_cpu_ms = _spmm_csr_alg2_build_bucket_descriptors(
+        rows_flat,
+        counts,
+        offsets,
+        prepared.data.dtype,
+    )
+    return PreparedSpmmCsrAlg2Plan(
+        data=prepared.data,
+        kernel_indices=prepared.kernel_indices,
+        kernel_indptr=prepared.kernel_indptr,
+        shape=prepared.shape,
+        row_buckets=row_buckets,
+        process_cpu_ms=process_cpu_ms,
+        process_gpu_ms=process_gpu_ms,
+        long_row_count=long_row_count,
+    )
+
+
+def _spmm_csr_alg2_kernel_bundle():
+    from .spmm_csr_opt_alg2 import (
+        _spmm_csr_alg2_batched_rows_kernel,
+        _spmm_csr_alg2_row_rows_kernel,
+        _spmm_csr_alg2_segmented_rows_kernel,
+    )
+
+    return (
+        _spmm_csr_alg2_batched_rows_kernel,
+        _spmm_csr_alg2_row_rows_kernel,
+        _spmm_csr_alg2_segmented_rows_kernel,
+    )
+
+
+def _spmm_csr_alg2_acc_dtype(dtype):
+    return tl.float64 if dtype == torch.float64 else tl.float32
+
+
+def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels):
+    launch = _resolve_spmm_csr_alg2_launch(
+        bucket,
+        int(B.shape[1]),
+        plan.data.dtype,
+        device_props,
+    )
+    rows = bucket["rows"]
+    if rows.numel() == 0:
+        return launch
+
+    batched_kernel, row_kernel, segmented_kernel = kernels
+    acc_dtype = _spmm_csr_alg2_acc_dtype(plan.data.dtype)
+    out_dtype = tl.float64 if plan.data.dtype == torch.float64 else tl.float32
+    common_kwargs = {
+        "num_warps": launch["num_warps"],
+        "num_stages": launch["num_stages"],
+    }
+
+    if bucket["kind"] == "batched2d":
+        grid = (
+            triton.cdiv(rows.numel(), launch["batch_rows"]),
+            triton.cdiv(B.shape[1], launch["block_n"]),
+        )
+        batched_kernel[grid](
+            plan.data,
+            plan.kernel_indices,
+            plan.kernel_indptr,
+            B,
+            C_out,
+            rows,
+            rows.numel(),
+            B.shape[1],
+            B.stride(0),
+            B.stride(1),
+            C_out.stride(0),
+            C_out.stride(1),
+            BATCH=launch["batch_rows"],
+            BLOCK_N=launch["block_n"],
+            BLOCK_K=launch["block_k"],
+            ACC_DTYPE=acc_dtype,
+            OUT_DTYPE=out_dtype,
+            **common_kwargs,
+        )
+    elif bucket["kind"] == "row2d":
+        grid = (rows.numel(), triton.cdiv(B.shape[1], launch["block_n"]))
+        row_kernel[grid](
+            plan.data,
+            plan.kernel_indices,
+            plan.kernel_indptr,
+            B,
+            C_out,
+            rows,
+            rows.numel(),
+            B.shape[1],
+            B.stride(0),
+            B.stride(1),
+            C_out.stride(0),
+            C_out.stride(1),
+            BLOCK_N=launch["block_n"],
+            BLOCK_K=launch["block_k"],
+            ACC_DTYPE=acc_dtype,
+            OUT_DTYPE=out_dtype,
+            **common_kwargs,
+        )
+    else:
+        grid = (rows.numel(), triton.cdiv(B.shape[1], launch["block_n"]))
+        segmented_kernel[grid](
+            plan.data,
+            plan.kernel_indices,
+            plan.kernel_indptr,
+            B,
+            C_out,
+            rows,
+            rows.numel(),
+            B.shape[1],
+            B.stride(0),
+            B.stride(1),
+            C_out.stride(0),
+            C_out.stride(1),
+            BLOCK_N=launch["block_n"],
+            BLOCK_K=launch["block_k"],
+            SEGMENTS=launch["segments"],
+            ACC_DTYPE=acc_dtype,
+            OUT_DTYPE=out_dtype,
+            **common_kwargs,
+        )
+
+    launch["grid_m"] = int(grid[0])
+    launch["grid_n"] = int(grid[1])
+    return launch
+
+
+def _spmm_csr_alg2_compute(plan, B):
+    if B.ndim != 2:
+        raise ValueError("B must be a 2D dense tensor")
+    if not B.is_cuda:
+        raise ValueError("B must be a CUDA tensor")
+    if B.device != plan.data.device:
+        raise ValueError("B must be on the same CUDA device as sparse matrix data")
+    if B.dtype != plan.data.dtype:
+        raise TypeError("B dtype must match sparse matrix dtype")
+    if B.shape[0] != plan.n_cols:
+        raise ValueError(f"B.shape[0] must be n_cols={plan.n_cols}, got {B.shape[0]}")
+
+    B = B.contiguous()
+    C_out = torch.zeros((plan.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
+    device_props = _normalize_spmm_csr_alg2_device_props(plan.data.device)
+    kernels = _spmm_csr_alg2_kernel_bundle()
+    plan.launch_configs.clear()
+    for bucket in plan.row_buckets:
+        launch = _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels)
+        plan.launch_configs.append(launch)
+    return C_out
+
+
+def _run_spmm_csr_alg2_route(prepared, B, *, timing=False, diagnostics=False):
+    B = _validate_spmm_route_runtime_inputs(prepared, B)
+    plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
+    compute_ms = None
+    if timing:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+    C = _spmm_csr_alg2_compute(plan, B)
+    if timing:
+        end.record()
+        torch.cuda.synchronize()
+        compute_ms = start.elapsed_time(end)
+    meta = {
+        "alg": "spmm_csr_alg2",
+        "display_name": "Alg2",
+        "op": prepared.op,
+        "process_cpu_ms": plan.process_cpu_ms,
+        "process_gpu_ms": plan.process_gpu_ms if timing else None,
+        "compute_ms": compute_ms,
+    }
+    if diagnostics:
+        first_launch = plan.launch_configs[0] if plan.launch_configs else {}
+        meta["diagnostics"] = {
+            "launch_config_scope": "bucket",
+            "launch_config_count": len(plan.launch_configs),
+            "bucket_count": plan.bucket_count,
+            "long_row_count": plan.long_row_count,
+            "long_part_count": 0,
+            "launch_version": "spmm_csr_alg2_v1",
+            "block_n": first_launch.get("block_n"),
+            "block_nnz": first_launch.get("block_k"),
+            "num_warps": first_launch.get("num_warps"),
+            "num_stages": first_launch.get("num_stages"),
+            "grid_m": first_launch.get("grid_m"),
+            "grid_n": first_launch.get("grid_n"),
+        }
+    return C, meta
+
+
 SPMM_CSR_ALGORITHMS = {
     "csr_base": SpmmCsrAlgorithm(
         name="csr_base",
@@ -1319,6 +1919,13 @@ SPMM_CSR_ALGORITHMS = {
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(torch.float32, torch.float64),
         run=_run_spmm_csr_alg1_route,
+    ),
+    "spmm_csr_alg2": SpmmCsrAlgorithm(
+        name="spmm_csr_alg2",
+        display_name="Alg2",
+        supported_ops=tuple(SPMM_OP_NAMES.values()),
+        supported_dtypes=(torch.float32, torch.float64),
+        run=_run_spmm_csr_alg2_route,
     ),
 }
 
