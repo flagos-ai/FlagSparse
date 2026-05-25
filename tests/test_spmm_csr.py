@@ -26,8 +26,6 @@ from test_spmm import (
     _build_dense_matrix,
     _build_pytorch_reference,
     _normalize_csv_path,
-    _scaled_allclose_error,
-    _tolerance_for_dtype,
     load_mtx_to_csr_torch,
 )
 
@@ -40,7 +38,7 @@ DTYPE_MAP = {
     "complex64": torch.complex64,
     "complex128": torch.complex128,
 }
-DEFAULT_DTYPE_NAMES = tuple(DTYPE_MAP)
+DEFAULT_DTYPE_NAMES = ("float32", "float64", "complex64", "complex128")
 DEFAULT_OP_NAMES = tuple(spmm_ops.SPMM_OP_NAMES.values())
 CUSPARSE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 
@@ -111,6 +109,31 @@ def _ratio(numerator, denominator):
     if numerator is None or denominator is None or denominator <= 0:
         return None
     return float(numerator) / float(denominator)
+
+
+def _reference_tolerance(dtype):
+    if dtype in (torch.float32, torch.complex64):
+        return 1e-4, 1e-2
+    if dtype in (torch.float64, torch.complex128):
+        return 1e-12, 1e-10
+    if dtype == torch.float16:
+        return 2e-3, 2e-3
+    if dtype == torch.bfloat16:
+        return 1e-1, 1e-1
+    return 1e-6, 1e-5
+
+
+def _error_profile(candidate, reference, dtype):
+    if candidate is None or reference is None:
+        return {"global_err": None, "status": "SKIP"}
+    atol, rtol = _reference_tolerance(dtype)
+    if candidate.numel() == 0:
+        return {"global_err": 0.0, "status": "PASS"}
+    diff = torch.abs(candidate - reference).to(torch.float64)
+    denom = (atol + rtol * torch.abs(reference)).to(torch.float64)
+    ratio = diff / denom
+    global_err = float(torch.max(ratio).item()) if ratio.numel() > 0 else 0.0
+    return {"global_err": global_err, "status": "PASS" if global_err <= 1.0 else "FAIL"}
 
 
 def _resolve_input_paths(input_paths):
@@ -297,14 +320,8 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
         )
         out = result.pop("out")
         diagnostics = result.pop("diagnostics")
-        err_torch = _scaled_allclose_error(out, ref, dtype)
-        err_cusparse = (
-            _scaled_allclose_error(out, cusparse_out, dtype)
-            if cusparse_out is not None
-            else None
-        )
-        atol, rtol = _tolerance_for_dtype(dtype)
-        ok = torch.allclose(out, ref, atol=atol, rtol=rtol)
+        torch_profile = _error_profile(out, ref, dtype)
+        cusparse_profile = _error_profile(out, cusparse_out, dtype)
         row = {
             "matrix": os.path.basename(path),
             "dtype": _dtype_name(dtype),
@@ -321,9 +338,9 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
             "cusparse_ms": cusparse_ms,
             "torch_vs_alg_speedup": _ratio(torch_ms, result["ms"]),
             "cusparse_vs_alg_speedup": _ratio(cusparse_ms, result["ms"]),
-            "err_vs_torch": err_torch,
-            "err_vs_cusparse": err_cusparse,
-            "status": "PASS" if ok else "FAIL",
+            "err_vs_torch": torch_profile["global_err"],
+            "err_vs_cusparse": cusparse_profile["global_err"],
+            "status": torch_profile["status"],
         }
         if timing:
             row["process_gpu_ms"] = result["process_gpu_ms"]
@@ -389,7 +406,14 @@ def main():
     parser = argparse.ArgumentParser(description="AlphaSparse-style CSR SpMM route benchmark.")
     parser.add_argument("input", nargs="+", help=".mtx file(s) or directories")
     parser.add_argument("--alg", default="auto", help="auto, all, or comma-separated algorithms")
-    parser.add_argument("--dtype", default="all", help="all or comma-separated dtype names")
+    parser.add_argument(
+        "--dtype",
+        default="all",
+        help=(
+            "all or comma-separated dtype names. all runs float32,float64,"
+            "complex64,complex128 by default; float16/bfloat16 are opt-in."
+        ),
+    )
     parser.add_argument("--op", default="all", help="all or comma-separated ops: non,trans,conj")
     parser.add_argument("--dense-cols", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=10)
