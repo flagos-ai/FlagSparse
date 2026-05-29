@@ -34,7 +34,6 @@ for _name, _tol in {
     "float8_e5m2": 1e-3,
     "float8_e4m3fnuz": 1e-3,
     "float8_e5m2fnuz": 1e-3,
-    "complex32": 1e-3,
 }.items():
     _dtype = _optional_dtype(_name)
     if _dtype is not None:
