@@ -64,9 +64,10 @@ python tests/test_spmv_opt.py <目录/> --csv out.csv
 
 ```bash
 python tests/test_spmm.py <目录或文件.mtx>
-python tests/test_spmm.py --synthetic                    # 可选：--skip-api-checks、--skip-alg1-coverage
-python tests/test_spmm.py <目录/> --csv results.csv     # CSV 内为 float32/float64 + int32；控制台逐矩阵输出
-# 常用选项：--dtype、--index-dtype、--dense-cols、--block-n、--block-nnz、--max-segments、--warmup、--iters、--no-cusparse
+python tests/test_spmm.py --synthetic                    # 可选：--ops non,trans,conj
+python tests/test_spmm.py <目录/> --csv results.csv     # CSV 覆盖 float32/float64/complex64/complex128 + int32/int64 + ops
+# 常用选项：--dtype、--index-dtype、--ops、--dense-cols、--block-n、--block-nnz、--max-segments、--warmup、--iters、--no-cusparse
+# CSR SpMM 支持 op="non" (A @ B)、op="trans" (A.T @ B)、op="conj" (A.conj().T @ B)。
 ```
 
 **test_spmm_opt.py** - CSR SpMM 基线与优化版 A/B 对比：

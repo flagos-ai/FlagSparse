@@ -124,11 +124,7 @@ def _alg_num_supports_case(alg_num, fmt, op_mode, lower, value_dtype):
     if alg_num == 1:
         return True
     if alg_num in (2, 3, 4, 8):
-        return (
-            fmt in ("CSR", "COO")
-            and op_mode == "NON"
-            and bool(lower)
-        )
+        return fmt in ("CSR", "COO") and op_mode == "NON"
     return False
 
 
@@ -632,6 +628,35 @@ def _benchmark_flagsparse_spsv_csr_reuse(
     )
 
 
+def _benchmark_flagsparse_spsv_csr(
+    data,
+    indices,
+    indptr,
+    b,
+    shape,
+    *,
+    lower=True,
+    transpose=False,
+    solve_kind=None,
+    warmup=WARMUP,
+    iters=ITERS,
+):
+    return _benchmark_flagsparse(
+        lambda: fs.flagsparse_spsv_csr(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+        ),
+        warmup=warmup,
+        iters=iters,
+    )
+
+
 def _benchmark_flagsparse_spsv_csr_split(
     data,
     indices,
@@ -650,6 +675,32 @@ def _benchmark_flagsparse_spsv_csr_split(
         data.dtype,
         fmt="CSR",
     )
+    if op_mode != "N":
+        analysis_ms = fs_spsv_impl._analyze_spsv_csr(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            clear_cache=True,
+            return_time=True,
+        )
+        x, solve_ms = _benchmark_flagsparse_spsv_csr(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            warmup=warmup,
+            iters=iters,
+        )
+        return x, analysis_ms, solve_ms
     descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
         data,
         indices,
@@ -697,6 +748,32 @@ def _benchmark_flagsparse_spsv_coo_split(
         data.dtype,
         fmt="COO",
     )
+    if trans_mode != "N":
+        analysis_ms = fs_spsv_impl._analyze_spsv_csr(
+            data_csr,
+            indices_csr,
+            indptr_csr,
+            b,
+            (n_rows, n_cols),
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            clear_cache=True,
+            return_time=True,
+        )
+        x, solve_ms = _benchmark_flagsparse_spsv_csr(
+            data_csr,
+            indices_csr,
+            indptr_csr,
+            b,
+            (n_rows, n_cols),
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            warmup=warmup,
+            iters=iters,
+        )
+        return x, analysis_ms, solve_ms
     descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
         data_csr,
         indices_csr,
@@ -1906,10 +1983,6 @@ def main():
         if args.check_transpose:
             raise ValueError(
                 f"ALG{args.alg_num} matches allinone's NON-only path; --check-transpose is not supported"
-            )
-        if args.upper:
-            raise ValueError(
-                f"ALG{args.alg_num} matches allinone's lower-triangular path; --upper is not supported"
             )
         if args.ops:
             op_modes_cli = _parse_op_modes_filter(args.ops)

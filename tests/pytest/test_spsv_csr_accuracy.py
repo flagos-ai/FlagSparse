@@ -313,6 +313,25 @@ def test_spsv_csr_complex_non_trans_defaults_to_cw_route():
 
 
 @pytest.mark.spsv
+def test_spsv_csr_complex_upper_non_trans_defaults_to_smblk_route():
+    device = torch.device("cuda")
+    n = SPSV_N[0]
+    dtype = torch.complex128
+    A = _build_triangular(n, dtype, device, lower=False)
+    Asp = A.to_sparse_csr()
+    data = Asp.values()
+    indices = Asp.col_indices().to(torch.int32)
+    indptr = Asp.crow_indices().to(torch.int32)
+    b = _rand_like(dtype, (n,), device)
+
+    _, _, _, trans_mode, _, _, solve_plan = fs_spsv_impl._resolve_spsv_csr_runtime(
+        data, indices, indptr, b, (n, n), False, False, False
+    )
+    selected = fs_spsv_impl._select_spsv_runtime_plan(solve_plan, trans_mode)
+    assert selected["solve_kind"] == "csr_smblk"
+
+
+@pytest.mark.spsv
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_csr_transpose_family_defaults_to_cw_route(op_mode):
     device = torch.device("cuda")
@@ -366,6 +385,26 @@ def test_spsv_auto_route_promotes_dense_real_lower_to_nnz_balance():
 
 
 @pytest.mark.spsv
+def test_spsv_auto_route_promotes_dense_real_upper_to_nnz_balance():
+    matrix_stats = {
+        "num_levels": 256,
+        "max_frontier": 1,
+        "avg_frontier": 1.0,
+        "frontier_ratio": 1.0 / 256.0,
+        "avg_nnz_per_row": 128.0,
+        "max_nnz_per_row": 256,
+    }
+    route = fs_spsv_impl._choose_spsv_nontrans_auto_route(
+        256,
+        matrix_stats,
+        lower=False,
+        unit_diagonal=False,
+        value_dtype=torch.float64,
+    )
+    assert route == "csr_smblk"
+
+
+@pytest.mark.spsv
 def test_spsv_levelschd_analysis_builds_sorted_row_map():
     device = torch.device("cuda")
     data = torch.tensor([4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 4.0, 7.0], dtype=torch.float64, device=device)
@@ -402,6 +441,56 @@ def test_spsv_nnz_balance_analysis_builds_row_idx_and_indegree():
 
 
 @pytest.mark.spsv
+def test_spsv_levelschd_analysis_builds_upper_row_map():
+    device = torch.device("cuda")
+    indices = torch.tensor([3, 2, 0, 3, 1, 3, 2, 3], dtype=torch.int64, device=device)
+    indptr = torch.tensor([0, 3, 5, 7, 8], dtype=torch.int64, device=device)
+    meta = fs_spsv_impl._build_spsv_level_schedule_metadata(
+        indices,
+        indptr,
+        4,
+        lower=False,
+        unit_diagonal=False,
+    )
+    assert meta["row_map32"].tolist() == [3, 2, 1, 0]
+    assert meta["level_ptr32"].tolist() == [0, 1, 3, 4]
+    assert meta["indegree_init32"].tolist() == [3, 2, 2, 1]
+    assert meta["matrix_stats"]["num_levels"] == 3
+    assert meta["matrix_stats"]["max_frontier"] == 2
+
+
+@pytest.mark.spsv
+def test_spsv_nnz_balance_analysis_builds_upper_row_idx_and_indegree():
+    device = torch.device("cuda")
+    indices = torch.tensor([3, 2, 0, 3, 1, 3, 2, 3], dtype=torch.int64, device=device)
+    indptr = torch.tensor([0, 3, 5, 7, 8], dtype=torch.int64, device=device)
+    meta = fs_spsv_impl._build_spsv_nnz_balance_metadata(
+        indices,
+        indptr,
+        4,
+        lower=False,
+        unit_diagonal=False,
+    )
+    assert meta["indegree_init32"].tolist() == [3, 2, 2, 1]
+    assert meta["csr_row_idx32"].tolist() == [0, 0, 0, 1, 1, 2, 2, 3]
+
+
+@pytest.mark.spsv
+def test_spsv_csr_row_sorted_check_respects_row_boundaries():
+    device = torch.device("cuda")
+    indptr = torch.tensor([0, 3, 5, 8], dtype=torch.int64, device=device)
+    lower_sorted = torch.tensor([0, 1, 2, 0, 2, 0, 1, 2], dtype=torch.int64, device=device)
+    lower_unsorted = torch.tensor([0, 2, 1, 0, 2, 0, 1, 2], dtype=torch.int64, device=device)
+    upper_sorted = torch.tensor([2, 1, 0, 2, 0, 2, 1, 0], dtype=torch.int64, device=device)
+    upper_unsorted = torch.tensor([2, 0, 1, 2, 0, 2, 1, 0], dtype=torch.int64, device=device)
+
+    assert fs_spsv_impl._csr_rows_are_sorted(lower_sorted, indptr, 3, lower=True)
+    assert not fs_spsv_impl._csr_rows_are_sorted(lower_unsorted, indptr, 3, lower=True)
+    assert fs_spsv_impl._csr_rows_are_sorted(upper_sorted, indptr, 3, lower=False)
+    assert not fs_spsv_impl._csr_rows_are_sorted(upper_unsorted, indptr, 3, lower=False)
+
+
+@pytest.mark.spsv
 def test_spsv_auto_route_promotes_wide_frontier_real_lower_to_levelschd():
     matrix_stats = {
         "num_levels": 48,
@@ -419,6 +508,26 @@ def test_spsv_auto_route_promotes_wide_frontier_real_lower_to_levelschd():
         value_dtype=torch.float32,
     )
     assert route == "csr_cw_levelschd"
+
+
+@pytest.mark.spsv
+def test_spsv_auto_route_promotes_wide_frontier_real_upper_to_levelschd():
+    matrix_stats = {
+        "num_levels": 48,
+        "max_frontier": 64,
+        "avg_frontier": 12.0,
+        "frontier_ratio": 0.125,
+        "avg_nnz_per_row": 12.0,
+        "max_nnz_per_row": 48,
+    }
+    route = fs_spsv_impl._choose_spsv_nontrans_auto_route(
+        512,
+        matrix_stats,
+        lower=False,
+        unit_diagonal=False,
+        value_dtype=torch.float32,
+    )
+    assert route == "csr_smblk"
 
 
 @pytest.mark.spsv
@@ -688,6 +797,75 @@ def test_spsv_csr_explicit_nnz_balance_analysis_builds_only_nnz_metadata():
     assert int(descr.solve_plan["level_row_map32"].numel()) == 0
     assert int(descr.solve_plan["nnz_balance_row_idx32"].numel()) == int(Asp.values().numel())
     assert int(descr.solve_plan["nnz_balance_indegree32"].numel()) == n
+
+
+@pytest.mark.spsv
+@pytest.mark.parametrize("dtype", [torch.float64, torch.complex128], ids=_dtype_id)
+@pytest.mark.parametrize(
+    "solve_kind",
+    ["csr_roc", "csr_smblk", "csr_cw_levelschd", "csr_nnz_balance"],
+)
+def test_spsv_csr_explicit_upper_optimized_routes_match_dense(dtype, solve_kind):
+    device = torch.device("cuda")
+    n = 96 if solve_kind == "csr_nnz_balance" else 64
+    A = _build_triangular(n, dtype, device, lower=False)
+    b = _rand_like(dtype, (n,), device)
+    Asp = A.to_sparse_csr()
+
+    x = flagsparse_spsv_csr(
+        Asp.values(),
+        Asp.col_indices().to(torch.int32),
+        Asp.crow_indices().to(torch.int32),
+        b,
+        (n, n),
+        lower=False,
+        unit_diagonal=False,
+        solve_kind=solve_kind,
+    )
+    x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=False, unit_diagonal=False)
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+@pytest.mark.parametrize(
+    "solve_kind",
+    ["csr_roc", "csr_smblk", "csr_cw_levelschd", "csr_nnz_balance"],
+)
+def test_spsv_csr_upper_optimized_route_analysis_workspace_matches_direct(solve_kind):
+    device = torch.device("cuda")
+    dtype = torch.float64
+    n = 96 if solve_kind == "csr_nnz_balance" else 64
+    A = _build_triangular(n, dtype, device, lower=False)
+    b = _rand_like(dtype, (n,), device)
+    Asp = A.to_sparse_csr()
+
+    descr = flagsparse_spsv_analysis_csr(
+        Asp.values(),
+        Asp.col_indices().to(torch.int32),
+        Asp.crow_indices().to(torch.int32),
+        (n, n),
+        lower=False,
+        unit_diagonal=False,
+        transpose=False,
+        solve_kind=solve_kind,
+    )
+    workspace = flagsparse_spsv_preprocess_csr(
+        descr, workspace=flagsparse_spsv_create_workspace(descr)
+    )
+    x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
+    x_direct = flagsparse_spsv_csr(
+        Asp.values(),
+        Asp.col_indices().to(torch.int32),
+        Asp.crow_indices().to(torch.int32),
+        b,
+        (n, n),
+        lower=False,
+        unit_diagonal=False,
+        solve_kind=solve_kind,
+    )
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(x_via_descr, x_direct, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv

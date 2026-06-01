@@ -66,9 +66,10 @@ python tests/test_spmv_opt.py <dir/> --csv out.csv
 
 ```bash
 python tests/test_spmm.py <dir_or_file.mtx>
-python tests/test_spmm.py --synthetic                    # optional: --skip-api-checks, --skip-alg1-coverage
-python tests/test_spmm.py <dir/> --csv results.csv      # float32/float64 + int32 in CSV; per-matrix console output
-# common options: --dtype, --index-dtype, --dense-cols, --block-n, --block-nnz, --max-segments, --warmup, --iters, --no-cusparse
+python tests/test_spmm.py --synthetic                    # optional: --ops non,trans,conj
+python tests/test_spmm.py <dir/> --csv results.csv      # float32/float64/complex64/complex128 + int32/int64 + ops grid
+# common options: --dtype, --index-dtype, --ops, --dense-cols, --block-n, --block-nnz, --max-segments, --warmup, --iters, --no-cusparse
+# CSR SpMM supports op="non" (A @ B), op="trans" (A.T @ B), and op="conj" (A.conj().T @ B).
 ```
 
 **test_spmm_opt.py** - CSR SpMM baseline vs optimised A/B:
