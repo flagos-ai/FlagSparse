@@ -13,7 +13,8 @@ def test_readme_install_command_is_present():
 def test_readme_cpu_smoke_examples_are_present():
     for snippet in [
         "pytest tests/pytest --mode quick",
-        "python run_flagsparse_pytest.py --mode quick --ops gather,spmv_csr,spmm_csr --gpus 0",
+        "python run_flagsparse_pytest.py --phase accuracy --mode quick --gpus 0",
+        "python run_flagsparse_pytest.py --phase both --mode quick --gpus 0,1 --benchmark-input matrix --results-dir pytest_results",
         "python tests/test_spmv.py <dir_or_file.mtx>",
         "python tests/test_spmm.py --synthetic",
         "python tests/test_spgemm.py <dir_or_file.mtx> --input-mode auto",
