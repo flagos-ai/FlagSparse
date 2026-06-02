@@ -12,7 +12,7 @@ def test_readme_install_command_is_present():
 
 def test_readme_cpu_smoke_examples_are_present():
     accuracy_runner = (
-        "python run_flagsparse_pytest.py --phase accuracy " "--mode quick --gpus 0"
+        "python run_flagsparse_pytest.py --phase accuracy --mode quick --gpus 0"
     )
     both_phase_runner = (
         "python run_flagsparse_pytest.py --phase both --mode quick "
@@ -44,7 +44,7 @@ def test_readme_ci_cd_section_mentions_workflows():
 def test_readme_documents_standardized_command_policy():
     for snippet in [
         "documented invocation standard",
-        ("CPU-only install, build, help-text, and smoke paths " "are checked in CI"),
+        ("CPU-only install, build, help-text, and smoke paths are checked in CI"),
         "`make ci` / `make check`",
         "`make format-check`, `make lint`, and `make lint-src`",
         "`make release-check` / `make release`",
