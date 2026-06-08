@@ -24,21 +24,110 @@ def _tol(dtype):
     return close_tolerances(dtype)
 
 
+def _reference(Asp, B, op):
+    if op == "non":
+        return torch.sparse.mm(Asp, B)
+    if op == "trans":
+        return torch.sparse.mm(Asp.transpose(0, 1), B)
+    if op == "conj":
+        return torch.sparse.mm(Asp.conj().transpose(0, 1), B)
+    raise ValueError(op)
+
+
 @pytest.mark.spmm_coo
 @pytest.mark.parametrize("M, N, K", MNK_SHAPES)
 @pytest.mark.parametrize("dtype", SPMM_OPT_DTYPES, ids=SPMM_OPT_DTYPE_IDS)
-def test_spmm_coo_matches_torch(M, N, K, dtype):
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmm_coo_matches_torch(M, N, K, dtype, index_dtype, op):
     device = torch.device("cuda")
     Asp = _random_coo_mk(M, K, dtype, device)
     indices = Asp.indices()
     data = Asp.values()
-    row = indices[0].contiguous()
-    col = indices[1].contiguous()
-    B = torch.randn(K, N, dtype=dtype, device=device)
+    row = indices[0].to(index_dtype).contiguous()
+    col = indices[1].to(index_dtype).contiguous()
+    b_rows = M if op in ("trans", "conj") else K
+    B = torch.randn(b_rows, N, dtype=dtype, device=device)
+    ref_A = Asp
+    ref_B = B
     if dtype == torch.float32:
-        ref = torch.sparse.mm(Asp.double(), B.double()).float()
-    else:
-        ref = torch.sparse.mm(Asp, B)
-    out = flagsparse_spmm_coo(data, row, col, B, (M, K))
+        ref_A = Asp.double()
+        ref_B = B.double()
+    ref = _reference(ref_A, ref_B, op).to(dtype)
+    out = flagsparse_spmm_coo(data, row, col, B, (M, K), op=op)
     rtol, atol = _tol(dtype)
     assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spmm_coo
+def test_spmm_coo_return_meta_times_transpose_path():
+    device = torch.device("cuda")
+    data = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device=device)
+    row = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    col = torch.tensor([1, 2, 0], dtype=torch.int32, device=device)
+    B = torch.randn(3, 4, dtype=torch.float32, device=device)
+    out, elapsed_ms, meta = flagsparse_spmm_coo(
+        data,
+        row,
+        col,
+        B,
+        (3, 3),
+        op="trans",
+        return_time=True,
+        return_meta=True,
+    )
+    assert out.shape == (3, 4)
+    assert meta["op"] == "trans"
+    assert meta["symbolic_ms"] >= 0.0
+    assert meta["compute_ms"] >= 0.0
+    assert elapsed_ms == pytest.approx(meta["op_total_ms"])
+    assert meta["op_total_ms"] == pytest.approx(meta["symbolic_ms"] + meta["compute_ms"])
+
+
+@pytest.mark.spmm_coo
+def test_spmm_coo_non_meta_has_zero_symbolic_time():
+    device = torch.device("cuda")
+    data = torch.tensor([1.0, 2.0], dtype=torch.float32, device=device)
+    row = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    col = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    B = torch.randn(2, 3, dtype=torch.float32, device=device)
+    out, meta = flagsparse_spmm_coo(
+        data,
+        row,
+        col,
+        B,
+        (2, 2),
+        return_meta=True,
+    )
+    assert out.shape == (2, 3)
+    assert meta["op"] == "non"
+    assert meta["symbolic_ms"] == 0.0
+
+
+@pytest.mark.spmm_coo
+def test_spmm_coo_rejects_invalid_ops_and_shapes():
+    device = torch.device("cuda")
+    data = torch.tensor([1.0, 2.0], dtype=torch.float32, device=device)
+    row = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    col = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    B_non = torch.randn(2, 3, dtype=torch.float32, device=device)
+    B_bad_trans = torch.randn(4, 3, dtype=torch.float32, device=device)
+
+    with pytest.raises(ValueError):
+        flagsparse_spmm_coo(data, row, col, B_non, (2, 4), op="bad")
+    with pytest.raises(ValueError):
+        flagsparse_spmm_coo(data, row, col, B_non, (2, 4), op="non", transpose=True)
+    with pytest.raises(ValueError):
+        flagsparse_spmm_coo(data, row, col, B_bad_trans, (2, 4), op="trans", transpose=False)
+    with pytest.raises(ValueError):
+        flagsparse_spmm_coo(data, row, col, B_bad_trans, (2, 4), op="trans")
+    with pytest.raises(ValueError):
+        flagsparse_spmm_coo(
+            data,
+            row,
+            col,
+            B_non,
+            (2, 4),
+            op="trans",
+            out=torch.empty((2, 3), dtype=torch.float32, device=device),
+        )

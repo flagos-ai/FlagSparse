@@ -8,6 +8,54 @@ from .spmm_csr import (
     _spmm_relative_threshold,
     _spmm_validation_metrics,
 )
+
+SPMM_COO_OP_NON = 0
+SPMM_COO_OP_TRANS = 1
+SPMM_COO_OP_CONJ_TRANS = 2
+SPMM_COO_OP_NAMES = {
+    SPMM_COO_OP_NON: "non",
+    SPMM_COO_OP_TRANS: "trans",
+    SPMM_COO_OP_CONJ_TRANS: "conj",
+}
+_SPMM_COO_OP_NAME_TO_CODE = {name: code for code, name in SPMM_COO_OP_NAMES.items()}
+
+
+def _normalize_spmm_coo_op(op=None, transpose=False):
+    if op is None:
+        return SPMM_COO_OP_TRANS if bool(transpose) else SPMM_COO_OP_NON
+    if isinstance(op, str):
+        token = op.strip().lower()
+        if token not in _SPMM_COO_OP_NAME_TO_CODE:
+            raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+        return _SPMM_COO_OP_NAME_TO_CODE[token]
+    try:
+        op_code = int(op)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj") from exc
+    if op_code not in SPMM_COO_OP_NAMES:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+    return op_code
+
+
+def _spmm_coo_op_to_name(op):
+    return SPMM_COO_OP_NAMES[_normalize_spmm_coo_op(op)]
+
+
+def _spmm_coo_op_transposes(op):
+    return _normalize_spmm_coo_op(op) in (SPMM_COO_OP_TRANS, SPMM_COO_OP_CONJ_TRANS)
+
+
+def _materialize_spmm_coo_op(data, row, col, shape, op_code):
+    if op_code == SPMM_COO_OP_NON:
+        return data, row, col, shape
+    data_op = data
+    if op_code == SPMM_COO_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+        data_op = data.conj()
+        if hasattr(data_op, "resolve_conj"):
+            data_op = data_op.resolve_conj()
+    return data_op, col, row, (int(shape[1]), int(shape[0]))
+
+
 def _spmm_coo_compute_dtype(value_dtype):
     if _is_complex_dtype(value_dtype):
         return torch.complex128 if value_dtype == torch.complex64 else value_dtype
@@ -656,13 +704,41 @@ def _run_spmm_coo_route(
     block_nnz=256,
     out=None,
     return_time=False,
+    return_meta=False,
     route="rowrun",
+    op=None,
+    transpose=None,
 ):
     route = _normalize_spmm_coo_route(route)
+    op_explicit = op is not None
+    op_code = _normalize_spmm_coo_op(
+        op,
+        transpose=False if transpose is None else bool(transpose),
+    )
+    if (
+        op_explicit
+        and transpose is not None
+        and bool(transpose) != _spmm_coo_op_transposes(op_code)
+    ):
+        raise ValueError("transpose conflicts with op")
+    op_name = _spmm_coo_op_to_name(op_code)
     if block_n is not None and block_n <= 0:
         raise ValueError("block_n must be positive when provided")
     if block_nnz is not None and block_nnz <= 0:
         raise ValueError("block_nnz must be positive when provided")
+
+    do_timing = bool(return_time or return_meta)
+    symbolic_ms = 0.0 if do_timing else None
+    compute_ms = None
+    op_total_ms = None
+
+    if do_timing:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+    data, row, col, shape = _materialize_spmm_coo_op(data, row, col, shape, op_code)
+    if do_timing:
+        torch.cuda.synchronize()
+        symbolic_ms = (time.perf_counter() - t0) * 1000.0 if _spmm_coo_op_transposes(op_code) else 0.0
 
     (
         canonical_data,
@@ -676,7 +752,7 @@ def _run_spmm_coo_route(
         _,
     ) = _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape)
 
-    return _run_spmm_coo_canonical_route(
+    result = _run_spmm_coo_canonical_route(
         canonical_data,
         canonical_row,
         canonical_col,
@@ -687,9 +763,31 @@ def _run_spmm_coo_route(
         block_n=block_n,
         block_nnz=block_nnz,
         out=out,
-        return_time=return_time,
+        return_time=do_timing,
         route=route,
     )
+    if do_timing:
+        C, compute_ms = result
+        op_total_ms = symbolic_ms + compute_ms
+    else:
+        C = result
+
+    meta = None
+    if return_meta:
+        meta = {
+            "op": op_name,
+            "route": route,
+            "symbolic_ms": symbolic_ms,
+            "compute_ms": compute_ms,
+            "op_total_ms": op_total_ms,
+        }
+    if return_time and return_meta:
+        return C, op_total_ms, meta
+    if return_time:
+        return C, op_total_ms
+    if return_meta:
+        return C, meta
+    return C
 
 def flagsparse_spmm_coo(
     data,
@@ -701,8 +799,15 @@ def flagsparse_spmm_coo(
     block_nnz=256,
     out=None,
     return_time=False,
+    transpose=None,
+    op=None,
+    return_meta=False,
 ):
-    """COO SpMM: C = A @ B using a native Triton COO row-run kernel by default."""
+    """COO SpMM using a native Triton COO row-run kernel by default.
+
+    op: 0/'non' for A @ B, 1/'trans' for A.T @ B,
+    2/'conj' for A.conj().T @ B.
+    """
     return _run_spmm_coo_route(
         data,
         row,
@@ -713,7 +818,10 @@ def flagsparse_spmm_coo(
         block_nnz=block_nnz,
         out=out,
         return_time=return_time,
+        return_meta=return_meta,
         route="rowrun",
+        op=op,
+        transpose=transpose,
     )
 
 
@@ -736,7 +844,9 @@ def _build_spmm_coo_pytorch_reference_from_canonical(
 
 
 
-def _build_spmm_coo_pytorch_reference(data, row, col, B, shape):
+def _build_spmm_coo_pytorch_reference(data, row, col, B, shape, op="non"):
+    op_code = _normalize_spmm_coo_op(op)
+    data, row, col, shape = _materialize_spmm_coo_op(data, row, col, shape, op_code)
     native_data, native_row, native_col, native_B, n_rows, n_cols, n_dense_cols = _prepare_spmm_coo_inputs(
         data, row, col, B, shape
     )
@@ -824,32 +934,28 @@ def _benchmark_spmm_coo_route(
     block_n,
     block_nnz,
     route,
+    op="non",
 ):
-    (
-        canonical_data,
-        canonical_row,
-        canonical_col,
-        canonical_B,
-        n_rows,
-        _,
-        n_dense_cols,
-        output_dtype,
-        _,
-    ) = _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape)
-    return _benchmark_spmm_coo_canonical_route(
-        canonical_data,
-        canonical_row,
-        canonical_col,
-        canonical_B,
-        n_rows,
-        n_dense_cols,
-        output_dtype,
-        warmup,
-        iters,
-        block_n,
-        block_nnz,
-        route,
+    route = _normalize_spmm_coo_route(route)
+    run = lambda: _run_spmm_coo_route(
+        data,
+        row,
+        col,
+        B,
+        shape,
+        block_n=block_n,
+        block_nnz=block_nnz,
+        return_time=False,
+        route=route,
+        op=op,
     )
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    _ = run()
+    torch.cuda.synchronize()
+    first_call_ms = (time.perf_counter() - t0) * 1000.0
+    values, steady_ms = _benchmark_cuda_op(run, warmup=warmup, iters=iters)
+    return values, steady_ms, first_call_ms
 def _spmm_coo_pairwise_summary(candidate, reference, value_dtype):
     metrics = _spmm_validation_metrics(candidate, reference)
     atol, rtol = _spmm_coo_reference_tolerance(value_dtype)
@@ -882,18 +988,29 @@ def benchmark_spmm_coo_case(
     run_cusparse=True,
     route="rowrun",
     compare_routes=False,
+    op="non",
 ):
     """Benchmark native COO SpMM vs PyTorch COO sparse.mm and CuPy/cuSPARSE COO @ dense."""
     selected_route = _normalize_spmm_coo_route(route)
+    op_code = _normalize_spmm_coo_op(op)
+    op_name = _spmm_coo_op_to_name(op_code)
     device = torch.device("cuda")
     data, row, col = _build_random_coo(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
-    B = _build_random_dense((n_cols, n_dense_cols), value_dtype, device)
     shape = (n_rows, n_cols)
+    b_rows = n_rows if _spmm_coo_op_transposes(op_code) else n_cols
+    B = _build_random_dense((b_rows, n_dense_cols), value_dtype, device)
+    effective_data, effective_row, effective_col, effective_shape = _materialize_spmm_coo_op(
+        data,
+        row,
+        col,
+        shape,
+        op_code,
+    )
 
     native_data, native_row, native_col, native_B, _, _, _ = _prepare_spmm_coo_inputs(
-        data, row, col, B, shape
+        effective_data, effective_row, effective_col, B, effective_shape
     )
     (
         canonical_data,
@@ -928,27 +1045,26 @@ def benchmark_spmm_coo_case(
         canonical_row,
         canonical_col,
         canonical_B,
-        shape,
+        effective_shape,
         output_dtype,
     )
-    pytorch_coo = _build_torch_sparse_coo(native_data, native_row, native_col, shape)
+    pytorch_coo = _build_torch_sparse_coo(native_data, native_row, native_col, effective_shape)
     pytorch_op = lambda: torch.sparse.mm(pytorch_coo, native_B)
     pytorch_format = "COO"
     pytorch_reason = None
 
-    triton_C, triton_ms, triton_first_call_ms = _benchmark_spmm_coo_canonical_route(
-        canonical_data,
-        canonical_row,
-        canonical_col,
-        canonical_B,
-        n_rows,
-        n_dense_cols,
-        output_dtype,
+    triton_C, triton_ms, triton_first_call_ms = _benchmark_spmm_coo_route(
+        data,
+        row,
+        col,
+        B,
+        shape,
         warmup,
         iters,
         launch["block_n"],
         launch["block_nnz"],
         selected_route,
+        op=op_name,
     )
     triton_summary = _spmm_coo_pairwise_summary(triton_C, expected, value_dtype)
     triton_match = triton_summary["match"]
@@ -985,7 +1101,7 @@ def benchmark_spmm_coo_case(
                 col_cp = _cupy_from_torch(native_col.to(torch.int64))
                 B_cp = _cupy_from_torch(native_B)
                 A_coo = cpx_sparse.coo_matrix(
-                    (data_cp, (row_cp, col_cp)), shape=shape
+                    (data_cp, (row_cp, col_cp)), shape=effective_shape
                 )
                 cusparse_values_cp, cusparse_ms = _benchmark_cuda_op(
                     lambda: A_coo @ B_cp, warmup=warmup, iters=iters
@@ -1026,19 +1142,18 @@ def benchmark_spmm_coo_case(
             if extra_route in route_outputs:
                 continue
             try:
-                extra_values, extra_ms, extra_first_call_ms = _benchmark_spmm_coo_canonical_route(
-                    canonical_data,
-                    canonical_row,
-                    canonical_col,
-                    canonical_B,
-                    n_rows,
-                    n_dense_cols,
-                    output_dtype,
+                extra_values, extra_ms, extra_first_call_ms = _benchmark_spmm_coo_route(
+                    data,
+                    row,
+                    col,
+                    B,
+                    shape,
                     warmup,
                     iters,
                     launch["block_n"],
                     launch["block_nnz"],
                     extra_route,
+                    op=op_name,
                 )
                 extra_summary = _spmm_coo_pairwise_summary(extra_values, expected, value_dtype)
                 route_outputs[extra_route] = extra_values
@@ -1100,6 +1215,7 @@ def benchmark_spmm_coo_case(
             "format": "coo",
             "internal_format": f"native-{selected_route}",
             "route": selected_route,
+            "op": op_name,
             "compare_routes": bool(compare_routes),
             "n_rows": n_rows,
             "n_cols": n_cols,
@@ -1178,6 +1294,7 @@ def comprehensive_spmm_coo_test(
     block_n=None,
     block_nnz=256,
     run_cusparse=True,
+    op="non",
 ):
     """Full COO SpMM benchmark entry for one configuration."""
     return benchmark_spmm_coo_case(
@@ -1192,4 +1309,5 @@ def comprehensive_spmm_coo_test(
         block_n=block_n,
         block_nnz=block_nnz,
         run_cusparse=run_cusparse,
+        op=op,
     )
