@@ -1039,6 +1039,18 @@ def benchmark_spmm_coo_case(
     )
     seg_starts = _seg_starts_from_sorted_rows(canonical_row, canonical_data.numel(), device)
     n_row_runs = int(seg_starts.numel()) - 1 if seg_starts is not None else 0
+    cusparse_data, cusparse_row, cusparse_col = _coalesce_coo_entries(
+        native_data,
+        native_row,
+        native_col,
+        effective_shape,
+    )
+    cusparse_data, cusparse_row, cusparse_col = _sort_coo_lex_inplace(
+        cusparse_data,
+        cusparse_row,
+        cusparse_col,
+        effective_shape[1],
+    )
 
     expected = _build_spmm_coo_pytorch_reference_from_canonical(
         canonical_data,
@@ -1096,9 +1108,9 @@ def benchmark_spmm_coo_case(
             cusparse_reason = "float16/bfloat16 not supported by CuPy sparse; skipped"
         else:
             try:
-                data_cp = _cupy_from_torch(native_data)
-                row_cp = _cupy_from_torch(native_row.to(torch.int64))
-                col_cp = _cupy_from_torch(native_col.to(torch.int64))
+                data_cp = _cupy_from_torch(cusparse_data)
+                row_cp = _cupy_from_torch(cusparse_row.to(torch.int64))
+                col_cp = _cupy_from_torch(cusparse_col.to(torch.int64))
                 B_cp = _cupy_from_torch(native_B)
                 A_coo = cpx_sparse.coo_matrix(
                     (data_cp, (row_cp, col_cp)), shape=effective_shape

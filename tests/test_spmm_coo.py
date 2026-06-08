@@ -341,6 +341,18 @@ def _prepare_canonical_case(data, row, col, shape, B, op="non"):
         n_cols,
         n_dense_cols,
     )
+    cusparse_data, cusparse_row, cusparse_col = ast_ops._coalesce_coo_entries(
+        native_data,
+        native_row,
+        native_col,
+        (n_rows, n_cols),
+    )
+    cusparse_data, cusparse_row, cusparse_col = ast_ops._sort_coo_lex_inplace(
+        cusparse_data,
+        cusparse_row,
+        cusparse_col,
+        n_cols,
+    )
     native_coo = ast_ops._build_torch_sparse_coo(native_data, native_row, native_col, shape)
     return {
         "native_data": native_data,
@@ -348,6 +360,9 @@ def _prepare_canonical_case(data, row, col, shape, B, op="non"):
         "native_col": native_col,
         "native_B": native_B,
         "native_coo": native_coo,
+        "cusparse_data": cusparse_data,
+        "cusparse_row": cusparse_row,
+        "cusparse_col": cusparse_col,
         "canonical_data": canonical_data,
         "canonical_row": canonical_row,
         "canonical_col": canonical_col,
@@ -368,7 +383,7 @@ def _build_pytorch_reference(data, row, col, shape, B, prepared=None, op="non"):
         prepared["canonical_row"],
         prepared["canonical_col"],
         prepared["canonical_B"],
-        shape,
+        (prepared["n_rows"], prepared["n_cols"]),
         prepared["output_dtype"],
     )
     pytorch_op = lambda: torch.sparse.mm(prepared["native_coo"], prepared["native_B"])
@@ -681,9 +696,9 @@ def run_one_mtx(
                 import cupy as cp
                 import cupyx.scipy.sparse as cpx
 
-                data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["native_data"]))
-                row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["native_row"].to(torch.int64)))
-                col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["native_col"].to(torch.int64)))
+                data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["cusparse_data"]))
+                row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["cusparse_row"].to(torch.int64)))
+                col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["cusparse_col"].to(torch.int64)))
                 B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["native_B"]))
                 A_coo = cpx.coo_matrix(
                     (data_cp, (row_cp, col_cp)),

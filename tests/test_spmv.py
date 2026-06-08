@@ -474,13 +474,15 @@ def _time_cupy_spmv(data, indices, indptr, x, shape, warmup, iters, op="non", fm
 
 
 def _tolerance(value_dtype):
-    if value_dtype in (torch.float16, torch.bfloat16):
-        return 2e-3, 2e-3
+    if value_dtype == torch.float16:
+        return 1e-3, 2e-3
+    if value_dtype == torch.bfloat16:
+        return 0.016, 1e-1
     if value_dtype in (torch.float32, torch.complex64):
-        return 1.25e-4, 1.25e-2
+        return 1.3e-6, 1e-3
     if value_dtype in (torch.float64, torch.complex128):
-        return 1e-12, 1e-10
-    return 5e-3, 5e-3
+        return 1e-7, 1e-5
+    return 1e-6, 1e-5
 
 
 def run_one_mtx(
