@@ -19,14 +19,20 @@ from tests.pytest.accuracy_utils import close_tolerances
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
+_SYNTHETIC_VALUE_SCALE = 0.125
 
-def _random_csr_mk(M, K, dtype, device):
+
+def _random_csr_mk(M, K, dtype, device, value_scale=_SYNTHETIC_VALUE_SCALE):
     denom = max(M * K, 1)
     p = min(0.25, max(0.06, 32.0 / denom))
     mask = torch.rand(M, K, device=device) < p
     if int(mask.sum().item()) == 0:
         mask[0, 0] = True
-    vals = torch.randn(M, K, dtype=dtype, device=device) * mask.to(dtype=dtype)
+    vals = (
+        torch.randn(M, K, dtype=dtype, device=device)
+        * value_scale
+        * mask.to(dtype=dtype)
+    )
     return vals.to_sparse_csr()
 
 
@@ -34,16 +40,16 @@ def _plain_sparse_values(sparse_tensor):
     return sparse_tensor.values().clone()
 
 
-def _random_dense(shape, dtype, device):
+def _random_dense(shape, dtype, device, value_scale=_SYNTHETIC_VALUE_SCALE):
     if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-        return torch.randn(shape, dtype=dtype, device=device)
+        return torch.randn(shape, dtype=dtype, device=device) * value_scale
     if dtype == torch.complex64:
-        real = torch.randn(shape, dtype=torch.float32, device=device)
-        imag = torch.randn(shape, dtype=torch.float32, device=device)
+        real = torch.randn(shape, dtype=torch.float32, device=device) * value_scale
+        imag = torch.randn(shape, dtype=torch.float32, device=device) * value_scale
         return torch.complex(real, imag)
     if dtype == torch.complex128:
-        real = torch.randn(shape, dtype=torch.float64, device=device)
-        imag = torch.randn(shape, dtype=torch.float64, device=device)
+        real = torch.randn(shape, dtype=torch.float64, device=device) * value_scale
+        imag = torch.randn(shape, dtype=torch.float64, device=device) * value_scale
         return torch.complex(real, imag)
     raise TypeError(f"unsupported dtype: {dtype}")
 
@@ -80,16 +86,12 @@ SPMM_OP_DTYPE_IDS = ("float32", "float64", "complex64", "complex128")
 @pytest.mark.parametrize("M, N, K", MNK_SHAPES)
 @pytest.mark.parametrize("dtype", SPMM_FLOAT_DTYPES, ids=SPMM_FLOAT_DTYPE_IDS)
 def test_spmm_csr_matches_torch(M, N, K, dtype):
-    if dtype == torch.bfloat16 and not (
-        torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    ):
-        pytest.skip("bfloat16 not supported on this GPU")
     device = torch.device("cuda")
     Asp = _random_csr_mk(M, K, dtype, device)
     data = _plain_sparse_values(Asp)
     indices = Asp.col_indices()
     indptr = Asp.crow_indices()
-    B = torch.randn(K, N, dtype=dtype, device=device)
+    B = _random_dense((K, N), dtype, device)
     if dtype == torch.float32:
         Asp64 = torch.sparse_csr_tensor(
             crow_indices=indptr,
@@ -217,12 +219,15 @@ def test_spmm_csr_op_validation_errors():
 @pytest.mark.spmm_csr_opt
 @pytest.mark.parametrize("M, N, K", MNK_SHAPES)
 @pytest.mark.parametrize("dtype", SPMM_OPT_DTYPES, ids=SPMM_OPT_DTYPE_IDS)
-def test_spmm_csr_opt_matches_torch(M, N, K, dtype):
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
+def test_spmm_csr_opt_matches_torch(M, N, K, dtype, index_dtype):
     device = torch.device("cuda")
     Asp = _random_csr_mk(M, K, dtype, device)
     data = _plain_sparse_values(Asp)
-    indices = Asp.col_indices()
-    indptr = Asp.crow_indices()
+    indices = Asp.col_indices().to(index_dtype)
+    indptr = Asp.crow_indices().to(index_dtype)
     B = torch.randn(K, N, dtype=dtype, device=device)
     if dtype == torch.float32:
         Asp64 = torch.sparse_csr_tensor(

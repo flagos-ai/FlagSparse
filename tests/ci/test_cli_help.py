@@ -15,6 +15,8 @@ if os.environ.get("FLAGSPARSE_TRITON_SMOKE") != "1":
     )
 
 SCRIPTS = [
+    "run_flagsparse_accuracy.py",
+    "run_flagsparse_performance.py",
     "run_flagsparse_pytest.py",
     "tests/test_spmv.py",
     "tests/test_spmv_coo.py",

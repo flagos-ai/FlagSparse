@@ -5,7 +5,10 @@ from flagsparse import flagsparse_gather, flagsparse_scatter
 from flagsparse.sparse_operations import gather_scatter as gather_scatter_ops
 
 from tests.pytest.accuracy_utils import close_tolerances
-from tests.pytest.param_shapes import FLOAT_DTYPES, GATHER_SCATTER_SHAPES
+from tests.pytest.param_shapes import (
+    GATHER_SCATTER_FLOAT_DTYPES,
+    GATHER_SCATTER_SHAPES,
+)
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -26,7 +29,10 @@ GATHER_DTYPE_IDS = [name for name, _ in GATHER_DTYPE_CASES]
 
 
 def _scatter_dtype_cases():
-    cases = [(str(dtype).replace("torch.", ""), dtype) for dtype in FLOAT_DTYPES]
+    cases = [
+        (str(dtype).replace("torch.", ""), dtype)
+        for dtype in GATHER_SCATTER_FLOAT_DTYPES
+    ]
     cases.append(("complex64", torch.complex64))
     cases.append(("complex128", torch.complex128))
     return cases
@@ -145,7 +151,9 @@ def test_scatter_int64_auto_fallback_to_int32(monkeypatch):
             block_size=block_size,
         )
 
-    monkeypatch.setattr(gather_scatter_ops, "_launch_triton_scatter_kernel", fake_launch)
+    monkeypatch.setattr(
+        gather_scatter_ops, "_launch_triton_scatter_kernel", fake_launch
+    )
 
     flagsparse_scatter(
         dense,
@@ -181,7 +189,9 @@ def test_scatter_int64_strict_no_fallback(monkeypatch):
             block_size=block_size,
         )
 
-    monkeypatch.setattr(gather_scatter_ops, "_launch_triton_scatter_kernel", fake_launch)
+    monkeypatch.setattr(
+        gather_scatter_ops, "_launch_triton_scatter_kernel", fake_launch
+    )
 
     with pytest.raises(RuntimeError, match="Triton scatter failed for index dtype"):
         flagsparse_scatter(

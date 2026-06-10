@@ -28,16 +28,16 @@ Run from project root, or `cd tests` then run scripts (paths like `../matrix` fo
 
 The commands below are the repository's documented invocation standard. CPU-only install, build, help-text, and smoke paths are checked in CI; GPU-specific examples are documented but not executed there unless you opt into the triton smoke job locally.
 
-**Unified operator test runner** - YAML-driven accuracy/performance runs by operator:
+**Operator test runners** - YAML-driven accuracy/performance runs by operator:
 
 ```bash
-python run_flagsparse_pytest.py --list-ops
-python run_flagsparse_pytest.py --phase accuracy --mode quick --gpus 0
+python run_flagsparse_accuracy.py --list-ops
+python run_flagsparse_accuracy.py --mode quick --gpus 0
+python run_flagsparse_performance.py --ops spmv_csr,spmm_csr --benchmark-input matrix --benchmark-warmup 5 --benchmark-iters 20
 python run_flagsparse_pytest.py --phase both --mode quick --gpus 0,1 --benchmark-input matrix --results-dir pytest_results
-python run_flagsparse_pytest.py --phase performance --ops spmv_csr,spmm_csr --benchmark-input matrix --benchmark-warmup 5 --benchmark-iters 20
 ```
 
-By default, `run_flagsparse_pytest.py` reads operator ids from `conf/operators.yaml`, filters by `--stages`, and distributes operators across `--gpus`. `--ops` and `--op-list` override the YAML selection. The default sweep excludes manual-test entries `alpha_spmm_alg1` and `spmv_coo_tocsr`; include them explicitly with `--ops` or `--op-list` when needed. Helper APIs such as `spsv_descriptor_api` and `sparse_format_constructors` are not operator test entries.
+By default, `run_flagsparse_accuracy.py` and `run_flagsparse_performance.py` read operator ids from `conf/operators.yaml`, filter by `--stages`, and distribute operators across `--gpus`. `run_flagsparse_pytest.py --phase both` remains available when one command should run both phases. `--ops` and `--op-list` override the YAML selection. The default sweep excludes manual-test entries `alpha_spmm_alg1` and `spmv_coo_tocsr`; include them explicitly with `--ops` or `--op-list` when needed. Helper APIs such as `spsv_descriptor_api` and `sparse_format_constructors` are not operator test entries.
 
 The accuracy phase launches `pytest tests/pytest -m <operator marker> --mode quick|normal --record json --output <op>/accuracy_result.json` and uses synthetic CUDA data. The performance phase launches the configured `tests/test_*.py` benchmark command for each operator; MatrixMarket-backed commands receive `--benchmark-input` (default `tests/data`, or pass `matrix` for the local matrix directory), and the CSV output is also normalized into a FlagGems-style `<op>/performance_result.json`. Results are written under `pytest_results_<timestamp>/` unless `--results-dir` is provided. Each operator directory contains `accuracy.log`, `accuracy_result.json`, `accuracy_detail.json`, `performance.log`, `performance.csv`, `performance_result.json`, and `performance_detail.json` when those phases run. The root `summary.json` uses the FlagGems `timestamp` / `env` / `result` structure. FlagSparse-only fields such as GPU id, commands, logs, totals, parsed pytest cases, and normalized benchmark records are kept in `summary_flat.json` and the per-operator `*_detail.json` files. `summary.csv` and optional `summary.xlsx` provide table-friendly views.
 

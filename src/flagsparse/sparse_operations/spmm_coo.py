@@ -566,6 +566,8 @@ def _triton_spmm_coo_impl(
     output_dtype=None,
 ):
     route = _normalize_spmm_coo_route(route)
+    if route == "rowrun" and _is_complex_dtype(data.dtype):
+        route = "atomic"
     resolved_output_dtype = output_dtype if output_dtype is not None else data.dtype
     if route == "rowrun":
         return _triton_spmm_coo_rowrun_impl(
@@ -702,7 +704,11 @@ def flagsparse_spmm_coo(
     out=None,
     return_time=False,
 ):
-    """COO SpMM: C = A @ B using a native Triton COO row-run kernel by default."""
+    """COO SpMM: C = A @ B.
+
+    Real dtypes use the row-run kernel by default. Complex dtypes use the
+    atomic COO route because the complex row-run kernel is not stable yet.
+    """
     return _run_spmm_coo_route(
         data,
         row,

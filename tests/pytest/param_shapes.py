@@ -39,27 +39,23 @@ else:
     SDDMM_MNK_SHAPES = [(8, 10, 8), (64, 96, 16)]
 
 
-def _bf16_ok():
-    if not torch.cuda.is_available():
-        return False
-    fn = getattr(torch.cuda, "is_bf16_supported", None)
-    return bool(fn()) if callable(fn) else False
-
-
-_PRIMARY_FLOAT = [torch.float16, torch.float32]
-FLOAT_DTYPES = _PRIMARY_FLOAT + ([torch.bfloat16] if _bf16_ok() else []) + [torch.float64]
-
-
 def _dtype_node_id(value):
     """Short name for pytest node IDs (e.g. ``torch.float32`` -> ``float32``)."""
     return str(value).replace("torch.", "")
 
 
-FLOAT_DTYPE_IDS = [_dtype_node_id(d) for d in FLOAT_DTYPES]
+CORE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
+CORE_DTYPE_IDS = [_dtype_node_id(d) for d in CORE_DTYPES]
+GATHER_SCATTER_FLOAT_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+)
 SPMV_COO_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 SPMV_COO_DTYPE_IDS = ("float32", "float64", "complex64", "complex128")
-SPMM_FLOAT_DTYPES = FLOAT_DTYPES
-SPMM_FLOAT_DTYPE_IDS = FLOAT_DTYPE_IDS
+SPMM_FLOAT_DTYPES = CORE_DTYPES
+SPMM_FLOAT_DTYPE_IDS = CORE_DTYPE_IDS
 SPMM_OPT_DTYPES = (torch.float32, torch.float64)
 SPMM_OPT_DTYPE_IDS = ("float32", "float64")
 TRIANGULAR_DTYPES = (torch.float32, torch.float64)

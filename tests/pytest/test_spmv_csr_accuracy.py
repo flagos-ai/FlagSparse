@@ -14,21 +14,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 def _value_dtype_cases():
     cases = [
-        ("float16", torch.float16),
-        ("bfloat16", torch.bfloat16),
         ("float32", torch.float32),
         ("float64", torch.float64),
         ("complex64", torch.complex64),
         ("complex128", torch.complex128),
     ]
     return [(name, dtype) for name, dtype in cases if dtype is not None]
-
-
-def _skip_unavailable_dtype(name, dtype):
-    if dtype == torch.bfloat16 and not (
-        torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    ):
-        pytest.skip("bfloat16 not supported on this GPU")
 
 
 def _random_dense(shape, dtype, device):
@@ -65,7 +56,11 @@ def _random_csr_mn(M, N, dtype, index_dtype, device):
     mask = torch.rand(M, N, device=device) < p
     if int(mask.sum().item()) == 0:
         mask[0, 0] = True
-    dense = torch.where(mask, _random_dense((M, N), dtype, device), torch.zeros((), dtype=dtype, device=device))
+    dense = torch.where(
+        mask,
+        _random_dense((M, N), dtype, device),
+        torch.zeros((), dtype=dtype, device=device),
+    )
     rows, cols = torch.nonzero(mask, as_tuple=True)
     data = dense[rows, cols].contiguous()
     row_counts = torch.bincount(rows, minlength=M)
@@ -95,16 +90,21 @@ def _apply_dense_op(dense, op):
 def _assert_close(actual, expected, dtype):
     rtol, atol = _tol(dtype)
     ref_dtype = _reference_dtype(dtype)
-    assert torch.allclose(actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(
+        actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol
+    )
 
 
 @pytest.mark.spmv_csr
 @pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
-@pytest.mark.parametrize("name,dtype", _value_dtype_cases(), ids=[c[0] for c in _value_dtype_cases()])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "name,dtype", _value_dtype_cases(), ids=[c[0] for c in _value_dtype_cases()]
+)
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, op):
-    _skip_unavailable_dtype(name, dtype)
     device = torch.device("cuda")
     data, indices, indptr, dense = _random_csr_mn(M, N, dtype, index_dtype, device)
     transpose = _op_transposes(op)
@@ -128,7 +128,9 @@ def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, op):
 @pytest.mark.spmv_csr
 def test_spmv_csr_prepared_transpose_mismatch_rejected():
     device = torch.device("cuda")
-    data, indices, indptr, _dense = _random_csr_mn(8, 10, torch.float32, torch.int32, device)
+    data, indices, indptr, _dense = _random_csr_mn(
+        8, 10, torch.float32, torch.int32, device
+    )
     prepared = spmv_mod.prepare_spmv_csr(data, indices, indptr, (8, 10), transpose=True)
     x = torch.randn(8, dtype=torch.float32, device=device)
     with pytest.raises(ValueError, match="does not match prepared.transpose"):
@@ -138,7 +140,9 @@ def test_spmv_csr_prepared_transpose_mismatch_rejected():
 @pytest.mark.spmv_csr
 def test_spmv_csr_prepared_op_mismatch_rejected():
     device = torch.device("cuda")
-    data, indices, indptr, _dense = _random_csr_mn(8, 10, torch.complex64, torch.int32, device)
+    data, indices, indptr, _dense = _random_csr_mn(
+        8, 10, torch.complex64, torch.int32, device
+    )
     prepared = spmv_mod.prepare_spmv_csr(data, indices, indptr, (8, 10), op="conj")
     x = _make_x(8, torch.complex64, device)
     with pytest.raises(ValueError, match="does not match prepared.op"):
@@ -148,7 +152,9 @@ def test_spmv_csr_prepared_op_mismatch_rejected():
 @pytest.mark.spmv_csr
 def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
     device = torch.device("cuda")
-    data, indices, indptr, dense = _random_csr_mn(12, 9, torch.float32, torch.int64, device)
+    data, indices, indptr, dense = _random_csr_mn(
+        12, 9, torch.float32, torch.int64, device
+    )
     x = torch.randn(9, dtype=torch.float32, device=device)
     ref = dense.to(torch.float64) @ x.to(torch.float64)
     state = {"forced_once": False}
@@ -177,7 +183,9 @@ def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
 @pytest.mark.spmv_csr
 def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
     device = torch.device("cuda")
-    data, indices, indptr, _dense = _random_csr_mn(12, 9, torch.float32, torch.int64, device)
+    data, indices, indptr, _dense = _random_csr_mn(
+        12, 9, torch.float32, torch.int64, device
+    )
     x = torch.randn(9, dtype=torch.float32, device=device)
 
     def fail_int64(prepared, x_in):

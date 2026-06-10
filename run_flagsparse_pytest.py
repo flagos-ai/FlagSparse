@@ -1747,16 +1747,27 @@ def _should_fail(results: list[dict[str, object]], strict: bool) -> bool:
     return False
 
 
-def _print_ops(ops: list[str]) -> None:
+def _print_ops(ops: list[str], phase_arg: str = "both") -> None:
     for op in ops:
         config = OP_TEST_CONFIGS.get(op, OperatorTestConfig())
         accuracy = config.accuracy_marker or "-"
         performance = "yes" if config.performance_cmd else "-"
-        print(f"{op}\taccuracy={accuracy}\tperformance={performance}")
+        if phase_arg == "accuracy":
+            print(f"{op}\taccuracy={accuracy}")
+        elif phase_arg == "performance":
+            print(f"{op}\tperformance={performance}")
+        else:
+            print(f"{op}\taccuracy={accuracy}\tperformance={performance}")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(
+    default_phase: str = "both",
+    expose_phase_arg: bool = True,
+    description: str | None = None,
+    include_accuracy_args: bool = True,
+    include_performance_args: bool = True,
+) -> int:
+    parser = argparse.ArgumentParser(description=description or __doc__)
     parser.add_argument("--operators-yaml", default="conf/operators.yaml")
     parser.add_argument(
         "--op-list", default=None, help="File with one operator id per line."
@@ -1777,31 +1788,35 @@ def main() -> int:
     parser.add_argument(
         "--gpus", default="0", help="Comma-separated GPU ids for CUDA_VISIBLE_DEVICES."
     )
-    parser.add_argument("--mode", default="quick", choices=("quick", "normal"))
-    parser.add_argument(
-        "--phase",
-        default="both",
-        choices=("accuracy", "performance", "both"),
-        help="Which phase to run for each operator.",
-    )
+    if include_accuracy_args:
+        parser.add_argument("--mode", default="quick", choices=("quick", "normal"))
+    if expose_phase_arg:
+        parser.add_argument(
+            "--phase",
+            default=default_phase,
+            choices=("accuracy", "performance", "both"),
+            help="Which phase to run for each operator.",
+        )
     parser.add_argument("--results-dir", default=None)
-    parser.add_argument(
-        "--pytest-args",
-        default="",
-        help="Extra pytest args appended to every accuracy invocation.",
-    )
-    parser.add_argument(
-        "--benchmark-input",
-        default="tests/data",
-        help="Matrix file or directory passed to performance scripts that need input.",
-    )
-    parser.add_argument(
-        "--benchmark-args",
-        default="",
-        help="Extra args appended to every performance invocation.",
-    )
-    parser.add_argument("--benchmark-warmup", type=int, default=5)
-    parser.add_argument("--benchmark-iters", type=int, default=20)
+    if include_accuracy_args:
+        parser.add_argument(
+            "--pytest-args",
+            default="",
+            help="Extra pytest args appended to every accuracy invocation.",
+        )
+    if include_performance_args:
+        parser.add_argument(
+            "--benchmark-input",
+            default="tests/data",
+            help="Matrix file or directory passed to performance scripts that need input.",
+        )
+        parser.add_argument(
+            "--benchmark-args",
+            default="",
+            help="Extra args appended to every performance invocation.",
+        )
+        parser.add_argument("--benchmark-warmup", type=int, default=5)
+        parser.add_argument("--benchmark-iters", type=int, default=20)
     parser.add_argument(
         "--timeout",
         type=int,
@@ -1819,6 +1834,7 @@ def main() -> int:
         help="Print resolved operators and configured phases, then exit.",
     )
     args = parser.parse_args()
+    phase_arg = args.phase if expose_phase_arg else default_phase
 
     project_root = Path(__file__).resolve().parent
     ops = read_ops(
@@ -1832,7 +1848,7 @@ def main() -> int:
     if not ops:
         raise SystemExit("no operators to run")
     if args.list_ops:
-        _print_ops(ops)
+        _print_ops(ops, phase_arg=phase_arg)
         return 0
 
     gpus = parse_gpus(args.gpus)
@@ -1843,10 +1859,23 @@ def main() -> int:
     )
     ensure_dir(results_dir)
 
-    benchmark_input = _resolve_path(project_root, args.benchmark_input)
-    extra_pytest_args = shlex.split(args.pytest_args) if args.pytest_args else []
+    mode = args.mode if include_accuracy_args else "quick"
+    benchmark_input = (
+        _resolve_path(project_root, args.benchmark_input)
+        if include_performance_args
+        else None
+    )
+    benchmark_warmup = args.benchmark_warmup if include_performance_args else 5
+    benchmark_iters = args.benchmark_iters if include_performance_args else 20
+    extra_pytest_args = (
+        shlex.split(args.pytest_args)
+        if include_accuracy_args and args.pytest_args
+        else []
+    )
     extra_benchmark_args = (
-        shlex.split(args.benchmark_args) if args.benchmark_args else []
+        shlex.split(args.benchmark_args)
+        if include_performance_args and args.benchmark_args
+        else []
     )
     env_info = collect_env_info(project_root)
 
@@ -1862,12 +1891,12 @@ def main() -> int:
                 project_root=project_root,
                 gpu_id=gpu,
                 ops=gpu_ops,
-                phase_arg=args.phase,
-                mode=args.mode,
+                phase_arg=phase_arg,
+                mode=mode,
                 results_dir=results_dir,
                 benchmark_input=benchmark_input,
-                benchmark_warmup=args.benchmark_warmup,
-                benchmark_iters=args.benchmark_iters,
+                benchmark_warmup=benchmark_warmup,
+                benchmark_iters=benchmark_iters,
                 timeout=args.timeout,
                 extra_pytest_args=extra_pytest_args,
                 extra_benchmark_args=extra_benchmark_args,

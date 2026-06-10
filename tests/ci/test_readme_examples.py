@@ -11,8 +11,10 @@ def test_readme_install_command_is_present():
 
 
 def test_readme_cpu_smoke_examples_are_present():
-    accuracy_runner = (
-        "python run_flagsparse_pytest.py --phase accuracy --mode quick --gpus 0"
+    accuracy_runner = "python run_flagsparse_accuracy.py --mode quick --gpus 0"
+    performance_runner = (
+        "python run_flagsparse_performance.py --ops spmv_csr,spmm_csr "
+        "--benchmark-input matrix --benchmark-warmup 5 --benchmark-iters 20"
     )
     both_phase_runner = (
         "python run_flagsparse_pytest.py --phase both --mode quick "
@@ -21,6 +23,7 @@ def test_readme_cpu_smoke_examples_are_present():
     for snippet in [
         "pytest tests/pytest --mode quick",
         accuracy_runner,
+        performance_runner,
         both_phase_runner,
         "python tests/test_spmv.py <dir_or_file.mtx>",
         "python tests/test_spmm.py --synthetic",
