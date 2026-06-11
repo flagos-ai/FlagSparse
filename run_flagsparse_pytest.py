@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as _dt
+import html
 import importlib
 import importlib.metadata as importlib_metadata
 import json
@@ -654,6 +655,14 @@ def _data_file(phase_result: dict[str, object]) -> object:
     return phase_result.get("data_file", phase_result.get("data_path"))
 
 
+def _stdout_log_file(phase_result: dict[str, object]) -> object:
+    return phase_result.get("stdout_log_path", phase_result.get("log_path"))
+
+
+def _stderr_log_file(phase_result: dict[str, object]) -> object:
+    return phase_result.get("stderr_log_path", "")
+
+
 def _json_data_file(phase_result: dict[str, object]) -> object:
     return phase_result.get("data_file")
 
@@ -849,6 +858,8 @@ def _phase_detail_for_file(phase_result: dict[str, object]) -> dict[str, object]
         "duration_sec": phase_result.get("duration_sec"),
         "command": phase_result.get("command", []),
         "log_path": phase_result.get("log_path"),
+        "stdout_log_path": phase_result.get("stdout_log_path"),
+        "stderr_log_path": phase_result.get("stderr_log_path"),
         "data_path": phase_result.get("data_path"),
         "csv_file": phase_result.get("csv_file"),
         "reason": phase_result.get("reason"),
@@ -912,7 +923,7 @@ def run_subprocess(
     project_root: Path,
     env: dict[str, str],
     timeout: int,
-) -> tuple[int, str, float, bool]:
+) -> tuple[int, str, str, float, bool]:
     start = time.monotonic()
     proc = subprocess.Popen(
         cmd,
@@ -933,7 +944,7 @@ def run_subprocess(
         stdout, stderr = proc.communicate()
         returncode = TIMEOUT_RETURN_CODE
     duration = time.monotonic() - start
-    return returncode, (stdout or "") + "\n" + (stderr or ""), duration, timed_out
+    return returncode, stdout or "", stderr or "", duration, timed_out
 
 
 def _not_configured(op: str, phase: str, reason: str) -> dict[str, object]:
@@ -985,14 +996,17 @@ def run_accuracy(
         "no:cacheprovider",
         *extra_pytest_args,
     ]
-    returncode, output, duration, timed_out = run_subprocess(
+    returncode, stdout, stderr, duration, timed_out = run_subprocess(
         cmd,
         project_root=project_root,
         env=_base_env(project_root, gpu_id),
         timeout=timeout,
     )
-    log_path = op_dir / "accuracy.log"
-    log_path.write_text(output, encoding="utf-8")
+    output = stdout + ("\n" if stdout and stderr else "") + stderr
+    stdout_path = op_dir / "accuracy_stdout.log"
+    stderr_path = op_dir / "accuracy_stderr.log"
+    stdout_path.write_text(stdout, encoding="utf-8")
+    stderr_path.write_text(stderr, encoding="utf-8")
 
     counts = parse_pytest_summary(output)
     status = "TIMEOUT" if timed_out else status_from_pytest_counts(counts, returncode)
@@ -1023,7 +1037,9 @@ def run_accuracy(
         "duration_sec": duration,
         "duration": duration,
         "command": cmd,
-        "log_path": str(log_path),
+        "stdout_log_path": str(stdout_path),
+        "stderr_log_path": str(stderr_path),
+        "log_path": str(stdout_path),
         "failures": failures,
         "tests": cases,
         **counts,
@@ -1423,14 +1439,17 @@ def run_performance(
         iters=iters,
         extra_args=extra_args,
     )
-    returncode, output, duration, timed_out = run_subprocess(
+    returncode, stdout, stderr, duration, timed_out = run_subprocess(
         cmd,
         project_root=project_root,
         env=_base_env(project_root, gpu_id),
         timeout=timeout,
     )
-    log_path = op_dir / "performance.log"
-    log_path.write_text(output, encoding="utf-8")
+    output = stdout + ("\n" if stdout and stderr else "") + stderr
+    stdout_path = op_dir / "performance_stdout.log"
+    stderr_path = op_dir / "performance_stderr.log"
+    stdout_path.write_text(stdout, encoding="utf-8")
+    stderr_path.write_text(stderr, encoding="utf-8")
 
     if timed_out:
         status = "TIMEOUT"
@@ -1453,7 +1472,9 @@ def run_performance(
         "duration_sec": duration,
         "duration": duration,
         "command": cmd,
-        "log_path": str(log_path),
+        "stdout_log_path": str(stdout_path),
+        "stderr_log_path": str(stderr_path),
+        "log_path": str(stdout_path),
         "data_path": str(csv_path) if csv_path.exists() else None,
     }
     if csv_path.exists():
@@ -1592,6 +1613,8 @@ def _phase_rows(results: list[dict[str, object]]) -> list[dict[str, object]]:
                     "speedup": phase_result.get("speedup", ""),
                     "data_file": _data_file(phase_result),
                     "log_path": phase_result.get("log_path", ""),
+                    "stdout_log_path": phase_result.get("stdout_log_path", ""),
+                    "stderr_log_path": phase_result.get("stderr_log_path", ""),
                     "data_path": phase_result.get("data_path", ""),
                     "reason": phase_result.get("reason", ""),
                     "command": shlex.join(phase_result.get("command", []))
@@ -1639,6 +1662,229 @@ def _flaggems_summary(
             str(result["operator"]): _operator_summary(result) for result in ordered
         },
     }
+
+
+def _html_text(value: object) -> str:
+    return html.escape("" if value is None else str(value))
+
+
+def _read_text_for_html(path_value: object) -> str:
+    if not path_value:
+        return ""
+    path = Path(str(path_value))
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"Unable to read {path}: {exc}"
+
+
+def _format_html_json(value: object) -> str:
+    try:
+        return json.dumps(value, indent=2, sort_keys=True, default=str)
+    except TypeError:
+        return str(value)
+
+
+def _phase_counts_text(phase_result: dict[str, object] | None) -> str:
+    if not isinstance(phase_result, dict):
+        return ""
+    if phase_result.get("phase") == "performance":
+        row_count = phase_result.get("row_count")
+        speedup = phase_result.get("speedup")
+        if row_count not in (None, ""):
+            parts = [f"rows={row_count}"]
+            if speedup not in (None, ""):
+                parts.append(f"speedup={speedup}")
+            return " / ".join(parts)
+        return ""
+    return (
+        f"{phase_result.get('passed', 0)}/"
+        f"{phase_result.get('failed', 0)}/"
+        f"{phase_result.get('skipped', 0)}"
+    )
+
+
+def _phase_status_for_html(phase_result: dict[str, object] | None) -> str:
+    if not isinstance(phase_result, dict):
+        return "NotFound"
+    return _flaggems_status(str(phase_result.get("status") or "UNKNOWN"))
+
+
+def _relative_path_for_html(path_value: object, root: Path) -> str:
+    if not path_value:
+        return ""
+    path = Path(str(path_value))
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def _html_tab_group(group_id: str, tabs: list[tuple[str, str]]) -> str:
+    safe_tabs = [(name, content) for name, content in tabs if content is not None]
+    if not safe_tabs:
+        return "<em>No details</em>"
+    buttons = []
+    panels = []
+    for index, (name, content) in enumerate(safe_tabs):
+        active = " active" if index == 0 else ""
+        display = "" if index == 0 else ' style="display:none"'
+        buttons.append(
+            f'<button class="tab-btn{active}" onclick="switchTab(\'{group_id}\', {index})">'
+            f"{_html_text(name)}</button>"
+        )
+        panels.append(
+            f'<div class="tab-panel"{display}><pre class="log-content">'
+            f"{_html_text(content)}</pre></div>"
+        )
+    return (
+        f'<div class="log-tabs" id="{_html_text(group_id)}">'
+        f'<div class="tab-buttons">{"".join(buttons)}</div>'
+        f"{''.join(panels)}</div>"
+    )
+
+
+def _phase_html_details(
+    phase: str,
+    op: str,
+    phase_result: dict[str, object] | None,
+    results_dir: Path,
+) -> str:
+    if not isinstance(phase_result, dict):
+        return "<em>Not configured</em>"
+    tabs: list[tuple[str, str]] = []
+    result_path = phase_result.get("result_path")
+    if result_path:
+        tabs.append((Path(str(result_path)).name, _read_text_for_html(result_path)))
+    elif phase_result.get("data_file"):
+        tabs.append(
+            (
+                Path(str(phase_result["data_file"])).name,
+                _format_html_json(_flaggems_phase_result(phase_result)),
+            )
+        )
+    stdout_path = _stdout_log_file(phase_result)
+    stderr_path = _stderr_log_file(phase_result)
+    if stdout_path:
+        tabs.append((Path(str(stdout_path)).name, _read_text_for_html(stdout_path)))
+    if stderr_path:
+        tabs.append((Path(str(stderr_path)).name, _read_text_for_html(stderr_path)))
+    detail_path = (
+        Path(str(result_path)).with_name(f"{phase}_detail.json")
+        if result_path
+        else None
+    )
+    if detail_path and detail_path.exists():
+        tabs.append((detail_path.name, _read_text_for_html(detail_path)))
+    if phase == "performance" and phase_result.get("data_path"):
+        csv_path = Path(str(phase_result["data_path"]))
+        if csv_path.exists():
+            tabs.append((csv_path.name, _read_text_for_html(csv_path)))
+    if not tabs:
+        tabs.append((f"{phase}.json", _format_html_json(phase_result)))
+    return _html_tab_group(f"tabs-{phase}-{op}", tabs)
+
+
+def write_result_html(
+    results: list[dict[str, object]],
+    results_dir: Path,
+    env_info: dict[str, object],
+) -> None:
+    ordered = sorted(results, key=lambda item: str(item["operator"]))
+    rows = _phase_rows(ordered)
+    totals = _totals(rows)
+    generated_at = _dt.datetime.now().isoformat(timespec="seconds")
+    env_rows = []
+    for key, value in sorted(env_info.items()):
+        env_rows.append(
+            f"<tr><td>{_html_text(key)}</td><td><tt>{_html_text(_format_html_json(value) if isinstance(value, (dict, list)) else value)}</tt></td></tr>"
+        )
+    total_rows = []
+    for phase, by_status in sorted(totals.get("by_phase", {}).items()):
+        total_rows.append(
+            f"<tr><td>{_html_text(phase)}</td><td><tt>{_html_text(by_status)}</tt></td></tr>"
+        )
+
+    op_rows = []
+    for index, result in enumerate(ordered, start=1):
+        op = str(result["operator"])
+        accuracy = result.get("accuracy")
+        performance = result.get("performance")
+        acc_status = _phase_status_for_html(accuracy)
+        perf_status = _phase_status_for_html(performance)
+        op_rows.append(
+            "<tr>"
+            f'<td class="sticky-col sticky-col-0">{index}</td>'
+            f'<td class="sticky-col sticky-col-1">{_html_text(op)}</td>'
+            f'<td><details><summary class="status-{_html_text(acc_status.lower())}">{_html_text(acc_status)}</summary>'
+            f"{_phase_html_details('accuracy', op, accuracy, results_dir)}</details></td>"
+            f"<td>{_html_text(_phase_counts_text(accuracy))}</td>"
+            f'<td><details><summary class="status-{_html_text(perf_status.lower())}">{_html_text(perf_status)}</summary>'
+            f"{_phase_html_details('performance', op, performance, results_dir)}</details></td>"
+            f"<td>{_html_text(_phase_counts_text(performance))}</td>"
+            "</tr>"
+        )
+
+    html_text = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>FlagSparse Test Report</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 20px; color: #333; }}
+h3 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 6px; }}
+table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; font-size: 14px; }}
+thead th {{ background-color: #3498db; color: #fff; padding: 8px 10px; text-align: left; position: sticky; top: 0; z-index: 2; }}
+tbody td {{ padding: 6px 10px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }}
+tbody tr:nth-child(even) {{ background: #f8fafc; }}
+details summary {{ cursor: pointer; font-weight: 600; }}
+.status-passed {{ color: #15803d; }}
+.status-failed, .status-error, .status-timeout {{ color: #b91c1c; }}
+.status-skipped, .status-notfound {{ color: #a16207; }}
+.log-tabs {{ margin-top: 8px; }}
+.tab-buttons {{ margin-bottom: 6px; }}
+.tab-btn {{ border: 1px solid #cbd5e1; background: #f8fafc; padding: 4px 8px; cursor: pointer; }}
+.tab-btn.active {{ background: #2563eb; color: white; border-color: #2563eb; }}
+.log-content {{ max-height: 420px; overflow: auto; background: #0f172a; color: #e2e8f0; padding: 10px; border-radius: 4px; font-size: 12px; white-space: pre-wrap; }}
+.sticky-col {{ position: sticky; background: inherit; z-index: 1; }}
+.sticky-col-0 {{ left: 0; min-width: 42px; }}
+.sticky-col-1 {{ left: 48px; min-width: 180px; font-weight: 600; }}
+</style>
+</head>
+<body>
+<h3>FlagSparse Test Report</h3>
+<h4>Environment</h4>
+<table><thead><tr><th>Env</th><th>Setting</th></tr></thead><tbody>
+<tr><td>Generated</td><td><tt>{_html_text(generated_at)}</tt></td></tr>
+{"".join(env_rows)}
+</tbody></table>
+<h4>Totals</h4>
+<table><thead><tr><th>Phase</th><th>Status Counts</th></tr></thead><tbody>
+{"".join(total_rows)}
+</tbody></table>
+<h4>Operators</h4>
+<table id="main-table">
+<thead><tr><th>#</th><th>Operator</th><th>Accuracy</th><th>Passed/Failed/Skipped</th><th>Performance</th><th>Rows/Speedup</th></tr></thead>
+<tbody>
+{"".join(op_rows)}
+</tbody></table>
+<script>
+function switchTab(containerId, idx) {{
+  var container = document.getElementById(containerId);
+  var btns = container.querySelectorAll('.tab-btn');
+  var panels = container.querySelectorAll('.tab-panel');
+  for (var i = 0; i < btns.length; i++) {{
+    btns[i].classList.remove('active');
+    panels[i].style.display = 'none';
+  }}
+  btns[idx].classList.add('active');
+  panels[idx].style.display = '';
+}}
+</script>
+</body>
+</html>
+"""
+    (results_dir / "result.html").write_text(html_text, encoding="utf-8")
 
 
 def _compat_summary(
@@ -1707,6 +1953,8 @@ def write_summary(
         "speedup",
         "data_file",
         "log_path",
+        "stdout_log_path",
+        "stderr_log_path",
         "data_path",
         "reason",
         "command",
@@ -1718,6 +1966,7 @@ def write_summary(
             writer.writerow({key: row.get(key, "") for key in headers})
 
     if Workbook is None:
+        write_result_html(ordered, results_dir, env_info)
         return
     wb = Workbook()
     ws = wb.active
@@ -1726,6 +1975,7 @@ def write_summary(
     for row in rows:
         ws.append([row.get(key, "") for key in headers])
     wb.save(results_dir / "summary.xlsx")
+    write_result_html(ordered, results_dir, env_info)
 
 
 def _should_fail(results: list[dict[str, object]], strict: bool) -> bool:

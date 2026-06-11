@@ -21,7 +21,9 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
                 "duration_sec": 1.25,
                 "duration": 1.25,
                 "command": ["python", "-m", "pytest"],
-                "log_path": "gather/accuracy.log",
+                "log_path": "gather/accuracy_stdout.log",
+                "stdout_log_path": "gather/accuracy_stdout.log",
+                "stderr_log_path": "gather/accuracy_stderr.log",
                 "data_file": "gather/accuracy_result.json",
                 "passed": 3,
                 "failed": 0,
@@ -41,7 +43,9 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
                 "duration_sec": 0.5,
                 "duration": 0.5,
                 "command": ["python", "tests/test_gather.py"],
-                "log_path": "gather/performance.log",
+                "log_path": "gather/performance_stdout.log",
+                "stdout_log_path": "gather/performance_stdout.log",
+                "stderr_log_path": "gather/performance_stderr.log",
                 "data_path": "gather/performance.csv",
                 "data_file": "gather/performance_result.json",
                 "row_count": 0,
@@ -99,6 +103,13 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
     assert rows[0]["phase"] == "accuracy"
     assert rows[0]["duration"] == "1.25"
     assert rows[0]["exit_code"] == "0"
+    assert rows[0]["stdout_log_path"] == "gather/accuracy_stdout.log"
+    assert rows[0]["stderr_log_path"] == "gather/accuracy_stderr.log"
+
+    html_report = (tmp_path / "result.html").read_text(encoding="utf-8")
+    assert "FlagSparse Test Report" in html_report
+    assert "gather" in html_report
+    assert "accuracy_result.json" in html_report
 
 
 def test_runner_writes_per_operator_phase_result(tmp_path):
@@ -114,7 +125,9 @@ def test_runner_writes_per_operator_phase_result(tmp_path):
         "duration_sec": 2.0,
         "duration": 2.0,
         "command": ["python", "-m", "pytest"],
-        "log_path": "gather/accuracy.log",
+        "log_path": "gather/accuracy_stdout.log",
+        "stdout_log_path": "gather/accuracy_stdout.log",
+        "stderr_log_path": "gather/accuracy_stderr.log",
         "passed": 1,
         "failed": 1,
         "skipped": 0,
@@ -158,6 +171,8 @@ def test_runner_writes_per_operator_phase_result(tmp_path):
         "FAILED tests/pytest/test_example.py::test_case"
     ]
     assert detail["status_raw"] == "FAIL"
+    assert detail["stdout_log_path"] == "gather/accuracy_stdout.log"
+    assert detail["stderr_log_path"] == "gather/accuracy_stderr.log"
     assert detail["summary"]["failed"] == 1
     assert (
         detail["tests"][0]["nodeid"]
