@@ -32,8 +32,8 @@ VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 INDEX_DTYPES = [torch.int32]
 CSV_VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
 CSV_INDEX_DTYPES = [torch.int32]
-WARMUP = 1
-ITERS = 1
+WARMUP = 10
+ITERS = 20
 SPSM_OP_MODES = ["NON", "NON_TRANS"]
 
 
@@ -113,6 +113,24 @@ def _sum_ms(*values):
 def _spsm_benchmark_schedule(nnz, n_rhs, value_dtype, fmt="csr"):
     del nnz, n_rhs, value_dtype, fmt
     return int(WARMUP), int(ITERS)
+
+
+def _allinone_filtered_avg_ms(times):
+    if not times:
+        return None
+    times = [float(t) for t in times]
+    if len(times) == 1:
+        return times[0]
+    ordered = sorted(times)
+    n = len(ordered)
+    if n % 2 == 0:
+        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    else:
+        median = ordered[n // 2]
+    lo = median * 0.9
+    hi = median * 1.1
+    kept = [t for t in ordered if lo <= t <= hi]
+    return sum(kept) / len(kept) if kept else median
 
 
 def _csv_export_row_spsm(row):
@@ -242,14 +260,16 @@ def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup,
         for _ in range(warmup):
             _ = cpx_cusparse.spsm(A_cp, B_cp, lower=True, unit_diag=False, transa=False)
         cp.cuda.runtime.deviceSynchronize()
-        c0 = cp.cuda.Event()
-        c1 = cp.cuda.Event()
-        c0.record()
+        times = []
         for _ in range(iters):
+            c0 = cp.cuda.Event()
+            c1 = cp.cuda.Event()
+            c0.record()
             X_cp = cpx_cusparse.spsm(A_cp, B_cp, lower=True, unit_diag=False, transa=False)
-        c1.record()
-        c1.synchronize()
-        ms = cp.cuda.get_elapsed_time(c0, c1) / iters
+            c1.record()
+            c1.synchronize()
+            times.append(cp.cuda.get_elapsed_time(c0, c1))
+        ms = _allinone_filtered_avg_ms(times)
         X_t = torch.utils.dlpack.from_dlpack(X_cp.toDlpack()).to(B.dtype)
         return X_t, ms, None
     except Exception as exc:
@@ -277,14 +297,16 @@ def _benchmark_flagsparse(call, warmup, iters):
     for _ in range(warmup):
         X = call()
     torch.cuda.synchronize()
-    e0 = torch.cuda.Event(True)
-    e1 = torch.cuda.Event(True)
-    e0.record()
+    times = []
     for _ in range(iters):
+        e0 = torch.cuda.Event(True)
+        e1 = torch.cuda.Event(True)
+        e0.record()
         X = call()
-    e1.record()
-    torch.cuda.synchronize()
-    return X, e0.elapsed_time(e1) / iters
+        e1.record()
+        torch.cuda.synchronize()
+        times.append(e0.elapsed_time(e1))
+    return X, _allinone_filtered_avg_ms(times)
 
 
 def _benchmark_flagsparse_spsm_csr_split(data, indices, indptr, B, shape):
@@ -608,8 +630,8 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
     )
     print("=" * 176)
     print(
-        f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-        "(Library-main style defaults; override with --warmup/--iters)"
+        f"Benchmark schedule: warmup={WARMUP}, timed_iters={ITERS} "
+        "(solve columns use per-iteration filtered averages; override with --warmup/--iters)"
     )
     print(
         "PT.total is the aggregated time of one torch.sparse.spsolve call per RHS column; "
@@ -779,13 +801,13 @@ def main():
         "--warmup",
         type=int,
         default=WARMUP,
-        help="Benchmark warmup iterations (Library-main style default: 1)",
+        help="Benchmark warmup solve iterations (default: 10, matching all-in-one cuSPARSE SpSM timing)",
     )
     parser.add_argument(
         "--iters",
         type=int,
         default=ITERS,
-        help="Benchmark timed iterations (Library-main style default: 1)",
+        help="Benchmark timed solve iterations; solve times report the average (default: 20, matching all-in-one cuSPARSE SpSM timing)",
     )
     args = parser.parse_args()
     WARMUP = max(0, int(args.warmup))

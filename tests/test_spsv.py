@@ -157,6 +157,28 @@ def _spsv_benchmark_schedule(nnz, op_mode, value_dtype, fmt="CSR"):
     return int(WARMUP), int(ITERS)
 
 
+def _allinone_filtered_avg_ms(times, fmt="CSR"):
+    if not times:
+        return None
+    times = [float(t) for t in times]
+    if len(times) == 1:
+        return times[0]
+    if fmt.upper() == "COO":
+        avg = sum(times) / len(times)
+        kept = [t for t in times if t < 2.0 * avg]
+        return sum(kept) / len(kept) if kept else avg
+    ordered = sorted(times)
+    n = len(ordered)
+    if n % 2 == 0:
+        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    else:
+        median = ordered[n // 2]
+    lo = median * 0.9
+    hi = median * 1.1
+    kept = [t for t in ordered if lo <= t <= hi]
+    return sum(kept) / len(kept) if kept else median
+
+
 def _status_str(ok_flag, has_value):
     if ok_flag:
         return "PASS"
@@ -570,14 +592,16 @@ def _benchmark_flagsparse(call, *, warmup=WARMUP, iters=ITERS):
     for _ in range(warmup):
         x = call()
     torch.cuda.synchronize()
-    e0 = torch.cuda.Event(True)
-    e1 = torch.cuda.Event(True)
-    e0.record()
+    times = []
     for _ in range(iters):
+        e0 = torch.cuda.Event(True)
+        e1 = torch.cuda.Event(True)
+        e0.record()
         x = call()
-    e1.record()
-    torch.cuda.synchronize()
-    return x, e0.elapsed_time(e1) / iters
+        e1.record()
+        torch.cuda.synchronize()
+        times.append(e0.elapsed_time(e1))
+    return x, _allinone_filtered_avg_ms(times)
 
 
 def _analyze_flagsparse_spsv_csr_reuse(
@@ -837,16 +861,18 @@ def _cupy_spsolve_lower_csr_or_coo(
                 A_cp, b_cp, lower=lower, unit_diagonal=False
             )
         cp.cuda.runtime.deviceSynchronize()
-        t0 = cp.cuda.Event()
-        t1 = cp.cuda.Event()
-        t0.record()
+        times = []
         for _ in range(iters):
+            t0 = cp.cuda.Event()
+            t1 = cp.cuda.Event()
+            t0.record()
             x_cu = cpx_spsolve_triangular(
                 A_cp, b_cp, lower=lower, unit_diagonal=False
             )
-        t1.record()
-        t1.synchronize()
-        cupy_ms = cp.cuda.get_elapsed_time(t0, t1) / iters
+            t1.record()
+            t1.synchronize()
+            times.append(cp.cuda.get_elapsed_time(t0, t1))
+        cupy_ms = _allinone_filtered_avg_ms(times, fmt=fmt)
         x_cu_t = torch.utils.dlpack.from_dlpack(x_cu.toDlpack())
         x_cu_t = x_cu_t.to(b.dtype)
         return cupy_ms, x_cu_t
@@ -888,16 +914,18 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
                 A_eff, b_cp, lower=lower_eff, unit_diagonal=False
             )
         cp.cuda.runtime.deviceSynchronize()
-        c0 = cp.cuda.Event()
-        c1 = cp.cuda.Event()
-        c0.record()
+        times = []
         for _ in range(iters):
+            c0 = cp.cuda.Event()
+            c1 = cp.cuda.Event()
+            c0.record()
             x_cp = cpx_spsolve_triangular(
                 A_eff, b_cp, lower=lower_eff, unit_diagonal=False
             )
-        c1.record()
-        c1.synchronize()
-        ms = cp.cuda.get_elapsed_time(c0, c1) / iters
+            c1.record()
+            c1.synchronize()
+            times.append(cp.cuda.get_elapsed_time(c0, c1))
+        ms = _allinone_filtered_avg_ms(times, fmt="CSR")
         x_t = torch.utils.dlpack.from_dlpack(x_cp.toDlpack()).to(b.dtype)
         return ms, x_t
     except Exception:
@@ -916,7 +944,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-        "(override with --warmup/--iters)"
+        "(solve columns use per-iteration filtered averages; override with --warmup/--iters)"
     )
     print(f"Triangle: {'LOWER' if lower else 'UPPER'}")
     print(f"Algorithm: {_alg_label(alg_num)}")
@@ -1420,7 +1448,7 @@ def run_all_supported_spsv_csr_csv(
                 )
                 print(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-                    "(override with --warmup/--iters)"
+                    "(solve columns use per-iteration filtered averages; override with --warmup/--iters)"
                 )
                 print(
                     "RHS is generated directly. "
@@ -1584,7 +1612,7 @@ def run_all_dtypes_spsv_coo_csv(
                 )
                 print(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-                    "(override with --warmup/--iters)"
+                    "(solve columns use per-iteration filtered averages; override with --warmup/--iters)"
                 )
                 print(
                     "PT.total / CU.total are single official interface call times. "
