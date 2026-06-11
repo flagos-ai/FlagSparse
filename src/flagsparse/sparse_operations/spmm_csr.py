@@ -84,13 +84,8 @@ def _spmm_error_metrics(candidate, reference):
             "reference_sum_magnitude": 0.0,
         }
 
-    if _is_complex_dtype(reference.dtype):
-        candidate_compare = torch.abs(candidate)
-        reference_compare = torch.abs(reference)
-        abs_diff = torch.abs(candidate_compare - reference_compare)
-    else:
-        reference_compare = torch.abs(reference)
-        abs_diff = torch.abs(candidate - reference)
+    reference_compare = torch.abs(reference)
+    abs_diff = torch.abs(candidate - reference)
 
     max_abs_error = float(torch.max(abs_diff).item())
     reference_max_magnitude = float(torch.max(reference_compare).item())
