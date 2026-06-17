@@ -18,8 +18,9 @@ def _read(path: Path) -> str:
 def test_gpu_accuracy_workflow_is_self_hosted_and_manual():
     text = _read(WORKFLOWS_DIR / "gpu-ci.yml")
     assert "workflow_dispatch:" in text
-    for label in ["self-hosted", "linux", "test-flagsparse"]:
-        assert f"- {label}" in text
+    # Runner scale sets (ARC) must be referenced by name alone in `runs-on`;
+    # combining it with labels like self-hosted/linux breaks job matching.
+    assert "runs-on: test-flagsparse" in text
     assert 'python-version: "3.12"' in text
     assert "tools/ci/requirements-triton-smoke.lock.txt" in text
 
@@ -34,8 +35,7 @@ def test_gpu_accuracy_workflow_checks_cuda_before_tests():
 
 def test_gpu_benchmark_workflow_uploads_artifacts():
     text = _read(WORKFLOWS_DIR / "gpu-benchmark.yml")
-    assert "self-hosted" in text
-    assert "test-flagsparse" in text
+    assert "runs-on: test-flagsparse" in text
     assert "run_flagsparse_performance.py" in text
     assert "matrix_dir:" in text
     assert "actions/upload-artifact@v4" in text

@@ -22,10 +22,7 @@ on:
 jobs:
   accuracy-smoke:
     name: GPU accuracy smoke
-    runs-on:
-      - self-hosted
-      - linux
-      - test-flagsparse
+    runs-on: test-flagsparse
     timeout-minutes: 90
 
     steps:

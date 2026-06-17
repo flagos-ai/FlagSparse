@@ -35,10 +35,7 @@ on:
 jobs:
   benchmark:
     name: Run GPU benchmark
-    runs-on:
-      - self-hosted
-      - linux
-      - test-flagsparse
+    runs-on: test-flagsparse
     timeout-minutes: 90
 
     steps:
