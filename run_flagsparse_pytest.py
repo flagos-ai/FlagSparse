@@ -1935,6 +1935,7 @@ HTML_SPEEDUP_DTYPES = (
     ("int64", ("int64", "torch.int64", "long")),
     ("bool", ("bool", "torch.bool")),
     ("cf64", ("complex64", "torch.complex64", "cfloat", "cf64")),
+    ("cf128", ("complex128", "torch.complex128", "cdouble", "cf128")),
     ("float8_e4m3fn", ("float8_e4m3fn", "torch.float8_e4m3fn")),
     ("float8_e5m2", ("float8_e5m2", "torch.float8_e5m2")),
 )
