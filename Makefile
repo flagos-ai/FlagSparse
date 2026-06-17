@@ -68,7 +68,7 @@ gpu-env-check:
 	$(PYTHON) tools/ci/check_gpu_environment.py --require-cuda
 
 gpu-benchmark: gpu-env-check
-	$(PYTHON) tools/ci/run_gpu_benchmark.py --suite quick
+	$(PYTHON) run_flagsparse_performance.py --ops gather,scatter,spmv_csr,spmm_csr --results-dir benchmark_results
 
 release-check: ci-deps compile format-check lint lint-src pre-commit-check build install-wheel validate-wheel test-ci
 	$(PYTHON) -m twine check $(DIST_DIR)/*.whl $(DIST_DIR)/*.tar.gz
