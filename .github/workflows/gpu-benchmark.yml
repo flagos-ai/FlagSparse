@@ -3,47 +3,34 @@ name: GPU Benchmark
 on:
   workflow_dispatch:
     inputs:
-      suite:
-        description: GPU benchmark suite to run
-        required: true
-        default: quick
-        type: choice
-        options:
-          - quick
-          - full
-          - full-synthetic
-          - gather
-          - scatter
-          - spmv
-          - spmv-coo
-          - spmm
-          - spmm-coo
-          - spsv
-          - spsm
-          - alpha-spmm-alg1
-          - spmm-opt-alg2
-          - spgemm
-          - sddmm
+      ops:
+        description: >-
+          Comma-separated operator ids to benchmark (keys of OP_TEST_CONFIGS in
+          run_flagsparse_pytest.py). Leave empty to run all configured
+          operators from conf/operators.yaml.
+        required: false
+        type: string
       matrix_dir:
-        description: MatrixMarket file or directory used by mtx-backed suites
+        description: MatrixMarket file or directory passed to mtx-backed operators
         required: true
         default: tests/data
         type: string
       warmup:
-        description: Warmup iterations for suites that support it
+        description: Warmup iterations for operators that support it
         required: true
         default: "5"
         type: string
       iters:
-        description: Timed iterations for suites that support it
+        description: Timed iterations for operators that support it
         required: true
         default: "20"
         type: string
-      use_cusparse:
-        description: Include cuSPARSE baselines when available on the runner
-        required: true
-        default: false
-        type: boolean
+      benchmark_args:
+        description: >-
+          Extra args appended to every performance invocation (e.g.
+          "--no-cusparse" or "--with-cusparse" for operators that support it).
+        required: false
+        type: string
 
 jobs:
   benchmark:
@@ -84,19 +71,24 @@ jobs:
       - name: Validate installed wheel import
         run: python tools/ci/check_installed_wheel.py --expected-version 1.0.0
 
-      - name: Run selected GPU benchmark suite
+      - name: Run GPU performance benchmarks
         shell: bash
         run: |
           args=(
-            --suite "${{ inputs.suite }}"
-            --matrix-dir "${{ inputs.matrix_dir }}"
-            --warmup "${{ inputs.warmup }}"
-            --iters "${{ inputs.iters }}"
+            run_flagsparse_performance.py
+            --benchmark-input "${{ inputs.matrix_dir }}"
+            --benchmark-warmup "${{ inputs.warmup }}"
+            --benchmark-iters "${{ inputs.iters }}"
+            --gpus 0
+            --results-dir benchmark_results
           )
-          if [ "${{ inputs.use_cusparse }}" = "true" ]; then
-            args+=(--with-cusparse)
+          if [ -n "${{ inputs.ops }}" ]; then
+            args+=(--ops "${{ inputs.ops }}")
           fi
-          python tools/ci/run_gpu_benchmark.py "${args[@]}"
+          if [ -n "${{ inputs.benchmark_args }}" ]; then
+            args+=(--benchmark-args "${{ inputs.benchmark_args }}")
+          fi
+          python "${args[@]}"
 
       - name: Upload benchmark artifacts
         if: always()
