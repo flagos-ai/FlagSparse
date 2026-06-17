@@ -18,7 +18,7 @@ def _read(path: Path) -> str:
 def test_gpu_accuracy_workflow_is_self_hosted_and_manual():
     text = _read(WORKFLOWS_DIR / "gpu-ci.yml")
     assert "workflow_dispatch:" in text
-    for label in ["self-hosted", "linux", "gpu"]:
+    for label in ["self-hosted", "linux", "test-flagsparse"]:
         assert f"- {label}" in text
     assert 'python-version: "3.12"' in text
     assert "tools/ci/requirements-triton-smoke.lock.txt" in text
@@ -29,18 +29,15 @@ def test_gpu_accuracy_workflow_checks_cuda_before_tests():
     assert "nvidia-smi" in text
     assert "tools/ci/check_gpu_environment.py" in text
     assert "--require-cuda" in text
-    assert "pytest" in text
-    assert "tests/pytest" in text
+    assert "run_flagsparse_accuracy.py" in text
 
 
 def test_gpu_benchmark_workflow_uploads_artifacts():
     text = _read(WORKFLOWS_DIR / "gpu-benchmark.yml")
     assert "self-hosted" in text
-    assert "gpu" in text
-    assert "tools/ci/run_gpu_benchmark.py" in text
+    assert "test-flagsparse" in text
+    assert "run_flagsparse_performance.py" in text
     assert "matrix_dir:" in text
-    for suite_name in ["alpha-spmm-alg1", "spmm-opt-alg2", "spgemm", "sddmm"]:
-        assert suite_name in text
     assert "actions/upload-artifact@v4" in text
 
 
