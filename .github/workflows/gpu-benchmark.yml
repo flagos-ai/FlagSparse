@@ -42,11 +42,24 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Initialize artifact paths
+        run: mkdir -p benchmark_results
+
       - name: Verify runner Python
         run: python3.12 --version
 
-      - name: Install benchmark dependencies
-        run: python3.12 -m pip install --upgrade -r tools/ci/requirements-triton-smoke.lock.txt
+      - name: Verify benchmark dependencies
+        run: |
+          python3.12 -m pip show build pytest torch
+          python3.12 - <<'PY'
+          import build
+          import pytest
+          import torch
+
+          print("build", getattr(build, "__version__", "unknown"))
+          print("pytest", pytest.__version__)
+          print("torch", torch.__version__)
+          PY
 
       - name: Install FlagTree Triton
         shell: bash
