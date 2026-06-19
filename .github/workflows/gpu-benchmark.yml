@@ -68,10 +68,8 @@ jobs:
           python3.12 -m pip install --upgrade flagtree===0.6.0rc2 \
             --index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple
           python3.12 - <<'PY'
-          import flagtree
           import triton
 
-          print("flagtree", getattr(flagtree, "__version__", "unknown"))
           print("triton", getattr(triton, "__version__", "unknown"))
           PY
 
