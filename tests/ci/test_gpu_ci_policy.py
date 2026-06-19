@@ -21,7 +21,8 @@ def test_gpu_accuracy_workflow_is_self_hosted_and_manual():
     # Runner scale sets (ARC) must be referenced by name alone in `runs-on`;
     # combining it with labels like self-hosted/linux breaks job matching.
     assert "runs-on: test-flagsparse" in text
-    assert 'python-version: "3.12"' in text
+    assert "actions/setup-python" not in text
+    assert "python3.12 --version" in text
     assert "tools/ci/requirements-triton-smoke.lock.txt" in text
 
 
