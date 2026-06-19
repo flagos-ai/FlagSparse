@@ -29,32 +29,41 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Use runner Python
-        shell: bash
-        run: |
-          python3.12 --version
-          mkdir -p "$RUNNER_TEMP/python-bin"
-          ln -sf "$(command -v python3.12)" "$RUNNER_TEMP/python-bin/python"
-          echo "$RUNNER_TEMP/python-bin" >> "$GITHUB_PATH"
+      - name: Verify runner Python
+        run: python3.12 --version
 
       - name: Install GPU test dependencies
-        run: python -m pip install --upgrade -r tools/ci/requirements-triton-smoke.lock.txt
+        run: python3.12 -m pip install --upgrade -r tools/ci/requirements-triton-smoke.lock.txt
+
+      - name: Install FlagTree Triton
+        shell: bash
+        run: |
+          python3.12 -m pip uninstall -y triton
+          python3.12 -m pip install --upgrade flagtree===0.6.0rc2 \
+            --index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple
+          python3.12 - <<'PY'
+          import flagtree
+          import triton
+
+          print("flagtree", getattr(flagtree, "__version__", "unknown"))
+          print("triton", getattr(triton, "__version__", "unknown"))
+          PY
 
       - name: Validate CUDA environment
         run: |
           nvidia-smi
-          python tools/ci/check_gpu_environment.py \
+          python3.12 tools/ci/check_gpu_environment.py \
             --require-cuda \
             --metadata gpu_ci_metadata.json
 
       - name: Build source and wheel distributions
-        run: python -m build
+        run: python3.12 -m build
 
       - name: Install package
-        run: python -m pip install --force-reinstall --no-deps dist/*.whl
+        run: python3.12 -m pip install --force-reinstall --no-deps dist/*.whl
 
       - name: Validate installed wheel import
-        run: python tools/ci/check_installed_wheel.py --expected-version 1.0.0
+        run: python3.12 tools/ci/check_installed_wheel.py --expected-version 1.0.0
 
       - name: Run GPU accuracy tests
         shell: bash
@@ -68,7 +77,7 @@ jobs:
           if [ -n "${{ inputs.ops }}" ]; then
             args+=(--ops "${{ inputs.ops }}")
           fi
-          python "${args[@]}"
+          python3.12 "${args[@]}"
 
       - name: Upload GPU CI artifacts
         if: always()

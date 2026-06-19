@@ -23,7 +23,10 @@ def test_gpu_accuracy_workflow_is_self_hosted_and_manual():
     assert "runs-on: test-flagsparse" in text
     assert "actions/setup-python" not in text
     assert "python3.12 --version" in text
+    assert "$GITHUB_PATH" not in text
     assert "tools/ci/requirements-triton-smoke.lock.txt" in text
+    assert "python3.12 -m pip uninstall -y triton" in text
+    assert "flagtree===0.6.0rc2" in text
 
 
 def test_gpu_accuracy_workflow_checks_cuda_before_tests():
@@ -37,9 +40,17 @@ def test_gpu_accuracy_workflow_checks_cuda_before_tests():
 def test_gpu_benchmark_workflow_uploads_artifacts():
     text = _read(WORKFLOWS_DIR / "gpu-benchmark.yml")
     assert "runs-on: test-flagsparse" in text
+    assert "python3.12 -m pip uninstall -y triton" in text
+    assert "flagtree===0.6.0rc2" in text
     assert "run_flagsparse_performance.py" in text
     assert "matrix_dir:" in text
     assert "actions/upload-artifact@v4" in text
+
+
+def test_gpu_dependency_bundle_leaves_triton_to_flagtree():
+    text = _read(TOOLS_DIR / "requirements-triton-smoke.lock.txt")
+    assert "torch==2.9.0" in text
+    assert "triton==" not in text
 
 
 def test_gpu_environment_check_can_run_without_gpu():
