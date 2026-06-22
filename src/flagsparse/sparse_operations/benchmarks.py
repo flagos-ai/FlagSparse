@@ -3,10 +3,11 @@
 from ._common import *
 
 from .gather_scatter import (
+    DEFAULT_GATHER_BLOCK_SIZE,
+    _PreparedCusparseNativeGather,
     SUPPORTED_SCATTER_VALUE_DTYPES,
     _scatter_dtype_error_message,
     _cusparse_spmv,
-    _make_gather_selector_matrix,
     _make_scatter_selector_matrix,
     _pytorch_scatter_impl,
     _triton_gather_impl,
@@ -76,10 +77,10 @@ def benchmark_gather_case(
     index_dtype=torch.int32,
     warmup=20,
     iters=200,
-    block_size=1024,
+    block_size=DEFAULT_GATHER_BLOCK_SIZE,
     run_cusparse=True,
 ):
-    """Benchmark Triton vs PyTorch indexing vs cuSPARSE-backed COO SpMV."""
+    """Benchmark Triton vs PyTorch indexing vs native cuSPARSE gather."""
     device = torch.device("cuda")
     dense_vector = _build_random_dense(dense_size, value_dtype, device)
     indices = _build_indices(nnz, dense_size, index_dtype, device, unique=False)
@@ -88,7 +89,9 @@ def benchmark_gather_case(
     expected = dense_vector[indices]
 
     pytorch_op = lambda: dense_vector[indices]
-    triton_op = lambda: _triton_gather_impl(dense_vector, kernel_indices, block_size=block_size)
+    triton_op = lambda: _triton_gather_impl(
+        dense_vector, kernel_indices, block_size=block_size
+    )
 
     pytorch_values, pytorch_ms = _benchmark_cuda_op(pytorch_op, warmup=warmup, iters=iters)
     triton_values, triton_ms = _benchmark_cuda_op(triton_op, warmup=warmup, iters=iters)
@@ -110,11 +113,13 @@ def benchmark_gather_case(
         if skip_reason:
             cusparse_reason = skip_reason
         else:
+            cusparse_plan = None
             try:
-                selector_matrix = _make_gather_selector_matrix(
-                    indices, dense_vector.numel(), dense_vector.dtype
+                cusparse_out = torch.empty_like(expected)
+                cusparse_plan = _PreparedCusparseNativeGather(
+                    dense_vector, indices, out=cusparse_out
                 )
-                cusparse_op = lambda: _cusparse_spmv(selector_matrix, dense_vector)
+                cusparse_op = lambda: cusparse_plan.run()
                 cusparse_values, cusparse_ms = _benchmark_cuda_op(
                     cusparse_op, warmup=warmup, iters=iters
                 )
@@ -128,6 +133,9 @@ def benchmark_gather_case(
                 )
             except Exception as exc:
                 cusparse_reason = str(exc)
+            finally:
+                if cusparse_plan is not None:
+                    cusparse_plan.close()
 
     triton_speedup_vs_pytorch = (
         pytorch_ms / triton_ms if triton_ms > 0 else float("inf")
