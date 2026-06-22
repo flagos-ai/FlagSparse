@@ -2,12 +2,10 @@ import argparse
 import csv
 import math
 import os
-import time
 
 import torch
 
 import flagsparse as ast
-from flagsparse.sparse_operations._common import cp
 
 
 DEFAULT_CASES = [
@@ -107,27 +105,6 @@ def _write_csv(path, rows, fieldnames):
             writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
 
 
-def _sync_all():
-    torch.cuda.synchronize()
-    if cp is not None:
-        cp.cuda.runtime.deviceSynchronize()
-
-
-def _bench_cuda_op(op, warmup, iters):
-    warmup = max(0, int(warmup))
-    iters = max(1, int(iters))
-    output = None
-    for _ in range(warmup):
-        output = op()
-    _sync_all()
-    start = time.perf_counter()
-    for _ in range(iters):
-        output = op()
-    _sync_all()
-    elapsed_ms = (time.perf_counter() - start) * 1000.0 / iters
-    return output, elapsed_ms
-
-
 def _to_real_imag(value):
     if hasattr(value, "is_complex") and value.is_complex():
         return float(value.real.item()), float(value.imag.item())
@@ -162,167 +139,26 @@ def _collect_samples(case_id, expected, flagsparse_out, limit):
     return rows
 
 
-def _dtype_mode(value_dtype_req):
-    _ = value_dtype_req
-    return "gather_triton"
-
-
-def _select_mode(value_dtype_req, index_dtype):
-    _ = index_dtype
-    return _dtype_mode(value_dtype_req)
-
-
-def _build_dense(value_dtype_req, dense_size, device):
-    if value_dtype_req == "float16":
-        return torch.randn(dense_size, dtype=torch.float16, device=device)
-    if value_dtype_req == "bfloat16":
-        return torch.randn(dense_size, dtype=torch.bfloat16, device=device)
-    if value_dtype_req == "float32":
-        return torch.randn(dense_size, dtype=torch.float32, device=device)
-    if value_dtype_req == "float64":
-        return torch.randn(dense_size, dtype=torch.float64, device=device)
-    if value_dtype_req == "complex64":
-        real = torch.randn(dense_size, dtype=torch.float32, device=device)
-        imag = torch.randn(dense_size, dtype=torch.float32, device=device)
-        return torch.complex(real, imag)
-    if value_dtype_req == "complex128":
-        real = torch.randn(dense_size, dtype=torch.float64, device=device)
-        imag = torch.randn(dense_size, dtype=torch.float64, device=device)
-        return torch.complex(real, imag)
-    raise ValueError(f"Unsupported value dtype request: {value_dtype_req}")
-
-
-def _effective_dtype_name(value_dtype_req):
-    mapping = {
-        "float16": "float16",
-        "bfloat16": "bfloat16",
-        "float32": "float32",
-        "float64": "float64",
-        "complex64": "complex64",
-        "complex128": "complex128",
-    }
-    return mapping[value_dtype_req]
-
-
-def _tolerance(value_dtype_req):
-    if value_dtype_req == "float16":
-        return 5e-3, 5e-3
-    if value_dtype_req in ("bfloat16",):
-        return 1e-2, 1e-2
-    if value_dtype_req in ("float32", "complex64"):
-        return 1e-6, 1e-5
-    if value_dtype_req in ("float64", "complex128"):
-        return 1e-10, 1e-8
-    return 1e-6, 1e-5
-
-
 def _check_dtype_supported(value_dtype_req):
     if value_dtype_req in ("bfloat16",) and not torch.cuda.is_bf16_supported():
         raise RuntimeError("bfloat16 not supported on this GPU")
 
 
+def _resolve_value_dtype(value_dtype_req):
+    mapping = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+        "complex64": torch.complex64,
+        "complex128": torch.complex128,
+    }
+    return mapping[value_dtype_req]
+
+
 def _is_supported_gather_combo(index_dtype):
     # Required gather coverage is the full 6 value dtypes x 2 index dtypes matrix.
     return index_dtype in (torch.int32, torch.int64)
-
-
-def _build_indices(dense_size, nnz, index_dtype, device):
-    return torch.randint(0, dense_size, (nnz,), dtype=index_dtype, device=device)
-
-
-def _benchmark_gather_case(
-    value_dtype_req,
-    index_dtype,
-    dense_size,
-    nnz,
-    warmup,
-    iters,
-    run_cusparse,
-    index_fallback_policy,
-):
-    device = torch.device("cuda")
-    _check_dtype_supported(value_dtype_req)
-    dense_vector = _build_dense(value_dtype_req, dense_size, device)
-    indices = _build_indices(dense_size, nnz, index_dtype, device)
-    expected = dense_vector.index_select(0, indices.to(torch.int64))
-
-    mode = _select_mode(value_dtype_req, index_dtype)
-    gather_meta = {
-        "index_fallback_applied": False,
-        "index_fallback_reason": None,
-        "kernel_index_dtype": str(index_dtype).replace("torch.", ""),
-    }
-    flagsparse_op = lambda: ast.flagsparse_gather(dense_vector, indices)
-    cusparse_op = lambda: ast.cusparse_spmv_gather(dense_vector, indices)[0]
-
-    pytorch_op = lambda: dense_vector.index_select(0, indices.to(torch.int64))
-    pytorch_values, pytorch_ms = _bench_cuda_op(pytorch_op, warmup=warmup, iters=iters)
-    flagsparse_values, flagsparse_ms = _bench_cuda_op(flagsparse_op, warmup=warmup, iters=iters)
-
-    atol, rtol = _tolerance(value_dtype_req)
-    fs_match = torch.allclose(flagsparse_values, expected, atol=atol, rtol=rtol)
-    fs_max_error = (
-        float(torch.max(torch.abs(flagsparse_values - expected)).item())
-        if expected.numel() > 0
-        else 0.0
-    )
-
-    cusparse_values = None
-    cusparse_ms = None
-    cusparse_match = None
-    cusparse_max_error = None
-    cusparse_reason = None
-    if run_cusparse:
-        try:
-            cusparse_values, cusparse_ms = _bench_cuda_op(cusparse_op, warmup=warmup, iters=iters)
-            cusparse_match = torch.allclose(cusparse_values, expected, atol=atol, rtol=rtol)
-            cusparse_max_error = (
-                float(torch.max(torch.abs(cusparse_values - expected)).item())
-                if expected.numel() > 0
-                else 0.0
-            )
-        except Exception as exc:
-            cusparse_reason = str(exc)
-
-    fs_vs_pt = pytorch_ms / flagsparse_ms if flagsparse_ms > 0 else float("inf")
-    fs_vs_cs = (
-        cusparse_ms / flagsparse_ms
-        if (cusparse_ms is not None and flagsparse_ms > 0)
-        else None
-    )
-
-    return {
-        "parameters": {
-            "dense_size": dense_size,
-            "nnz": int(indices.numel()),
-            "value_dtype": value_dtype_req,
-            "effective_value_dtype": _effective_dtype_name(value_dtype_req),
-            "index_dtype": str(index_dtype),
-            "mode": mode,
-        },
-        "performance": {
-            "pytorch_ms": pytorch_ms,
-            "triton_ms": flagsparse_ms,
-            "cusparse_ms": cusparse_ms,
-            "triton_speedup_vs_pytorch": fs_vs_pt,
-            "triton_speedup_vs_cusparse": fs_vs_cs,
-        },
-        "verification": {
-            "triton_match_pytorch": fs_match,
-            "triton_max_error": fs_max_error,
-            "cusparse_match_pytorch": cusparse_match,
-            "cusparse_max_error": cusparse_max_error,
-        },
-        "backend_status": {
-            "cusparse_unavailable_reason": cusparse_reason,
-            "index_fallback_applied": bool(gather_meta.get("index_fallback_applied")),
-            "index_fallback_reason": gather_meta.get("index_fallback_reason"),
-        },
-        "samples": {
-            "pytorch": pytorch_values,
-            "triton": flagsparse_values,
-        },
-    }
 
 
 def _status_from_result(verification):
@@ -391,15 +227,16 @@ def run_cli(args):
                 )
                 total_cases += 1
                 try:
-                    result = _benchmark_gather_case(
-                        value_dtype_req=value_dtype,
+                    _check_dtype_supported(value_dtype)
+                    value_dtype_t = _resolve_value_dtype(value_dtype)
+                    result = ast.benchmark_gather_case(
                         index_dtype=index_dtype,
                         dense_size=dense_size,
                         nnz=nnz,
+                        value_dtype=value_dtype_t,
                         warmup=args.warmup,
                         iters=args.iters,
                         run_cusparse=run_cusparse,
-                        index_fallback_policy=args.index_fallback_policy,
                     )
                     perf = result["performance"]
                     verify = result["verification"]
@@ -411,16 +248,16 @@ def run_cli(args):
                     row = {
                         "case_id": case_id,
                         "gpu": torch.cuda.get_device_name(0),
-                        "value_dtype_req": params.get("value_dtype"),
-                        "value_dtype_compute": str(params.get("effective_value_dtype")),
+                        "value_dtype_req": value_dtype,
+                        "value_dtype_compute": str(params.get("value_dtype")).replace(
+                            "torch.", ""
+                        ),
                         "index_dtype": str(params.get("index_dtype")).replace("torch.", ""),
                         "dense_size": int(params.get("dense_size")),
                         "nnz": int(params.get("nnz")),
-                        "mode": params.get("mode"),
+                        "mode": "gather_triton",
                         "index_fallback_policy": args.index_fallback_policy,
-                        "index_fallback_applied": bool(
-                            backend.get("index_fallback_applied")
-                        ),
+                        "index_fallback_applied": False,
                         "triton_ms": perf.get("triton_ms"),
                         "pytorch_ms": perf.get("pytorch_ms"),
                         "cusparse_ms": perf.get("cusparse_ms"),
@@ -431,7 +268,7 @@ def run_cli(args):
                         "triton_max_error": verify.get("triton_max_error"),
                         "cusparse_max_error": verify.get("cusparse_max_error"),
                         "cusparse_unavailable_reason": backend.get("cusparse_unavailable_reason"),
-                        "index_fallback_reason": backend.get("index_fallback_reason"),
+                        "index_fallback_reason": None,
                         "status": status,
                     }
                     summary_rows.append(row)
@@ -456,7 +293,7 @@ def run_cli(args):
                         "index_dtype": index_name,
                         "dense_size": dense_size,
                         "nnz": nnz,
-                        "mode": _select_mode(value_dtype, index_dtype),
+                        "mode": "gather_triton",
                         "index_fallback_policy": args.index_fallback_policy,
                         "index_fallback_applied": False,
                         "triton_ms": None,
