@@ -148,8 +148,8 @@ outputs compare against CPU int32 references.
 - `.github/workflows/nightly-cpu.yml` is a `main`-branch-only nightly CPU check that repeats the package, lint, and shared-runtime smoke tests.
 - `.github/workflows/release.yml` builds source and wheel artifacts, then attaches them to GitHub Releases on `v*` tags.
 - `.github/workflows/triton-smoke.yml` is a manual opt-in job for triton-dependent smoke checks.
-- `.github/workflows/gpu-ci.yml` is a manual GPU accuracy smoke workflow for a self-hosted runner labeled `self-hosted`, `linux`, and `gpu`.
-- `.github/workflows/gpu-benchmark.yml` adds an Actions button for synthetic GPU benchmark runs on a self-hosted runner labeled `self-hosted`, `linux`, and `gpu`.
+- `.github/workflows/gpu-ci.yml` is a manual GPU accuracy smoke workflow that runs on the `test-flagsparse` Actions Runner Controller scale set.
+- `.github/workflows/gpu-benchmark.yml` adds an Actions button for synthetic GPU benchmark runs on the `test-flagsparse` Actions Runner Controller scale set.
 - `.github/workflows/release-drafter.yml` keeps draft release notes current from merged PRs.
 - `make help` lists the local entry points.
 - `make ci` / `make check` run the same CPU-only pipeline used by CI.
