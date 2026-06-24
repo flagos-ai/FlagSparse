@@ -454,6 +454,7 @@ def _spmm_csr_alg2_batched_rows_kernel(
     BLOCK_K: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ACCURACY: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -469,17 +470,32 @@ def _spmm_csr_alg2_batched_rows_kernel(
         row_nnz = end - start
         acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
         for chunk_start in tl.range(0, row_nnz, BLOCK_K):
-            for kk in tl.static_range(0, BLOCK_K):
-                idx = start + chunk_start + kk
-                valid = active & (idx < end)
-                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            offs_k = tl.arange(0, BLOCK_K)
+            idx = start + chunk_start + offs_k
+            valid_k = active & (idx < end)
+            if ACCURACY:
+                a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+                a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
                 b_vals = tl.load(
-                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                    mask=mask_n & valid,
+                    b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
-                )
-                acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+                ).to(ACC_DTYPE)
+                # HP routes widen only after the requested f32 multiplication.
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                acc = acc + tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+            else:
+                for kk in tl.static_range(0, BLOCK_K):
+                    scalar_idx = start + chunk_start + kk
+                    valid = active & (scalar_idx < end)
+                    a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                    a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                    b_vals = tl.load(
+                        b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                        mask=mask_n & valid,
+                        other=0.0,
+                    )
+                    acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
         tl.store(
             c_ptr + row * stride_cm + offs_n * stride_cn,
             acc.to(OUT_DTYPE),
@@ -505,6 +521,7 @@ def _spmm_csr_alg2_row_rows_kernel(
     BLOCK_K: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ACCURACY: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -519,17 +536,31 @@ def _spmm_csr_alg2_row_rows_kernel(
     mask_n = offs_n < n_dense_cols
     acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
     for chunk_start in tl.range(0, row_nnz, BLOCK_K):
-        for kk in tl.static_range(0, BLOCK_K):
-            idx = start + chunk_start + kk
-            valid = idx < end
-            a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-            a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+        offs_k = tl.arange(0, BLOCK_K)
+        idx = start + chunk_start + offs_k
+        valid_k = idx < end
+        if ACCURACY:
+            a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+            a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
             b_vals = tl.load(
-                b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid,
+                b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                mask=valid_k[:, None] & mask_n[None, :],
                 other=0.0,
-            )
-            acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            ).to(ACC_DTYPE)
+            products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+            acc = acc + tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+        else:
+            for kk in tl.static_range(0, BLOCK_K):
+                scalar_idx = start + chunk_start + kk
+                valid = scalar_idx < end
+                a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
     tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n)
 
 
@@ -552,6 +583,7 @@ def _spmm_csr_alg2_segmented_rows_kernel(
     SEGMENTS: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ACCURACY: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -579,17 +611,32 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         seg_end = tl.minimum(end, seg_start + seg_span)
         for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
             chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
-            for kk in tl.static_range(0, BLOCK_K):
-                idx = seg_start + chunk_offset + kk
-                valid = idx < seg_end
-                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            offs_k = tl.arange(0, BLOCK_K)
+            idx = seg_start + chunk_offset + offs_k
+            valid_k = idx < seg_end
+            if ACCURACY:
+                a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+                a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
                 b_vals = tl.load(
-                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                    mask=mask_n & valid,
+                    b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
-                )
-                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+                ).to(ACC_DTYPE)
+                # HP routes widen the rounded f32 products before reduction.
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+            else:
+                for kk in tl.static_range(0, BLOCK_K):
+                    scalar_idx = seg_start + chunk_offset + kk
+                    valid = scalar_idx < seg_end
+                    a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                    a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                    b_vals = tl.load(
+                        b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                        mask=mask_n & valid,
+                        other=0.0,
+                    )
+                    chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
             acc0 = acc0 + chunk_acc
 
     if SEGMENTS > 1:
@@ -597,17 +644,31 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         seg_end = tl.minimum(end, seg_start + seg_span)
         for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
             chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
-            for kk in tl.static_range(0, BLOCK_K):
-                idx = seg_start + chunk_offset + kk
-                valid = idx < seg_end
-                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            offs_k = tl.arange(0, BLOCK_K)
+            idx = seg_start + chunk_offset + offs_k
+            valid_k = idx < seg_end
+            if ACCURACY:
+                a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+                a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
                 b_vals = tl.load(
-                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                    mask=mask_n & valid,
+                    b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
-                )
-                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+                ).to(ACC_DTYPE)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+            else:
+                for kk in tl.static_range(0, BLOCK_K):
+                    scalar_idx = seg_start + chunk_offset + kk
+                    valid = scalar_idx < seg_end
+                    a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                    a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                    b_vals = tl.load(
+                        b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                        mask=mask_n & valid,
+                        other=0.0,
+                    )
+                    chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
             acc1 = acc1 + chunk_acc
 
     if SEGMENTS > 2:
@@ -615,17 +676,31 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         seg_end = tl.minimum(end, seg_start + seg_span)
         for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
             chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
-            for kk in tl.static_range(0, BLOCK_K):
-                idx = seg_start + chunk_offset + kk
-                valid = idx < seg_end
-                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            offs_k = tl.arange(0, BLOCK_K)
+            idx = seg_start + chunk_offset + offs_k
+            valid_k = idx < seg_end
+            if ACCURACY:
+                a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+                a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
                 b_vals = tl.load(
-                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                    mask=mask_n & valid,
+                    b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
-                )
-                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+                ).to(ACC_DTYPE)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+            else:
+                for kk in tl.static_range(0, BLOCK_K):
+                    scalar_idx = seg_start + chunk_offset + kk
+                    valid = scalar_idx < seg_end
+                    a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                    a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                    b_vals = tl.load(
+                        b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                        mask=mask_n & valid,
+                        other=0.0,
+                    )
+                    chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
             acc2 = acc2 + chunk_acc
 
     if SEGMENTS > 3:
@@ -633,17 +708,31 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         seg_end = tl.minimum(end, seg_start + seg_span)
         for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
             chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
-            for kk in tl.static_range(0, BLOCK_K):
-                idx = seg_start + chunk_offset + kk
-                valid = idx < seg_end
-                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            offs_k = tl.arange(0, BLOCK_K)
+            idx = seg_start + chunk_offset + offs_k
+            valid_k = idx < seg_end
+            if ACCURACY:
+                a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+                a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
                 b_vals = tl.load(
-                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                    mask=mask_n & valid,
+                    b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
-                )
-                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+                ).to(ACC_DTYPE)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+            else:
+                for kk in tl.static_range(0, BLOCK_K):
+                    scalar_idx = seg_start + chunk_offset + kk
+                    valid = scalar_idx < seg_end
+                    a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                    a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                    b_vals = tl.load(
+                        b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                        mask=mask_n & valid,
+                        other=0.0,
+                    )
+                    chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
             acc3 = acc3 + chunk_acc
 
     if SEGMENTS > 4:
@@ -651,17 +740,31 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         seg_end = tl.minimum(end, seg_start + seg_span)
         for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
             chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
-            for kk in tl.static_range(0, BLOCK_K):
-                idx = seg_start + chunk_offset + kk
-                valid = idx < seg_end
-                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            offs_k = tl.arange(0, BLOCK_K)
+            idx = seg_start + chunk_offset + offs_k
+            valid_k = idx < seg_end
+            if ACCURACY:
+                a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+                a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
                 b_vals = tl.load(
-                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                    mask=mask_n & valid,
+                    b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
-                )
-                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+                ).to(ACC_DTYPE)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+            else:
+                for kk in tl.static_range(0, BLOCK_K):
+                    scalar_idx = seg_start + chunk_offset + kk
+                    valid = scalar_idx < seg_end
+                    a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                    a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                    b_vals = tl.load(
+                        b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                        mask=mask_n & valid,
+                        other=0.0,
+                    )
+                    chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
             acc4 = acc4 + chunk_acc
 
     if SEGMENTS > 5:
@@ -669,17 +772,31 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         seg_end = tl.minimum(end, seg_start + seg_span)
         for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
             chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
-            for kk in tl.static_range(0, BLOCK_K):
-                idx = seg_start + chunk_offset + kk
-                valid = idx < seg_end
-                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            offs_k = tl.arange(0, BLOCK_K)
+            idx = seg_start + chunk_offset + offs_k
+            valid_k = idx < seg_end
+            if ACCURACY:
+                a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+                a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
                 b_vals = tl.load(
-                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                    mask=mask_n & valid,
+                    b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
-                )
-                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+                ).to(ACC_DTYPE)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+            else:
+                for kk in tl.static_range(0, BLOCK_K):
+                    scalar_idx = seg_start + chunk_offset + kk
+                    valid = scalar_idx < seg_end
+                    a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                    a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                    b_vals = tl.load(
+                        b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                        mask=mask_n & valid,
+                        other=0.0,
+                    )
+                    chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
             acc5 = acc5 + chunk_acc
 
     if SEGMENTS > 6:
@@ -687,17 +804,31 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         seg_end = tl.minimum(end, seg_start + seg_span)
         for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
             chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
-            for kk in tl.static_range(0, BLOCK_K):
-                idx = seg_start + chunk_offset + kk
-                valid = idx < seg_end
-                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            offs_k = tl.arange(0, BLOCK_K)
+            idx = seg_start + chunk_offset + offs_k
+            valid_k = idx < seg_end
+            if ACCURACY:
+                a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+                a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
                 b_vals = tl.load(
-                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                    mask=mask_n & valid,
+                    b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
-                )
-                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+                ).to(ACC_DTYPE)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+            else:
+                for kk in tl.static_range(0, BLOCK_K):
+                    scalar_idx = seg_start + chunk_offset + kk
+                    valid = scalar_idx < seg_end
+                    a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                    a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                    b_vals = tl.load(
+                        b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                        mask=mask_n & valid,
+                        other=0.0,
+                    )
+                    chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
             acc6 = acc6 + chunk_acc
 
     if SEGMENTS > 7:
@@ -705,17 +836,31 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         seg_end = tl.minimum(end, seg_start + seg_span)
         for chunk_offset in tl.range(0, seg_end - seg_start, BLOCK_K):
             chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
-            for kk in tl.static_range(0, BLOCK_K):
-                idx = seg_start + chunk_offset + kk
-                valid = idx < seg_end
-                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            offs_k = tl.arange(0, BLOCK_K)
+            idx = seg_start + chunk_offset + offs_k
+            valid_k = idx < seg_end
+            if ACCURACY:
+                a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+                a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
                 b_vals = tl.load(
-                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                    mask=mask_n & valid,
+                    b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
-                )
-                chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+                ).to(ACC_DTYPE)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
+            else:
+                for kk in tl.static_range(0, BLOCK_K):
+                    scalar_idx = seg_start + chunk_offset + kk
+                    valid = scalar_idx < seg_end
+                    a_val = tl.load(data_ptr + scalar_idx, mask=valid, other=0.0)
+                    a_col = tl.load(indices_ptr + scalar_idx, mask=valid, other=0)
+                    b_vals = tl.load(
+                        b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                        mask=mask_n & valid,
+                        other=0.0,
+                    )
+                    chunk_acc = chunk_acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
             acc7 = acc7 + chunk_acc
 
     if SEGMENTS == 1:
@@ -820,6 +965,7 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
             BLOCK_K=launch["block_k"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
+            ACCURACY=False,
             **common_kwargs,
         )
     elif bucket["kind"] == "row2d":
@@ -841,6 +987,7 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
             BLOCK_K=launch["block_k"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
+            ACCURACY=False,
             **common_kwargs,
         )
     else:
@@ -863,6 +1010,7 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
             SEGMENTS=launch["segments"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
+            ACCURACY=False,
             **common_kwargs,
         )
 

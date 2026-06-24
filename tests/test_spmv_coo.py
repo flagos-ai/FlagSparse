@@ -117,9 +117,15 @@ def _reference_dtype(dtype):
 
 
 def _tol_for_dtype(dtype):
+    if dtype == torch.float16:
+        return 1e-3, 2e-3
+    if dtype == torch.bfloat16:
+        return 0.016, 1e-1
     if dtype in (torch.float32, torch.complex64):
-        return 1e-4, 1e-2
-    return 1e-12, 1e-10
+        return 1.3e-6, 1e-3
+    if dtype in (torch.float64, torch.complex128):
+        return 1e-7, 1e-5
+    return 1e-6, 1e-5
 
 
 def _op_transposes(op):

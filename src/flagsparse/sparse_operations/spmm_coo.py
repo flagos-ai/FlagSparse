@@ -8,6 +8,125 @@ from .spmm_csr import (
     _spmm_relative_threshold,
     _spmm_validation_metrics,
 )
+
+SPMM_COO_OP_NON = 0
+SPMM_COO_OP_TRANS = 1
+SPMM_COO_OP_CONJ_TRANS = 2
+SPMM_COO_OP_NAMES = {
+    SPMM_COO_OP_NON: "non",
+    SPMM_COO_OP_TRANS: "trans",
+    SPMM_COO_OP_CONJ_TRANS: "conj",
+}
+_SPMM_COO_OP_NAME_TO_CODE = {name: code for code, name in SPMM_COO_OP_NAMES.items()}
+
+
+def _normalize_spmm_coo_op(op=None, transpose=False):
+    if op is None:
+        return SPMM_COO_OP_TRANS if bool(transpose) else SPMM_COO_OP_NON
+    if isinstance(op, str):
+        token = op.strip().lower()
+        if token not in _SPMM_COO_OP_NAME_TO_CODE:
+            raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+        return _SPMM_COO_OP_NAME_TO_CODE[token]
+    try:
+        op_code = int(op)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj") from exc
+    if op_code not in SPMM_COO_OP_NAMES:
+        raise ValueError("op must be one of: 0=non, 1=trans, 2=conj")
+    return op_code
+
+
+def _spmm_coo_op_to_name(op):
+    return SPMM_COO_OP_NAMES[_normalize_spmm_coo_op(op)]
+
+
+def _spmm_coo_op_transposes(op):
+    return _normalize_spmm_coo_op(op) in (SPMM_COO_OP_TRANS, SPMM_COO_OP_CONJ_TRANS)
+
+
+def _materialize_spmm_coo_op(data, row, col, shape, op_code):
+    if op_code == SPMM_COO_OP_NON:
+        return data, row, col, shape
+    data_op = data
+    if op_code == SPMM_COO_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+        data_op = data.conj()
+        if hasattr(data_op, "resolve_conj"):
+            data_op = data_op.resolve_conj()
+    return data_op, col, row, (int(shape[1]), int(shape[0]))
+
+
+def _normalize_dense_layout(layout):
+    token = "row" if layout is None else str(layout).strip().lower()
+    if token in ("auto", "default"):
+        return "row"
+    if token in ("row", "row_major", "row-major", "c", "c_order"):
+        return "row"
+    if token in (
+        "col",
+        "column",
+        "col_major",
+        "column_major",
+        "col-major",
+        "column-major",
+        "f",
+        "fortran",
+    ):
+        return "col"
+    raise ValueError("dense_layout must be one of: auto, row, col")
+
+
+def _is_col_major_2d(tensor):
+    return (
+        torch.is_tensor(tensor)
+        and tensor.ndim == 2
+        and tensor.stride(0) == 1
+        and tensor.stride(1) >= max(1, int(tensor.shape[0]))
+    )
+
+
+def _dense_layout_name(tensor):
+    if not torch.is_tensor(tensor) or tensor.ndim != 2:
+        return "unknown"
+    if tensor.is_contiguous():
+        return "row"
+    if _is_col_major_2d(tensor):
+        return "col"
+    return "strided"
+
+
+def _empty_dense_layout(shape, dtype, device, layout):
+    layout = _normalize_dense_layout(layout)
+    rows, cols = int(shape[0]), int(shape[1])
+    if layout == "col":
+        return torch.empty_strided(
+            (rows, cols),
+            (1, max(1, rows)),
+            dtype=dtype,
+            device=device,
+        )
+    return torch.empty((rows, cols), dtype=dtype, device=device)
+
+
+def _zeros_dense_layout(shape, dtype, device, layout):
+    out = _empty_dense_layout(shape, dtype, device, layout)
+    out.zero_()
+    return out
+
+
+def _materialize_dense_layout(tensor, layout):
+    layout = _normalize_dense_layout(layout)
+    if tensor.ndim != 2:
+        raise ValueError("dense layout materialization expects a 2D tensor")
+    if layout == "row":
+        return tensor.contiguous()
+    if _is_col_major_2d(tensor):
+        return tensor
+    out = _empty_dense_layout(tensor.shape, tensor.dtype, tensor.device, layout)
+    out.copy_(tensor)
+    return out
+
+
 def _spmm_coo_compute_dtype(value_dtype):
     if _is_complex_dtype(value_dtype):
         return torch.complex128 if value_dtype == torch.complex64 else value_dtype
@@ -98,11 +217,22 @@ def _build_random_coo(n_rows, n_cols, nnz, value_dtype, index_dtype, device):
     return data, row, col
 
 
-def _prepare_spmm_coo_canonical_prepared(data, row, col, B, n_rows, n_cols, n_dense_cols):
+def _prepare_spmm_coo_canonical_prepared(
+    data,
+    row,
+    col,
+    B,
+    n_rows,
+    n_cols,
+    n_dense_cols,
+    dense_layout="row",
+):
+    dense_layout = _normalize_dense_layout(dense_layout)
     output_dtype = data.dtype
     compute_dtype = _spmm_coo_compute_dtype(output_dtype)
     data_compute = data if compute_dtype == output_dtype else data.to(compute_dtype)
     B_compute = B if compute_dtype == output_dtype else B.to(compute_dtype)
+    B_compute = _materialize_dense_layout(B_compute, dense_layout)
     canonical_data, canonical_row, canonical_col = _coalesce_coo_entries(
         data_compute,
         row,
@@ -128,9 +258,9 @@ def _prepare_spmm_coo_canonical_prepared(data, row, col, B, n_rows, n_cols, n_de
     )
 
 
-def _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape):
+def _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape, dense_layout="row"):
     data, kernel_row, kernel_col, B, n_rows, n_cols, n_dense_cols = _prepare_spmm_coo_inputs(
-        data, row, col, B, shape
+        data, row, col, B, shape, dense_layout=dense_layout
     )
     return _prepare_spmm_coo_canonical_prepared(
         data,
@@ -140,6 +270,7 @@ def _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape):
         n_rows,
         n_cols,
         n_dense_cols,
+        dense_layout=dense_layout,
     )
 def _seg_starts_from_sorted_rows(row_i32, nnz, device):
     if nnz == 0:
@@ -332,7 +463,8 @@ def _spmm_coo_atomic_complex_kernel(
         contrib_im,
         sem="relaxed",
     )
-def _prepare_spmm_coo_inputs(data, row, col, B, shape):
+def _prepare_spmm_coo_inputs(data, row, col, B, shape, dense_layout="row"):
+    dense_layout = _normalize_dense_layout(dense_layout)
     if len(shape) != 2:
         raise ValueError("shape must be a 2-tuple: (n_rows, n_cols)")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
@@ -387,7 +519,7 @@ def _prepare_spmm_coo_inputs(data, row, col, B, shape):
     data = data.contiguous()
     row = row.contiguous()
     col = col.contiguous()
-    B = B.contiguous()
+    B = _materialize_dense_layout(B, dense_layout)
 
     kernel_row = row.to(torch.int32) if row.dtype == torch.int64 else row
     kernel_col = col.to(torch.int32) if col.dtype == torch.int64 else col
@@ -424,20 +556,40 @@ def _triton_spmm_coo_rowrun_impl(
     block_n,
     block_nnz,
     output_dtype,
+    out=None,
+    dense_layout="row",
 ):
     device = data.device
     dtype = data.dtype
+    dense_layout = _normalize_dense_layout(dense_layout)
+    if out is not None:
+        if out.shape != (int(n_rows), int(n_dense_cols)) or out.dtype != output_dtype:
+            raise ValueError("out shape/dtype must match result")
+        if out.device != device:
+            raise ValueError("out must be on the same CUDA device as data")
     if n_rows == 0 or n_dense_cols == 0 or B.shape[0] == 0 or data.numel() == 0:
-        return torch.zeros((n_rows, n_dense_cols), dtype=output_dtype, device=device)
+        if out is not None:
+            out.zero_()
+            return out
+        return _zeros_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
 
     seg_starts = _seg_starts_from_sorted_rows(row, int(data.numel()), device)
     n_segs = int(seg_starts.numel()) - 1 if seg_starts is not None else 0
     if n_segs == 0:
-        return torch.zeros((n_rows, n_dense_cols), dtype=output_dtype, device=device)
+        if out is not None:
+            out.zero_()
+            return out
+        return _zeros_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
 
     grid = (n_segs, triton.cdiv(n_dense_cols, block_n))
     if not _is_complex_dtype(dtype):
-        C_compute = torch.zeros((n_rows, n_dense_cols), dtype=dtype, device=device)
+        C_compute = (
+            out
+            if out is not None and dtype == output_dtype
+            else _zeros_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
+        )
+        if C_compute is out:
+            C_compute.zero_()
         acc_dtype = tl.float64 if dtype == torch.float64 else tl.float32
         _spmm_coo_rowrun_real_kernel[grid](
             data,
@@ -456,11 +608,33 @@ def _triton_spmm_coo_rowrun_impl(
             BLOCK_NNZ=block_nnz,
             ACC_DTYPE=acc_dtype,
         )
-        return C_compute if dtype == output_dtype else C_compute.to(output_dtype)
+        if dtype != output_dtype:
+            C_cast = C_compute.to(output_dtype)
+            if out is not None:
+                out.copy_(C_cast)
+                return out
+            if dense_layout == "col":
+                C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+                C_out.copy_(C_cast)
+                return C_out
+            return C_cast
+        return C_compute
 
     data_ri = torch.view_as_real(data).contiguous().reshape(-1)
-    B_ri = torch.view_as_real(B).contiguous()
-    C_ri = torch.zeros((n_rows, n_dense_cols, 2), dtype=B_ri.dtype, device=device)
+    B_ri = torch.view_as_real(B)
+    C_compute = (
+        out
+        if out is not None and dtype == output_dtype
+        else _zeros_dense_layout(
+            (n_rows, n_dense_cols),
+            dtype,
+            device,
+            dense_layout,
+        )
+    )
+    if C_compute is out:
+        C_compute.zero_()
+    C_ri = torch.view_as_real(C_compute)
     acc_dtype = tl.float64 if B_ri.dtype == torch.float64 else tl.float32
     _spmm_coo_rowrun_complex_kernel[grid](
         data_ri,
@@ -481,8 +655,17 @@ def _triton_spmm_coo_rowrun_impl(
         BLOCK_NNZ=block_nnz,
         ACC_DTYPE=acc_dtype,
     )
-    C = torch.view_as_complex(C_ri.contiguous())
-    return C if dtype == output_dtype else C.to(output_dtype)
+    if dtype != output_dtype:
+        C_cast = C_compute.to(output_dtype)
+        if out is not None:
+            out.copy_(C_cast)
+            return out
+        if dense_layout == "col":
+            C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+            C_out.copy_(C_cast)
+            return C_out
+        return C_cast
+    return C_compute
 
 def _triton_spmm_coo_atomic_impl(
     data,
@@ -494,18 +677,38 @@ def _triton_spmm_coo_atomic_impl(
     block_n,
     block_nnz,
     output_dtype,
+    out=None,
+    dense_layout="row",
 ):
     device = data.device
     dtype = data.dtype
+    dense_layout = _normalize_dense_layout(dense_layout)
+    if out is not None:
+        if out.shape != (int(n_rows), int(n_dense_cols)) or out.dtype != output_dtype:
+            raise ValueError("out shape/dtype must match result")
+        if out.device != device:
+            raise ValueError("out must be on the same CUDA device as data")
     if n_rows == 0 or n_dense_cols == 0 or B.shape[0] == 0 or data.numel() == 0:
-        return torch.zeros((n_rows, n_dense_cols), dtype=output_dtype, device=device)
+        if out is not None:
+            out.zero_()
+            return out
+        return _zeros_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
 
     nnz = int(data.numel())
     if nnz == 0:
-        return torch.zeros((n_rows, n_dense_cols), dtype=output_dtype, device=device)
+        if out is not None:
+            out.zero_()
+            return out
+        return _zeros_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
 
     if not _is_complex_dtype(dtype):
-        C_compute = torch.zeros((n_rows, n_dense_cols), dtype=dtype, device=device)
+        C_compute = (
+            out
+            if out is not None and dtype == output_dtype
+            else _zeros_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
+        )
+        if C_compute is out:
+            C_compute.zero_()
         acc_dtype = tl.float64 if dtype == torch.float64 else tl.float32
         _spmm_coo_atomic_real_kernel[(nnz, n_dense_cols)](
             data,
@@ -521,11 +724,33 @@ def _triton_spmm_coo_atomic_impl(
             C_compute.stride(1),
             ACC_DTYPE=acc_dtype,
         )
-        return C_compute if dtype == output_dtype else C_compute.to(output_dtype)
+        if dtype != output_dtype:
+            C_cast = C_compute.to(output_dtype)
+            if out is not None:
+                out.copy_(C_cast)
+                return out
+            if dense_layout == "col":
+                C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+                C_out.copy_(C_cast)
+                return C_out
+            return C_cast
+        return C_compute
 
     data_ri = torch.view_as_real(data).contiguous().reshape(-1)
-    B_ri = torch.view_as_real(B).contiguous()
-    C_ri = torch.zeros((n_rows, n_dense_cols, 2), dtype=B_ri.dtype, device=device)
+    B_ri = torch.view_as_real(B)
+    C_compute = (
+        out
+        if out is not None and dtype == output_dtype
+        else _zeros_dense_layout(
+            (n_rows, n_dense_cols),
+            dtype,
+            device,
+            dense_layout,
+        )
+    )
+    if C_compute is out:
+        C_compute.zero_()
+    C_ri = torch.view_as_real(C_compute)
     acc_dtype = tl.float64 if B_ri.dtype == torch.float64 else tl.float32
     _spmm_coo_atomic_complex_kernel[(nnz, n_dense_cols)](
         data_ri,
@@ -543,8 +768,17 @@ def _triton_spmm_coo_atomic_impl(
         C_ri.stride(2),
         ACC_DTYPE=acc_dtype,
     )
-    C = torch.view_as_complex(C_ri.contiguous())
-    return C if dtype == output_dtype else C.to(output_dtype)
+    if dtype != output_dtype:
+        C_cast = C_compute.to(output_dtype)
+        if out is not None:
+            out.copy_(C_cast)
+            return out
+        if dense_layout == "col":
+            C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+            C_out.copy_(C_cast)
+            return C_out
+        return C_cast
+    return C_compute
 
 def _normalize_spmm_coo_route(route):
     route = "rowrun" if route is None else str(route).lower()
@@ -564,10 +798,11 @@ def _triton_spmm_coo_impl(
     block_nnz,
     route="rowrun",
     output_dtype=None,
+    out=None,
+    dense_layout="row",
 ):
     route = _normalize_spmm_coo_route(route)
-    if route == "rowrun" and _is_complex_dtype(data.dtype):
-        route = "atomic"
+    dense_layout = _normalize_dense_layout(dense_layout)
     resolved_output_dtype = output_dtype if output_dtype is not None else data.dtype
     if route == "rowrun":
         return _triton_spmm_coo_rowrun_impl(
@@ -580,6 +815,8 @@ def _triton_spmm_coo_impl(
             block_n,
             block_nnz,
             output_dtype=resolved_output_dtype,
+            out=out,
+            dense_layout=dense_layout,
         )
     return _triton_spmm_coo_atomic_impl(
         data,
@@ -591,6 +828,8 @@ def _triton_spmm_coo_impl(
         block_n,
         block_nnz,
         output_dtype=resolved_output_dtype,
+        out=out,
+        dense_layout=dense_layout,
     )
 
 
@@ -607,8 +846,10 @@ def _run_spmm_coo_canonical_route(
     out=None,
     return_time=False,
     route="rowrun",
+    dense_layout="row",
 ):
     route = _normalize_spmm_coo_route(route)
+    dense_layout = _normalize_dense_layout(dense_layout)
     launch = _resolve_spmm_coo_launch_config(
         n_dense_cols,
         canonical_data.numel(),
@@ -623,7 +864,6 @@ def _run_spmm_coo_canonical_route(
             raise ValueError("out must be on the same CUDA device as the inputs")
         if out.shape != (n_rows, n_dense_cols) or out.dtype != output_dtype:
             raise ValueError("out shape/dtype must match result")
-
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     C = _triton_spmm_coo_impl(
@@ -637,13 +877,12 @@ def _run_spmm_coo_canonical_route(
         block_nnz=launch["block_nnz"],
         route=route,
         output_dtype=output_dtype,
+        out=out,
+        dense_layout=dense_layout,
     )
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    if out is not None:
-        out.copy_(C)
-        C = out
     if return_time:
         return C, elapsed_ms
     return C
@@ -658,13 +897,43 @@ def _run_spmm_coo_route(
     block_nnz=256,
     out=None,
     return_time=False,
+    return_meta=False,
     route="rowrun",
+    op=None,
+    transpose=None,
+    dense_layout="row",
 ):
     route = _normalize_spmm_coo_route(route)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    op_explicit = op is not None
+    op_code = _normalize_spmm_coo_op(
+        op,
+        transpose=False if transpose is None else bool(transpose),
+    )
+    if (
+        op_explicit
+        and transpose is not None
+        and bool(transpose) != _spmm_coo_op_transposes(op_code)
+    ):
+        raise ValueError("transpose conflicts with op")
+    op_name = _spmm_coo_op_to_name(op_code)
     if block_n is not None and block_n <= 0:
         raise ValueError("block_n must be positive when provided")
     if block_nnz is not None and block_nnz <= 0:
         raise ValueError("block_nnz must be positive when provided")
+
+    do_timing = bool(return_time or return_meta)
+    symbolic_ms = 0.0 if do_timing else None
+    compute_ms = None
+    op_total_ms = None
+
+    if do_timing:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+    data, row, col, shape = _materialize_spmm_coo_op(data, row, col, shape, op_code)
+    if do_timing:
+        torch.cuda.synchronize()
+        symbolic_ms = (time.perf_counter() - t0) * 1000.0 if _spmm_coo_op_transposes(op_code) else 0.0
 
     (
         canonical_data,
@@ -676,9 +945,16 @@ def _run_spmm_coo_route(
         n_dense_cols,
         output_dtype,
         _,
-    ) = _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape)
+    ) = _prepare_spmm_coo_canonical_inputs(
+        data,
+        row,
+        col,
+        B,
+        shape,
+        dense_layout=dense_layout,
+    )
 
-    return _run_spmm_coo_canonical_route(
+    result = _run_spmm_coo_canonical_route(
         canonical_data,
         canonical_row,
         canonical_col,
@@ -689,9 +965,36 @@ def _run_spmm_coo_route(
         block_n=block_n,
         block_nnz=block_nnz,
         out=out,
-        return_time=return_time,
+        return_time=do_timing,
         route=route,
+        dense_layout=dense_layout,
     )
+    if do_timing:
+        C, compute_ms = result
+        op_total_ms = symbolic_ms + compute_ms
+    else:
+        C = result
+
+    meta = None
+    if return_meta:
+        meta = {
+            "op": op_name,
+            "route": route,
+            "symbolic_ms": symbolic_ms,
+            "compute_ms": compute_ms,
+            "op_total_ms": op_total_ms,
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in canonical_B.stride()),
+            "c_stride": tuple(int(v) for v in C.stride()),
+            "output_layout": _dense_layout_name(C),
+        }
+    if return_time and return_meta:
+        return C, op_total_ms, meta
+    if return_time:
+        return C, op_total_ms
+    if return_meta:
+        return C, meta
+    return C
 
 def flagsparse_spmm_coo(
     data,
@@ -703,11 +1006,15 @@ def flagsparse_spmm_coo(
     block_nnz=256,
     out=None,
     return_time=False,
+    transpose=None,
+    op=None,
+    return_meta=False,
+    dense_layout="auto",
 ):
-    """COO SpMM: C = A @ B.
+    """COO SpMM using a native Triton COO row-run kernel by default.
 
-    Real dtypes use the row-run kernel by default. Complex dtypes use the
-    atomic COO route because the complex row-run kernel is not stable yet.
+    op: 0/'non' for A @ B, 1/'trans' for A.T @ B,
+    2/'conj' for A.conj().T @ B.
     """
     return _run_spmm_coo_route(
         data,
@@ -719,7 +1026,11 @@ def flagsparse_spmm_coo(
         block_nnz=block_nnz,
         out=out,
         return_time=return_time,
+        return_meta=return_meta,
         route="rowrun",
+        op=op,
+        transpose=transpose,
+        dense_layout=dense_layout,
     )
 
 
@@ -742,7 +1053,9 @@ def _build_spmm_coo_pytorch_reference_from_canonical(
 
 
 
-def _build_spmm_coo_pytorch_reference(data, row, col, B, shape):
+def _build_spmm_coo_pytorch_reference(data, row, col, B, shape, op="non"):
+    op_code = _normalize_spmm_coo_op(op)
+    data, row, col, shape = _materialize_spmm_coo_op(data, row, col, shape, op_code)
     native_data, native_row, native_col, native_B, n_rows, n_cols, n_dense_cols = _prepare_spmm_coo_inputs(
         data, row, col, B, shape
     )
@@ -830,32 +1143,31 @@ def _benchmark_spmm_coo_route(
     block_n,
     block_nnz,
     route,
+    op="non",
+    dense_layout="row",
 ):
-    (
-        canonical_data,
-        canonical_row,
-        canonical_col,
-        canonical_B,
-        n_rows,
-        _,
-        n_dense_cols,
-        output_dtype,
-        _,
-    ) = _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape)
-    return _benchmark_spmm_coo_canonical_route(
-        canonical_data,
-        canonical_row,
-        canonical_col,
-        canonical_B,
-        n_rows,
-        n_dense_cols,
-        output_dtype,
-        warmup,
-        iters,
-        block_n,
-        block_nnz,
-        route,
+    route = _normalize_spmm_coo_route(route)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    run = lambda: _run_spmm_coo_route(
+        data,
+        row,
+        col,
+        B,
+        shape,
+        block_n=block_n,
+        block_nnz=block_nnz,
+        return_time=False,
+        route=route,
+        op=op,
+        dense_layout=dense_layout,
     )
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    _ = run()
+    torch.cuda.synchronize()
+    first_call_ms = (time.perf_counter() - t0) * 1000.0
+    values, steady_ms = _benchmark_cuda_op(run, warmup=warmup, iters=iters)
+    return values, steady_ms, first_call_ms
 def _spmm_coo_pairwise_summary(candidate, reference, value_dtype):
     metrics = _spmm_validation_metrics(candidate, reference)
     atol, rtol = _spmm_coo_reference_tolerance(value_dtype)
@@ -888,18 +1200,39 @@ def benchmark_spmm_coo_case(
     run_cusparse=True,
     route="rowrun",
     compare_routes=False,
+    op="non",
+    dense_layout="row",
 ):
     """Benchmark native COO SpMM vs PyTorch COO sparse.mm and CuPy/cuSPARSE COO @ dense."""
     selected_route = _normalize_spmm_coo_route(route)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    op_code = _normalize_spmm_coo_op(op)
+    op_name = _spmm_coo_op_to_name(op_code)
     device = torch.device("cuda")
     data, row, col = _build_random_coo(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
-    B = _build_random_dense((n_cols, n_dense_cols), value_dtype, device)
     shape = (n_rows, n_cols)
+    b_rows = n_rows if _spmm_coo_op_transposes(op_code) else n_cols
+    B = _materialize_dense_layout(
+        _build_random_dense((b_rows, n_dense_cols), value_dtype, device),
+        dense_layout,
+    )
+    effective_data, effective_row, effective_col, effective_shape = _materialize_spmm_coo_op(
+        data,
+        row,
+        col,
+        shape,
+        op_code,
+    )
 
     native_data, native_row, native_col, native_B, _, _, _ = _prepare_spmm_coo_inputs(
-        data, row, col, B, shape
+        effective_data,
+        effective_row,
+        effective_col,
+        B,
+        effective_shape,
+        dense_layout=dense_layout,
     )
     (
         canonical_data,
@@ -919,6 +1252,7 @@ def benchmark_spmm_coo_case(
         n_rows,
         n_cols,
         native_B.shape[1],
+        dense_layout=dense_layout,
     )
     launch = _resolve_spmm_coo_launch_config(
         n_dense_cols,
@@ -928,33 +1262,45 @@ def benchmark_spmm_coo_case(
     )
     seg_starts = _seg_starts_from_sorted_rows(canonical_row, canonical_data.numel(), device)
     n_row_runs = int(seg_starts.numel()) - 1 if seg_starts is not None else 0
+    cusparse_data, cusparse_row, cusparse_col = _coalesce_coo_entries(
+        native_data,
+        native_row,
+        native_col,
+        effective_shape,
+    )
+    cusparse_data, cusparse_row, cusparse_col = _sort_coo_lex_inplace(
+        cusparse_data,
+        cusparse_row,
+        cusparse_col,
+        effective_shape[1],
+    )
 
     expected = _build_spmm_coo_pytorch_reference_from_canonical(
         canonical_data,
         canonical_row,
         canonical_col,
         canonical_B,
-        shape,
+        effective_shape,
         output_dtype,
     )
-    pytorch_coo = _build_torch_sparse_coo(native_data, native_row, native_col, shape)
+    pytorch_coo = _build_torch_sparse_coo(native_data, native_row, native_col, effective_shape)
     pytorch_op = lambda: torch.sparse.mm(pytorch_coo, native_B)
     pytorch_format = "COO"
     pytorch_reason = None
 
-    triton_C, triton_ms, triton_first_call_ms = _benchmark_spmm_coo_canonical_route(
-        canonical_data,
-        canonical_row,
-        canonical_col,
-        canonical_B,
-        n_rows,
-        n_dense_cols,
-        output_dtype,
+    triton_C, triton_ms, triton_first_call_ms = _benchmark_spmm_coo_route(
+        data,
+        row,
+        col,
+        B,
+        shape,
         warmup,
         iters,
         launch["block_n"],
         launch["block_nnz"],
         selected_route,
+        op=op_name,
+        dense_layout=dense_layout,
     )
     triton_summary = _spmm_coo_pairwise_summary(triton_C, expected, value_dtype)
     triton_match = triton_summary["match"]
@@ -986,12 +1332,12 @@ def benchmark_spmm_coo_case(
             cusparse_reason = "float16/bfloat16 not supported by CuPy sparse; skipped"
         else:
             try:
-                data_cp = _cupy_from_torch(native_data)
-                row_cp = _cupy_from_torch(native_row.to(torch.int64))
-                col_cp = _cupy_from_torch(native_col.to(torch.int64))
+                data_cp = _cupy_from_torch(cusparse_data)
+                row_cp = _cupy_from_torch(cusparse_row.to(torch.int64))
+                col_cp = _cupy_from_torch(cusparse_col.to(torch.int64))
                 B_cp = _cupy_from_torch(native_B)
                 A_coo = cpx_sparse.coo_matrix(
-                    (data_cp, (row_cp, col_cp)), shape=shape
+                    (data_cp, (row_cp, col_cp)), shape=effective_shape
                 )
                 cusparse_values_cp, cusparse_ms = _benchmark_cuda_op(
                     lambda: A_coo @ B_cp, warmup=warmup, iters=iters
@@ -1032,19 +1378,19 @@ def benchmark_spmm_coo_case(
             if extra_route in route_outputs:
                 continue
             try:
-                extra_values, extra_ms, extra_first_call_ms = _benchmark_spmm_coo_canonical_route(
-                    canonical_data,
-                    canonical_row,
-                    canonical_col,
-                    canonical_B,
-                    n_rows,
-                    n_dense_cols,
-                    output_dtype,
+                extra_values, extra_ms, extra_first_call_ms = _benchmark_spmm_coo_route(
+                    data,
+                    row,
+                    col,
+                    B,
+                    shape,
                     warmup,
                     iters,
                     launch["block_n"],
                     launch["block_nnz"],
                     extra_route,
+                    op=op_name,
+                    dense_layout=dense_layout,
                 )
                 extra_summary = _spmm_coo_pairwise_summary(extra_values, expected, value_dtype)
                 route_outputs[extra_route] = extra_values
@@ -1106,6 +1452,11 @@ def benchmark_spmm_coo_case(
             "format": "coo",
             "internal_format": f"native-{selected_route}",
             "route": selected_route,
+            "op": op_name,
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in native_B.stride()),
+            "c_stride": tuple(int(v) for v in triton_C.stride()),
+            "output_layout": _dense_layout_name(triton_C),
             "compare_routes": bool(compare_routes),
             "n_rows": n_rows,
             "n_cols": n_cols,
@@ -1184,6 +1535,8 @@ def comprehensive_spmm_coo_test(
     block_n=None,
     block_nnz=256,
     run_cusparse=True,
+    op="non",
+    dense_layout="row",
 ):
     """Full COO SpMM benchmark entry for one configuration."""
     return benchmark_spmm_coo_case(
@@ -1198,4 +1551,6 @@ def comprehensive_spmm_coo_test(
         block_n=block_n,
         block_nnz=block_nnz,
         run_cusparse=run_cusparse,
+        op=op,
+        dense_layout=dense_layout,
     )

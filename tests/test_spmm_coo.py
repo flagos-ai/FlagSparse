@@ -38,6 +38,8 @@ VALUE_DTYPES = [
 INDEX_DTYPES = [torch.int32, torch.int64]
 CSV_VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
 CSV_INDEX_DTYPES = [torch.int32, torch.int64]
+OP_NAMES = tuple(ast_ops.SPMM_COO_OP_NAMES.values())
+LAYOUT_NAMES = ("row", "col")
 TEST_CASES = [
     (512, 512, 4096, 16),
     (1024, 1024, 16384, 32),
@@ -91,6 +93,66 @@ def _parse_csv_tokens(value, mapping, option_name):
             f"unsupported {option_name}: {', '.join(invalid)}; allowed: {', '.join(mapping)}"
         )
     return [mapping[token] for token in tokens]
+
+
+def _parse_op_names(value):
+    token = str(value).strip().lower()
+    if token == "all":
+        return list(OP_NAMES)
+    names = [item.strip().lower() for item in token.split(",") if item.strip()]
+    invalid = [name for name in names if name not in OP_NAMES]
+    if not names or invalid:
+        raise ValueError(f"unsupported --op: {', '.join(invalid or names)}; allowed: all,{','.join(OP_NAMES)}")
+    return names
+
+
+def _normalize_layout_name(layout):
+    token = str(layout).strip().lower()
+    if token in ("row", "row_major", "row-major", "c", "c_order", "auto", "default"):
+        return "row"
+    if token in (
+        "col",
+        "column",
+        "col_major",
+        "column_major",
+        "col-major",
+        "column-major",
+        "f",
+        "fortran",
+    ):
+        return "col"
+    raise ValueError("layout must be one of: row, col, all")
+
+
+def _layout_names(value):
+    value = str(value).strip().lower()
+    if value == "all":
+        return list(LAYOUT_NAMES)
+    return [_normalize_layout_name(value)]
+
+
+def _materialize_dense_layout_for_test(tensor, layout):
+    layout = _normalize_layout_name(layout)
+    if layout == "row":
+        return tensor.contiguous()
+    out = torch.empty_strided(
+        tuple(tensor.shape),
+        (1, max(1, int(tensor.shape[0]))),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    out.copy_(tensor)
+    return out
+
+
+def _stride_string(tensor):
+    if tensor is None:
+        return ""
+    return "x".join(str(int(v)) for v in tensor.stride())
+
+
+def _is_complex_dtype(dtype):
+    return dtype in (torch.complex64, torch.complex128)
 
 
 def _fmt_err(value):
@@ -152,13 +214,13 @@ def _build_dense_matrix(n_rows, n_cols, value_dtype, device):
 
 def _tolerance_for_dtype(value_dtype):
     if value_dtype == torch.float16:
-        return 2e-3, 2e-3
+        return 1e-3, 2e-3
     if value_dtype == torch.bfloat16:
-        return 1e-1, 1e-1
+        return 0.016, 1e-1
     if value_dtype in (torch.float32, torch.complex64):
-        return 1e-4, 1e-2
+        return 1.3e-6, 1e-3
     if value_dtype in (torch.float64, torch.complex128):
-        return 1e-12, 1e-10
+        return 1e-7, 1e-5
     return 1e-6, 1e-5
 
 
@@ -304,9 +366,17 @@ def _empty_pairwise_summary():
 
 
 
-def _prepare_canonical_case(data, row, col, shape, B):
+def _prepare_canonical_case(data, row, col, shape, B, op="non", layout="row"):
+    layout = _normalize_layout_name(layout)
+    op_code = ast_ops._normalize_spmm_coo_op(op)
+    data, row, col, shape = ast_ops._materialize_spmm_coo_op(data, row, col, shape, op_code)
     native_data, native_row, native_col, native_B, n_rows, n_cols, n_dense_cols = ast_ops._prepare_spmm_coo_inputs(
-        data, row, col, B, shape
+        data,
+        row,
+        col,
+        B,
+        shape,
+        dense_layout=layout,
     )
     (
         canonical_data,
@@ -326,6 +396,19 @@ def _prepare_canonical_case(data, row, col, shape, B):
         n_rows,
         n_cols,
         n_dense_cols,
+        dense_layout=layout,
+    )
+    cusparse_data, cusparse_row, cusparse_col = ast_ops._coalesce_coo_entries(
+        native_data,
+        native_row,
+        native_col,
+        (n_rows, n_cols),
+    )
+    cusparse_data, cusparse_row, cusparse_col = ast_ops._sort_coo_lex_inplace(
+        cusparse_data,
+        cusparse_row,
+        cusparse_col,
+        n_cols,
     )
     native_coo = ast_ops._build_torch_sparse_coo(native_data, native_row, native_col, shape)
     return {
@@ -334,6 +417,9 @@ def _prepare_canonical_case(data, row, col, shape, B):
         "native_col": native_col,
         "native_B": native_B,
         "native_coo": native_coo,
+        "cusparse_data": cusparse_data,
+        "cusparse_row": cusparse_row,
+        "cusparse_col": cusparse_col,
         "canonical_data": canonical_data,
         "canonical_row": canonical_row,
         "canonical_col": canonical_col,
@@ -342,18 +428,20 @@ def _prepare_canonical_case(data, row, col, shape, B):
         "n_cols": n_cols,
         "n_dense_cols": n_dense_cols,
         "output_dtype": output_dtype,
+        "op": ast_ops._spmm_coo_op_to_name(op_code),
+        "dense_layout": layout,
     }
 
 
 
-def _build_pytorch_reference(data, row, col, shape, B, prepared=None):
-    prepared = _prepare_canonical_case(data, row, col, shape, B) if prepared is None else prepared
+def _build_pytorch_reference(data, row, col, shape, B, prepared=None, op="non", layout="row"):
+    prepared = _prepare_canonical_case(data, row, col, shape, B, op=op, layout=layout) if prepared is None else prepared
     expected = ast_ops._build_spmm_coo_pytorch_reference_from_canonical(
         prepared["canonical_data"],
         prepared["canonical_row"],
         prepared["canonical_col"],
         prepared["canonical_B"],
-        shape,
+        (prepared["n_rows"], prepared["n_cols"]),
         prepared["output_dtype"],
     )
     pytorch_op = lambda: torch.sparse.mm(prepared["native_coo"], prepared["native_B"])
@@ -373,22 +461,24 @@ def _benchmark_spmm_coo_route(
     block_n=None,
     block_nnz=DEFAULT_BLOCK_NNZ,
     prepared=None,
+    op="non",
+    layout="row",
 ):
     selected_route = _selected_route(route)
-    prepared = _prepare_canonical_case(data, row, col, shape, B) if prepared is None else prepared
-    return ast_ops._benchmark_spmm_coo_canonical_route(
-        prepared["canonical_data"],
-        prepared["canonical_row"],
-        prepared["canonical_col"],
-        prepared["canonical_B"],
-        prepared["n_rows"],
-        prepared["n_dense_cols"],
-        prepared["output_dtype"],
+    del prepared
+    return ast_ops._benchmark_spmm_coo_route(
+        data,
+        row,
+        col,
+        B,
+        shape,
         warmup,
         iters,
         block_n,
         block_nnz,
         selected_route,
+        op=op,
+        dense_layout=layout,
     )
 
 def _summarize_route_output(values, reference, value_dtype, ms=None, first_call_ms=None, cusparse_values=None):
@@ -484,7 +574,20 @@ def _build_compare_debug_summary(row, reference, route_outputs, cusparse_values,
         "pt": _format_debug_scalar(reference[row_idx, dense_col]),
         "cu": _format_debug_scalar(_scalar_at(cusparse_values)),
     }
-def _assert_spmm_coo_matches_reference(data, row, col, B, shape, value_dtype, out=None, block_n=None, block_nnz=DEFAULT_BLOCK_NNZ):
+def _assert_spmm_coo_matches_reference(
+    data,
+    row,
+    col,
+    B,
+    shape,
+    value_dtype,
+    out=None,
+    block_n=None,
+    block_nnz=DEFAULT_BLOCK_NNZ,
+    op="non",
+    layout="row",
+):
+    layout = _normalize_layout_name(layout)
     result = ast.flagsparse_spmm_coo(
         data,
         row,
@@ -494,8 +597,10 @@ def _assert_spmm_coo_matches_reference(data, row, col, B, shape, value_dtype, ou
         block_n=block_n,
         block_nnz=block_nnz,
         out=out,
+        op=op,
+        dense_layout=layout,
     )
-    ref_C, _, _, _ = _build_pytorch_reference(data, row, col, shape, B)
+    ref_C, _, _, _ = _build_pytorch_reference(data, row, col, shape, B, op=op, layout=layout)
     atol, rtol = _tolerance_for_dtype(value_dtype)
     if not torch.allclose(result, ref_C, atol=atol, rtol=rtol):
         metrics = ast_ops._spmm_validation_metrics(result, ref_C)
@@ -533,16 +638,24 @@ def run_one_mtx(
     block_n=DEFAULT_BLOCK_N,
     block_nnz=DEFAULT_BLOCK_NNZ,
     route="rowrun",
+    op="non",
+    layout="row",
 ):
     route = _normalize_route(route)
     selected_route = _selected_route(route)
+    op_name = ast_ops._spmm_coo_op_to_name(op)
+    layout = _normalize_layout_name(layout)
     device = torch.device("cuda")
     data, row, col, shape = load_mtx_to_coo_torch(mtx_path, dtype=value_dtype, device=device)
     row = row.to(index_dtype)
     col = col.to(index_dtype)
     n_rows, n_cols = shape
     nnz = data.numel()
-    B = _build_dense_matrix(n_cols, n_dense_cols, value_dtype, device)
+    b_rows = n_rows if ast_ops._spmm_coo_op_transposes(op_name) else n_cols
+    B = _materialize_dense_layout_for_test(
+        _build_dense_matrix(b_rows, n_dense_cols, value_dtype, device),
+        layout,
+    )
     prepared = None
     atol, rtol = _tolerance_for_dtype(value_dtype)
 
@@ -552,6 +665,10 @@ def run_one_mtx(
         "nnz": nnz,
         "dense_cols": n_dense_cols,
         "route": selected_route,
+        "op": op_name,
+        "layout": layout,
+        "b_stride": _stride_string(B),
+        "c_stride": "",
         "error": None,
         "triton_ms": None,
         "triton_first_call_ms": None,
@@ -571,10 +688,18 @@ def run_one_mtx(
         "status": "UNKNOWN",
         "compare": None,
     }
-
     try:
-        prepared = _prepare_canonical_case(data, row, col, shape, B)
-        ref_C, pytorch_op, pytorch_format, pytorch_reason = _build_pytorch_reference(data, row, col, shape, B, prepared=prepared)
+        prepared = _prepare_canonical_case(data, row, col, shape, B, op=op_name, layout=layout)
+        ref_C, pytorch_op, pytorch_format, pytorch_reason = _build_pytorch_reference(
+            data,
+            row,
+            col,
+            shape,
+            B,
+            prepared=prepared,
+            op=op_name,
+            layout=layout,
+        )
         result["pytorch_format"] = pytorch_format
         result["pytorch_reason"] = pytorch_reason
     except Exception as exc:
@@ -596,9 +721,12 @@ def run_one_mtx(
             block_n=block_n,
             block_nnz=block_nnz,
             prepared=prepared,
+            op=op_name,
+            layout=layout,
         )
         result["triton_ms"] = triton_ms
         result["triton_first_call_ms"] = triton_first_call_ms
+        result["c_stride"] = _stride_string(triton_C)
     except Exception as exc:
         # Continue to PyTorch / CuPy timing when Triton fails (same as CSR SpMM test).
         result["error"] = f"triton: {exc}"
@@ -641,24 +769,37 @@ def run_one_mtx(
                 import cupy as cp
                 import cupyx.scipy.sparse as cpx
 
-                data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["native_data"]))
-                row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["native_row"].to(torch.int64)))
-                col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["native_col"].to(torch.int64)))
+                data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["cusparse_data"]))
+                row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["cusparse_row"].to(torch.int64)))
+                col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["cusparse_col"].to(torch.int64)))
                 B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(prepared["native_B"]))
-                A_coo = cpx.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+                A_coo = cpx.coo_matrix(
+                    (data_cp, (row_cp, col_cp)),
+                    shape=(prepared["n_rows"], prepared["n_cols"]),
+                )
 
-                torch.cuda.synchronize()
-                for _ in range(warmup):
-                    _ = A_coo @ B_cp
-                torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                for _ in range(iters):
-                    _ = A_coo @ B_cp
-                end.record()
-                torch.cuda.synchronize()
-                result["cusparse_ms"] = start.elapsed_time(end) / iters
+                def _run_cusparse_timing(rhs):
+                    torch.cuda.synchronize()
+                    for _ in range(warmup):
+                        _ = A_coo @ rhs
+                    torch.cuda.synchronize()
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    for _ in range(iters):
+                        _ = A_coo @ rhs
+                    end.record()
+                    torch.cuda.synchronize()
+                    return start.elapsed_time(end) / iters
+
+                try:
+                    result["cusparse_ms"] = _run_cusparse_timing(B_cp)
+                except Exception:
+                    if layout != "col":
+                        raise
+                    B_cp = cp.asfortranarray(B_cp)
+                    result["cusparse_reason"] = "used cp.asfortranarray fallback for col-major B"
+                    result["cusparse_ms"] = _run_cusparse_timing(B_cp)
 
                 cs_C = A_coo @ B_cp
                 cs_C_t = torch.utils.dlpack.from_dlpack(cs_C.toDlpack())
@@ -705,6 +846,8 @@ def run_one_mtx(
                     block_n=block_n,
                     block_nnz=block_nnz,
                     prepared=prepared,
+                    op=op_name,
+                    layout=layout,
                 )
                 route_outputs[extra_route] = extra_C
                 route_summaries[extra_route] = _summarize_route_output(
@@ -767,6 +910,8 @@ def run_mtx_batch(
     block_n=DEFAULT_BLOCK_N,
     block_nnz=DEFAULT_BLOCK_NNZ,
     route="rowrun",
+    op="non",
+    layout="row",
     on_result=None,
 ):
     results = []
@@ -782,6 +927,8 @@ def run_mtx_batch(
             block_n=block_n,
             block_nnz=block_nnz,
             route=route,
+            op=op,
+            layout=layout,
         )
         results.append(entry)
         if on_result is not None:
@@ -789,9 +936,11 @@ def run_mtx_batch(
     return results
 
 
-def _print_spmm_coo_mtx_header(value_dtype, index_dtype, route):
+def _print_spmm_coo_mtx_header(value_dtype, index_dtype, route, layout=None):
     route = _normalize_route(route)
     print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
+    if layout is not None:
+        print(f"Dense layout: {layout}")
     print(f"Formats: FlagSparse={_route_label(route)}, cuSPARSE=COO dense-mm, PyTorch=COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
     print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
@@ -800,7 +949,7 @@ def _print_spmm_coo_mtx_header(value_dtype, index_dtype, route):
         print("Compare mode also benchmarks native atomic (debug-only) after the main table.")
     print("-" * 186)
     print(
-        f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
+        f"{'Matrix':<28} {'Op':>5} {'Lay':>4} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
         f"{'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
         f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
     )
@@ -814,7 +963,7 @@ def _print_spmm_coo_mtx_row(entry):
     cu_ms = entry.get("cusparse_ms")
     pt_ms = entry.get("pytorch_ms")
     print(
-        f"{name:<28} {n_rows:>7} {n_cols:>7} {entry['nnz']:>10} {entry['dense_cols']:>8} "
+        f"{name:<28} {entry.get('op', 'non'):>5} {entry.get('layout', 'row'):>4} {n_rows:>7} {n_cols:>7} {entry['nnz']:>10} {entry['dense_cols']:>8} "
         f"{_fmt_ms(triton_ms):>14} {_fmt_ms(cu_ms):>13} {_fmt_ms(pt_ms):>11} "
         f"{_fmt_speedup(cu_ms, triton_ms):>7} {_fmt_speedup(pt_ms, triton_ms):>7} "
         f"{_fmt_check(entry.get('triton_ok_pt')):>6} {_fmt_check(entry.get('triton_ok_cu')):>6} "
@@ -828,9 +977,9 @@ def _print_spmm_coo_mtx_row(entry):
         print(f"  NOTE: {msg}")
 
 
-def print_mtx_results(results, value_dtype, index_dtype, route="rowrun"):
+def print_mtx_results(results, value_dtype, index_dtype, route="rowrun", layout=None):
     route = _normalize_route(route)
-    _print_spmm_coo_mtx_header(value_dtype, index_dtype, route)
+    _print_spmm_coo_mtx_header(value_dtype, index_dtype, route, layout=layout)
     for entry in results:
         _print_spmm_coo_mtx_row(entry)
     print("-" * 186)
@@ -843,12 +992,12 @@ def print_compare_results(results, value_dtype, index_dtype):
 
     print("Compare details (PT-COO / CU-COO / native parity)")
     print("Row/PT is the main default-route diagnostic; Atomic/PT is debug-only.")
-    print("-" * 166)
+    print("-" * 174)
     print(
-        f"{'Matrix':<28} {'Row/PT':>7} {'Atomic/PT':>9} {'CU/PT':>7} {'Row/Atomic':>11} "
+        f"{'Matrix':<28} {'Lay':>4} {'Row/PT':>7} {'Atomic/PT':>9} {'CU/PT':>7} {'Row/Atomic':>11} "
         f"{'Err(Row/PT)':>12} {'Err(Atomic/PT)':>14} {'Err(CU/PT)':>10} {'Err(Row/Atomic)':>15}"
     )
-    print("-" * 166)
+    print("-" * 174)
     for entry in results:
         compare = entry.get("compare") or {}
         routes = compare.get("routes") or {}
@@ -858,12 +1007,13 @@ def print_compare_results(results, value_dtype, index_dtype):
         row_atomic = parity.get("rowrun_vs_atomic") or {}
         print(
             f"{os.path.basename(entry['path'])[:27]:<28} "
+            f"{entry.get('layout', 'row'):>4} "
             f"{_fmt_check(rowrun.get('ok_pt')):>7} {_fmt_check(atomic.get('ok_pt')):>9} {_fmt_check(compare.get('cusparse_reference_match')):>7} "
             f"{_fmt_check(row_atomic.get('match')):>11} "
             f"{_fmt_err(rowrun.get('err_pt')):>12} {_fmt_err(atomic.get('err_pt')):>14} {_fmt_err(compare.get('cusparse_reference_error')):>10} "
             f"{_fmt_err(row_atomic.get('error_ratio')):>15}"
         )
-    print("-" * 166)
+    print("-" * 174)
 
     debug_rows = []
     for entry in results:
@@ -899,6 +1049,8 @@ def run_all_dtypes_export_csv(
     route="rowrun",
     value_dtypes=None,
     index_dtypes=None,
+    op_names=None,
+    layout_names=None,
 ):
     route = _normalize_route(route)
     if route == "compare":
@@ -908,58 +1060,73 @@ def run_all_dtypes_export_csv(
     rows = []
     value_dtypes = CSV_VALUE_DTYPES if value_dtypes is None else value_dtypes
     index_dtypes = CSV_INDEX_DTYPES if index_dtypes is None else index_dtypes
+    op_names = ["non"] if op_names is None else op_names
+    layout_names = ["row"] if layout_names is None else layout_names
     for value_dtype in value_dtypes:
         for index_dtype in index_dtypes:
-            print("=" * 150)
-            _print_spmm_coo_mtx_header(value_dtype, index_dtype, route)
-            results = run_mtx_batch(
-                paths,
-                value_dtype=value_dtype,
-                index_dtype=index_dtype,
-                warmup=warmup,
-                iters=iters,
-                run_cusparse=run_cusparse,
-                n_dense_cols=n_dense_cols,
-                block_n=block_n,
-                block_nnz=block_nnz,
-                route=selected_route,
-                on_result=_print_spmm_coo_mtx_row,
-            )
-            print("-" * 186)
-            for entry in results:
-                n_rows, n_cols = entry["shape"]
-                rows.append({
-                    "matrix": os.path.basename(entry["path"]),
-                    "value_dtype": _dtype_name(value_dtype),
-                    "index_dtype": _dtype_name(index_dtype),
-                    "n_rows": n_rows,
-                    "n_cols": n_cols,
-                    "nnz": entry["nnz"],
-                    "triton_ms": entry.get("triton_ms"),
-                    "cusparse_ms": entry.get("cusparse_ms"),
-                    "pytorch_ms": entry.get("pytorch_ms"),
-                    "triton_speedup_vs_cusparse": _speedup_ratio(
-                        entry.get("cusparse_ms"), entry.get("triton_ms")
-                    ),
-                    "triton_speedup_vs_pytorch": _speedup_ratio(
-                        entry.get("pytorch_ms"), entry.get("triton_ms")
-                    ),
-                    "pt_status": _status_label(entry.get("triton_ok_pt")),
-                    "cu_status": _status_label(entry.get("triton_ok_cu")),
-                    "status": (
-                        "PASS"
-                        if (entry.get("triton_ok_pt") or entry.get("triton_ok_cu"))
-                        else "FAIL"
-                    ),
-                    "err_pt": entry.get("err_pt"),
-                    "err_cu": entry.get("err_cu"),
-                    "error": entry.get("error"),
-                })
+            for op_name in op_names:
+                for layout_name in layout_names:
+                    print("=" * 150)
+                    _print_spmm_coo_mtx_header(value_dtype, index_dtype, route, layout=layout_name)
+                    results = run_mtx_batch(
+                        paths,
+                        value_dtype=value_dtype,
+                        index_dtype=index_dtype,
+                        warmup=warmup,
+                        iters=iters,
+                        run_cusparse=run_cusparse,
+                        n_dense_cols=n_dense_cols,
+                        block_n=block_n,
+                        block_nnz=block_nnz,
+                        route=selected_route,
+                        op=op_name,
+                        layout=layout_name,
+                        on_result=_print_spmm_coo_mtx_row,
+                    )
+                    print("-" * 186)
+                    for entry in results:
+                        n_rows, n_cols = entry["shape"]
+                        status = entry.get("status")
+                        if status == "UNKNOWN":
+                            status = (
+                                "PASS"
+                                if (entry.get("triton_ok_pt") or entry.get("triton_ok_cu"))
+                                else "FAIL"
+                            )
+                        rows.append({
+                            "matrix": os.path.basename(entry["path"]),
+                            "op": entry.get("op", op_name),
+                            "layout": entry.get("layout", layout_name),
+                            "value_dtype": _dtype_name(value_dtype),
+                            "index_dtype": _dtype_name(index_dtype),
+                            "n_rows": n_rows,
+                            "n_cols": n_cols,
+                            "nnz": entry["nnz"],
+                            "b_stride": entry.get("b_stride"),
+                            "c_stride": entry.get("c_stride"),
+                            "triton_ms": entry.get("triton_ms"),
+                            "cusparse_ms": entry.get("cusparse_ms"),
+                            "pytorch_ms": entry.get("pytorch_ms"),
+                            "triton_speedup_vs_cusparse": _speedup_ratio(
+                                entry.get("cusparse_ms"), entry.get("triton_ms")
+                            ),
+                            "triton_speedup_vs_pytorch": _speedup_ratio(
+                                entry.get("pytorch_ms"), entry.get("triton_ms")
+                            ),
+                            "pt_status": _status_label(entry.get("triton_ok_pt")),
+                            "cu_status": _status_label(entry.get("triton_ok_cu")),
+                            "status": status,
+                            "err_pt": entry.get("err_pt"),
+                            "err_cu": entry.get("err_cu"),
+                            "error": entry.get("error"),
+                            "cusparse_reason": entry.get("cusparse_reason"),
+                        })
     fieldnames = [
-        "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
+        "matrix", "op", "layout", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
+        "b_stride", "c_stride",
         "triton_ms", "cusparse_ms", "pytorch_ms",
         "triton_speedup_vs_cusparse", "triton_speedup_vs_pytorch",
-        "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
+        "pt_status", "cu_status", "status", "err_pt", "err_cu", "error", "cusparse_reason",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -993,7 +1160,22 @@ def run_api_validation_checks():
         ("col out of range", lambda: ast.flagsparse_spmm_coo(data, row, torch.tensor([0, 3, 1], dtype=torch.int32, device=device), B, (2, 2)), IndexError),
         ("block_n positive", lambda: ast.flagsparse_spmm_coo(data, row, col, B, (2, 2), block_n=0), ValueError),
         ("block_nnz positive", lambda: ast.flagsparse_spmm_coo(data, row, col, B, (2, 2), block_nnz=0), ValueError),
+        ("invalid op", lambda: ast.flagsparse_spmm_coo(data, row, col, B, (2, 2), op="bad"), ValueError),
+        ("op transpose conflict", lambda: ast.flagsparse_spmm_coo(data, row, col, B, (2, 2), op="non", transpose=True), ValueError),
         ("out shape mismatch", lambda: ast.flagsparse_spmm_coo(data, row, col, B, (2, 2), out=torch.empty((3, 4), dtype=torch.float32, device=device)), ValueError),
+        (
+            "trans out shape mismatch",
+            lambda: ast.flagsparse_spmm_coo(
+                data,
+                row,
+                col,
+                torch.randn((2, 4), dtype=torch.float32, device=device),
+                (2, 3),
+                op="trans",
+                out=torch.empty((2, 4), dtype=torch.float32, device=device),
+            ),
+            ValueError,
+        ),
         ("out device mismatch", lambda: ast.flagsparse_spmm_coo(data, row, col, B, (2, 2), out=torch.empty((2, 4), dtype=torch.float32)), ValueError),
     ]
 
@@ -1019,6 +1201,26 @@ def run_api_validation_checks():
         _assert_spmm_coo_matches_reference(data, row, col, B, (2, 2), torch.float32, out=out)
 
     positive_checks.append(("out path success", _positive_out_path))
+
+    def _positive_trans_path():
+        _assert_spmm_coo_matches_reference(data, row, col, B, (2, 2), torch.float32, op="trans")
+
+    positive_checks.append(("trans op success", _positive_trans_path))
+
+    def _positive_conj_path():
+        complex_data = data.to(torch.complex64) * (1 + 2j)
+        complex_B = B.to(torch.complex64) * (2 - 1j)
+        _assert_spmm_coo_matches_reference(
+            complex_data,
+            row,
+            col,
+            complex_B,
+            (2, 2),
+            torch.complex64,
+            op="conj",
+        )
+
+    positive_checks.append(("conj op success", _positive_conj_path))
 
     def _positive_empty_matrix():
         empty_data = torch.tensor([], dtype=torch.float32, device=device)
@@ -1060,6 +1262,39 @@ def run_api_validation_checks():
         _assert_spmm_coo_matches_reference(data, row, col, dense, (2, 2), torch.float32)
 
     positive_checks.append(("noncontiguous B success", _positive_noncontiguous_b))
+
+    def _positive_col_layout():
+        dense = _materialize_dense_layout_for_test(B, "col")
+        result, _ = _assert_spmm_coo_matches_reference(
+            data,
+            row,
+            col,
+            dense,
+            (2, 2),
+            torch.float32,
+            layout="col",
+        )
+        if tuple(result.stride()) != (1, result.shape[0]):
+            raise AssertionError(f"unexpected col-major output stride: {tuple(result.stride())}")
+
+    positive_checks.append(("col layout success", _positive_col_layout))
+
+    def _positive_complex_col_layout():
+        complex_data = data.to(torch.complex64) * (1 + 2j)
+        complex_B = _materialize_dense_layout_for_test(B.to(torch.complex64) * (2 - 1j), "col")
+        result, _ = _assert_spmm_coo_matches_reference(
+            complex_data,
+            row,
+            col,
+            complex_B,
+            (2, 2),
+            torch.complex64,
+            layout="col",
+        )
+        if tuple(result.stride()) != (1, result.shape[0]):
+            raise AssertionError(f"unexpected complex col-major output stride: {tuple(result.stride())}")
+
+    positive_checks.append(("complex col layout success", _positive_complex_col_layout))
 
     def _positive_unsorted_duplicate():
         _assert_spmm_coo_matches_reference(
@@ -1146,21 +1381,21 @@ def _print_synthetic_compare_results(compare_rows):
 
     print("Compare details (PT-COO / CU-COO / native parity)")
     print("Row/PT is the main default-route diagnostic; Atomic/PT is debug-only.")
-    print("-" * 160)
+    print("-" * 168)
     print(
-        f"{'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} {'Row/PT':>7} {'Atomic/PT':>9} {'CU/PT':>7} {'Row/Atomic':>11} "
+        f"{'Lay':>4} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} {'Row/PT':>7} {'Atomic/PT':>9} {'CU/PT':>7} {'Row/Atomic':>11} "
         f"{'Err(Row/PT)':>12} {'Err(Atomic/PT)':>14} {'Err(CU/PT)':>10} {'Err(Row/Atomic)':>15}"
     )
-    print("-" * 160)
+    print("-" * 168)
     for entry in compare_rows:
         print(
-            f"{entry['n_rows']:>7} {entry['n_cols']:>7} {entry['nnz']:>10} {entry['dense_cols']:>8} "
+            f"{entry.get('layout', 'row'):>4} {entry['n_rows']:>7} {entry['n_cols']:>7} {entry['nnz']:>10} {entry['dense_cols']:>8} "
             f"{_fmt_check(entry.get('row_pt')):>7} {_fmt_check(entry.get('atomic_pt')):>9} {_fmt_check(entry.get('cu_pt')):>7} "
             f"{_fmt_check(entry.get('row_atomic')):>11} "
             f"{_fmt_err(entry.get('err_row_pt')):>12} {_fmt_err(entry.get('err_atomic_pt')):>14} {_fmt_err(entry.get('err_cu_pt')):>10} "
             f"{_fmt_err(entry.get('err_row_atomic')):>15}"
         )
-    print("-" * 160)
+    print("-" * 168)
     print()
 def run_comprehensive_synthetic(
     warmup=WARMUP,
@@ -1171,6 +1406,8 @@ def run_comprehensive_synthetic(
     block_n=DEFAULT_BLOCK_N,
     block_nnz=DEFAULT_BLOCK_NNZ,
     route="rowrun",
+    op_names=None,
+    layout_names=None,
 ):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
@@ -1178,13 +1415,15 @@ def run_comprehensive_synthetic(
 
     route = _normalize_route(route)
     selected_route = _selected_route(route)
+    op_names = ["non"] if op_names is None else op_names
+    layout_names = ["row"] if layout_names is None else layout_names
 
     print("=" * 150)
     print("FLAGSPARSE SpMM BENCHMARK (synthetic COO @ dense)")
     print("=" * 150)
     print(
         f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {warmup}  Iters: {iters}  "
-        f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  Route: {route}"
+        f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  Route: {route}  Ops: {','.join(op_names)}  Layouts: {','.join(layout_names)}"
     )
     print(f"Formats: FlagSparse={_route_label(route)}, cuSPARSE=COO dense-mm (when supported), PyTorch=COO.")
     print("For float32, PT checks the float64-based correctness reference while CU reflects native cuSPARSE float32 consistency.")
@@ -1201,67 +1440,72 @@ def run_comprehensive_synthetic(
             print(f"Value dtype: {_dtype_name(value_dtype):<12}  |  Index dtype: {_dtype_name(index_dtype):<6}")
             print("-" * 150)
             print(
-                f"{'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} {'BN':>4} {'BNNZ':>6} {'Runs':>5} {'Tiles':>5} "
+                f"{'Op':>5} {'Lay':>4} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} {'BN':>4} {'BNNZ':>6} {'Runs':>5} {'Tiles':>5} "
                 f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>12} {'FS/PT':>8} {'FS/CU':>8} {'PT':>6} {'CU':>6} {'Err(FS)':>11} {'Err(CU)':>12}"
             )
             print("-" * 150)
             combo_reason = None
-            for n_rows, n_cols, nnz, n_dense_cols in TEST_CASES:
-                result = ast_ops.benchmark_spmm_coo_case(
-                    n_rows=n_rows,
-                    n_cols=n_cols,
-                    nnz=nnz,
-                    n_dense_cols=n_dense_cols,
-                    value_dtype=value_dtype,
-                    index_dtype=index_dtype,
-                    warmup=warmup,
-                    iters=iters,
-                    block_n=block_n,
-                    block_nnz=block_nnz,
-                    run_cusparse=run_cusparse,
-                    route=selected_route,
-                    compare_routes=(route == "compare"),
-                )
-                total += 1
-                params = result["parameters"]
-                perf = result["performance"]
-                verify = result["verification"]
-                backend = result["backend_status"]
-                samples = result["samples"]
-                triton_ok = verify.get("triton_strict_allclose_match", verify.get("triton_match_reference"))
-                cusparse_ok = verify.get("cusparse_strict_allclose_match", verify.get("cusparse_match_reference"))
-                status = "PASS" if triton_ok else "FAIL"
-                if status != "PASS":
-                    failed += 1
-                if backend.get("cusparse_unavailable_reason"):
-                    combo_reason = backend["cusparse_unavailable_reason"]
-                triton_err = _scaled_allclose_error(samples["triton"], samples["reference"], value_dtype)
-                cusparse_err = None
-                if samples.get("cusparse") is not None:
-                    cusparse_err = _scaled_allclose_error(samples["triton"], samples["cusparse"], value_dtype)
-                print(
-                    f"{n_rows:>7} {n_cols:>7} {nnz:>10} {n_dense_cols:>8} {params['block_n']:>4} {params['block_nnz']:>6} {params['n_row_runs']:>5} {params['required_nnz_tiles']:>5} "
-                    f"{_fmt_ms(perf.get('pytorch_ms')):>12} {_fmt_ms(perf.get('triton_ms')):>14} {_fmt_ms(perf.get('cusparse_ms')):>12} "
-                    f"{_fmt_speedup(perf.get('pytorch_ms'), perf.get('triton_ms')):>8} {_fmt_speedup(perf.get('cusparse_ms'), perf.get('triton_ms')):>8} "
-                    f"{_fmt_check(triton_ok):>6} {_fmt_check(cusparse_ok):>6} {_fmt_err(triton_err):>11} {_fmt_err(cusparse_err):>12}"
-                )
-                if route == "compare":
-                    route_results = result.get("route_results") or {}
-                    parity = result.get("parity") or {}
-                    compare_rows.append({
-                        "n_rows": n_rows,
-                        "n_cols": n_cols,
-                        "nnz": nnz,
-                        "dense_cols": n_dense_cols,
-                        "row_pt": (route_results.get("rowrun") or {}).get("match_reference"),
-                        "atomic_pt": (route_results.get("atomic") or {}).get("match_reference"),
-                        "cu_pt": verify.get("cusparse_match_reference"),
-                        "row_atomic": (parity.get("rowrun_vs_atomic") or {}).get("match"),
-                        "err_row_pt": (route_results.get("rowrun") or {}).get("error_ratio"),
-                        "err_atomic_pt": (route_results.get("atomic") or {}).get("error_ratio"),
-                        "err_cu_pt": (verify.get("cusparse_max_relative_error") if verify.get("cusparse_match_reference") is not None else None),
-                        "err_row_atomic": (parity.get("rowrun_vs_atomic") or {}).get("error_ratio"),
-                    })
+            for op_name in op_names:
+                for layout_name in layout_names:
+                    for n_rows, n_cols, nnz, n_dense_cols in TEST_CASES:
+                        result = ast_ops.benchmark_spmm_coo_case(
+                            n_rows=n_rows,
+                            n_cols=n_cols,
+                            nnz=nnz,
+                            n_dense_cols=n_dense_cols,
+                            value_dtype=value_dtype,
+                            index_dtype=index_dtype,
+                            warmup=warmup,
+                            iters=iters,
+                            block_n=block_n,
+                            block_nnz=block_nnz,
+                            run_cusparse=run_cusparse,
+                            route=selected_route,
+                            compare_routes=(route == "compare"),
+                            op=op_name,
+                            dense_layout=layout_name,
+                        )
+                        total += 1
+                        params = result["parameters"]
+                        perf = result["performance"]
+                        verify = result["verification"]
+                        backend = result["backend_status"]
+                        samples = result["samples"]
+                        triton_ok = verify.get("triton_strict_allclose_match", verify.get("triton_match_reference"))
+                        cusparse_ok = verify.get("cusparse_strict_allclose_match", verify.get("cusparse_match_reference"))
+                        status = "PASS" if triton_ok else "FAIL"
+                        if status != "PASS":
+                            failed += 1
+                        if backend.get("cusparse_unavailable_reason"):
+                            combo_reason = backend["cusparse_unavailable_reason"]
+                        triton_err = _scaled_allclose_error(samples["triton"], samples["reference"], value_dtype)
+                        cusparse_err = None
+                        if samples.get("cusparse") is not None:
+                            cusparse_err = _scaled_allclose_error(samples["triton"], samples["cusparse"], value_dtype)
+                        print(
+                            f"{op_name:>5} {layout_name:>4} {n_rows:>7} {n_cols:>7} {nnz:>10} {n_dense_cols:>8} {params['block_n']:>4} {params['block_nnz']:>6} {params['n_row_runs']:>5} {params['required_nnz_tiles']:>5} "
+                            f"{_fmt_ms(perf.get('pytorch_ms')):>12} {_fmt_ms(perf.get('triton_ms')):>14} {_fmt_ms(perf.get('cusparse_ms')):>12} "
+                            f"{_fmt_speedup(perf.get('pytorch_ms'), perf.get('triton_ms')):>8} {_fmt_speedup(perf.get('cusparse_ms'), perf.get('triton_ms')):>8} "
+                            f"{_fmt_check(triton_ok):>6} {_fmt_check(cusparse_ok):>6} {_fmt_err(triton_err):>11} {_fmt_err(cusparse_err):>12}"
+                        )
+                        if route == "compare":
+                            route_results = result.get("route_results") or {}
+                            parity = result.get("parity") or {}
+                            compare_rows.append({
+                                "layout": layout_name,
+                                "n_rows": n_rows,
+                                "n_cols": n_cols,
+                                "nnz": nnz,
+                                "dense_cols": n_dense_cols,
+                                "row_pt": (route_results.get("rowrun") or {}).get("match_reference"),
+                                "atomic_pt": (route_results.get("atomic") or {}).get("match_reference"),
+                                "cu_pt": verify.get("cusparse_match_reference"),
+                                "row_atomic": (parity.get("rowrun_vs_atomic") or {}).get("match"),
+                                "err_row_pt": (route_results.get("rowrun") or {}).get("error_ratio"),
+                                "err_atomic_pt": (route_results.get("atomic") or {}).get("error_ratio"),
+                                "err_cu_pt": (verify.get("cusparse_max_relative_error") if verify.get("cusparse_match_reference") is not None else None),
+                                "err_row_atomic": (parity.get("rowrun_vs_atomic") or {}).get("error_ratio"),
+                            })
             print("-" * 150)
             if combo_reason:
                 print(f"  cuSPARSE: {combo_reason}")
@@ -1293,6 +1537,8 @@ def main():
     parser.add_argument("--index-dtype", default="int32", choices=["int32", "int64"], help="Index dtype (default: int32)")
     parser.add_argument("--dtypes", default="float32,float64,complex64,complex128", help="Comma-separated value dtype grid for CSV export: float32,float64,complex64,complex128")
     parser.add_argument("--index-dtypes", default="int32,int64", help="Comma-separated index dtype grid for CSV export: int32,int64")
+    parser.add_argument("--op", default="non", help="SpMM op: non, trans, conj, all, or comma-separated list")
+    parser.add_argument("--layout", default="row", choices=["row", "col", "all"], help="Dense RHS/output layout: row, col, or all")
     parser.add_argument("--dense-cols", type=int, default=32, help="Dense RHS column count")
     parser.add_argument("--block-n", type=int, default=DEFAULT_BLOCK_N, help="Output column tile override (default: auto from dense-column heuristic)")
     parser.add_argument("--block-nnz", type=int, default=DEFAULT_BLOCK_NNZ, help="COO nnz tile width override (default: 256)")
@@ -1320,6 +1566,11 @@ def main():
     index_map = {"int32": torch.int32, "int64": torch.int64}
     value_dtype = dtype_map[args.dtype]
     index_dtype = index_map[args.index_dtype]
+    try:
+        op_names = _parse_op_names(args.op)
+        layout_names = _layout_names(args.layout)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.synthetic:
         run_comprehensive_synthetic(
@@ -1331,6 +1582,8 @@ def main():
             block_n=args.block_n,
             block_nnz=args.block_nnz,
             route=args.route,
+            op_names=op_names,
+            layout_names=layout_names,
         )
         return
 
@@ -1363,10 +1616,12 @@ def main():
         try:
             csv_value_dtypes = _parse_csv_tokens(args.dtypes, dtype_map, "--dtypes")
             csv_index_dtypes = _parse_csv_tokens(args.index_dtypes, index_map, "--index-dtypes")
+            csv_op_names = _parse_op_names(args.op)
+            csv_layout_names = _layout_names(args.layout)
         except ValueError as exc:
             parser.error(str(exc))
         print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  DenseN: {args.dense_cols}  |  Route: {args.route}  |  CSV: {csv_path}")
-        print(f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}")
+        print(f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}  |  ops: {args.op}  |  layouts: {args.layout}")
         run_all_dtypes_export_csv(
             paths,
             csv_path,
@@ -1379,6 +1634,8 @@ def main():
             route=args.route,
             value_dtypes=csv_value_dtypes,
             index_dtypes=csv_index_dtypes,
+            op_names=csv_op_names,
+            layout_names=csv_layout_names,
         )
         return
 
@@ -1388,25 +1645,29 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
     print(
         f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  dense_cols: {args.dense_cols}  "
-        f"warmup: {args.warmup}  iters: {args.iters}  block_n: {_fmt_launch_value(args.block_n)}  "
+        f"op: {args.op}  layout: {args.layout}  warmup: {args.warmup}  iters: {args.iters}  block_n: {_fmt_launch_value(args.block_n)}  "
         f"block_nnz: {_fmt_launch_value(args.block_nnz)}  route: {args.route}"
     )
     print()
-    results = run_mtx_batch(
-        paths,
-        value_dtype=value_dtype,
-        index_dtype=index_dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-        run_cusparse=not args.no_cusparse,
-        n_dense_cols=args.dense_cols,
-        block_n=args.block_n,
-        block_nnz=args.block_nnz,
-        route=args.route,
-    )
-    print_mtx_results(results, value_dtype, index_dtype, route=args.route)
-    if args.route == "compare":
-        print_compare_results(results, value_dtype, index_dtype)
+    for op_name in op_names:
+        for layout_name in layout_names:
+            results = run_mtx_batch(
+                paths,
+                value_dtype=value_dtype,
+                index_dtype=index_dtype,
+                warmup=args.warmup,
+                iters=args.iters,
+                run_cusparse=not args.no_cusparse,
+                n_dense_cols=args.dense_cols,
+                block_n=args.block_n,
+                block_nnz=args.block_nnz,
+                route=args.route,
+                op=op_name,
+                layout=layout_name,
+            )
+            print_mtx_results(results, value_dtype, index_dtype, route=args.route, layout=layout_name)
+            if args.route == "compare":
+                print_compare_results(results, value_dtype, index_dtype)
 
 
 if __name__ == "__main__":

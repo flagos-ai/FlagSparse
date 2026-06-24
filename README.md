@@ -96,9 +96,9 @@ python tests/test_spmm_opt.py <dir/> --csv spmm_opt.csv  # optional: --dtype flo
 
 ```bash
 python tests/test_spmm_coo.py <dir_or_file.mtx>
-python tests/test_spmm_coo.py --synthetic                # optional: --route rowrun|atomic|compare, --skip-api-checks, --skip-coo-coverage
-python tests/test_spmm_coo.py <dir/> --csv out.csv      # only --route rowrun or atomic (not compare)
-# same tuning flags as CSR SpMM where applicable: --dense-cols, --block-n, --block-nnz, --warmup, --iters, --no-cusparse
+python tests/test_spmm_coo.py --synthetic                # optional: --op non|trans|conj|all, --route rowrun|atomic|compare
+python tests/test_spmm_coo.py <dir/> --csv out.csv      # only --route rowrun or atomic (not compare); optional: --op all
+# same tuning flags as CSR SpMM where applicable: --op, --dense-cols, --block-n, --block-nnz, --warmup, --iters, --no-cusparse
 ```
 
 **test_sddmm.py** - CSR SDDMM (`.mtx` batch or `--csv`):
