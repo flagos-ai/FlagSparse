@@ -298,6 +298,12 @@ _CUSPARSE_LIB = None
 _CUSPARSE_LIB_LOAD_ERROR = None
 
 
+def _cusparse_native_gather_skip_reason(value_dtype):
+    if value_dtype == torch.bfloat16:
+        return "bfloat16 is not supported by native cusparseGather; skipped"
+    return None
+
+
 def _cuda_data_type_from_torch(torch_dtype):
     mapping = {
         torch.float16: _CUDA_R_16F,
@@ -388,19 +394,25 @@ def _check_cusparse_status(status, op_name):
         raise RuntimeError(f"{op_name} failed with cuSPARSE status {int(status)}")
 
 
-def _set_cusparse_stream(lib, handle):
+def _set_cusparse_stream(lib, handle, *, strict=False):
     if not hasattr(lib, "cusparseSetStream"):
+        if strict:
+            raise RuntimeError("Loaded cuSPARSE library does not export cusparseSetStream")
         return
     try:
         stream = torch.cuda.current_stream()
         stream_ptr = getattr(stream, "cuda_stream", None)
         if stream_ptr is None:
+            if strict:
+                raise RuntimeError("Could not obtain the current CUDA stream pointer")
             return
         _check_cusparse_status(
             lib.cusparseSetStream(handle, ctypes.c_void_p(int(stream_ptr))),
             "cusparseSetStream",
         )
     except Exception:
+        if strict:
+            raise
         return
 
 
@@ -408,7 +420,7 @@ class _PreparedCusparseNativeGather:
     def __init__(self, dense_vector, indices, out=None):
         dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
         _validate_gather_value_dtype(dense_vector, "cusparse_native_gather")
-        skip_reason = _cusparse_baseline_skip_reason(dense_vector.dtype)
+        skip_reason = _cusparse_native_gather_skip_reason(dense_vector.dtype)
         if skip_reason:
             raise RuntimeError(skip_reason)
 

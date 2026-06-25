@@ -1,5 +1,6 @@
 """Shared imports, dtypes, and helpers for FlagSparse sparse ops."""
 
+import statistics
 import time
 
 try:
@@ -53,6 +54,7 @@ __all__ = (
     "_prepare_inputs",
     "_prepare_scatter_inputs",
     "_benchmark_cuda_op",
+    "_benchmark_cuda_graph_op",
     "cp",
     "cpx_sparse",
     "time",
@@ -332,3 +334,50 @@ def _benchmark_cuda_op(op, warmup, iters):
         cp.cuda.runtime.deviceSynchronize()
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / iters
     return output, elapsed_ms
+
+
+def _benchmark_cuda_graph_op(
+    op,
+    *,
+    graph_batch=100,
+    warmup=20,
+    repeats=10,
+    capture_setup=None,
+):
+    """Measure allocation-free CUDA work without Python/FFI launch gaps."""
+    graph_batch = max(1, int(graph_batch))
+    warmup = max(0, int(warmup))
+    repeats = max(1, int(repeats))
+
+    torch.cuda.synchronize()
+    capture_stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+
+    with torch.cuda.stream(capture_stream):
+        if capture_setup is not None:
+            capture_setup()
+        op()
+    capture_stream.synchronize()
+
+    with torch.cuda.graph(graph, stream=capture_stream):
+        for _ in range(graph_batch):
+            op()
+    capture_stream.synchronize()
+
+    with torch.cuda.stream(capture_stream):
+        for _ in range(warmup):
+            graph.replay()
+    capture_stream.synchronize()
+
+    samples_ms = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for _ in range(repeats):
+        with torch.cuda.stream(capture_stream):
+            start.record()
+            graph.replay()
+            end.record()
+        end.synchronize()
+        samples_ms.append(float(start.elapsed_time(end)) / graph_batch)
+
+    return statistics.median(samples_ms)
