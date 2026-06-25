@@ -2,6 +2,14 @@ import argparse
 import csv
 import math
 import os
+import sys
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if SRC_ROOT.is_dir():
+    sys.path.insert(0, str(SRC_ROOT))
 
 import torch
 
@@ -18,6 +26,7 @@ DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex64,complex128"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
+KERNEL_GRAPH_BATCH = 100
 
 
 def _fmt_ms(value):
@@ -82,8 +91,8 @@ def _parse_cases(raw):
         left, right = item.split(":", 1)
         dense_size = int(left)
         nnz = int(right)
-        if dense_size < 0 or nnz < 0:
-            raise ValueError(f"case values must be non-negative: {item}")
+        if dense_size <= 0 or nnz <= 0:
+            raise ValueError(f"case values must be positive: {item}")
         pairs.append((dense_size, nnz))
     if not pairs:
         raise ValueError("case list is empty")
@@ -172,7 +181,7 @@ def _print_header():
     print("-" * 196)
     print(
         f"{'ValueReq':>14} {'ValueEff':>18} {'Index':>6} {'Dense':>10} {'NNZ':>10} "
-        f"{'IFB':>4} {'PT(ms)':>10} {'FS(ms)':>10} {'CS(ms)':>10} "
+        f"{'IFB':>4} {'FS(ms)':>10} {'PT(ms)':>10} {'CS(ms)':>10} "
         f"{'FS/PT':>8} {'FS/CS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(CS)':>12}"
     )
     print("-" * 196)
@@ -182,7 +191,7 @@ def _print_row(row):
     print(
         f"{row['value_dtype_req']:>14} {row['value_dtype_compute']:>18} {row['index_dtype']:>6} "
         f"{row['dense_size']:>10,d} {row['nnz']:>10,d} {str(row['index_fallback_applied']):>4} "
-        f"{_fmt_ms(row['pytorch_ms']):>10} {_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['cusparse_ms']):>10} "
+        f"{_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['pytorch_ms']):>10} {_fmt_ms(row['cusparse_ms']):>10} "
         f"{_fmt_speedup(row['triton_speedup_vs_pytorch']):>8} {_fmt_speedup(row['triton_speedup_vs_cusparse']):>8} "
         f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['cusparse_max_error']):>12}"
     )
@@ -201,9 +210,11 @@ def run_cli(args):
     print("=" * 180)
     print("FLAGSPARSE GATHER BENCHMARK/VALIDATION")
     print("=" * 180)
+    print(f"FlagSparse source: {Path(ast.__file__).resolve()}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
+        f"Kernel graph batch: {KERNEL_GRAPH_BATCH} | "
         f"index_fallback_policy: {args.index_fallback_policy}"
     )
     print()
@@ -242,6 +253,18 @@ def run_cli(args):
                     verify = result["verification"]
                     params = result["parameters"]
                     backend = result["backend_status"]
+                    timing_method = perf.get("kernel_timing_method")
+                    graph_batch = params.get("kernel_graph_batch")
+                    if timing_method != "cuda_graph_event_amortized_device_estimate":
+                        raise RuntimeError(
+                            "loaded benchmark_gather_case does not provide CUDA Graph timing; "
+                            f"flagsparse was loaded from {Path(ast.__file__).resolve()}"
+                        )
+                    if graph_batch != KERNEL_GRAPH_BATCH:
+                        raise RuntimeError(
+                            "unexpected gather graph batch: "
+                            f"expected {KERNEL_GRAPH_BATCH}, got {graph_batch}"
+                        )
                     status = _status_from_result(verify)
                     if status != "PASS":
                         failed_cases += 1
@@ -263,6 +286,8 @@ def run_cli(args):
                         "cusparse_ms": perf.get("cusparse_ms"),
                         "triton_speedup_vs_pytorch": perf.get("triton_speedup_vs_pytorch"),
                         "triton_speedup_vs_cusparse": perf.get("triton_speedup_vs_cusparse"),
+                        "kernel_timing_method": timing_method,
+                        "kernel_graph_batch": graph_batch,
                         "triton_match_pytorch": verify.get("triton_match_pytorch"),
                         "cusparse_match_pytorch": verify.get("cusparse_match_pytorch"),
                         "triton_max_error": verify.get("triton_max_error"),
@@ -285,6 +310,8 @@ def run_cli(args):
                         )
                 except Exception as exc:
                     failed_cases += 1
+                    error_text = f"{exc.__class__.__name__}: {exc}"
+                    print(f"\nERROR [{case_id}]: {error_text}")
                     row = {
                         "case_id": case_id,
                         "gpu": torch.cuda.get_device_name(0),
@@ -301,12 +328,14 @@ def run_cli(args):
                         "cusparse_ms": None,
                         "triton_speedup_vs_pytorch": None,
                         "triton_speedup_vs_cusparse": None,
+                        "kernel_timing_method": "cuda_graph_event_amortized_device_estimate",
+                        "kernel_graph_batch": KERNEL_GRAPH_BATCH,
                         "triton_match_pytorch": None,
                         "cusparse_match_pytorch": None,
                         "triton_max_error": None,
                         "cusparse_max_error": None,
-                        "cusparse_unavailable_reason": str(exc),
-                        "index_fallback_reason": str(exc),
+                        "cusparse_unavailable_reason": error_text,
+                        "index_fallback_reason": error_text,
                         "status": "ERROR",
                     }
                     summary_rows.append(row)
@@ -334,6 +363,8 @@ def run_cli(args):
             "cusparse_ms",
             "triton_speedup_vs_pytorch",
             "triton_speedup_vs_cusparse",
+            "kernel_timing_method",
+            "kernel_graph_batch",
             "triton_match_pytorch",
             "cusparse_match_pytorch",
             "triton_max_error",

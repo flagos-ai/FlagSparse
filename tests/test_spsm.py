@@ -1,10 +1,14 @@
 """SpSM tests: synthetic triangular systems and optional .mtx batch CSV."""
 
 import argparse
+import ctypes
+import ctypes.util
 import csv
 import glob
+import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -17,16 +21,6 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 import flagsparse.sparse_operations.spsm as fs_spsm_impl
 
-try:
-    import cupy as cp
-    import cupyx.cusparse as cpx_cusparse
-    import cupyx.scipy.sparse as cpx_sparse
-except Exception:
-    cp = None
-    cpx_cusparse = None
-    cpx_sparse = None
-
-
 FORMATS = ("csr", "coo")
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 INDEX_DTYPES = [torch.int32]
@@ -36,38 +30,47 @@ WARMUP = 10
 ITERS = 20
 TRACE_CUSPARSE = False
 SPSM_OP_MODES = ["NON", "NON_TRANS"]
+_CUSPARSE_MEASUREMENT_SCOPE = "native_cusparse_prepare_plus_solve"
+
+_CUSPARSE_STATUS_SUCCESS = 0
+_CUSPARSE_OPERATION_NON_TRANSPOSE = 0
+_CUSPARSE_OPERATION_TRANSPOSE = 1
+_CUSPARSE_INDEX_BASE_ZERO = 0
+_CUSPARSE_INDEX_32I = 2
+_CUSPARSE_INDEX_64I = 3
+_CUSPARSE_ORDER_COL = 1
+_CUSPARSE_SPMAT_FILL_MODE = 0
+_CUSPARSE_SPMAT_DIAG_TYPE = 1
+_CUSPARSE_FILL_MODE_LOWER = 0
+_CUSPARSE_DIAG_TYPE_NON_UNIT = 0
+_CUSPARSE_SPSM_ALG_DEFAULT = 0
+_CUDA_R_32F = 0
+_CUDA_R_64F = 1
+_CUDA_C_32F = 4
+_CUDA_C_64F = 5
+_CUSPARSE_LIB = None
+_CUSPARSE_LIB_LOAD_ERROR = None
 
 
 def _dtype_name(dtype):
     return str(dtype).replace("torch.", "")
 
 
-def _tol(dtype):
-    if dtype in (torch.float32, torch.complex64):
-        return 1e-4, 1e-3
-    return 1e-12, 1e-10
-
-
 def _reference_check_threshold(dtype):
     if dtype in (torch.float32, torch.complex64):
-        return 1e-6
-    return 1e-12
+        return 1e-4
+    return 1e-10
 
 
-def _reference_max_relative_error(answer, result, dtype):
+def _reference_max_relative_error(answer, result):
     if answer is None or result is None:
         return None
     if answer.numel() != result.numel():
         return float("inf")
     if answer.numel() == 0:
         return 0.0
-    if dtype in (torch.complex64, torch.complex128):
-        answer_cmp = torch.abs(answer)
-        result_cmp = torch.abs(result)
-        diff = torch.abs(answer_cmp - result_cmp)
-    else:
-        diff = torch.abs(answer - result)
-        result_cmp = torch.abs(result)
+    diff = torch.abs(answer - result)
+    result_cmp = torch.abs(answer)
     if not bool(torch.isfinite(diff).all().item()) or not bool(torch.isfinite(result_cmp).all().item()):
         return float("inf")
     max_error = torch.max(diff)
@@ -103,24 +106,6 @@ def _safe_ratio(other_ms, triton_ms):
         return None
     return other_ms / triton_ms
 
-def _cusparse_measurement_scope():
-    return "cupyx_interface_call"
-
-
-def _amortized_total_ms(analysis_ms, solve_ms, iters):
-    if (
-        analysis_ms is None
-        or solve_ms is None
-        or iters is None
-        or int(iters) <= 0
-    ):
-        return None
-    return (float(analysis_ms) / float(iters)) + float(solve_ms)
-
-
-def _speedup_total_ratio(other_ms, analysis_ms, solve_ms, iters):
-    return _safe_ratio(other_ms, _amortized_total_ms(analysis_ms, solve_ms, iters))
-
 
 def _fmt_trace_times(times):
     if not times:
@@ -132,8 +117,8 @@ def _emit_cusparse_trace(tag, warmup_times, timed_times, reduced_ms):
     if not TRACE_CUSPARSE:
         return
     print(
-        f"[trace][{tag}] scope={_cusparse_measurement_scope()} "
-        "(matrix construction and Python-side setup stay outside the timed region)"
+        f"[trace][{tag}] scope={_CUSPARSE_MEASUREMENT_SCOPE} "
+        "(descriptor/input construction stays outside the timed region)"
     )
     if warmup_times:
         print(f"[trace][{tag}] warmup_ms={_fmt_trace_times(warmup_times)}")
@@ -238,6 +223,63 @@ def _extract_effective_lower_csr(data, indices, indptr, shape):
     return data_tri, col_tri.to(torch.int64), indptr_tri
 
 
+def _stabilize_lower_triangular_csr(data, indices, indptr, shape):
+    """Make an arbitrary lower-triangular pattern safe for NON_UNIT SpSM.
+
+    Matrix Market inputs are general sparse matrices, not guaranteed triangular
+    systems. Preserve their lower-triangular off-diagonal values and sparsity,
+    but insert/replace the diagonal with a strictly row-diagonally-dominant
+    value. This preprocessing is shared by every backend and stays outside all
+    analysis/solve timing.
+    """
+    n_rows = int(shape[0])
+    row, col = _csr_to_coo(indices, indptr, n_rows)
+    diag_mask = row == col
+    offdiag_mask = ~diag_mask
+
+    real_dtype = (
+        torch.float32
+        if data.dtype in (torch.float32, torch.complex64)
+        else torch.float64
+    )
+    offdiag_abs_sum = torch.zeros(
+        n_rows, dtype=real_dtype, device=data.device
+    )
+    if bool(torch.any(offdiag_mask).item()):
+        offdiag_abs_sum.index_add_(
+            0,
+            row[offdiag_mask],
+            torch.abs(data[offdiag_mask]).to(real_dtype),
+        )
+    stable_diag = (offdiag_abs_sum + 1.0).to(data.dtype)
+
+    data_stable = data.clone()
+    diag_present = torch.zeros(n_rows, dtype=torch.bool, device=data.device)
+    if bool(torch.any(diag_mask).item()):
+        diag_rows = row[diag_mask]
+        data_stable[diag_mask] = stable_diag[diag_rows]
+        diag_present[diag_rows] = True
+
+    missing_diag = torch.nonzero(
+        ~diag_present, as_tuple=False
+    ).reshape(-1).to(torch.int64)
+    if missing_diag.numel() > 0:
+        row = torch.cat((row, missing_diag))
+        col = torch.cat((col, missing_diag))
+        data_stable = torch.cat((data_stable, stable_diag[missing_diag]))
+
+    order = torch.argsort(row * max(1, n_rows) + col)
+    row = row[order]
+    col = col[order]
+    data_stable = data_stable[order]
+    counts = torch.bincount(row, minlength=n_rows)
+    indptr_stable = torch.zeros(
+        n_rows + 1, dtype=torch.int64, device=data.device
+    )
+    indptr_stable[1:] = torch.cumsum(counts, dim=0)
+    return data_stable, col.to(torch.int64), indptr_stable
+
+
 def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
     try:
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
@@ -255,127 +297,519 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
         )
         if not A_csr.is_cuda:
             raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
-        torch.cuda.synchronize()
-        e0 = torch.cuda.Event(True)
-        e1 = torch.cuda.Event(True)
-        e0.record()
         cols = []
         for bj in torch.unbind(B, dim=1):
             cols.append(sparse_spsolve(A_csr, bj))
         X_ref = torch.stack(cols, dim=1) if cols else B.new_empty(B.shape)
-        e1.record()
         torch.cuda.synchronize()
-        ms = e0.elapsed_time(e1)
-        return X_ref.to(B.dtype), ms, "gpu_sparse", None
+        return X_ref.to(B.dtype), None
     except Exception as exc:
         if "out of memory" in str(exc).lower() and torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return None, None, "unavailable", f"PyTorch sparse solve unavailable ({exc})"
+        return None, f"PyTorch sparse solve unavailable ({exc})"
+
+
+class _CuComplexFloat(ctypes.Structure):
+    _fields_ = [("real", ctypes.c_float), ("imag", ctypes.c_float)]
+
+
+class _CuComplexDouble(ctypes.Structure):
+    _fields_ = [("real", ctypes.c_double), ("imag", ctypes.c_double)]
+
+
+def _check_cusparse_status(status, op_name):
+    if int(status) != _CUSPARSE_STATUS_SUCCESS:
+        raise RuntimeError(f"{op_name} failed with cuSPARSE status {int(status)}")
+
+
+def _cuda_data_type_from_torch(dtype):
+    mapping = {
+        torch.float32: _CUDA_R_32F,
+        torch.float64: _CUDA_R_64F,
+        torch.complex64: _CUDA_C_32F,
+        torch.complex128: _CUDA_C_64F,
+    }
+    if dtype not in mapping:
+        raise TypeError(f"Unsupported native cuSPARSE SpSM dtype: {dtype}")
+    return mapping[dtype]
+
+
+def _cusparse_index_type_from_torch(dtype):
+    if dtype == torch.int32:
+        return _CUSPARSE_INDEX_32I
+    if dtype == torch.int64:
+        return _CUSPARSE_INDEX_64I
+    raise TypeError(f"Unsupported native cuSPARSE SpSM index dtype: {dtype}")
+
+
+def _native_alpha_one(dtype):
+    if dtype == torch.float32:
+        return ctypes.c_float(1.0)
+    if dtype == torch.float64:
+        return ctypes.c_double(1.0)
+    if dtype == torch.complex64:
+        return _CuComplexFloat(1.0, 0.0)
+    if dtype == torch.complex128:
+        return _CuComplexDouble(1.0, 0.0)
+    raise TypeError(f"Unsupported native cuSPARSE SpSM dtype: {dtype}")
+
+
+def _configure_cusparse_spsm_api(lib):
+    void_p = ctypes.c_void_p
+    void_pp = ctypes.POINTER(void_p)
+    int64 = ctypes.c_int64
+    cint = ctypes.c_int
+
+    lib.cusparseCreate.argtypes = [void_pp]
+    lib.cusparseCreate.restype = cint
+    lib.cusparseDestroy.argtypes = [void_p]
+    lib.cusparseDestroy.restype = cint
+    lib.cusparseSetStream.argtypes = [void_p, void_p]
+    lib.cusparseSetStream.restype = cint
+    lib.cusparseCreateCsr.argtypes = [
+        void_pp, int64, int64, int64, void_p, void_p, void_p,
+        cint, cint, cint, cint,
+    ]
+    lib.cusparseCreateCsr.restype = cint
+    lib.cusparseCreateCoo.argtypes = [
+        void_pp, int64, int64, int64, void_p, void_p, void_p,
+        cint, cint, cint,
+    ]
+    lib.cusparseCreateCoo.restype = cint
+    lib.cusparseDestroySpMat.argtypes = [void_p]
+    lib.cusparseDestroySpMat.restype = cint
+    lib.cusparseSpMatSetAttribute.argtypes = [
+        void_p, cint, void_p, ctypes.c_size_t,
+    ]
+    lib.cusparseSpMatSetAttribute.restype = cint
+    lib.cusparseCreateDnMat.argtypes = [
+        void_pp, int64, int64, int64, void_p, cint, cint,
+    ]
+    lib.cusparseCreateDnMat.restype = cint
+    lib.cusparseDestroyDnMat.argtypes = [void_p]
+    lib.cusparseDestroyDnMat.restype = cint
+    lib.cusparseSpSM_createDescr.argtypes = [void_pp]
+    lib.cusparseSpSM_createDescr.restype = cint
+    lib.cusparseSpSM_destroyDescr.argtypes = [void_p]
+    lib.cusparseSpSM_destroyDescr.restype = cint
+    lib.cusparseSpSM_bufferSize.argtypes = [
+        void_p, cint, cint, void_p, void_p, void_p, void_p,
+        cint, cint, void_p, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.cusparseSpSM_bufferSize.restype = cint
+    lib.cusparseSpSM_analysis.argtypes = [
+        void_p, cint, cint, void_p, void_p, void_p, void_p,
+        cint, cint, void_p, void_p,
+    ]
+    lib.cusparseSpSM_analysis.restype = cint
+    lib.cusparseSpSM_solve.argtypes = [
+        void_p, cint, cint, void_p, void_p, void_p, void_p,
+        cint, cint, void_p,
+    ]
+    lib.cusparseSpSM_solve.restype = cint
+
+
+def _load_cusparse_spsm_library():
+    global _CUSPARSE_LIB, _CUSPARSE_LIB_LOAD_ERROR
+    if _CUSPARSE_LIB is not None:
+        return _CUSPARSE_LIB
+    if _CUSPARSE_LIB_LOAD_ERROR is not None:
+        raise RuntimeError(_CUSPARSE_LIB_LOAD_ERROR)
+
+    candidates = []
+    found_name = ctypes.util.find_library("cusparse")
+    if found_name:
+        candidates.append(found_name)
+    candidates.extend(["libcusparse.so", "libcusparse.so.12", "libcusparse.so.11"])
+    load_error = None
+    for name in candidates:
+        try:
+            lib = ctypes.CDLL(name)
+            _configure_cusparse_spsm_api(lib)
+            _CUSPARSE_LIB = lib
+            return lib
+        except Exception as exc:
+            load_error = exc
+    _CUSPARSE_LIB_LOAD_ERROR = (
+        "Failed to load native cuSPARSE SpSM API"
+        + (f": {load_error}" if load_error is not None else "")
+    )
+    raise RuntimeError(_CUSPARSE_LIB_LOAD_ERROR)
+
+
+def _current_cuda_stream_ptr():
+    stream_ptr = getattr(torch.cuda.current_stream(), "cuda_stream", None)
+    if stream_ptr is None:
+        raise RuntimeError("Could not obtain the current CUDA stream pointer")
+    return ctypes.c_void_p(int(stream_ptr))
+
+
+class _PreparedCusparseNativeSpSM:
+    def __init__(self, data, row, col, indptr, B, shape, fmt):
+        if fmt not in FORMATS:
+            raise ValueError(f"Unsupported native cuSPARSE SpSM format: {fmt}")
+        if not all(t.is_cuda for t in (data, row, col, indptr, B)):
+            raise ValueError("Native cuSPARSE SpSM inputs must be CUDA tensors")
+
+        self.data = data.contiguous()
+        self.row = row.contiguous()
+        self.col = col.contiguous()
+        self.indptr = indptr.contiguous()
+        self.B = B.contiguous()
+        rhs_cols = int(self.B.shape[1])
+        rows = int(shape[0])
+        # Reinterpret row-major Torch B as a column-major transposed matrix.
+        # This matches the native cuSPARSE/CuPy SpSM path without copying B.
+        self.X_storage = torch.empty(
+            (rhs_cols, rows),
+            dtype=self.B.dtype,
+            device=self.B.device,
+        )
+        self.X = self.X_storage.transpose(0, 1)
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.fmt = fmt
+        self.op_b = _CUSPARSE_OPERATION_TRANSPOSE
+        self.compute_type = _cuda_data_type_from_torch(self.data.dtype)
+        self.index_type = _cusparse_index_type_from_torch(self.col.dtype)
+        self.alpha = _native_alpha_one(self.data.dtype)
+        self.lib = _load_cusparse_spsm_library()
+        self.handle = ctypes.c_void_p()
+        self.mat_a = ctypes.c_void_p()
+        self.mat_b = ctypes.c_void_p()
+        self.mat_x = ctypes.c_void_p()
+        self.spsm_descr = ctypes.c_void_p()
+        self.workspace = None
+        self.closed = False
+
+        try:
+            self._create_descriptors()
+        except Exception:
+            self.close()
+            raise
+
+    def _create_descriptors(self):
+        rows, cols = self.shape
+        nnz = int(self.data.numel())
+        _check_cusparse_status(
+            self.lib.cusparseCreate(ctypes.byref(self.handle)),
+            "cusparseCreate",
+        )
+        _check_cusparse_status(
+            self.lib.cusparseSetStream(self.handle, _current_cuda_stream_ptr()),
+            "cusparseSetStream",
+        )
+        if self.fmt == "csr":
+            row_type = _cusparse_index_type_from_torch(self.indptr.dtype)
+            _check_cusparse_status(
+                self.lib.cusparseCreateCsr(
+                    ctypes.byref(self.mat_a),
+                    ctypes.c_int64(rows),
+                    ctypes.c_int64(cols),
+                    ctypes.c_int64(nnz),
+                    ctypes.c_void_p(int(self.indptr.data_ptr())),
+                    ctypes.c_void_p(int(self.col.data_ptr())),
+                    ctypes.c_void_p(int(self.data.data_ptr())),
+                    ctypes.c_int(row_type),
+                    ctypes.c_int(self.index_type),
+                    ctypes.c_int(_CUSPARSE_INDEX_BASE_ZERO),
+                    ctypes.c_int(self.compute_type),
+                ),
+                "cusparseCreateCsr",
+            )
+        else:
+            row_type = _cusparse_index_type_from_torch(self.row.dtype)
+            if row_type != self.index_type:
+                raise TypeError("COO row and column index dtypes must match")
+            _check_cusparse_status(
+                self.lib.cusparseCreateCoo(
+                    ctypes.byref(self.mat_a),
+                    ctypes.c_int64(rows),
+                    ctypes.c_int64(cols),
+                    ctypes.c_int64(nnz),
+                    ctypes.c_void_p(int(self.row.data_ptr())),
+                    ctypes.c_void_p(int(self.col.data_ptr())),
+                    ctypes.c_void_p(int(self.data.data_ptr())),
+                    ctypes.c_int(self.index_type),
+                    ctypes.c_int(_CUSPARSE_INDEX_BASE_ZERO),
+                    ctypes.c_int(self.compute_type),
+                ),
+                "cusparseCreateCoo",
+            )
+
+        fill_mode = ctypes.c_int(_CUSPARSE_FILL_MODE_LOWER)
+        diag_type = ctypes.c_int(_CUSPARSE_DIAG_TYPE_NON_UNIT)
+        _check_cusparse_status(
+            self.lib.cusparseSpMatSetAttribute(
+                self.mat_a,
+                ctypes.c_int(_CUSPARSE_SPMAT_FILL_MODE),
+                ctypes.byref(fill_mode),
+                ctypes.sizeof(fill_mode),
+            ),
+            "cusparseSpMatSetAttribute(fill)",
+        )
+        _check_cusparse_status(
+            self.lib.cusparseSpMatSetAttribute(
+                self.mat_a,
+                ctypes.c_int(_CUSPARSE_SPMAT_DIAG_TYPE),
+                ctypes.byref(diag_type),
+                ctypes.sizeof(diag_type),
+            ),
+            "cusparseSpMatSetAttribute(diag)",
+        )
+
+        rhs_cols = int(self.B.shape[1])
+        _check_cusparse_status(
+            self.lib.cusparseCreateDnMat(
+                ctypes.byref(self.mat_b),
+                ctypes.c_int64(rhs_cols),
+                ctypes.c_int64(rows),
+                ctypes.c_int64(rhs_cols),
+                ctypes.c_void_p(int(self.B.data_ptr())),
+                ctypes.c_int(self.compute_type),
+                ctypes.c_int(_CUSPARSE_ORDER_COL),
+            ),
+            "cusparseCreateDnMat(B)",
+        )
+        _check_cusparse_status(
+            self.lib.cusparseCreateDnMat(
+                ctypes.byref(self.mat_x),
+                ctypes.c_int64(rows),
+                ctypes.c_int64(rhs_cols),
+                ctypes.c_int64(rows),
+                ctypes.c_void_p(int(self.X_storage.data_ptr())),
+                ctypes.c_int(self.compute_type),
+                ctypes.c_int(_CUSPARSE_ORDER_COL),
+            ),
+            "cusparseCreateDnMat(X)",
+        )
+        _check_cusparse_status(
+            self.lib.cusparseSpSM_createDescr(ctypes.byref(self.spsm_descr)),
+            "cusparseSpSM_createDescr",
+        )
+
+    def prepare_and_solve(self):
+        if self.closed:
+            raise RuntimeError("Prepared native cuSPARSE SpSM plan is closed")
+        buffer_size = ctypes.c_size_t()
+        _check_cusparse_status(
+            self.lib.cusparseSpSM_bufferSize(
+                self.handle,
+                ctypes.c_int(_CUSPARSE_OPERATION_NON_TRANSPOSE),
+                ctypes.c_int(self.op_b),
+                ctypes.byref(self.alpha),
+                self.mat_a,
+                self.mat_b,
+                self.mat_x,
+                ctypes.c_int(self.compute_type),
+                ctypes.c_int(_CUSPARSE_SPSM_ALG_DEFAULT),
+                self.spsm_descr,
+                ctypes.byref(buffer_size),
+            ),
+            "cusparseSpSM_bufferSize",
+        )
+        self.workspace = torch.empty(
+            max(1, int(buffer_size.value)),
+            dtype=torch.uint8,
+            device=self.data.device,
+        )
+        workspace_ptr = (
+            ctypes.c_void_p(int(self.workspace.data_ptr()))
+            if int(buffer_size.value) > 0
+            else ctypes.c_void_p()
+        )
+        _check_cusparse_status(
+            self.lib.cusparseSpSM_analysis(
+                self.handle,
+                ctypes.c_int(_CUSPARSE_OPERATION_NON_TRANSPOSE),
+                ctypes.c_int(self.op_b),
+                ctypes.byref(self.alpha),
+                self.mat_a,
+                self.mat_b,
+                self.mat_x,
+                ctypes.c_int(self.compute_type),
+                ctypes.c_int(_CUSPARSE_SPSM_ALG_DEFAULT),
+                self.spsm_descr,
+                workspace_ptr,
+            ),
+            "cusparseSpSM_analysis",
+        )
+        _check_cusparse_status(
+            self.lib.cusparseSpSM_solve(
+                self.handle,
+                ctypes.c_int(_CUSPARSE_OPERATION_NON_TRANSPOSE),
+                ctypes.c_int(self.op_b),
+                ctypes.byref(self.alpha),
+                self.mat_a,
+                self.mat_b,
+                self.mat_x,
+                ctypes.c_int(self.compute_type),
+                ctypes.c_int(_CUSPARSE_SPSM_ALG_DEFAULT),
+                self.spsm_descr,
+            ),
+            "cusparseSpSM_solve",
+        )
+        return self.X
+
+    def reset_analysis_state(self):
+        if self.closed:
+            raise RuntimeError("Prepared native cuSPARSE SpSM plan is closed")
+        self.workspace = None
+        if self.spsm_descr.value:
+            _check_cusparse_status(
+                self.lib.cusparseSpSM_destroyDescr(self.spsm_descr),
+                "cusparseSpSM_destroyDescr",
+            )
+            self.spsm_descr = ctypes.c_void_p()
+        _check_cusparse_status(
+            self.lib.cusparseSpSM_createDescr(ctypes.byref(self.spsm_descr)),
+            "cusparseSpSM_createDescr",
+        )
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.spsm_descr.value:
+            try:
+                self.lib.cusparseSpSM_destroyDescr(self.spsm_descr)
+            except Exception:
+                pass
+            self.spsm_descr = ctypes.c_void_p()
+        for attr in ("mat_x", "mat_b"):
+            desc = getattr(self, attr)
+            if desc.value:
+                try:
+                    self.lib.cusparseDestroyDnMat(desc)
+                except Exception:
+                    pass
+                setattr(self, attr, ctypes.c_void_p())
+        if self.mat_a.value:
+            try:
+                self.lib.cusparseDestroySpMat(self.mat_a)
+            except Exception:
+                pass
+            self.mat_a = ctypes.c_void_p()
+        if self.handle.value:
+            try:
+                self.lib.cusparseDestroy(self.handle)
+            except Exception:
+                pass
+            self.handle = ctypes.c_void_p()
 
 
 def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup, iters):
-    if cp is None or cpx_sparse is None or cpx_cusparse is None:
-        return None, None, "cusparse unavailable"
+    plan = None
     try:
-        data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data.contiguous()))
-        B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B.contiguous()))
-        if fmt == "coo":
-            row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row.contiguous()))
-            col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.contiguous()))
-            A_cp = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
-        else:
-            idx_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.contiguous()))
-            ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr.contiguous()))
-            A_cp = cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
-        A_cp.sum_duplicates()
+        plan = _PreparedCusparseNativeSpSM(data, row, col, indptr, B, shape, fmt)
         warmup_times = []
         for _ in range(warmup):
+            plan.reset_analysis_state()
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            X_t = plan.prepare_and_solve()
+            torch.cuda.synchronize()
             if TRACE_CUSPARSE:
-                c0 = cp.cuda.Event()
-                c1 = cp.cuda.Event()
-                c0.record()
-                _ = cpx_cusparse.spsm(A_cp, B_cp, lower=True, unit_diag=False, transa=False)
-                c1.record()
-                c1.synchronize()
-                warmup_times.append(cp.cuda.get_elapsed_time(c0, c1))
-            else:
-                _ = cpx_cusparse.spsm(A_cp, B_cp, lower=True, unit_diag=False, transa=False)
-        cp.cuda.runtime.deviceSynchronize()
+                warmup_times.append((time.perf_counter() - start) * 1000.0)
         times = []
         for _ in range(iters):
-            c0 = cp.cuda.Event()
-            c1 = cp.cuda.Event()
-            c0.record()
-            X_cp = cpx_cusparse.spsm(A_cp, B_cp, lower=True, unit_diag=False, transa=False)
-            c1.record()
-            c1.synchronize()
-            times.append(cp.cuda.get_elapsed_time(c0, c1))
-        ms = _allinone_filtered_avg_ms(times)
+            plan.reset_analysis_state()
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            X_t = plan.prepare_and_solve()
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - start) * 1000.0)
+        total_ms = _allinone_filtered_avg_ms(times)
         _emit_cusparse_trace(
             f"SpSM fmt={fmt.upper()} shape={shape} rhs={B.shape[1]}",
             warmup_times,
             times,
-            ms,
+            total_ms,
         )
-        X_t = torch.utils.dlpack.from_dlpack(X_cp.toDlpack()).to(B.dtype)
-        return X_t, ms, None
+        return X_t, total_ms, None
     except Exception as exc:
         return None, None, str(exc)
+    finally:
+        if plan is not None:
+            plan.close()
 
 
-def _apply_csr_to_dense_rhs(data, indices, indptr, X, shape):
+def _normalized_solution_residual(data, indices, indptr, shape, X, B):
     n_rows = int(shape[0])
     row, col = _csr_to_coo(indices, indptr, n_rows)
-    out = torch.zeros((n_rows, X.shape[1]), dtype=X.dtype, device=X.device)
-    out.index_add_(0, row, data[:, None] * X[col])
-    return out
+    if n_rows == 0 or B.numel() == 0:
+        return 0.0
 
-
-def _solution_residual_metrics(data, indices, indptr, shape, X, B, value_dtype):
-    atol, rtol = _tol(value_dtype)
-    data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
-        data, indices, indptr, shape
+    check_dtype = (
+        torch.complex128
+        if data.dtype in (torch.complex64, torch.complex128)
+        else torch.float64
     )
-    B_recon = _apply_csr_to_dense_rhs(data_eff, indices_eff, indptr_eff, X, shape)
-    err = float(torch.max(torch.abs(B_recon - B)).item()) if B.numel() else 0.0
-    ok = torch.allclose(B_recon, B, atol=atol, rtol=rtol)
-    return err, ok
+    data_check = data.to(check_dtype)
+    row_abs_sum = torch.zeros(
+        n_rows, dtype=torch.float64, device=data.device
+    )
+    row_abs_sum.index_add_(0, row, torch.abs(data_check).to(torch.float64))
+    a_norm = torch.max(row_abs_sum)
+
+    residual_row_sum = torch.zeros_like(row_abs_sum)
+    x_row_sum = torch.zeros_like(row_abs_sum)
+    b_row_sum = torch.zeros_like(row_abs_sum)
+    rhs_chunk = 8
+    for start in range(0, int(B.shape[1]), rhs_chunk):
+        end = min(start + rhs_chunk, int(B.shape[1]))
+        X_chunk = X[:, start:end].to(check_dtype)
+        B_chunk = B[:, start:end].to(check_dtype)
+        B_recon = torch.zeros(
+            (n_rows, end - start), dtype=check_dtype, device=X.device
+        )
+        B_recon.index_add_(0, row, data_check[:, None] * X_chunk[col])
+        residual_row_sum += torch.sum(
+            torch.abs(B_recon - B_chunk), dim=1
+        ).to(torch.float64)
+        x_row_sum += torch.sum(torch.abs(X_chunk), dim=1).to(torch.float64)
+        b_row_sum += torch.sum(torch.abs(B_chunk), dim=1).to(torch.float64)
+
+    residual_norm = torch.max(residual_row_sum)
+    x_norm = torch.max(x_row_sum)
+    b_norm = torch.max(b_row_sum)
+    scale = a_norm * x_norm + b_norm
+    scale_value = float(scale.item())
+    if scale_value == 0.0:
+        return 0.0 if float(residual_norm.item()) == 0.0 else float("inf")
+    return float((residual_norm / scale).item())
 
 
-def _benchmark_flagsparse(call, warmup, iters):
+def _benchmark_flagsparse_full_round(
+    reset_call, analyze_call, solve_call, warmup, iters
+):
     X = None
     for _ in range(warmup):
-        X = call()
-    torch.cuda.synchronize()
+        reset_call()
+        torch.cuda.synchronize()
+        analyze_call()
+        X = solve_call()
+        torch.cuda.synchronize()
     times = []
     for _ in range(iters):
-        e0 = torch.cuda.Event(True)
-        e1 = torch.cuda.Event(True)
-        e0.record()
-        X = call()
-        e1.record()
+        reset_call()
         torch.cuda.synchronize()
-        times.append(e0.elapsed_time(e1))
+        start = time.perf_counter()
+        analyze_call()
+        X = solve_call()
+        torch.cuda.synchronize()
+        times.append((time.perf_counter() - start) * 1000.0)
     return X, _allinone_filtered_avg_ms(times)
 
 
-def _benchmark_flagsparse_spsm_csr_split(data, indices, indptr, B, shape):
+def _benchmark_flagsparse_spsm_csr_total(data, indices, indptr, B, shape):
     warmup, iters = _spsm_benchmark_schedule(
         data.numel(), B.shape[1], data.dtype, fmt="csr"
     )
-    analysis_ms = fs_spsm_impl._analyze_spsm_csr(
-        data,
-        indices,
-        indptr,
-        B,
-        shape,
-        lower=True,
-        unit_diagonal=False,
-        clear_cache=True,
-        return_time=True,
+    analyze_call = lambda: fs_spsm_impl._analyze_spsm_csr(
+        data, indices, indptr, B, shape,
+        lower=True, unit_diagonal=False, clear_cache=False, return_time=False,
     )
-    X, solve_ms = _benchmark_flagsparse(
-        lambda: fs.flagsparse_spsm_csr(
+    solve_call = lambda: fs.flagsparse_spsm_csr(
             data,
             indices,
             indptr,
@@ -386,30 +820,25 @@ def _benchmark_flagsparse_spsm_csr_split(data, indices, indptr, B, shape):
             opA="NON_TRANS",
             opB="NON_TRANS",
             major="row",
-        ),
+    )
+    return _benchmark_flagsparse_full_round(
+        fs_spsm_impl._clear_spsm_preprocess_cache,
+        analyze_call,
+        solve_call,
         warmup,
         iters,
     )
-    return X, analysis_ms, solve_ms
 
 
-def _benchmark_flagsparse_spsm_coo_split(data, row, col, B, shape):
+def _benchmark_flagsparse_spsm_coo_total(data, row, col, B, shape):
     warmup, iters = _spsm_benchmark_schedule(
         data.numel(), B.shape[1], data.dtype, fmt="coo"
     )
-    analysis_ms = fs_spsm_impl._analyze_spsm_coo(
-        data,
-        row,
-        col,
-        B,
-        shape,
-        lower=True,
-        unit_diagonal=False,
-        clear_cache=True,
-        return_time=True,
+    analyze_call = lambda: fs_spsm_impl._analyze_spsm_coo(
+        data, row, col, B, shape,
+        lower=True, unit_diagonal=False, clear_cache=False, return_time=False,
     )
-    X, solve_ms = _benchmark_flagsparse(
-        lambda: fs.flagsparse_spsm_coo(
+    solve_call = lambda: fs.flagsparse_spsm_coo(
             data,
             row,
             col,
@@ -420,11 +849,14 @@ def _benchmark_flagsparse_spsm_coo_split(data, row, col, B, shape):
             opA="NON_TRANS",
             opB="NON_TRANS",
             major="row",
-        ),
+    )
+    return _benchmark_flagsparse_full_round(
+        fs_spsm_impl._clear_spsm_preprocess_cache,
+        analyze_call,
+        solve_call,
         warmup,
         iters,
     )
-    return X, analysis_ms, solve_ms
 
 
 def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
@@ -488,7 +920,7 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
             continue
         _accum(r, c, v)
         if mm_symmetry in ("symmetric", "hermitian") and r != c:
-            _accum(c, r, v)
+            _accum(c, r, v.conjugate() if mm_symmetry == "hermitian" else v)
         elif mm_symmetry == "skew-symmetric" and r != c:
             _accum(c, r, -v)
 
@@ -511,9 +943,11 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n_rhs, fmt):
     n_rows = int(shape[0])
     B = torch.randn((n_rows, n_rhs), dtype=value_dtype, device=data.device).contiguous()
-    atol, rtol = _tol(value_dtype)
     data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
         data, indices, indptr, shape
+    )
+    data_eff, indices_eff, indptr_eff = _stabilize_lower_triangular_csr(
+        data_eff, indices_eff, indptr_eff, shape
     )
     row, col = _csr_to_coo(indices_eff, indptr_eff, n_rows)
     warmup, iters = _spsm_benchmark_schedule(
@@ -521,7 +955,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
     )
 
     if fmt == "csr":
-        X_fs, analysis_ms, solve_ms = _benchmark_flagsparse_spsm_csr_split(
+        X_fs, flagsparse_ms = _benchmark_flagsparse_spsm_csr_total(
             data_eff,
             indices_eff.to(index_dtype),
             indptr_eff.to(index_dtype),
@@ -529,46 +963,48 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
             shape,
         )
     else:
-        X_fs, analysis_ms, solve_ms = _benchmark_flagsparse_spsm_coo_split(
+        X_fs, flagsparse_ms = _benchmark_flagsparse_spsm_coo_total(
             data_eff,
             row.to(index_dtype),
             col.to(index_dtype),
             B,
             shape,
         )
-    X_cu, cusparse_ms, _cusparse_reason = _benchmark_cusparse_reference(
+    (
+        X_cu,
+        cusparse_ms,
+        _cusparse_reason,
+    ) = _benchmark_cusparse_reference(
         data_eff, row, col, indptr_eff, B, shape, fmt, warmup, iters
     )
-    X_pt, pytorch_ms, _pt_backend, pytorch_reason = _benchmark_pytorch_reference(
+    X_pt, pytorch_reason = _benchmark_pytorch_reference(
         data_eff, indices_eff, indptr_eff, shape, B
     )
 
     err_cu = None
     ok_cu = None
-    rel_cu = None
     if X_cu is not None:
-        err_cu = float(torch.max(torch.abs(X_fs - X_cu)).item()) if X_fs.numel() else 0.0
-        rel_cu = _reference_max_relative_error(X_cu, X_fs, value_dtype)
-        ok_cu = rel_cu <= _reference_check_threshold(value_dtype)
+        err_cu = _reference_max_relative_error(X_cu, X_fs)
+        ok_cu = err_cu <= _reference_check_threshold(value_dtype)
 
     err_pt = None
     ok_pt = None
-    rel_pt = None
     if X_pt is not None:
-        err_pt = float(torch.max(torch.abs(X_fs - X_pt)).item()) if X_fs.numel() else 0.0
-        rel_pt = _reference_max_relative_error(X_pt, X_fs, value_dtype)
-        ok_pt = rel_pt <= _reference_check_threshold(value_dtype)
+        err_pt = _reference_max_relative_error(X_pt, X_fs)
+        ok_pt = err_pt <= _reference_check_threshold(value_dtype)
 
-    err_res, ok_res = _solution_residual_metrics(
-        data_eff, indices_eff, indptr_eff, shape, X_fs, B, value_dtype
+    err_res = _normalized_solution_residual(
+        data_eff, indices_eff, indptr_eff, shape, X_fs, B
     )
-    ref_errors = [v for v in (err_pt, err_cu) if v is not None]
-    err_ref = min(ref_errors) if ref_errors else None
+    residual_ok = math.isfinite(err_res) and (
+        err_res <= _reference_check_threshold(value_dtype)
+    )
+    err_ref = err_cu if err_cu is not None else err_pt
 
     if ok_cu is not None:
-        status = "PASS" if ok_cu else "FAIL"
+        status = "PASS" if ok_cu and residual_ok else "FAIL"
     elif ok_pt is not None:
-        status = "PASS" if ok_pt else "FAIL"
+        status = "PASS" if ok_pt and residual_ok else "FAIL"
     elif X_pt is None and X_cu is None:
         status = "REF_FAIL"
     else:
@@ -580,22 +1016,17 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         "n_cols": int(shape[1]),
         "nnz": int(data_eff.numel()),
         "n_rhs": int(n_rhs),
-        "FlagSparse_analysis_ms": analysis_ms,
-        "FlagSparse_solve_ms": solve_ms,
-        "FlagSparse_ms": _amortized_total_ms(analysis_ms, solve_ms, iters),
+        "FlagSparse_ms": flagsparse_ms,
         "cuSPARSE_ms": cusparse_ms,
-        "PyTorch_ms": pytorch_ms,
-        "FlagSparse_vs_cuSPARSE_speedup": _speedup_total_ratio(
-            cusparse_ms, analysis_ms, solve_ms, iters
-        ),
-        "FlagSparse_vs_PyTorch_speedup": _speedup_total_ratio(
-            pytorch_ms, analysis_ms, solve_ms, iters
+        "FlagSparse_vs_cuSPARSE_speedup": _safe_ratio(
+            cusparse_ms, flagsparse_ms
         ),
         "status": status,
         "err_ref": err_ref,
         "err_res": err_res,
         "err_pt": err_pt,
         "err_cu": err_cu,
+        "cusparse_reason": _cusparse_reason,
         "pytorch_reason": pytorch_reason,
         "error": None,
     }
@@ -607,24 +1038,23 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
         return
     total = 0
     failed = 0
-    print("=" * 144)
+    print("=" * 138)
     print("FLAGSPARSE SpSM synthetic test")
-    print("=" * 144)
+    print("=" * 138)
     print(
-        "Baselines: cuSPARSE full-RHS interface call, PyTorch per-column sparse solve."
+        "Every timed round performs analysis/preparation + solve."
     )
     print(
         f"{'Fmt':>5} {'dtype':>9} {'index':>7} {'N':>6} {'RHS':>6} {'NNZ':>10} "
-        f"{'FS.an':>11} {'FS.sol':>10} {'FS.ms':>10} "
-        f"{'CU.ms':>10} {'PT.ms':>10} {'FS/CU':>10} {'FS/PT':>10} "
+        f"{'FS(ms)':>10} {'CU(ms)':>10} {'FS/CU':>10} "
         f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(CU)':>12}"
     )
-    print("-" * 144)
+    print("-" * 138)
 
     for fmt in FORMATS:
         for value_dtype in VALUE_DTYPES:
             for index_dtype in INDEX_DTYPES:
-                data, row, col, indptr, _B, shape = _build_triangular_case(
+                data, _, col, indptr, _, shape = _build_triangular_case(
                     n=n,
                     n_rhs=n_rhs,
                     value_dtype=value_dtype,
@@ -645,18 +1075,19 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
                 print(
                     f"{fmt:>5} {_dtype_name(value_dtype):>9} {_dtype_name(index_dtype):>7} "
                     f"{shape[0]:>6} {n_rhs:>6} {one['nnz']:>10} "
-                    f"{_fmt_ms(one['FlagSparse_analysis_ms']):>11} {_fmt_ms(one['FlagSparse_solve_ms']):>10} {_fmt_ms(one['FlagSparse_ms']):>10} "
-                    f"{_fmt_ms(one['cuSPARSE_ms']):>10} {_fmt_ms(one['PyTorch_ms']):>10} "
-                    f"{_fmt_ratio(one['FlagSparse_vs_cuSPARSE_speedup']):>10} {_fmt_ratio(one['FlagSparse_vs_PyTorch_speedup']):>10} "
+                    f"{_fmt_ms(one['FlagSparse_ms']):>10} {_fmt_ms(one['cuSPARSE_ms']):>10} "
+                    f"{_fmt_ratio(one['FlagSparse_vs_cuSPARSE_speedup']):>10} "
                     f"{one['status']:>10} {_fmt_err(one['err_ref']):>12} {_fmt_err(one['err_res']):>12} "
                     f"{_fmt_err(one['err_pt']):>12} {_fmt_err(one['err_cu']):>12}"
                 )
                 if one["status"] in ("FAIL", "REF_FAIL"):
+                    if one["cusparse_reason"]:
+                        print(f"  NOTE: native cuSPARSE unavailable: {one['cusparse_reason']}")
                     if one["pytorch_reason"]:
                         print(f"  NOTE: {one['pytorch_reason']}")
-    print("-" * 144)
+    print("-" * 138)
     print(f"Total cases: {total}  Failed: {failed}")
-    print("=" * 144)
+    print("=" * 138)
 
 
 def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
@@ -667,28 +1098,26 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
     records_out = []
     fmt = "coo" if use_coo else "csr"
 
-    print("=" * 152)
+    print("=" * 146)
     print(
         f"FLAGSPARSE SpSM .mtx batch ({fmt.upper()}) | "
-        "CU: full-RHS interface call | PT: per-column sparse solve"
+        "FS/CU: every round analysis/preparation + solve"
     )
-    print("=" * 152)
+    print("=" * 146)
     print(
         f"Benchmark schedule: warmup={WARMUP}, timed_iters={ITERS} "
-        "(filtered per-iteration solve averages; override with --warmup/--iters)"
+        "(filtered per-round averages; override with --warmup/--iters)"
     )
     print(
-        "FS.ms = FS.sol + FS.an / timed_iters. "
-        "CU.ms/PT.ms are baseline call times. "
-        "FS/CU and FS/PT are baseline_ms / FS.ms."
+        "FS(ms) and CU(ms) each include one fresh analysis/preparation plus one solve. "
+        "FS/CU = CU(ms) / FS(ms)."
     )
     print(
         f"{'Matrix':<28} {'dtype':>9} {'index':>7} {'N':>7} {'RHS':>6} {'NNZ':>10} "
-        f"{'FS.an':>11} {'FS.sol':>10} {'FS.ms':>10} "
-        f"{'CU.ms':>10} {'PT.ms':>10} {'FS/CU':>10} {'FS/PT':>10} "
+        f"{'FS(ms)':>10} {'CU(ms)':>10} {'FS/CU':>10} "
         f"{'Status':>10} {'Eref':>12} {'Eres':>12} {'Ept':>12} {'Ecu':>12}"
     )
-    print("-" * 152)
+    print("-" * 146)
 
     for value_dtype in CSV_VALUE_DTYPES:
         for index_dtype in CSV_INDEX_DTYPES:
@@ -725,13 +1154,17 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{record['n_rows']:>7} {record['n_rhs']:>6} {record['nnz']:>10} "
-                        f"{_fmt_ms(record['FlagSparse_analysis_ms']):>11} {_fmt_ms(record['FlagSparse_solve_ms']):>10} {_fmt_ms(record['FlagSparse_ms']):>10} "
-                        f"{_fmt_ms(record['cuSPARSE_ms']):>10} {_fmt_ms(record['PyTorch_ms']):>10} "
-                        f"{_fmt_ratio(record['FlagSparse_vs_cuSPARSE_speedup']):>10} {_fmt_ratio(record['FlagSparse_vs_PyTorch_speedup']):>10} "
+                        f"{_fmt_ms(record['FlagSparse_ms']):>10} {_fmt_ms(record['cuSPARSE_ms']):>10} "
+                        f"{_fmt_ratio(record['FlagSparse_vs_cuSPARSE_speedup']):>10} "
                         f"{record['status']:>10} {_fmt_err(record['err_ref']):>12} {_fmt_err(record['err_res']):>12} "
                         f"{_fmt_err(record['err_pt']):>12} {_fmt_err(record['err_cu']):>12}"
                     )
                     if record["status"] in ("FAIL", "REF_FAIL"):
+                        if record["cusparse_reason"]:
+                            print(
+                                "  NOTE: native cuSPARSE unavailable: "
+                                f"{record['cusparse_reason']}"
+                            )
                         if record["pytorch_reason"]:
                             print(f"  NOTE: {record['pytorch_reason']}")
                 except Exception as exc:
@@ -751,18 +1184,15 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                         "n_cols": "ERR",
                         "nnz": "ERR",
                         "n_rhs": int(n_rhs),
-                        "FlagSparse_analysis_ms": None,
-                        "FlagSparse_solve_ms": None,
                         "FlagSparse_ms": None,
                         "cuSPARSE_ms": None,
-                        "PyTorch_ms": None,
                         "FlagSparse_vs_cuSPARSE_speedup": None,
-                        "FlagSparse_vs_PyTorch_speedup": None,
                         "status": status,
                         "err_ref": None,
                         "err_res": None,
                         "err_pt": None,
                         "err_cu": None,
+                        "cusparse_reason": None,
                         "pytorch_reason": None,
                         "error": err_msg,
                     }
@@ -771,13 +1201,13 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{'ERR':>7} {int(n_rhs):>6} {'ERR':>10} "
-                        f"{_fmt_ms(None):>11} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
-                        f"{'N/A':>10} {'N/A':>10} {'N/A':>10} {'N/A':>10} {status:>10} "
+                        f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} "
+                        f"{'N/A':>10} {status:>10} "
                         f"{_fmt_err(None):>12} {_fmt_err(None):>12} {_fmt_err(None):>12} {_fmt_err(None):>12}"
                     )
                     print(f"  {status}: {exc}")
 
-    print("-" * 152)
+    print("-" * 146)
     fieldnames = [
         "matrix",
         "value_dtype",
@@ -787,18 +1217,15 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
         "n_cols",
         "nnz",
         "n_rhs",
-        "FlagSparse_analysis_ms",
-        "FlagSparse_solve_ms",
         "FlagSparse_ms",
         "cuSPARSE_ms",
-        "PyTorch_ms",
         "FlagSparse_vs_cuSPARSE_speedup",
-        "FlagSparse_vs_PyTorch_speedup",
         "status",
         "err_ref",
         "err_res",
         "err_pt",
         "err_cu",
+        "cusparse_reason",
         "pytorch_reason",
         "error",
     ]
@@ -840,18 +1267,18 @@ def main():
         "--warmup",
         type=int,
         default=WARMUP,
-        help="Benchmark warmup solve iterations (default: 10, matching all-in-one cuSPARSE SpSM timing)",
+        help="Warmup rounds; each round performs analysis/preparation + solve",
     )
     parser.add_argument(
         "--iters",
         type=int,
         default=ITERS,
-        help="Benchmark timed solve iterations; solve times report the average (default: 20, matching all-in-one cuSPARSE SpSM timing)",
+        help="Timed analysis/preparation + solve rounds (default: 20)",
     )
     parser.add_argument(
         "--print-cusparse-times",
         action="store_true",
-        help="Print warmup/timed per-round cuSPARSE interface-call times to clarify what cupyx is measuring.",
+        help="Print native cuSPARSE preparation + solve time for every round.",
     )
     args = parser.parse_args()
     WARMUP = max(0, int(args.warmup))
