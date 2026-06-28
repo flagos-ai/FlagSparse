@@ -245,6 +245,68 @@ def _spmm_csr_complex_kernel(
         mask=mask_n,
     )
 
+
+@triton.jit
+def _spmm_csr_selected_rows_complex_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ri_ptr,
+    c_ri_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_br,
+    stride_cm,
+    stride_cn,
+    stride_cr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_bucket_rows:
+        return
+
+    row = tl.load(rows_ptr + pid_row)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    row_nnz = end - start
+    acc_re = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc_im = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+
+    for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
+        for kk in tl.static_range(0, BLOCK_NNZ):
+            idx = start + chunk_start + kk
+            valid = idx < end
+            a_re = tl.load(data_ri_ptr + idx * 2, mask=valid, other=0.0)
+            a_im = tl.load(data_ri_ptr + idx * 2 + 1, mask=valid, other=0.0)
+            a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            b_re = tl.load(
+                b_ri_ptr + a_col * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid,
+                other=0.0,
+            )
+            b_im = tl.load(
+                b_ri_ptr + a_col * stride_bk + offs_n * stride_bn + stride_br,
+                mask=mask_n & valid,
+                other=0.0,
+            )
+            acc_re = acc_re + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE) - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+            acc_im = acc_im + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE) + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+
+    tl.store(c_ri_ptr + row * stride_cm + offs_n * stride_cn, acc_re, mask=mask_n)
+    tl.store(
+        c_ri_ptr + row * stride_cm + offs_n * stride_cn + stride_cr,
+        acc_im,
+        mask=mask_n,
+    )
+
 def _prepare_spmm_csr_matrix(data, indices, indptr, shape):
     if len(shape) != 2:
         raise ValueError("shape must be a 2-tuple: (n_rows, n_cols)")
@@ -732,14 +794,12 @@ def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False, de
     )
 
 
-def _run_spmm_csr_base_accuracy_route(prepared, B, *, timing=False, diagnostics=False):
-    if prepared.op != "non":
-        raise SpmmCsrAlgorithmUnavailable("csr_base_accuracy currently supports op=non only")
-    if prepared.data.dtype != torch.float32:
-        raise SpmmCsrAlgorithmUnavailable("csr_base_accuracy currently supports float32 only")
+def _run_spmm_csr_base_accuracy_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     return _run_spmm_csr_base_route_impl(
         prepared, B, timing=timing, diagnostics=diagnostics,
-        dense_layout="row", accuracy=True, route_name="csr_base_accuracy",
+        dense_layout=dense_layout, accuracy=True, route_name="csr_base_accuracy",
     )
 
 
@@ -849,8 +909,17 @@ def _run_alpha_spmm_alg1_tle_route(
     run_fn_name,
     timing=False,
     diagnostics=False,
+    dense_layout="row",
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    B = _materialize_dense_layout(B, dense_layout)
+    C_out = _empty_dense_layout(
+        (prepared.n_rows, int(B.shape[1])),
+        prepared.data.dtype,
+        prepared.data.device,
+        dense_layout,
+    )
     from . import alpha_spmm_alg1 as alpha_mod
     availability_fn = getattr(alpha_mod, availability_fn_name)
     unavailable_reason_fn = getattr(alpha_mod, unavailable_reason_fn_name)
@@ -869,7 +938,7 @@ def _run_alpha_spmm_alg1_tle_route(
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-    C = run_fn(B=B, prepared=alpha_prepared, meta=launch_meta)
+    C = run_fn(B=B, prepared=alpha_prepared, meta=launch_meta, out=C_out)
     if timing:
         end.record()
         torch.cuda.synchronize()
@@ -881,6 +950,10 @@ def _run_alpha_spmm_alg1_tle_route(
         "process_cpu_ms": process_cpu_ms,
         "process_gpu_ms": process_gpu_ms,
         "compute_ms": compute_ms,
+        "dense_layout": dense_layout,
+        "b_stride": tuple(int(v) for v in B.stride()),
+        "c_stride": tuple(int(v) for v in C.stride()),
+        "output_layout": _dense_layout_name(C),
     }
     if diagnostics:
         meta["diagnostics"] = {
@@ -899,11 +972,17 @@ def _run_alpha_spmm_alg1_tle_route(
             "block_cols": launch_meta.get("block_cols"),
             "grid_m": launch_meta.get("grid_m"),
             "grid_n": launch_meta.get("grid_n"),
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C.stride()),
+            "output_layout": _dense_layout_name(C),
         }
     return C, meta
 
 
-def _run_alpha_spmm_alg1_tle_opt_route(prepared, B, *, timing=False, diagnostics=False):
+def _run_alpha_spmm_alg1_tle_opt_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     return _run_alpha_spmm_alg1_tle_route(
         prepared,
         B,
@@ -914,10 +993,13 @@ def _run_alpha_spmm_alg1_tle_opt_route(prepared, B, *, timing=False, diagnostics
         run_fn_name="flagsparse_alpha_spmm_alg1_tle_opt",
         timing=timing,
         diagnostics=diagnostics,
+        dense_layout=dense_layout,
     )
 
 
-def _run_alpha_spmm_alg1_tle_opt2_route(prepared, B, *, timing=False, diagnostics=False):
+def _run_alpha_spmm_alg1_tle_opt2_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     return _run_alpha_spmm_alg1_tle_route(
         prepared,
         B,
@@ -928,6 +1010,7 @@ def _run_alpha_spmm_alg1_tle_opt2_route(prepared, B, *, timing=False, diagnostic
         run_fn_name="flagsparse_alpha_spmm_alg1_tle_opt2",
         timing=timing,
         diagnostics=diagnostics,
+        dense_layout=dense_layout,
     )
 
 
@@ -1347,7 +1430,7 @@ def _spmm_csr_alg1_run_split_bucket(plan, B, C_out, block_n, device_props):
     )
 
 
-def _spmm_csr_alg1_compute(plan, B):
+def _spmm_csr_alg1_compute(plan, B, *, out=None, dense_layout="row"):
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
     if not B.is_cuda:
@@ -1358,9 +1441,39 @@ def _spmm_csr_alg1_compute(plan, B):
         raise TypeError("B dtype must match sparse matrix dtype")
     if B.shape[0] != plan.n_cols:
         raise ValueError(f"B.shape[0] must be n_cols={plan.n_cols}, got {B.shape[0]}")
-    B = B.contiguous()
+    dense_layout = _normalize_dense_layout(dense_layout)
+    B = _materialize_dense_layout(B, dense_layout)
     block_n = _select_spmm_opt_block_n(int(B.shape[1]))
-    C_out = torch.zeros((plan.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
+    if _is_complex_dtype(B.dtype):
+        C_out = out if out is not None else _empty_dense_layout(
+            (plan.n_rows, int(B.shape[1])),
+            B.dtype,
+            B.device,
+            dense_layout,
+        )
+        C_out.zero_()
+        for bucket in plan.row_buckets:
+            rows = plan.long_row_ids if bucket["kind"] == "split" else bucket["rows"]
+            _spmm_csr_run_selected_rows_complex(
+                plan.data,
+                plan.kernel_indices,
+                plan.kernel_indptr,
+                B,
+                C_out,
+                rows,
+                block_n=block_n,
+                block_nnz=int(bucket.get("block_nnz", 256)),
+                num_warps=4,
+                num_stages=3,
+            )
+        return C_out
+    C_out = out if out is not None else _empty_dense_layout(
+        (plan.n_rows, int(B.shape[1])),
+        B.dtype,
+        B.device,
+        dense_layout,
+    )
+    C_out.zero_()
     device_props = _normalize_spmm_opt_device_props(plan.data.device)
     for bucket in plan.row_buckets:
         if bucket["kind"] == "split":
@@ -1370,15 +1483,23 @@ def _spmm_csr_alg1_compute(plan, B):
     return C_out
 
 
-def _run_spmm_csr_alg1_route(prepared, B, *, timing=False, diagnostics=False):
+def _run_spmm_csr_alg1_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    B = _materialize_dense_layout(B, dense_layout)
+    C_out = _empty_dense_layout(
+        (prepared.n_rows, int(B.shape[1])),
+        prepared.data.dtype,
+        prepared.data.device,
+        dense_layout,
+    )
     plan = _spmm_csr_alg1_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
     if timing:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-    C = _spmm_csr_alg1_compute(plan, B)
+    C = _spmm_csr_alg1_compute(plan, B, out=C_out, dense_layout=dense_layout)
     if timing:
         end.record()
         torch.cuda.synchronize()
@@ -1390,6 +1511,10 @@ def _run_spmm_csr_alg1_route(prepared, B, *, timing=False, diagnostics=False):
         "process_cpu_ms": plan.process_cpu_ms,
         "process_gpu_ms": plan.process_gpu_ms if timing else None,
         "compute_ms": compute_ms,
+        "dense_layout": dense_layout,
+        "b_stride": tuple(int(v) for v in B.stride()),
+        "c_stride": tuple(int(v) for v in C.stride()),
+        "output_layout": _dense_layout_name(C),
     }
     if diagnostics:
         meta["diagnostics"] = {
@@ -1403,6 +1528,10 @@ def _run_spmm_csr_alg1_route(prepared, B, *, timing=False, diagnostics=False):
             "num_warps": None,
             "num_stages": None,
             "long_part_count": plan.long_part_count,
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C.stride()),
+            "output_layout": _dense_layout_name(C),
         }
     return C, meta
 
@@ -1865,6 +1994,7 @@ def _spmm_csr_alg2_run_bucket(
     batched_kernel, row_kernel, segmented_kernel = kernels
     acc_dtype = tl.float64 if high_precision else _spmm_csr_alg2_acc_dtype(plan.data.dtype)
     out_dtype = tl.float64 if plan.data.dtype == torch.float64 else tl.float32
+    accuracy_kernel = bool(accuracy and plan.data.dtype == torch.float32)
     common_kwargs = {
         "num_warps": launch["num_warps"],
         "num_stages": launch["num_stages"],
@@ -1893,7 +2023,7 @@ def _spmm_csr_alg2_run_bucket(
             BLOCK_K=launch["block_k"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
-            ACCURACY=bool(accuracy),
+            ACCURACY=accuracy_kernel,
             **common_kwargs,
         )
     elif bucket["kind"] == "row2d":
@@ -1915,7 +2045,7 @@ def _spmm_csr_alg2_run_bucket(
             BLOCK_K=launch["block_k"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
-            ACCURACY=bool(accuracy),
+            ACCURACY=accuracy_kernel,
             **common_kwargs,
         )
     else:
@@ -1938,7 +2068,7 @@ def _spmm_csr_alg2_run_bucket(
             SEGMENTS=launch["segments"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
-            ACCURACY=bool(accuracy),
+            ACCURACY=accuracy_kernel,
             **common_kwargs,
         )
 
@@ -1947,7 +2077,9 @@ def _spmm_csr_alg2_run_bucket(
     return launch
 
 
-def _spmm_csr_alg2_compute(plan, B, *, accuracy=False, high_precision=False):
+def _spmm_csr_alg2_compute(
+    plan, B, *, accuracy=False, high_precision=False, out=None, dense_layout="row"
+):
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
     if not B.is_cuda:
@@ -1959,8 +2091,50 @@ def _spmm_csr_alg2_compute(plan, B, *, accuracy=False, high_precision=False):
     if B.shape[0] != plan.n_cols:
         raise ValueError(f"B.shape[0] must be n_cols={plan.n_cols}, got {B.shape[0]}")
 
-    B = B.contiguous()
-    C_out = torch.zeros((plan.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    B = _materialize_dense_layout(B, dense_layout)
+    if _is_complex_dtype(B.dtype):
+        C_out = out if out is not None else _empty_dense_layout(
+            (plan.n_rows, int(B.shape[1])),
+            B.dtype,
+            B.device,
+            dense_layout,
+        )
+        C_out.zero_()
+        device_props = _normalize_spmm_csr_alg2_device_props(plan.data.device)
+        plan.launch_configs.clear()
+        for bucket in plan.row_buckets:
+            launch = _resolve_spmm_csr_alg2_launch(
+                bucket,
+                int(B.shape[1]),
+                plan.data.dtype,
+                device_props,
+            )
+            rows = bucket["rows"]
+            _spmm_csr_run_selected_rows_complex(
+                plan.data,
+                plan.kernel_indices,
+                plan.kernel_indptr,
+                B,
+                C_out,
+                rows,
+                block_n=launch["block_n"],
+                block_nnz=launch["block_k"],
+                num_warps=launch["num_warps"],
+                num_stages=launch["num_stages"],
+                high_precision=bool(high_precision),
+            )
+            launch["grid_m"] = int(rows.numel())
+            launch["grid_n"] = int(triton.cdiv(B.shape[1], launch["block_n"]))
+            plan.launch_configs.append(launch)
+        return C_out
+    C_out = out if out is not None else _empty_dense_layout(
+        (plan.n_rows, int(B.shape[1])),
+        B.dtype,
+        B.device,
+        dense_layout,
+    )
+    C_out.zero_()
     device_props = _normalize_spmm_csr_alg2_device_props(plan.data.device)
     kernels = _spmm_csr_alg2_kernel_bundle()
     plan.launch_configs.clear()
@@ -1973,15 +2147,23 @@ def _spmm_csr_alg2_compute(plan, B, *, accuracy=False, high_precision=False):
     return C_out
 
 
-def _run_spmm_csr_alg2_route(prepared, B, *, timing=False, diagnostics=False):
+def _run_spmm_csr_alg2_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    B = _materialize_dense_layout(B, dense_layout)
+    C_out = _empty_dense_layout(
+        (prepared.n_rows, int(B.shape[1])),
+        prepared.data.dtype,
+        prepared.data.device,
+        dense_layout,
+    )
     plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
     if timing:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-    C = _spmm_csr_alg2_compute(plan, B)
+    C = _spmm_csr_alg2_compute(plan, B, out=C_out, dense_layout=dense_layout)
     if timing:
         end.record()
         torch.cuda.synchronize()
@@ -1993,6 +2175,10 @@ def _run_spmm_csr_alg2_route(prepared, B, *, timing=False, diagnostics=False):
         "process_cpu_ms": plan.process_cpu_ms,
         "process_gpu_ms": plan.process_gpu_ms if timing else None,
         "compute_ms": compute_ms,
+        "dense_layout": dense_layout,
+        "b_stride": tuple(int(v) for v in B.stride()),
+        "c_stride": tuple(int(v) for v in C.stride()),
+        "output_layout": _dense_layout_name(C),
     }
     if diagnostics:
         first_launch = plan.launch_configs[0] if plan.launch_configs else {}
@@ -2009,40 +2195,59 @@ def _run_spmm_csr_alg2_route(prepared, B, *, timing=False, diagnostics=False):
             "num_stages": first_launch.get("num_stages"),
             "grid_m": first_launch.get("grid_m"),
             "grid_n": first_launch.get("grid_n"),
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C.stride()),
+            "output_layout": _dense_layout_name(C),
         }
     return C, meta
 
 
-def _run_spmm_csr_alg2_accuracy_route(prepared, B, *, timing=False, diagnostics=False):
+def _run_spmm_csr_alg2_accuracy_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     return _run_spmm_csr_alg2_accuracy_impl(
         prepared, B, timing=timing, diagnostics=diagnostics,
-        high_precision=False, route_name="spmm_csr_alg2_accuracy",
+        dense_layout=dense_layout, high_precision=False, route_name="spmm_csr_alg2_accuracy",
     )
 
 
-def _run_spmm_csr_alg2_accuracy_hp_route(prepared, B, *, timing=False, diagnostics=False):
+def _run_spmm_csr_alg2_accuracy_hp_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     return _run_spmm_csr_alg2_accuracy_impl(
         prepared, B, timing=timing, diagnostics=diagnostics,
-        high_precision=True, route_name="spmm_csr_alg2_accuracy_hp",
+        dense_layout=dense_layout, high_precision=True, route_name="spmm_csr_alg2_accuracy_hp",
     )
 
 
 def _run_spmm_csr_alg2_accuracy_impl(
-    prepared, B, *, timing=False, diagnostics=False,
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row",
     high_precision=False, route_name="spmm_csr_alg2_accuracy",
 ):
-    if prepared.op != "non":
-        raise SpmmCsrAlgorithmUnavailable(f"{route_name} currently supports op=non only")
-    if prepared.data.dtype != torch.float32:
-        raise SpmmCsrAlgorithmUnavailable(f"{route_name} currently supports float32 only")
     B = _validate_spmm_route_runtime_inputs(prepared, B)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    B = _materialize_dense_layout(B, dense_layout)
+    C_out = _empty_dense_layout(
+        (prepared.n_rows, int(B.shape[1])),
+        prepared.data.dtype,
+        prepared.data.device,
+        dense_layout,
+    )
     plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
     if timing:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-    C = _spmm_csr_alg2_compute(plan, B, accuracy=True, high_precision=high_precision)
+    C = _spmm_csr_alg2_compute(
+        plan,
+        B,
+        accuracy=True,
+        high_precision=high_precision,
+        out=C_out,
+        dense_layout=dense_layout,
+    )
     if timing:
         end.record()
         torch.cuda.synchronize()
@@ -2054,6 +2259,10 @@ def _run_spmm_csr_alg2_accuracy_impl(
         "process_cpu_ms": plan.process_cpu_ms,
         "process_gpu_ms": plan.process_gpu_ms if timing else None,
         "compute_ms": compute_ms,
+        "dense_layout": dense_layout,
+        "b_stride": tuple(int(v) for v in B.stride()),
+        "c_stride": tuple(int(v) for v in C.stride()),
+        "output_layout": _dense_layout_name(C),
     }
     if diagnostics:
         first_launch = plan.launch_configs[0] if plan.launch_configs else {}
@@ -2073,6 +2282,10 @@ def _run_spmm_csr_alg2_accuracy_impl(
             "num_stages": first_launch.get("num_stages"),
             "grid_m": first_launch.get("grid_m"),
             "grid_n": first_launch.get("grid_n"),
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C.stride()),
+            "output_layout": _dense_layout_name(C),
         }
     return C, meta
 
@@ -2088,50 +2301,50 @@ SPMM_CSR_ALGORITHMS = {
     "csr_base_accuracy": SpmmCsrAlgorithm(
         name="csr_base_accuracy",
         display_name="BaseAccuracy",
-        supported_ops=("non",),
-        supported_dtypes=(torch.float32,),
+        supported_ops=tuple(SPMM_OP_NAMES.values()),
+        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
         run=_run_spmm_csr_base_accuracy_route,
     ),
     "alpha_alg1_tle_opt": SpmmCsrAlgorithm(
         name="alpha_alg1_tle_opt",
         display_name="TLEOpt",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64),
+        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
         run=_run_alpha_spmm_alg1_tle_opt_route,
     ),
     "alpha_alg1_tle_opt2": SpmmCsrAlgorithm(
         name="alpha_alg1_tle_opt2",
         display_name="TLEOpt2",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64),
+        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
         run=_run_alpha_spmm_alg1_tle_opt2_route,
     ),
     "spmm_csr_alg1": SpmmCsrAlgorithm(
         name="spmm_csr_alg1",
         display_name="Alg1",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64),
+        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
         run=_run_spmm_csr_alg1_route,
     ),
     "spmm_csr_alg2": SpmmCsrAlgorithm(
         name="spmm_csr_alg2",
         display_name="Alg2",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64),
+        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
         run=_run_spmm_csr_alg2_route,
     ),
     "spmm_csr_alg2_accuracy": SpmmCsrAlgorithm(
         name="spmm_csr_alg2_accuracy",
         display_name="Alg2Accuracy",
-        supported_ops=("non",),
-        supported_dtypes=(torch.float32,),
+        supported_ops=tuple(SPMM_OP_NAMES.values()),
+        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
         run=_run_spmm_csr_alg2_accuracy_route,
     ),
     "spmm_csr_alg2_accuracy_hp": SpmmCsrAlgorithm(
         name="spmm_csr_alg2_accuracy_hp",
         display_name="Alg2AccuracyHP",
-        supported_ops=("non",),
-        supported_dtypes=(torch.float32,),
+        supported_ops=tuple(SPMM_OP_NAMES.values()),
+        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
         run=_run_spmm_csr_alg2_accuracy_hp_route,
     ),
 }
@@ -2220,9 +2433,19 @@ def flagsparse_spmm_csr_run(
     alg_name = prepared.alg if alg is None else _normalize_spmm_csr_alg(alg)
     algorithm = resolve_spmm_csr_algorithm(alg_name, op_name, prepared.data.dtype)
     dense_layout = _normalize_dense_layout(dense_layout)
-    if dense_layout == "col" and algorithm.name != "csr_base":
+    col_major_algorithms = {
+        "csr_base",
+        "csr_base_accuracy",
+        "alpha_alg1_tle_opt",
+        "alpha_alg1_tle_opt2",
+        "spmm_csr_alg1",
+        "spmm_csr_alg2",
+        "spmm_csr_alg2_accuracy",
+        "spmm_csr_alg2_accuracy_hp",
+    }
+    if dense_layout == "col" and algorithm.name not in col_major_algorithms:
         raise SpmmCsrAlgorithmUnavailable(
-            "col-major layout is currently supported only by csr_base"
+            "col-major layout is currently supported only by CSR SpMM main algorithms"
         )
     if B is None or not torch.is_tensor(B):
         raise TypeError("B must be a torch.Tensor")
@@ -2245,21 +2468,13 @@ def flagsparse_spmm_csr_run(
         op_name,
         timing=bool(timing),
     )
-    if algorithm.name == "csr_base":
-        C, route_meta = algorithm.run(
-            runtime_prepared,
-            B,
-            timing=bool(timing),
-            diagnostics=bool(diagnostics),
-            dense_layout=dense_layout,
-        )
-    else:
-        C, route_meta = algorithm.run(
-            runtime_prepared,
-            B,
-            timing=bool(timing),
-            diagnostics=bool(diagnostics),
-        )
+    C, route_meta = algorithm.run(
+        runtime_prepared,
+        B,
+        timing=bool(timing),
+        diagnostics=bool(diagnostics),
+        dense_layout=dense_layout,
+    )
     if end is not None:
         end.record()
         torch.cuda.synchronize()
@@ -2809,6 +3024,115 @@ def _build_spmm_csr_opt_runtime_symbolic_triton(prepared):
     )
 
 
+def _triton_spmm_csr_complex_impl(
+    data,
+    indices,
+    indptr,
+    B,
+    n_rows,
+    n_dense_cols,
+    block_n,
+    block_nnz,
+    num_warps,
+    num_stages,
+    out=None,
+    dense_layout="row",
+    high_precision=False,
+):
+    dtype = data.dtype
+    device = data.device
+    dense_layout = _normalize_dense_layout(dense_layout)
+    if dtype not in (torch.complex64, torch.complex128):
+        raise TypeError("_triton_spmm_csr_complex_impl requires a complex dtype")
+    if out is not None:
+        if out.shape != (int(n_rows), int(n_dense_cols)) or out.dtype != dtype:
+            raise ValueError("out shape/dtype must match result")
+        if out.device != device:
+            raise ValueError("out must be on the same CUDA device as data")
+    if n_rows == 0 or n_dense_cols == 0 or B.shape[0] == 0:
+        if out is not None:
+            out.zero_()
+            return out
+        return _zeros_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
+
+    data_ri = torch.view_as_real(data).contiguous().reshape(-1)
+    B_ri = torch.view_as_real(B)
+    C_complex = out if out is not None else _empty_dense_layout(
+        (n_rows, n_dense_cols),
+        dtype,
+        device,
+        dense_layout,
+    )
+    C_ri = torch.view_as_real(C_complex)
+    grid = (n_rows, triton.cdiv(n_dense_cols, block_n))
+    acc_dtype = tl.float64 if (B_ri.dtype == torch.float64 or high_precision) else tl.float32
+    _spmm_csr_complex_kernel[grid](
+        data_ri,
+        indices,
+        indptr,
+        B_ri,
+        C_ri,
+        n_rows,
+        n_dense_cols,
+        B_ri.stride(0),
+        B_ri.stride(1),
+        B_ri.stride(2),
+        C_ri.stride(0),
+        C_ri.stride(1),
+        C_ri.stride(2),
+        BLOCK_N=block_n,
+        BLOCK_NNZ=block_nnz,
+        ACC_DTYPE=acc_dtype,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return C_complex
+
+
+def _spmm_csr_run_selected_rows_complex(
+    data,
+    indices,
+    indptr,
+    B,
+    C_out,
+    rows,
+    *,
+    block_n,
+    block_nnz,
+    num_warps,
+    num_stages,
+    high_precision=False,
+):
+    if rows.numel() == 0:
+        return
+    data_ri = torch.view_as_real(data).contiguous().reshape(-1)
+    B_ri = torch.view_as_real(B)
+    C_ri = torch.view_as_real(C_out)
+    acc_dtype = tl.float64 if (B_ri.dtype == torch.float64 or high_precision) else tl.float32
+    grid = (rows.numel(), triton.cdiv(int(B.shape[1]), block_n))
+    _spmm_csr_selected_rows_complex_kernel[grid](
+        data_ri,
+        indices,
+        indptr,
+        B_ri,
+        C_ri,
+        rows,
+        rows.numel(),
+        int(B.shape[1]),
+        B_ri.stride(0),
+        B_ri.stride(1),
+        B_ri.stride(2),
+        C_ri.stride(0),
+        C_ri.stride(1),
+        C_ri.stride(2),
+        BLOCK_N=block_n,
+        BLOCK_NNZ=block_nnz,
+        ACC_DTYPE=acc_dtype,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+
 def _triton_spmm_csr_impl(
     data,
     indices,
@@ -2869,7 +3193,7 @@ def _triton_spmm_csr_impl(
             BLOCK_N=block_n,
             BLOCK_NNZ=block_nnz,
             ACC_DTYPE=acc_dtype,
-            ACCURACY=bool(accuracy),
+            ACCURACY=bool(accuracy and compute_dtype == torch.float32),
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -2885,38 +3209,20 @@ def _triton_spmm_csr_impl(
             return C_cast
         return C_compute
 
-    data_ri = torch.view_as_real(data).contiguous().reshape(-1)
-    B_ri = torch.view_as_real(B)
-    C_complex = out if out is not None else _empty_dense_layout(
-        (n_rows, n_dense_cols),
-        dtype,
-        device,
-        dense_layout,
-    )
-    C_ri = torch.view_as_real(C_complex)
-    grid = (n_rows, triton.cdiv(n_dense_cols, block_n))
-    acc_dtype = tl.float64 if B_ri.dtype == torch.float64 else tl.float32
-    _spmm_csr_complex_kernel[grid](
-        data_ri,
+    return _triton_spmm_csr_complex_impl(
+        data,
         indices,
         indptr,
-        B_ri,
-        C_ri,
+        B,
         n_rows,
         n_dense_cols,
-        B_ri.stride(0),
-        B_ri.stride(1),
-        B_ri.stride(2),
-        C_ri.stride(0),
-        C_ri.stride(1),
-        C_ri.stride(2),
-        BLOCK_N=block_n,
-        BLOCK_NNZ=block_nnz,
-        ACC_DTYPE=acc_dtype,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        block_n,
+        block_nnz,
+        num_warps,
+        num_stages,
+        out=out,
+        dense_layout=dense_layout,
     )
-    return C_complex
 
 
 @triton.jit

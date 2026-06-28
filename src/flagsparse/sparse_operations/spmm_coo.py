@@ -558,6 +558,7 @@ def _triton_spmm_coo_rowrun_impl(
     output_dtype,
     out=None,
     dense_layout="row",
+    seg_starts=None,
 ):
     device = data.device
     dtype = data.dtype
@@ -573,7 +574,8 @@ def _triton_spmm_coo_rowrun_impl(
             return out
         return _zeros_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
 
-    seg_starts = _seg_starts_from_sorted_rows(row, int(data.numel()), device)
+    if seg_starts is None:
+        seg_starts = _seg_starts_from_sorted_rows(row, int(data.numel()), device)
     n_segs = int(seg_starts.numel()) - 1 if seg_starts is not None else 0
     if n_segs == 0:
         if out is not None:
