@@ -1178,8 +1178,10 @@ def _spmm_csr_alg1_build_bucket_descriptors(rows_flat, counts, offsets):
 
 
 def _spmm_csr_alg1_build_process_plan(prepared, *, timing=False):
-    if prepared.data.dtype not in (torch.float32, torch.float64):
-        raise TypeError("spmm_csr_alg1 only supports float32 and float64")
+    if prepared.data.dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+        raise TypeError(
+            "spmm_csr_alg1 only supports float32, float64, complex64, and complex128"
+        )
     device = prepared.data.device
     row_count = int(prepared.row_lengths.numel())
     row_index_dtype = torch.int32 if row_count <= _INDEX_LIMIT_INT32 else torch.int64
@@ -1891,8 +1893,10 @@ def _spmm_csr_alg2_build_bucket_descriptors(rows_flat, counts, offsets, dtype):
 
 
 def _spmm_csr_alg2_build_process_plan(prepared, *, timing=False):
-    if prepared.data.dtype not in (torch.float32, torch.float64):
-        raise TypeError("spmm_csr_alg2 only supports float32 and float64")
+    if prepared.data.dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+        raise TypeError(
+            "spmm_csr_alg2 only supports float32, float64, complex64, and complex128"
+        )
     device = prepared.data.device
     row_count = int(prepared.row_lengths.numel())
     row_index_dtype = torch.int32 if row_count <= _INDEX_LIMIT_INT32 else torch.int64
