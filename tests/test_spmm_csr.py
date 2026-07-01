@@ -38,8 +38,13 @@ DTYPE_MAP = {
     "complex64": torch.complex64,
     "complex128": torch.complex128,
 }
+INDEX_DTYPE_MAP = {
+    "int32": torch.int32,
+    "int64": torch.int64,
+}
 DEFAULT_DTYPE_NAMES = ("float32", "float64", "complex64", "complex128")
 DEFAULT_RUN_DTYPE_NAMES = ("float32", "float64")
+DEFAULT_INDEX_DTYPE_NAMES = ("int32", "int64")
 DEFAULT_OP_NAMES = tuple(spmm_ops.SPMM_OP_NAMES.values())
 CUSPARSE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 MAIN_CSR_SPMM_ALGORITHMS = {
@@ -56,6 +61,7 @@ MAIN_CSR_SPMM_ALGORITHMS = {
 PERF_FIELDS = [
     "matrix",
     "dtype",
+    "index_dtype",
     "op",
     "layout",
     "alg",
@@ -84,6 +90,7 @@ TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
 DIAG_FIELDS = [
     "matrix",
     "dtype",
+    "index_dtype",
     "op",
     "layout",
     "alg",
@@ -112,6 +119,7 @@ DIAG_FIELDS = [
 BEST_FIELDS = [
     "matrix",
     "dtype",
+    "index_dtype",
     "op",
     "layout",
     "best_alg",
@@ -336,6 +344,7 @@ def _time_route(prepared, B, alg, warmup, iters, timing=False, diagnose=False, l
 def _skip_row(
     path,
     dtype,
+    index_dtype_name,
     op,
     layout,
     alg,
@@ -353,6 +362,7 @@ def _skip_row(
     row = {
         "matrix": os.path.basename(path),
         "dtype": _dtype_name(dtype),
+        "index_dtype": index_dtype_name,
         "op": op,
         "layout": layout,
         "alg": alg,
@@ -412,10 +422,25 @@ def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters, layout="r
         return None, None, str(exc)
 
 
-def run_one_case(path, dtype, op, layout, alg_names, dense_cols, warmup, iters, run_cusparse, timing, diagnose):
+def run_one_case(
+    path,
+    dtype,
+    index_dtype_name,
+    index_dtype,
+    op,
+    layout,
+    alg_names,
+    dense_cols,
+    warmup,
+    iters,
+    run_cusparse,
+    timing,
+    diagnose,
+):
     device = torch.device("cuda")
     data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
-    indices = indices.to(torch.int32)
+    indices = indices.to(index_dtype)
+    indptr = indptr.to(index_dtype)
     n_rows, n_cols = shape
     b_rows = n_rows if op in ("trans", "conj") else n_cols
     B = _materialize_dense_layout_for_test(
@@ -444,6 +469,7 @@ def run_one_case(path, dtype, op, layout, alg_names, dense_cols, warmup, iters, 
                     _skip_row(
                         path,
                         dtype,
+                        index_dtype_name,
                         op,
                         layout,
                         alg,
@@ -474,6 +500,7 @@ def run_one_case(path, dtype, op, layout, alg_names, dense_cols, warmup, iters, 
                 _skip_row(
                     path,
                     dtype,
+                    index_dtype_name,
                     op,
                     layout,
                     alg,
@@ -496,6 +523,7 @@ def run_one_case(path, dtype, op, layout, alg_names, dense_cols, warmup, iters, 
         row = {
             "matrix": os.path.basename(path),
             "dtype": _dtype_name(dtype),
+            "index_dtype": index_dtype_name,
             "op": op,
             "layout": layout,
             "alg": result["alg"],
@@ -526,6 +554,7 @@ def run_one_case(path, dtype, op, layout, alg_names, dense_cols, warmup, iters, 
             diag = {
                 "matrix": os.path.basename(path),
                 "dtype": _dtype_name(dtype),
+                "index_dtype": index_dtype_name,
                 "op": op,
                 "layout": layout,
                 "alg": result["alg"],
@@ -542,15 +571,16 @@ def _best_rows(rows):
     for row in rows:
         if row.get("status") != "PASS" or row.get("ms") is None:
             continue
-        key = (row["matrix"], row["dtype"], row["op"], row["layout"])
+        key = (row["matrix"], row["dtype"], row["index_dtype"], row["op"], row["layout"])
         groups.setdefault(key, []).append(row)
     best = []
-    for (matrix, dtype, op, layout), group in sorted(groups.items()):
+    for (matrix, dtype, index_dtype, op, layout), group in sorted(groups.items()):
         selected = min(group, key=lambda item: item["ms"])
         best.append(
             {
                 "matrix": matrix,
                 "dtype": dtype,
+                "index_dtype": index_dtype,
                 "op": op,
                 "layout": layout,
                 "best_alg": selected["alg"],
@@ -572,7 +602,7 @@ def _write_csv(path, rows, fields):
 
 def _print_row(row):
     print(
-        f"{row['matrix']:<28} {row['dtype']:<10} {row['op']:<5} {row['layout']:<4} {row['alg']:<10} "
+        f"{row['matrix']:<28} {row['dtype']:<10} {row['index_dtype']:<5} {row['op']:<5} {row['layout']:<4} {row['alg']:<10} "
         f"{_fmt(row['ms']):>9} {_fmt(row['gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9} "
         f"{_fmt(row['torch_ms']):>9} {_fmt(row['cusparse_ms']):>9} "
         f"{_fmt(row['torch_vs_alg_speedup'], 2):>9} {_fmt(row['cusparse_vs_alg_speedup'], 2):>9} "
@@ -593,6 +623,7 @@ def main():
         ),
     )
     parser.add_argument("--op", default="all", help="all or comma-separated ops: non,trans,conj")
+    parser.add_argument("--index-dtype", default="all", help="int32, int64, or all")
     parser.add_argument("--layout", default="row", help="row, col, or all")
     parser.add_argument("--dense-cols", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=10)
@@ -619,6 +650,12 @@ def main():
             explicit_names=tuple(DTYPE_MAP),
         )
         op_names = _parse_csv_names(args.op, DEFAULT_OP_NAMES, "--op")
+        index_dtype_names = _parse_csv_names(
+            args.index_dtype,
+            DEFAULT_INDEX_DTYPE_NAMES,
+            "--index-dtype",
+            explicit_names=tuple(INDEX_DTYPE_MAP),
+        )
         layout_names = _layout_names(args.layout)
         alg_names = _parse_algs(args.alg)
     except ValueError as exc:
@@ -629,35 +666,42 @@ def main():
     rows = []
     diag_rows = []
     print(
-        f"{'Matrix':<28} {'DType':<10} {'Op':<5} {'Lay':<4} {'Alg':<10} "
+        f"{'Matrix':<28} {'DType':<10} {'Idx':<5} {'Op':<5} {'Lay':<4} {'Alg':<10} "
         f"{'ms':>9} {'gpu_ms':>9} {'cpu_ms':>9} {'torch':>9} {'cu':>9} "
         f"{'PT/Alg':>9} {'CU/Alg':>9} {'ErrPT':>10} {'Status':>6}"
     )
     for dtype_name in dtype_names:
         dtype = DTYPE_MAP[dtype_name]
-        for op in op_names:
-            for layout in layout_names:
-                for path in paths:
-                    try:
-                        case_rows, case_diag = run_one_case(
-                            path,
-                            dtype,
-                            op,
-                            layout,
-                            alg_names,
-                            args.dense_cols,
-                            args.warmup,
-                            args.iters,
-                            not args.no_cusparse,
-                            args.timing,
-                            args.diagnose,
-                        )
-                        rows.extend(case_rows)
-                        diag_rows.extend(case_diag)
-                        for row in case_rows:
-                            _print_row(row)
-                    except Exception as exc:
-                        print(f"  ERROR on {os.path.basename(path)} dtype={dtype_name} op={op} layout={layout}: {exc}")
+        for index_dtype_name in index_dtype_names:
+            index_dtype = INDEX_DTYPE_MAP[index_dtype_name]
+            for op in op_names:
+                for layout in layout_names:
+                    for path in paths:
+                        try:
+                            case_rows, case_diag = run_one_case(
+                                path,
+                                dtype,
+                                index_dtype_name,
+                                index_dtype,
+                                op,
+                                layout,
+                                alg_names,
+                                args.dense_cols,
+                                args.warmup,
+                                args.iters,
+                                not args.no_cusparse,
+                                args.timing,
+                                args.diagnose,
+                            )
+                            rows.extend(case_rows)
+                            diag_rows.extend(case_diag)
+                            for row in case_rows:
+                                _print_row(row)
+                        except Exception as exc:
+                            print(
+                                f"  ERROR on {os.path.basename(path)} dtype={dtype_name} "
+                                f"index_dtype={index_dtype_name} op={op} layout={layout}: {exc}"
+                            )
     if args.csv:
         csv_path = _normalize_csv_path(args.csv)
         _write_csv(csv_path, rows, fields)
