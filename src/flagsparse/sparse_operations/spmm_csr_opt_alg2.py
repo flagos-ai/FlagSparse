@@ -8,13 +8,19 @@ from .spmm_csr import (
     _prepare_spmm_csr_matrix,
     _spmm_coo_reference_tolerance,
     _spmm_validation_metrics,
+    _triton_spmm_csr_complex_impl,
     flagsparse_spmm_csr,
     flagsparse_spmm_csr_opt,
     prepare_spmm_csr_opt,
 )
 
 
-SUPPORTED_SPMM_OPT_ALG2_DTYPES = (torch.float32, torch.float64)
+SUPPORTED_SPMM_OPT_ALG2_DTYPES = (
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
 
 
 class PreparedCsrSpmmOptAlg2:
@@ -903,7 +909,10 @@ def prepare_spmm_csr_opt_alg2_preprocess(data, indices, indptr, shape):
 
 def _validate_spmm_opt_alg2_runtime_inputs(prepared, B, out):
     if not prepared.supports_opt:
-        raise TypeError("flagsparse_spmm_csr_opt_alg2 only supports float32 and float64")
+        raise TypeError(
+            "flagsparse_spmm_csr_opt_alg2 only supports float32, float64, "
+            "complex64, and complex128"
+        )
     if B is None:
         raise ValueError("B is required")
     if B.ndim != 2:
@@ -926,7 +935,7 @@ def _validate_spmm_opt_alg2_runtime_inputs(prepared, B, out):
 
 
 def _spmm_opt_alg2_acc_dtype(dtype):
-    return tl.float64 if dtype == torch.float64 else tl.float32
+    return tl.float64 if dtype in (torch.float64, torch.complex128) else tl.float32
 
 
 def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
@@ -1021,6 +1030,33 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
 
 def _triton_spmm_csr_impl_opt_alg2_prepared(prepared, B, opt_buckets=None, return_meta=False):
     device_props = _normalize_spmm_opt_alg2_device_props(prepared.data.device)
+    if B.dtype in (torch.complex64, torch.complex128):
+        C_out = _triton_spmm_csr_complex_impl(
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            B,
+            prepared.n_rows,
+            int(B.shape[1]),
+            block_n=32,
+            block_nnz=256,
+            num_warps=4,
+            num_stages=3,
+            dense_layout="row",
+        )
+        meta = None
+        if return_meta:
+            meta = {
+                "device_name": device_props["device_name"],
+                "sm_count": device_props["sm_count"],
+                "warp_size": device_props["warp_size"],
+                "bucket_hits": [],
+                "launch_configs": [],
+                "max_row_nnz": prepared.max_row_nnz,
+                "n_dense_cols": int(B.shape[1]),
+                "complex_kernel": "csr_base_complex",
+            }
+        return C_out, meta
     C_out = torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
     launch_configs = []
     bucket_hits = []

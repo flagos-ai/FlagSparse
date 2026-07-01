@@ -31,7 +31,12 @@ def _load_tle_language():
 tle, _TLE_IMPORT_ERROR = _load_tle_language()
 
 
-SUPPORTED_ALPHA_SPMM_ALG1_DTYPES = (torch.float32, torch.float64)
+SUPPORTED_ALPHA_SPMM_ALG1_DTYPES = (
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
 _ALPHA_SPMM_ALG1_NUM_WARPS = 8
 _ALPHA_SPMM_ALG1_NUM_STAGES = 1
 
@@ -82,7 +87,10 @@ def _prepare_alpha_spmm_alg1_common(data, indices, indptr, shape):
         max_row_nnz,
     ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
     if data.dtype not in SUPPORTED_ALPHA_SPMM_ALG1_DTYPES:
-        raise TypeError("alpha_spmm_alg1 TLE routes only support float32 and float64")
+        raise TypeError(
+            "alpha_spmm_alg1 TLE routes only support float32, float64, "
+            "complex64, and complex128"
+        )
     return PreparedAlphaSpmmAlg1(
         data=data,
         kernel_indices=kernel_indices,
@@ -116,7 +124,7 @@ def prepare_alpha_spmm_alg1_tle_opt2(data, indices, indptr, shape):
 
 
 def _alpha_spmm_alg1_acc_dtype(dtype):
-    return tl.float64 if dtype == torch.float64 else tl.float32
+    return tl.float64 if dtype in (torch.float64, torch.complex128) else tl.float32
 
 
 def _normalize_alpha_spmm_alg1_device_props(device):
@@ -418,18 +426,17 @@ def _alpha_spmm_alg1_rowmajor_kernel(
                 tl.store(c_ptr + row * stride_cm + offs3 * stride_cn, acc3, mask=mask3)
 
 
-def _run_alpha_spmm_alg1(prepared, B, meta):
+def _run_alpha_spmm_alg1(prepared, B, meta, out=None):
     if prepared.n_rows == 0 or int(B.shape[1]) == 0:
-        return torch.zeros(
-            (prepared.n_rows, int(B.shape[1])),
-            dtype=prepared.data.dtype,
-            device=prepared.data.device,
-        )
+        if out is not None:
+            out.zero_()
+            return out
+        return torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+    if prepared.data.is_complex():
+        return _run_alpha_spmm_alg1_complex_kernel(prepared, B, out)
 
-    C_out = torch.empty(
-        (prepared.n_rows, int(B.shape[1])),
-        dtype=prepared.data.dtype,
-        device=prepared.data.device,
+    C_out = out if out is not None else torch.empty(
+        (prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device
     )
     grid = (meta["grid_m"], meta["grid_n"])
     _alpha_spmm_alg1_rowmajor_kernel[grid](
@@ -905,23 +912,117 @@ def build_alpha_spmm_alg1_tle_opt2_meta(prepared, B):
     )
 
 
-def _run_alpha_spmm_alg1_tle(prepared, B, meta):
+@triton.jit
+def _alpha_spmm_alg1_complex_rowmajor_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ri_ptr,
+    c_ri_ptr,
+    n_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_br,
+    stride_cm,
+    stride_cn,
+    stride_cr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if row >= n_rows:
+        return
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    row_nnz = end - start
+    acc_re = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc_im = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+
+    for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
+        for kk in tl.static_range(0, BLOCK_NNZ):
+            idx = start + chunk_start + kk
+            valid = idx < end
+            a_re = tl.load(data_ri_ptr + idx * 2, mask=valid, other=0.0)
+            a_im = tl.load(data_ri_ptr + idx * 2 + 1, mask=valid, other=0.0)
+            a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            b_re = tl.load(
+                b_ri_ptr + a_col * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid,
+                other=0.0,
+            )
+            b_im = tl.load(
+                b_ri_ptr + a_col * stride_bk + offs_n * stride_bn + stride_br,
+                mask=mask_n & valid,
+                other=0.0,
+            )
+            acc_re = acc_re + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE) - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+            acc_im = acc_im + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE) + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+
+    tl.store(c_ri_ptr + row * stride_cm + offs_n * stride_cn, acc_re, mask=mask_n)
+    tl.store(
+        c_ri_ptr + row * stride_cm + offs_n * stride_cn + stride_cr,
+        acc_im,
+        mask=mask_n,
+    )
+
+
+def _run_alpha_spmm_alg1_complex_kernel(prepared, B, out):
+    if out is None:
+        C_out = torch.empty((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+    else:
+        C_out = out
+    data_ri = torch.view_as_real(prepared.data).contiguous().reshape(-1)
+    B_ri = torch.view_as_real(B)
+    C_ri = torch.view_as_real(C_out)
+    block_n = 32
+    block_nnz = 256
+    grid = (prepared.n_rows, triton.cdiv(int(B.shape[1]), block_n))
+    acc_dtype = tl.float64 if B_ri.dtype == torch.float64 else tl.float32
+    _alpha_spmm_alg1_complex_rowmajor_kernel[grid](
+        data_ri,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        B_ri,
+        C_ri,
+        prepared.n_rows,
+        int(B.shape[1]),
+        B_ri.stride(0),
+        B_ri.stride(1),
+        B_ri.stride(2),
+        C_ri.stride(0),
+        C_ri.stride(1),
+        C_ri.stride(2),
+        BLOCK_N=block_n,
+        BLOCK_NNZ=block_nnz,
+        ACC_DTYPE=acc_dtype,
+        num_warps=4,
+        num_stages=3,
+    )
+    return C_out
+
+
+def _run_alpha_spmm_alg1_tle(prepared, B, meta, out=None):
     if tle is None:
         raise RuntimeError(
             "flagsparse_alpha_spmm_alg1_tle requires FlagTree/TLE-Struct runtime "
             f"support ({alpha_spmm_alg1_tle_unavailable_reason()})"
         )
     if prepared.n_rows == 0 or int(B.shape[1]) == 0:
-        return torch.zeros(
-            (prepared.n_rows, int(B.shape[1])),
-            dtype=prepared.data.dtype,
-            device=prepared.data.device,
-        )
+        if out is not None:
+            out.zero_()
+            return out
+        return torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+    if prepared.data.is_complex():
+        return _run_alpha_spmm_alg1_complex_kernel(prepared, B, out)
 
-    C_out = torch.empty(
-        (prepared.n_rows, int(B.shape[1])),
-        dtype=prepared.data.dtype,
-        device=prepared.data.device,
+    C_out = out if out is not None else torch.empty(
+        (prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device
     )
     grid = (meta["grid_m"], meta["grid_n"])
     _alpha_spmm_alg1_tle_rowmajor_kernel[grid](
@@ -948,23 +1049,22 @@ def _run_alpha_spmm_alg1_tle(prepared, B, meta):
     return C_out
 
 
-def _run_alpha_spmm_alg1_tle_opt(prepared, B, meta):
+def _run_alpha_spmm_alg1_tle_opt(prepared, B, meta, out=None):
     if tle is None:
         raise RuntimeError(
             "flagsparse_alpha_spmm_alg1_tle_opt requires FlagTree/TLE-Struct runtime "
             f"support ({alpha_spmm_alg1_tle_opt_unavailable_reason()})"
         )
     if prepared.n_rows == 0 or int(B.shape[1]) == 0:
-        return torch.zeros(
-            (prepared.n_rows, int(B.shape[1])),
-            dtype=prepared.data.dtype,
-            device=prepared.data.device,
-        )
+        if out is not None:
+            out.zero_()
+            return out
+        return torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+    if prepared.data.is_complex():
+        return _run_alpha_spmm_alg1_complex_kernel(prepared, B, out)
 
-    C_out = torch.empty(
-        (prepared.n_rows, int(B.shape[1])),
-        dtype=prepared.data.dtype,
-        device=prepared.data.device,
+    C_out = out if out is not None else torch.empty(
+        (prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device
     )
     grid = (meta["grid_m"], meta["grid_n"])
     _alpha_spmm_alg1_tle_opt_rowmajor_kernel[grid](
@@ -991,23 +1091,22 @@ def _run_alpha_spmm_alg1_tle_opt(prepared, B, meta):
     return C_out
 
 
-def _run_alpha_spmm_alg1_tle_opt2(prepared, B, meta):
+def _run_alpha_spmm_alg1_tle_opt2(prepared, B, meta, out=None):
     if tle is None:
         raise RuntimeError(
             "flagsparse_alpha_spmm_alg1_tle_opt2 requires FlagTree/TLE-Struct runtime "
             f"support ({alpha_spmm_alg1_tle_opt2_unavailable_reason()})"
         )
     if prepared.n_rows == 0 or int(B.shape[1]) == 0:
-        return torch.zeros(
-            (prepared.n_rows, int(B.shape[1])),
-            dtype=prepared.data.dtype,
-            device=prepared.data.device,
-        )
+        if out is not None:
+            out.zero_()
+            return out
+        return torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+    if prepared.data.is_complex():
+        return _run_alpha_spmm_alg1_complex_kernel(prepared, B, out)
 
-    C_out = torch.empty(
-        (prepared.n_rows, int(B.shape[1])),
-        dtype=prepared.data.dtype,
-        device=prepared.data.device,
+    C_out = out if out is not None else torch.empty(
+        (prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device
     )
     grid = (meta["grid_m"], meta["grid_n"])
     _alpha_spmm_alg1_tle_opt2_rowmajor_kernel[grid](
@@ -1062,8 +1161,8 @@ def flagsparse_alpha_spmm_alg1(
         _build_alpha_spmm_alg1_runtime_meta(prepared, B),
         "alpha_spmm_alg1",
     )
-    C = _run_alpha_spmm_alg1(prepared, B, meta)
-    if out is not None:
+    C = _run_alpha_spmm_alg1(prepared, B, meta, out=out)
+    if out is not None and C is not out:
         out.copy_(C)
         C = out
     if return_meta:
@@ -1099,8 +1198,8 @@ def flagsparse_alpha_spmm_alg1_tle(
         _build_alpha_spmm_alg1_runtime_meta(prepared, B),
         "alpha_spmm_alg1_tle",
     )
-    C = _run_alpha_spmm_alg1_tle(prepared, B, meta)
-    if out is not None:
+    C = _run_alpha_spmm_alg1_tle(prepared, B, meta, out=out)
+    if out is not None and C is not out:
         out.copy_(C)
         C = out
     if return_meta:
@@ -1136,8 +1235,8 @@ def flagsparse_alpha_spmm_alg1_tle_opt(
     if meta is None:
         meta = _build_alpha_spmm_alg1_tle_opt_runtime_meta(prepared, B)
     meta = _with_alpha_spmm_alg1_route(meta, "alpha_spmm_alg1_tle_opt")
-    C = _run_alpha_spmm_alg1_tle_opt(prepared, B, meta)
-    if out is not None:
+    C = _run_alpha_spmm_alg1_tle_opt(prepared, B, meta, out=out)
+    if out is not None and C is not out:
         out.copy_(C)
         C = out
     if return_meta:
@@ -1173,8 +1272,8 @@ def flagsparse_alpha_spmm_alg1_tle_opt2(
     if meta is None:
         meta = _build_alpha_spmm_alg1_tle_opt2_runtime_meta(prepared, B)
     meta = _with_alpha_spmm_alg1_route(meta, "alpha_spmm_alg1_tle_opt2")
-    C = _run_alpha_spmm_alg1_tle_opt2(prepared, B, meta)
-    if out is not None:
+    C = _run_alpha_spmm_alg1_tle_opt2(prepared, B, meta, out=out)
+    if out is not None and C is not out:
         out.copy_(C)
         C = out
     if return_meta:
