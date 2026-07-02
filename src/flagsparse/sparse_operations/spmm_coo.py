@@ -1196,7 +1196,9 @@ def _spmm_coo_alg1_build_bucket_descriptors(segs_flat, counts, offsets):
                 "bucket_id": bucket_id,
                 "rows": segs_flat.narrow(0, offset, count),
                 "count": count,
-                "block_nnz": (32, 128, 512, 2048, 2048)[bucket_id],
+                # Keep large row-run buckets logically separate, but cap the
+                # static inner loop to avoid enormous Triton specializations.
+                "block_nnz": (32, 64, 128, 128, 256)[bucket_id],
             }
         )
     process_cpu_ms = (time.perf_counter() - t0) * 1000.0
@@ -1320,7 +1322,7 @@ def _run_spmm_coo_alg1_route(prepared, B, *, timing=False, diagnostics=False, de
             "long_part_count": counts_cpu[-1],
             "launch_version": "spmm_coo_alg1_v1",
             "block_n": launch["block_n"],
-            "block_nnz": "32|128|512|2048|2048",
+            "block_nnz": "32|64|128|128|256",
             "warp_size": launch["heuristic_warp_size"],
             "factor": launch["heuristic_factor"],
             "grid_m": prepared.n_segs,
