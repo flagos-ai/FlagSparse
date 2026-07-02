@@ -303,6 +303,9 @@ def _print_row(row, timing=False):
         f"{_spd(row['pytorch_ms'], row['csc_ms']):>8} {_spd(row['cusparse_ms'], row['csc_ms']):>8} "
         f"{_fmt_err(row['err']):>10} {row['status']:>6}"
     )
+    error = row.get("error")
+    if error:
+        print(f"  error: {str(error)[:240]}")
 
 
 def _run_one_case(
@@ -323,9 +326,48 @@ def _run_one_case(
     indptr = indptr.to(index_dtype).contiguous()
     x = _random_values((_x_size_for_op(shape, op),), dtype, data.device)
     atol, rtol = _reference_tolerance(dtype)
-    csc = _time_flagsparse_csc(data, indices, indptr, x, shape, op, warmup, iters, timing=timing)
-    y_ref = _pytorch_reference(data, indices, indptr, x, shape, dtype, op)
-    err = _allclose_error_ratio(csc["out"], y_ref, atol, rtol)
+    base_row = {
+        "matrix": matrix_name,
+        "value_dtype": _dtype_name(dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "op": op,
+        "out_size": _out_size_for_op(shape, op),
+        "n_rows": int(shape[0]),
+        "n_cols": int(shape[1]),
+        "nnz": int(data.numel()),
+        "csc_ms": None,
+        "csc_gpu_ms": None,
+        "process_cpu_ms": 0.0,
+        "process_gpu_ms": 0.0 if timing else None,
+        "compute_ms": None,
+        "pytorch_ms": None,
+        "cusparse_ms": None,
+        "err": None,
+        "status": "ERROR",
+        "error": None,
+    }
+    try:
+        csc = _time_flagsparse_csc(
+            data, indices, indptr, x, shape, op, warmup, iters, timing=timing
+        )
+    except Exception as exc:
+        base_row["error"] = f"flagsparse_spmv_csc failed: {exc}"
+        return base_row
+    base_row.update(
+        {
+            "csc_ms": csc["ms"],
+            "csc_gpu_ms": csc["gpu_ms"],
+            "process_cpu_ms": csc["process_cpu_ms"],
+            "process_gpu_ms": csc["process_gpu_ms"],
+            "compute_ms": csc["compute_ms"],
+        }
+    )
+    try:
+        y_ref = _pytorch_reference(data, indices, indptr, x, shape, dtype, op)
+        err = _allclose_error_ratio(csc["out"], y_ref, atol, rtol)
+    except Exception as exc:
+        base_row["error"] = f"reference failed after CSC run: {exc}"
+        return base_row
     pt_ms = None
     cu_ms = None
     try:
@@ -338,25 +380,16 @@ def _run_one_case(
         except Exception:
             pass
     ok = (not math.isnan(err)) and err <= 1.0
-    return {
-        "matrix": matrix_name,
-        "value_dtype": _dtype_name(dtype),
-        "index_dtype": _dtype_name(index_dtype),
-        "op": op,
-        "out_size": _out_size_for_op(shape, op),
-        "n_rows": int(shape[0]),
-        "n_cols": int(shape[1]),
-        "nnz": int(data.numel()),
-        "csc_ms": csc["ms"],
-        "csc_gpu_ms": csc["gpu_ms"],
-        "process_cpu_ms": csc["process_cpu_ms"],
-        "process_gpu_ms": csc["process_gpu_ms"],
-        "compute_ms": csc["compute_ms"],
-        "pytorch_ms": pt_ms,
-        "cusparse_ms": cu_ms,
-        "err": err,
-        "status": _status(ok),
-    }
+    base_row.update(
+        {
+            "pytorch_ms": pt_ms,
+            "cusparse_ms": cu_ms,
+            "err": err,
+            "status": _status(ok),
+            "error": None if ok else "correctness check failed",
+        }
+    )
+    return base_row
 
 
 def _mtx_value_for_dtype(raw_value, dtype):
@@ -481,7 +514,18 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None, warmup=WARMUP,
                 print()
 
 
-def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, ops=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True):
+def run_csv(
+    mtx_paths,
+    csv_path,
+    value_dtypes=None,
+    index_dtypes=None,
+    ops=None,
+    warmup=WARMUP,
+    iters=ITERS,
+    timing=False,
+    run_cusparse=True,
+    fail_fast=False,
+):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
         return
@@ -516,6 +560,8 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, ops=None,
                             run_cusparse=run_cusparse,
                         )
                     except Exception as exc:
+                        if fail_fast:
+                            raise
                         row = {
                             "matrix": os.path.basename(path),
                             "value_dtype": _dtype_name(dtype),
@@ -536,6 +582,8 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, ops=None,
                             "status": "ERROR",
                             "error": str(exc),
                         }
+                    if fail_fast and row.get("status") == "ERROR":
+                        raise RuntimeError(row.get("error") or "CSC SpMV case failed")
                     rows.append(row)
                     _print_row(row, timing=timing)
                 print(_sep(timing))
@@ -565,6 +613,9 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, ops=None,
             for field in fieldnames
             if field not in ("process_gpu_ms", "compute_ms")
         ]
+    csv_parent = Path(csv_path).parent
+    if str(csv_parent) not in ("", "."):
+        csv_parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -585,6 +636,7 @@ def main():
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--timing", action="store_true")
     parser.add_argument("--no-cusparse", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
     try:
         value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
@@ -601,6 +653,7 @@ def main():
             iters=args.iters,
             timing=args.timing,
             run_cusparse=not args.no_cusparse,
+            fail_fast=args.fail_fast,
         )
         return
     paths = []
@@ -625,6 +678,7 @@ def main():
             iters=args.iters,
             timing=args.timing,
             run_cusparse=not args.no_cusparse,
+            fail_fast=args.fail_fast,
         )
         return
     if not paths:
@@ -640,6 +694,7 @@ def main():
         iters=args.iters,
         timing=args.timing,
         run_cusparse=not args.no_cusparse,
+        fail_fast=args.fail_fast,
     )
 
 
