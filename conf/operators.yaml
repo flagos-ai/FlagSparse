@@ -63,6 +63,23 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: spmv_csc
+    description: |
+      Computes sparse matrix-vector multiplication for a CSC matrix.
+    for:
+      - flagsparse_spmv_csc
+      - prepare_spmv_csc
+    labels:
+      - flagsparse
+      - sparse
+      - csc
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
   - id: spmv_coo_tocsr
     description: |
       Computes COO SpMV through a COO-to-CSR preparation path.
