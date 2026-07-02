@@ -786,18 +786,36 @@ def run_one_alg_case(
     run_cusparse,
     timing,
     diagnose,
+    progress=False,
 ):
+    matrix_name = os.path.basename(path)
+
+    def _start(stage):
+        if progress:
+            print(f"[{matrix_name}] {stage} ...", flush=True)
+        return time.perf_counter()
+
+    def _done(stage, started_at, extra=""):
+        if progress:
+            suffix = f" {extra}" if extra else ""
+            print(f"[{matrix_name}] {stage} done in {(time.perf_counter() - started_at) * 1000.0:.2f} ms{suffix}", flush=True)
+
     device = torch.device("cuda")
+    stage_t0 = _start("load mtx")
     data, row, col, shape = load_mtx_to_coo_torch(path, dtype=dtype, device=device)
     row = row.to(index_dtype)
     col = col.to(index_dtype)
     n_rows, n_cols = shape
+    _done("load mtx", stage_t0, f"shape=({n_rows},{n_cols}) nnz={int(data.numel())}")
     b_rows = n_rows if ast_ops._spmm_coo_op_transposes(op) else n_cols
+    stage_t0 = _start(f"build dense B shape=({b_rows},{dense_cols})")
     B = _materialize_dense_layout_for_test(
         _build_dense_matrix(b_rows, dense_cols, dtype, device),
         layout,
     )
     b_stride = _stride_string(B)
+    _done("build dense B", stage_t0, f"stride={b_stride}")
+    stage_t0 = _start("prepare canonical reference")
     case = _prepare_canonical_case(data, row, col, shape, B, op=op, layout=layout)
     ref, pytorch_op, _torch_format, pytorch_reason = _build_pytorch_reference(
         data,
@@ -809,16 +827,21 @@ def run_one_alg_case(
         op=op,
         layout=layout,
     )
+    _done("prepare canonical reference", stage_t0)
     torch_ms = None
     try:
+        stage_t0 = _start("time PyTorch COO reference")
         _torch_out, torch_ms = _cuda_event_benchmark(pytorch_op, warmup, iters)
+        _done("time PyTorch COO reference", stage_t0, f"ms={_fmt_ms(torch_ms)}")
     except Exception as exc:
         pytorch_reason = str(exc) if pytorch_reason is None else f"{pytorch_reason}; timing: {exc}"
+        _done("time PyTorch COO reference", stage_t0, f"failed={exc}")
 
     cusparse_out = None
     cusparse_ms = None
     cusparse_reason = ""
     if run_cusparse:
+        stage_t0 = _start("time CuPy/cuSPARSE COO reference")
         cusparse_out, cusparse_ms, cusparse_reason = _time_cusparse_coo(
             case,
             ref,
@@ -827,12 +850,16 @@ def run_one_alg_case(
             iters,
             layout=layout,
         )
+        _done("time CuPy/cuSPARSE COO reference", stage_t0, f"ms={_fmt_ms(cusparse_ms)} reason={cusparse_reason or ''}")
 
     rows = []
     diag_rows = []
     try:
+        stage_t0 = _start("prepare COO route")
         prepared = ast.prepare_spmm_coo_route(data, row, col, shape, op=op, alg="auto")
+        _done("prepare COO route", stage_t0, f"row_runs={prepared.n_segs}")
     except Exception as exc:
+        _done("prepare COO route", stage_t0, f"failed={exc}")
         for alg in _expand_algs(alg_names, op, dtype):
             rows.append(
                 _skip_alg_row(
@@ -856,8 +883,10 @@ def run_one_alg_case(
         return rows, diag_rows
 
     for alg in _expand_algs(alg_names, op, dtype):
+        stage_t0 = None
         try:
             ast.resolve_spmm_coo_algorithm(alg, op, dtype)
+            stage_t0 = _start(f"run {alg}")
             result = _time_coo_algorithm(
                 prepared,
                 B,
@@ -868,7 +897,10 @@ def run_one_alg_case(
                 diagnose=diagnose,
                 layout=layout,
             )
+            _done(f"run {alg}", stage_t0, f"ms={_fmt_ms(result['ms'])}")
         except (ast.SpmmCooAlgorithmUnavailable, ValueError, TypeError) as exc:
+            if stage_t0 is not None:
+                _done(f"run {alg}", stage_t0, f"skip={exc}")
             rows.append(
                 _skip_alg_row(
                     path,
@@ -2010,6 +2042,11 @@ def run_all_dtypes_export_csv(
     csv_path = _normalize_csv_path(csv_path)
     rows = []
     diag_rows = []
+    fieldnames = list(PERF_FIELDS)
+    if timing:
+        fieldnames += TIMING_FIELDS
+    best_path = csv_path[:-4] + ".best.csv"
+    diag_path = csv_path[:-4] + ".diagnose.csv"
     value_dtypes = CSV_VALUE_DTYPES if value_dtypes is None else value_dtypes
     index_dtypes = CSV_INDEX_DTYPES if index_dtypes is None else index_dtypes
     op_names = ["non"] if op_names is None else op_names
@@ -2021,9 +2058,11 @@ def run_all_dtypes_export_csv(
                     print("=" * 150)
                     print(
                         f"COO SpMM registry | dtype={_dtype_name(value_dtype)} index={_dtype_name(index_dtype)} "
-                        f"op={op_name} layout={layout_name} alg={','.join(alg_names)}"
+                        f"op={op_name} layout={layout_name} alg={','.join(alg_names)}",
+                        flush=True,
                     )
-                    for path in paths:
+                    for matrix_idx, path in enumerate(paths, start=1):
+                        print(f"[{matrix_idx}/{len(paths)}] [{os.path.basename(path)}] START", flush=True)
                         case_rows, case_diag_rows = run_one_alg_case(
                             path,
                             value_dtype,
@@ -2038,6 +2077,7 @@ def run_all_dtypes_export_csv(
                             run_cusparse,
                             timing,
                             diagnose,
+                            progress=True,
                         )
                         rows.extend(case_rows)
                         diag_rows.extend(case_diag_rows)
@@ -2045,16 +2085,12 @@ def run_all_dtypes_export_csv(
                             print(
                                 f"{row['matrix']:<32} {row['alg']:<16} {row['status']:<5} "
                                 f"ms={_fmt_ms(row['ms'])} torch={_fmt_ms(row['torch_ms'])} "
-                                f"err={_fmt_err(row['err_vs_torch'])} reason={row.get('reason') or row.get('cusparse_reason') or ''}"
+                                f"err={_fmt_err(row['err_vs_torch'])} reason={row.get('reason') or row.get('cusparse_reason') or ''}",
+                                flush=True,
                             )
-    fieldnames = list(PERF_FIELDS)
-    if timing:
-        fieldnames += TIMING_FIELDS
     _write_csv(csv_path, rows, fieldnames)
-    best_path = csv_path[:-4] + ".best.csv"
     _write_csv(best_path, _best_rows(rows), BEST_FIELDS)
     if diagnose:
-        diag_path = csv_path[:-4] + ".diagnose.csv"
         _write_csv(diag_path, diag_rows, DIAG_FIELDS)
         print(f"Wrote {len(diag_rows)} diagnose rows to {diag_path}")
     print(f"Wrote best rows to {best_path}")
