@@ -18,6 +18,8 @@ from flagsparse.sparse_operations import (  # noqa: E402
     gather_scatter as gather_scatter_ops,
 )
 from flagsparse.sparse_operations import spmv_coo as spmv_coo_ops  # noqa: E402
+from flagsparse.sparse_operations import spmv_bsr as spmv_bsr_ops  # noqa: E402
+from flagsparse.sparse_operations import spmv_csc as spmv_csc_ops  # noqa: E402
 from flagsparse.sparse_operations import spmv_csr as spmv_csr_ops  # noqa: E402
 # isort: on
 # fmt: on
@@ -51,6 +53,16 @@ def test_spmv_coo_index_fallback_policy_normalization(policy):
     assert spmv_coo_ops._normalize_spmv_coo_index_fallback_policy(policy) == policy
 
 
+@pytest.mark.parametrize("policy", ["auto", "strict"])
+def test_spmv_csc_index_fallback_policy_normalization(policy):
+    assert spmv_csc_ops._normalize_spmv_csc_index_fallback_policy(policy) == policy
+
+
+@pytest.mark.parametrize("policy", ["auto", "strict"])
+def test_spmv_bsr_index_fallback_policy_normalization(policy):
+    assert spmv_bsr_ops._normalize_spmv_bsr_index_fallback_policy(policy) == policy
+
+
 @pytest.mark.parametrize(
     ("op", "expected"),
     [
@@ -64,6 +76,32 @@ def test_spmv_coo_op_normalization(op, expected):
     assert spmv_coo_ops._normalize_spmv_coo_op(op) == expected
 
 
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (None, 0),
+        ("non", 0),
+        ("trans", 1),
+        ("conj", 2),
+    ],
+)
+def test_spmv_csc_op_normalization(op, expected):
+    assert spmv_csc_ops._normalize_spmv_csc_op(op) == expected
+
+
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (None, 0),
+        ("non", 0),
+        ("trans", 1),
+        ("conj", 2),
+    ],
+)
+def test_spmv_bsr_op_normalization(op, expected):
+    assert spmv_bsr_ops._normalize_spmv_bsr_op(op) == expected
+
+
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 def test_spmv_csr_op_transpose_contract(op):
     if op == "non":
@@ -75,6 +113,50 @@ def test_spmv_csr_op_transpose_contract(op):
         assert (
             spmv_csr_ops._spmv_op_transposes(spmv_csr_ops._normalize_spmv_op(op))
             is True
+        )
+
+
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmv_csc_op_transpose_contract(op):
+    if op == "non":
+        assert (
+            spmv_csc_ops._spmv_csc_op_transposes(
+                spmv_csc_ops._normalize_spmv_csc_op(op)
+            )
+            is False
+        )
+    else:
+        assert (
+            spmv_csc_ops._spmv_csc_op_transposes(
+                spmv_csc_ops._normalize_spmv_csc_op(op)
+            )
+            is True
+        )
+
+
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmv_bsr_op_transpose_contract(op):
+    if op == "non":
+        assert (
+            spmv_bsr_ops._spmv_bsr_op_transposes(
+                spmv_bsr_ops._normalize_spmv_bsr_op(op)
+            )
+            is False
+        )
+    else:
+        assert (
+            spmv_bsr_ops._spmv_bsr_op_transposes(
+                spmv_bsr_ops._normalize_spmv_bsr_op(op)
+            )
+            is True
+        )
+
+
+@pytest.mark.parametrize("op", ["trans", "conj"])
+def test_spmv_bsr_unsupported_ops_rejected_by_policy(op):
+    with pytest.raises(NotImplementedError, match="only supports op='non'"):
+        spmv_bsr_ops._ensure_spmv_bsr_supported_op(
+            spmv_bsr_ops._normalize_spmv_bsr_op(op)
         )
 
 

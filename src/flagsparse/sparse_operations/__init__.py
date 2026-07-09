@@ -74,6 +74,7 @@ from .spmm_csr_opt_alg2 import (
     prepare_spmm_csr_opt_alg2_preprocess,
 )
 from .spmv_coo import PreparedCoo, flagsparse_spmv_coo, prepare_spmv_coo
+from .spmv_bsr import PreparedBsrSpmv, flagsparse_spmv_bsr, prepare_spmv_bsr
 from .spmv_csc import PreparedCscSpmv, flagsparse_spmv_csc, prepare_spmv_csc
 from .spmv_csr import (
     PreparedCsrSpmv,
@@ -122,6 +123,7 @@ __all__ = [
     "PreparedCoo",
     "PreparedCooSpmmRoute",
     "PreparedAlphaSpmmAlg1",
+    "PreparedBsrSpmv",
     "PreparedCsrSpmv",
     "PreparedCscSpmv",
     "PreparedCsrSpmmOpt",
@@ -174,6 +176,7 @@ __all__ = [
     "flagsparse_spmm_csr_opt_alg2",
     "flagsparse_spmm_csr_opt_alg2_preprocess",
     "flagsparse_spmv_coo",
+    "flagsparse_spmv_bsr",
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spmv_csc",
     "flagsparse_spmv_csr",
@@ -220,6 +223,7 @@ __all__ = [
     "prepare_spmm_csr_opt_alg2",
     "prepare_spmm_csr_opt_alg2_preprocess",
     "prepare_spmv_coo",
+    "prepare_spmv_bsr",
     "prepare_spmv_coo_tocsr",
     "prepare_spmv_csc",
     "prepare_spmv_csr",
