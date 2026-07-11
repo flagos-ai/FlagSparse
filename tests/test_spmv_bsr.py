@@ -6,6 +6,7 @@ import glob
 import math
 import os
 import sys
+import warnings
 from pathlib import Path
 
 import torch
@@ -33,6 +34,25 @@ TEST_SIZES = ((64, 96), (160, 1024), (128, 256))
 DEFAULT_BLOCK_DIMS = (4,)
 WARMUP = 10
 ITERS = 50
+
+
+def _cupy_bsr_unavailable_reason():
+    if cp is None or cpx_sparse is None:
+        return "CuPy/cupyx.scipy.sparse is not available"
+    if not hasattr(cpx_sparse, "bsr_matrix"):
+        return "CuPy cupyx.scipy.sparse has no bsr_matrix baseline"
+    return None
+
+
+def _print_baseline_notes(run_cusparse=True):
+    print(
+        "PyTorch baseline: PT(ms) uses torch.sparse_bsr_tensor when shape is divisible by block_dim; "
+        "unsupported shapes are recorded in pytorch_error CSV."
+    )
+    if run_cusparse:
+        reason = _cupy_bsr_unavailable_reason()
+        if reason:
+            print(f"CuPy baseline: unavailable for BSR ({reason}); CU(ms)=N/A.")
 
 
 def _dtype_name(dtype):
@@ -134,7 +154,12 @@ def _zero_value(dtype):
 def _choose_auto_block_dim(entries, shape):
     n_rows, n_cols = shape
     nnz = max(1, len(entries))
+    first_divisible = None
     for block_dim in (16, 8, 4, 2):
+        if n_rows % block_dim != 0 or n_cols % block_dim != 0:
+            continue
+        if first_divisible is None:
+            first_divisible = block_dim
         blocks = {
             (int(row) // block_dim, int(col) // block_dim)
             for row, col in entries.keys()
@@ -142,12 +167,18 @@ def _choose_auto_block_dim(entries, shape):
         stored = len(blocks) * block_dim * block_dim
         if stored <= 2.0 * nnz:
             return block_dim
-    return 4 if max(n_rows, n_cols) >= 4 else 2
+    return first_divisible
+
+
+def _shape_divisible_by_block_dim(shape, block_dim):
+    return int(shape[0]) % int(block_dim) == 0 and int(shape[1]) % int(block_dim) == 0
 
 
 def _entries_to_bsr_torch(entries, shape, dtype, index_dtype, block_dim, device):
     n_rows, n_cols = int(shape[0]), int(shape[1])
     block_dim = int(block_dim)
+    if not _shape_divisible_by_block_dim((n_rows, n_cols), block_dim):
+        raise ValueError("shape is not divisible by block_dim for standard BSR")
     blocks = {}
     for (row, col), value in entries.items():
         brow = int(row) // block_dim
@@ -159,7 +190,7 @@ def _entries_to_bsr_torch(entries, shape, dtype, index_dtype, block_dim, device)
             [_zero_value(dtype) for _ in range(block_dim * block_dim)],
         )
         block[inner_row * block_dim + inner_col] += _mtx_value_for_dtype(value, dtype)
-    n_block_rows = (n_rows + block_dim - 1) // block_dim
+    n_block_rows = n_rows // block_dim
     rows = [[] for _ in range(n_block_rows)]
     for key in sorted(blocks):
         rows[key[0]].append(key)
@@ -287,15 +318,35 @@ def _time_flagsparse_bsr(data, indices, indptr, x, shape, block_dim, warmup, ite
 
 
 def _time_pytorch(data, indices, indptr, x, shape, block_dim, warmup, iters):
-    A = _bsr_to_torch_coo(data, indices, indptr, shape, block_dim)
+    if int(shape[0]) % int(block_dim) != 0 or int(shape[1]) % int(block_dim) != 0:
+        return (
+            None,
+            "PyTorch BSR baseline requires both matrix dimensions to be divisible by block_dim",
+        )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Sparse BSR tensor support is in beta state.*",
+            category=UserWarning,
+        )
+        A = torch.sparse_bsr_tensor(
+            indptr,
+            indices,
+            data,
+            size=shape,
+            device=data.device,
+            dtype=data.dtype,
+        )
     fn = lambda: torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
     _, ms = _cuda_event_benchmark(fn, warmup, iters)
-    return ms
+    return ms, None
 
 
 def _time_cusparse(data, indices, indptr, x, shape, block_dim, warmup, iters):
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cupyx.scipy.sparse is not available"
+    if not hasattr(cpx_sparse, "bsr_matrix"):
+        return None, "CuPy cupyx.scipy.sparse has no bsr_matrix baseline"
     if data.dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
         return None, f"unsupported cuSPARSE dtype: {_dtype_name(data.dtype)}"
 
@@ -384,9 +435,6 @@ def _print_row(row, timing=False):
     error = row.get("error")
     if error:
         print(f"  error: {str(error)[:240]}")
-    cusparse_error = row.get("cusparse_error")
-    if cusparse_error and row.get("cusparse_ms") is None:
-        print(f"  cusparse: {str(cusparse_error)[:240]}")
 
 
 def _base_row(
@@ -422,11 +470,45 @@ def _base_row(
         "process_gpu_ms": None,
         "compute_ms": None,
         "pytorch_ms": None,
+        "pytorch_error": None,
         "cusparse_ms": None,
         "cusparse_error": None,
         "err": None,
         "status": status,
         "error": None,
+    }
+
+
+def _skip_row(matrix_name, dtype, index_dtype, op, shape, block_dim, logical_nnz, error):
+    try:
+        block_dim_value = int(block_dim)
+    except (TypeError, ValueError):
+        block_dim_value = block_dim
+    return {
+        "matrix": matrix_name,
+        "value_dtype": _dtype_name(dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "op": op,
+        "block_dim": block_dim_value,
+        "out_size": int(shape[0]) if op == "non" else "UNSUP",
+        "n_rows": int(shape[0]),
+        "n_cols": int(shape[1]),
+        "nnzb": "SKIP",
+        "logical_nnz": max(1, int(logical_nnz)),
+        "stored_nnz": "SKIP",
+        "padding_ratio": "SKIP",
+        "bsr_ms": None,
+        "bsr_gpu_ms": None,
+        "process_cpu_ms": 0.0,
+        "process_gpu_ms": None,
+        "compute_ms": None,
+        "pytorch_ms": None,
+        "pytorch_error": None,
+        "cusparse_ms": None,
+        "cusparse_error": None,
+        "err": None,
+        "status": "SKIP",
+        "error": error,
     }
 
 
@@ -487,9 +569,18 @@ def _run_one_case(
         row["error"] = f"reference failed after BSR run: {exc}"
         return row
     try:
-        row["pytorch_ms"] = _time_pytorch(data, indices, indptr, x, shape, block_dim, warmup, iters)
-    except Exception:
-        pass
+        row["pytorch_ms"], row["pytorch_error"] = _time_pytorch(
+            data,
+            indices,
+            indptr,
+            x,
+            shape,
+            block_dim,
+            warmup,
+            iters,
+        )
+    except Exception as exc:
+        row["pytorch_error"] = str(exc)
     if run_cusparse:
         try:
             row["cusparse_ms"], row["cusparse_error"] = _time_cusparse(
@@ -575,7 +666,8 @@ def load_mtx_entries(path):
 
 def _resolve_block_dims(block_dims, entries, shape):
     if block_dims == ["auto"]:
-        return [_choose_auto_block_dim(entries, shape)]
+        block_dim = _choose_auto_block_dim(entries, shape)
+        return [] if block_dim is None else [block_dim]
     return block_dims
 
 
@@ -592,9 +684,12 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=Non
     print("FLAGSPARSE SpMV BSR BENCHMARK (native BSR Triton)")
     print("=" * 140)
     print("Timing policy: bsr_ms = process_cpu_ms + bsr_gpu_ms; BSR construction is setup.")
+    _print_baseline_notes(run_cusparse=run_cusparse)
     for dtype in value_dtypes:
         for index_dtype in index_dtypes:
             for block_dim in block_dims:
+                if block_dim == "auto":
+                    block_dim = 4
                 for op in ops:
                     print(_sep(timing))
                     print(f"dtype: {_dtype_name(dtype)} | index_dtype: {_dtype_name(index_dtype)} | block_dim: {block_dim} | op: {op}")
@@ -637,6 +732,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
     block_dims = list(DEFAULT_BLOCK_DIMS) if block_dims is None else block_dims
     ops = SUPPORTED_OPS if ops is None else ops
     rows = []
+    _print_baseline_notes(run_cusparse=run_cusparse)
     for dtype in value_dtypes:
         for index_dtype in index_dtypes:
             for op in ops:
@@ -648,7 +744,36 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                 for path in mtx_paths:
                     try:
                         entries, shape = load_mtx_entries(path)
-                        for block_dim in _resolve_block_dims(block_dims, entries, shape):
+                        resolved_block_dims = _resolve_block_dims(block_dims, entries, shape)
+                        if not resolved_block_dims:
+                            row = _skip_row(
+                                os.path.basename(path),
+                                dtype,
+                                index_dtype,
+                                op,
+                                shape,
+                                "auto",
+                                len(entries),
+                                "shape is not divisible by any supported standard BSR block_dim",
+                            )
+                            rows.append(row)
+                            _print_row(row, timing=timing)
+                            continue
+                        for block_dim in resolved_block_dims:
+                            if not _shape_divisible_by_block_dim(shape, int(block_dim)):
+                                row = _skip_row(
+                                    os.path.basename(path),
+                                    dtype,
+                                    index_dtype,
+                                    op,
+                                    shape,
+                                    int(block_dim),
+                                    len(entries),
+                                    "shape is not divisible by block_dim for standard BSR",
+                                )
+                                rows.append(row)
+                                _print_row(row, timing=timing)
+                                continue
                             data, indices, indptr = _entries_to_bsr_torch(
                                 entries, shape, dtype, index_dtype, int(block_dim), device
                             )
@@ -694,6 +819,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                             "process_gpu_ms": None,
                             "compute_ms": None,
                             "pytorch_ms": None,
+                            "pytorch_error": None,
                             "cusparse_ms": None,
                             "cusparse_error": None,
                             "err": None,
@@ -722,6 +848,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
         "process_gpu_ms",
         "compute_ms",
         "pytorch_ms",
+        "pytorch_error",
         "cusparse_ms",
         "cusparse_error",
         "err",

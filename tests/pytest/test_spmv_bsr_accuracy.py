@@ -5,11 +5,11 @@ import torch
 
 from flagsparse import flagsparse_spmv_bsr, prepare_spmv_bsr
 from tests.pytest.accuracy_utils import close_tolerances
-from tests.pytest.param_shapes import SPMV_MN_SHAPES
 
 
 spmv_bsr_mod = importlib.import_module("flagsparse.sparse_operations.spmv_bsr")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+BSR_MN_SHAPES = ((8, 8), (16, 32), (64, 96))
 
 
 def _value_dtype_cases():
@@ -49,7 +49,9 @@ def _reference_dtype(dtype):
 def _dense_to_bsr(dense, index_dtype, block_dim):
     device = dense.device
     M, N = dense.shape
-    n_block_rows = (M + block_dim - 1) // block_dim
+    if M % block_dim != 0 or N % block_dim != 0:
+        raise ValueError("shape is not divisible by block_dim for standard BSR")
+    n_block_rows = M // block_dim
     rows, cols = torch.nonzero(dense != 0, as_tuple=True)
     blocks = {}
     for row, col in zip(rows.tolist(), cols.tolist()):
@@ -112,7 +114,7 @@ def _assert_close(actual, expected, dtype):
 
 
 @pytest.mark.spmv_bsr
-@pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
+@pytest.mark.parametrize("M, N", BSR_MN_SHAPES)
 @pytest.mark.parametrize(
     "name,dtype", _value_dtype_cases(), ids=[c[0] for c in _value_dtype_cases()]
 )
@@ -143,7 +145,7 @@ def test_spmv_bsr_matches_dense_reference(M, N, name, dtype, index_dtype, block_
 @pytest.mark.spmv_bsr
 def test_spmv_bsr_prepared_path_matches_dense_reference():
     device = torch.device("cuda")
-    M, N = 8, 10
+    M, N = 8, 12
     dtype = torch.complex64
     block_dim = 4
     data, indices, indptr, dense = _random_bsr_mn(
@@ -161,22 +163,22 @@ def test_spmv_bsr_prepared_path_matches_dense_reference():
 def test_spmv_bsr_unsupported_ops_are_rejected(op):
     device = torch.device("cuda")
     data, indices, indptr, _dense = _random_bsr_mn(
-        8, 10, torch.float32, torch.int32, 2, device
+        8, 12, torch.float32, torch.int32, 2, device
     )
     x = torch.randn(8, dtype=torch.float32, device=device)
     with pytest.raises(NotImplementedError, match="only supports op='non'"):
-        flagsparse_spmv_bsr(data, indices, indptr, x, shape=(8, 10), block_dim=2, op=op)
+        flagsparse_spmv_bsr(data, indices, indptr, x, shape=(8, 12), block_dim=2, op=op)
 
 
 @pytest.mark.spmv_bsr
 def test_spmv_bsr_x_length_mismatch_rejected():
     device = torch.device("cuda")
     data, indices, indptr, _dense = _random_bsr_mn(
-        8, 10, torch.float32, torch.int32, 2, device
+        8, 12, torch.float32, torch.int32, 2, device
     )
-    prepared = prepare_spmv_bsr(data, indices, indptr, (8, 10), 2)
+    prepared = prepare_spmv_bsr(data, indices, indptr, (8, 12), 2)
     x = torch.randn(8, dtype=torch.float32, device=device)
-    with pytest.raises(ValueError, match="x length must be 10"):
+    with pytest.raises(ValueError, match="x length must be 12"):
         flagsparse_spmv_bsr(x=x, prepared=prepared)
 
 
@@ -184,9 +186,9 @@ def test_spmv_bsr_x_length_mismatch_rejected():
 def test_spmv_bsr_int64_auto_fallback_to_int32(monkeypatch):
     device = torch.device("cuda")
     data, indices, indptr, dense = _random_bsr_mn(
-        12, 9, torch.float32, torch.int64, 2, device
+        12, 10, torch.float32, torch.int64, 2, device
     )
-    x = torch.randn(9, dtype=torch.float32, device=device)
+    x = torch.randn(10, dtype=torch.float32, device=device)
     ref = dense.to(torch.float64) @ x.to(torch.float64)
     state = {"forced_once": False}
     original = spmv_bsr_mod._triton_spmv_bsr_kernel
@@ -203,7 +205,7 @@ def test_spmv_bsr_int64_auto_fallback_to_int32(monkeypatch):
         indices,
         indptr,
         x,
-        shape=(12, 9),
+        shape=(12, 10),
         block_dim=2,
         index_fallback_policy="auto",
     )
@@ -215,9 +217,9 @@ def test_spmv_bsr_int64_auto_fallback_to_int32(monkeypatch):
 def test_spmv_bsr_int64_strict_no_fallback(monkeypatch):
     device = torch.device("cuda")
     data, indices, indptr, _dense = _random_bsr_mn(
-        12, 9, torch.float32, torch.int64, 2, device
+        12, 10, torch.float32, torch.int64, 2, device
     )
-    x = torch.randn(9, dtype=torch.float32, device=device)
+    x = torch.randn(10, dtype=torch.float32, device=device)
     original = spmv_bsr_mod._triton_spmv_bsr_kernel
 
     def fail_int64(prepared, x_in, op_code):
@@ -232,7 +234,20 @@ def test_spmv_bsr_int64_strict_no_fallback(monkeypatch):
             indices,
             indptr,
             x,
-            shape=(12, 9),
+            shape=(12, 10),
             block_dim=2,
             index_fallback_policy="strict",
         )
+
+
+@pytest.mark.spmv_bsr
+def test_spmv_bsr_rejects_non_divisible_shape():
+    device = torch.device("cuda")
+    data = torch.ones((1, 4, 4), dtype=torch.float32, device=device)
+    indices = torch.tensor([0], dtype=torch.int32, device=device)
+    indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    x = torch.randn(8, dtype=torch.float32, device=device)
+    with pytest.raises(ValueError, match="shape is not divisible by block_dim"):
+        prepare_spmv_bsr(data, indices, indptr, (7, 8), 4)
+    with pytest.raises(ValueError, match="shape is not divisible by block_dim"):
+        flagsparse_spmv_bsr(data, indices, indptr, x, shape=(7, 8), block_dim=4)
