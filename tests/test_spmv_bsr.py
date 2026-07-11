@@ -295,27 +295,42 @@ def _time_pytorch(data, indices, indptr, x, shape, block_dim, warmup, iters):
 
 def _time_cusparse(data, indices, indptr, x, shape, block_dim, warmup, iters):
     if cp is None or cpx_sparse is None:
-        return None
+        return None, "CuPy/cupyx.scipy.sparse is not available"
     if data.dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
-        return None
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr.to(torch.int64)))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
-    A = cpx_sparse.bsr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    fn = lambda: A @ x_cp
-    for _ in range(max(0, int(warmup))):
-        _ = fn()
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        _ = fn()
-    end.record()
-    end.synchronize()
-    return cp.cuda.get_elapsed_time(start, end) / count
+        return None, f"unsupported cuSPARSE dtype: {_dtype_name(data.dtype)}"
+
+    def run_with_index_dtype(index_dtype, fallback_note=None):
+        data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
+        ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(index_dtype)))
+        ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr.to(index_dtype)))
+        x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
+        A = cpx_sparse.bsr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+        fn = lambda: A @ x_cp
+        for _ in range(max(0, int(warmup))):
+            _ = fn()
+        cp.cuda.runtime.deviceSynchronize()
+        start = cp.cuda.Event()
+        end = cp.cuda.Event()
+        count = max(1, int(iters))
+        start.record()
+        for _ in range(count):
+            _ = fn()
+        end.record()
+        end.synchronize()
+        return cp.cuda.get_elapsed_time(start, end) / count, fallback_note
+
+    try:
+        return run_with_index_dtype(indices.dtype)
+    except Exception as exc:
+        if indices.dtype == torch.int32 and indptr.dtype == torch.int32:
+            raise
+        try:
+            return run_with_index_dtype(
+                torch.int32,
+                f"CuPy BSR failed with {_dtype_name(indices.dtype)} indices; used int32 baseline fallback: {exc}",
+            )
+        except Exception:
+            raise exc
 
 
 def _fmt(v):
@@ -369,6 +384,9 @@ def _print_row(row, timing=False):
     error = row.get("error")
     if error:
         print(f"  error: {str(error)[:240]}")
+    cusparse_error = row.get("cusparse_error")
+    if cusparse_error and row.get("cusparse_ms") is None:
+        print(f"  cusparse: {str(cusparse_error)[:240]}")
 
 
 def _base_row(
@@ -405,6 +423,7 @@ def _base_row(
         "compute_ms": None,
         "pytorch_ms": None,
         "cusparse_ms": None,
+        "cusparse_error": None,
         "err": None,
         "status": status,
         "error": None,
@@ -473,9 +492,18 @@ def _run_one_case(
         pass
     if run_cusparse:
         try:
-            row["cusparse_ms"] = _time_cusparse(data, indices, indptr, x, shape, block_dim, warmup, iters)
-        except Exception:
-            pass
+            row["cusparse_ms"], row["cusparse_error"] = _time_cusparse(
+                data,
+                indices,
+                indptr,
+                x,
+                shape,
+                block_dim,
+                warmup,
+                iters,
+            )
+        except Exception as exc:
+            row["cusparse_error"] = str(exc)
     ok = (not math.isnan(err)) and err <= 1.0
     row["err"] = err
     row["status"] = _status(ok)
@@ -667,6 +695,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                             "compute_ms": None,
                             "pytorch_ms": None,
                             "cusparse_ms": None,
+                            "cusparse_error": None,
                             "err": None,
                             "status": "ERROR",
                             "error": str(exc),
@@ -694,6 +723,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
         "compute_ms",
         "pytorch_ms",
         "cusparse_ms",
+        "cusparse_error",
         "err",
         "status",
         "error",
