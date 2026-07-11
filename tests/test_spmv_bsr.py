@@ -46,8 +46,11 @@ def _cupy_bsr_unavailable_reason():
 
 def _print_baseline_notes(run_cusparse=True):
     print(
-        "PyTorch baseline: PT(ms) uses torch.sparse_bsr_tensor when shape is divisible by block_dim; "
-        "unsupported shapes are recorded in pytorch_error CSV."
+        "FlagSparse BSR follows AlphaSparse/cuSPARSE-style ceil block grid with boundary masks."
+    )
+    print(
+        "PyTorch baseline: PT(ms) uses torch.sparse_bsr_tensor only when shape is divisible by block_dim; "
+        "otherwise PT(ms)=N/A and pytorch_error records the PyTorch limitation."
     )
     if run_cusparse:
         reason = _cupy_bsr_unavailable_reason()
@@ -152,14 +155,9 @@ def _zero_value(dtype):
 
 
 def _choose_auto_block_dim(entries, shape):
-    n_rows, n_cols = shape
     nnz = max(1, len(entries))
-    first_divisible = None
+    best = None
     for block_dim in (16, 8, 4, 2):
-        if n_rows % block_dim != 0 or n_cols % block_dim != 0:
-            continue
-        if first_divisible is None:
-            first_divisible = block_dim
         blocks = {
             (int(row) // block_dim, int(col) // block_dim)
             for row, col in entries.keys()
@@ -167,18 +165,14 @@ def _choose_auto_block_dim(entries, shape):
         stored = len(blocks) * block_dim * block_dim
         if stored <= 2.0 * nnz:
             return block_dim
-    return first_divisible
-
-
-def _shape_divisible_by_block_dim(shape, block_dim):
-    return int(shape[0]) % int(block_dim) == 0 and int(shape[1]) % int(block_dim) == 0
+        if best is None or stored < best[0]:
+            best = (stored, block_dim)
+    return best[1] if best is not None else 2
 
 
 def _entries_to_bsr_torch(entries, shape, dtype, index_dtype, block_dim, device):
     n_rows, n_cols = int(shape[0]), int(shape[1])
     block_dim = int(block_dim)
-    if not _shape_divisible_by_block_dim((n_rows, n_cols), block_dim):
-        raise ValueError("shape is not divisible by block_dim for standard BSR")
     blocks = {}
     for (row, col), value in entries.items():
         brow = int(row) // block_dim
@@ -190,7 +184,7 @@ def _entries_to_bsr_torch(entries, shape, dtype, index_dtype, block_dim, device)
             [_zero_value(dtype) for _ in range(block_dim * block_dim)],
         )
         block[inner_row * block_dim + inner_col] += _mtx_value_for_dtype(value, dtype)
-    n_block_rows = n_rows // block_dim
+    n_block_rows = (n_rows + block_dim - 1) // block_dim
     rows = [[] for _ in range(n_block_rows)]
     for key in sorted(blocks):
         rows[key[0]].append(key)
@@ -666,8 +660,7 @@ def load_mtx_entries(path):
 
 def _resolve_block_dims(block_dims, entries, shape):
     if block_dims == ["auto"]:
-        block_dim = _choose_auto_block_dim(entries, shape)
-        return [] if block_dim is None else [block_dim]
+        return [_choose_auto_block_dim(entries, shape)]
     return block_dims
 
 
@@ -745,35 +738,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                     try:
                         entries, shape = load_mtx_entries(path)
                         resolved_block_dims = _resolve_block_dims(block_dims, entries, shape)
-                        if not resolved_block_dims:
-                            row = _skip_row(
-                                os.path.basename(path),
-                                dtype,
-                                index_dtype,
-                                op,
-                                shape,
-                                "auto",
-                                len(entries),
-                                "shape is not divisible by any supported standard BSR block_dim",
-                            )
-                            rows.append(row)
-                            _print_row(row, timing=timing)
-                            continue
                         for block_dim in resolved_block_dims:
-                            if not _shape_divisible_by_block_dim(shape, int(block_dim)):
-                                row = _skip_row(
-                                    os.path.basename(path),
-                                    dtype,
-                                    index_dtype,
-                                    op,
-                                    shape,
-                                    int(block_dim),
-                                    len(entries),
-                                    "shape is not divisible by block_dim for standard BSR",
-                                )
-                                rows.append(row)
-                                _print_row(row, timing=timing)
-                                continue
                             data, indices, indptr = _entries_to_bsr_torch(
                                 entries, shape, dtype, index_dtype, int(block_dim), device
                             )

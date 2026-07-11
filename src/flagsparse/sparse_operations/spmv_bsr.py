@@ -251,10 +251,8 @@ def _prepare_spmv_bsr_matrix(data, indices, indptr, shape, block_dim):
         raise ValueError("block_dim must be greater than 1 for BSR SpMV")
     if data.shape[1] != block_dim or data.shape[2] != block_dim:
         raise ValueError("data block dimensions must match block_dim")
-    if n_rows % block_dim != 0 or n_cols % block_dim != 0:
-        raise ValueError("shape is not divisible by block_dim for standard BSR")
-    n_block_rows = n_rows // block_dim
-    n_block_cols = n_cols // block_dim
+    n_block_rows = (n_rows + block_dim - 1) // block_dim
+    n_block_cols = (n_cols + block_dim - 1) // block_dim
     if indptr.numel() != n_block_rows + 1:
         raise ValueError(
             f"indptr length must be n_block_rows+1={n_block_rows + 1}, got {indptr.numel()}"
