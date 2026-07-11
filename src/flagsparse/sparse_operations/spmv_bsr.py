@@ -83,6 +83,8 @@ class PreparedBsrSpmv:
         "shape",
         "n_rows",
         "n_cols",
+        "padded_n_rows",
+        "padded_n_cols",
         "block_dim",
         "n_block_rows",
         "n_block_cols",
@@ -127,6 +129,8 @@ class PreparedBsrSpmv:
         self.block_dim = int(block_dim)
         self.n_block_rows = int(n_block_rows)
         self.n_block_cols = int(n_block_cols)
+        self.padded_n_rows = self.n_block_rows * self.block_dim
+        self.padded_n_cols = self.n_block_cols * self.block_dim
         self.nnzb = int(data.shape[0])
         self.stored_nnz = int(data.numel())
         if block_row_lengths is None:
@@ -161,8 +165,6 @@ def _spmv_bsr_non_real_kernel(
     if brow >= n_block_rows:
         return
     row = brow * BLOCK_DIM + inner_row
-    if row >= n_rows:
-        return
     start = tl.load(indptr_ptr + brow)
     end = tl.load(indptr_ptr + brow + 1)
     offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
@@ -175,7 +177,7 @@ def _spmv_bsr_non_real_kernel(
     ) * 0
     for inner_col in tl.static_range(0, BLOCK_DIM):
         col = bcols * BLOCK_DIM + inner_col
-        valid = mask & (col < n_cols)
+        valid = mask
         vals = tl.load(
             data_ptr + offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col,
             mask=mask,
@@ -205,8 +207,6 @@ def _spmv_bsr_non_complex_kernel(
     if brow >= n_block_rows:
         return
     row = brow * BLOCK_DIM + inner_row
-    if row >= n_rows:
-        return
     start = tl.load(indptr_ptr + brow)
     end = tl.load(indptr_ptr + brow + 1)
     offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
@@ -224,7 +224,7 @@ def _spmv_bsr_non_complex_kernel(
     ) * 0
     for inner_col in tl.static_range(0, BLOCK_DIM):
         col = bcols * BLOCK_DIM + inner_col
-        valid = mask & (col < n_cols)
+        valid = mask
         elem = offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col
         a_re = tl.load(data_ri_ptr + elem * 2, mask=mask, other=0.0)
         a_im = tl.load(data_ri_ptr + elem * 2 + 1, mask=mask, other=0.0)
@@ -367,18 +367,30 @@ def _validate_spmv_bsr_x(x, prepared, op_code):
         raise ValueError("x must be a CUDA tensor")
     if x.dtype != prepared.data.dtype:
         raise TypeError("x dtype must match sparse matrix dtype")
-    expected = prepared.n_rows if _spmv_bsr_op_transposes(op_code) else prepared.n_cols
-    if x.numel() != expected:
-        raise ValueError(f"x length must be {expected}, got {x.numel()}")
+    logical_expected = prepared.n_rows if _spmv_bsr_op_transposes(op_code) else prepared.n_cols
+    padded_expected = (
+        prepared.padded_n_rows
+        if _spmv_bsr_op_transposes(op_code)
+        else prepared.padded_n_cols
+    )
+    if x.numel() not in (logical_expected, padded_expected):
+        raise ValueError(
+            f"x length must be {logical_expected} or padded length {padded_expected}, got {x.numel()}"
+        )
     if x.device != prepared.data.device:
         raise ValueError("x must be on the same device as sparse matrix data")
-    return x.contiguous()
+    x = x.contiguous()
+    if x.numel() == padded_expected:
+        return x
+    padded = torch.zeros(padded_expected, dtype=x.dtype, device=x.device)
+    padded[: x.numel()].copy_(x)
+    return padded
 
 
 def _triton_spmv_bsr_kernel(prepared, x, op_code):
     _ensure_spmv_bsr_supported_op(op_code)
     dtype = prepared.data.dtype
-    y = torch.zeros(prepared.n_rows, dtype=dtype, device=prepared.data.device)
+    y = torch.zeros(prepared.padded_n_rows, dtype=dtype, device=prepared.data.device)
     if prepared.nnzb == 0:
         return y
     for seg in range(prepared.max_segments):
@@ -393,8 +405,8 @@ def _triton_spmv_bsr_kernel(prepared, x, op_code):
                 prepared.kernel_indptr,
                 x_ri,
                 y_ri,
-                prepared.n_rows,
-                prepared.n_cols,
+                prepared.padded_n_rows,
+                prepared.padded_n_cols,
                 prepared.n_block_rows,
                 BLOCK_DIM=prepared.block_dim,
                 BLOCK_NNZ=prepared.block_nnz,
@@ -407,8 +419,8 @@ def _triton_spmv_bsr_kernel(prepared, x, op_code):
                 prepared.kernel_indptr,
                 x,
                 y,
-                prepared.n_rows,
-                prepared.n_cols,
+                prepared.padded_n_rows,
+                prepared.padded_n_cols,
                 prepared.n_block_rows,
                 BLOCK_DIM=prepared.block_dim,
                 BLOCK_NNZ=prepared.block_nnz,
@@ -561,6 +573,8 @@ def flagsparse_spmv_bsr(
         meta = {
             "op": _spmv_bsr_op_to_name(op_code),
             "block_dim": prepared.block_dim,
+            "logical_shape": prepared.shape,
+            "padded_shape": (prepared.padded_n_rows, prepared.padded_n_cols),
             "n_block_rows": prepared.n_block_rows,
             "n_block_cols": prepared.n_block_cols,
             "nnzb": prepared.nnzb,
