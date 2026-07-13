@@ -94,9 +94,9 @@ python tests/test_spmm_opt.py <目录/> --csv spmm_opt.csv  # 可选：--dtype f
 
 ```bash
 python tests/test_spmm_coo.py <目录或文件.mtx>
-python tests/test_spmm_coo.py --synthetic                # 可选：--route rowrun|atomic|compare、--skip-api-checks、--skip-coo-coverage
-python tests/test_spmm_coo.py <目录/> --csv out.csv     # 仅支持 --route rowrun 或 atomic（compare 不能配 --csv）
-# 与 CSR SpMM 类似的调参：--dense-cols、--block-n、--block-nnz、--warmup、--iters、--no-cusparse
+python tests/test_spmm_coo.py --synthetic                # 可选：--op non|trans|conj|all、--route rowrun|atomic|compare
+python tests/test_spmm_coo.py <目录/> --csv out.csv     # 仅支持 --route rowrun 或 atomic（compare 不能配 --csv）；可选：--op all
+# 与 CSR SpMM 类似的调参：--op、--dense-cols、--block-n、--block-nnz、--warmup、--iters、--no-cusparse
 ```
 
 **test_sddmm.py** - CSR SDDMM（`.mtx` 批量或 `--csv`）：

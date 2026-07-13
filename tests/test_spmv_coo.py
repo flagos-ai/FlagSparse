@@ -4,6 +4,7 @@ import glob
 import csv
 import math
 import os
+import time
 
 import torch
 import flagsparse as fs
@@ -117,9 +118,15 @@ def _reference_dtype(dtype):
 
 
 def _tol_for_dtype(dtype):
+    if dtype == torch.float16:
+        return 1e-3, 2e-3
+    if dtype == torch.bfloat16:
+        return 0.016, 1e-1
     if dtype in (torch.float32, torch.complex64):
-        return 1e-4, 1e-2
-    return 1e-12, 1e-10
+        return 1.3e-6, 1e-3
+    if dtype in (torch.float64, torch.complex128):
+        return 1e-7, 1e-5
+    return 1e-6, 1e-5
 
 
 def _op_transposes(op):
@@ -224,12 +231,25 @@ def _dense_to_coo(A):
 
 
 COO_SEP = "-" * 200
-COO_HEADER = (
-    f"{'Matrix':<28} {'Op':>5} {'Out':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
-    f"{'Base(ms)':>9} {'Opt(ms)':>9} {'PT(ms)':>9} {'CU(ms)':>9}  "
-    f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
-    f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
-)
+
+
+def _coo_header(timing=False):
+    split = (
+        f" {'BasePGPU':>9} {'BaseComp':>9} {'OptPGPU':>9} {'OptComp':>9}"
+        if timing
+        else ""
+    )
+    base = (
+        f"{'Matrix':<28} {'Op':>5} {'Out':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
+        f"{'Base(ms)':>9} {'BaseGPU':>9} {'BaseCPU':>9} "
+        f"{'Opt(ms)':>9} {'OptGPU':>9} {'OptCPU':>9}{split}"
+    )
+    return (
+        base
+        + f" {'PT(ms)':>9} {'CU(ms)':>9}  "
+        f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
+        f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
+    )
 
 
 def _spd(num, den):
@@ -243,44 +263,136 @@ COO_ATOMIC_BLOCK = 256
 COO_ATOMIC_WARPS = 4
 COO_SEG_BLOCK_INNER = 128
 
-def _timed_flagsparse_coo(
-    prepared,
+
+def _cuda_event_benchmark(op, warmup, iters):
+    out = None
+    count = max(1, int(iters))
+    for _ in range(max(0, int(warmup))):
+        out = op()
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(enable_timing=True)
+    e1 = torch.cuda.Event(enable_timing=True)
+    e0.record()
+    for _ in range(count):
+        out = op()
+    e1.record()
+    torch.cuda.synchronize()
+    return out, e0.elapsed_time(e1) / count
+
+
+def _run_flagsparse_coo_launch(
+    launch,
+    x,
+):
+    x = spmv_coo_mod._validate_x_coo(x, launch)
+    return spmv_coo_mod._run_spmv_coo_prepared_with_fallback(
+        launch,
+        x,
+        block_size=COO_ATOMIC_BLOCK,
+        num_warps=COO_ATOMIC_WARPS,
+        block_inner=COO_SEG_BLOCK_INNER,
+    )
+
+
+def _build_flagsparse_coo_launch(
+    data,
+    row,
+    col,
+    shape,
+    sort_by_row,
+    op,
+):
+    return spmv_coo_mod._prepare_spmv_coo_launch_from_raw(
+        data=data,
+        row=row,
+        col=col,
+        shape=shape,
+        sort_by_row=sort_by_row,
+        op=op,
+    )
+
+
+def _time_flagsparse_coo_row_run(
     data,
     row,
     col,
     x,
     shape,
-    sort_by_row,
     op,
     warmup,
     iters,
+    timing=False,
 ):
-    op = op.lower()
-    if op == "non":
-        spmv_op = lambda: _run_flagsparse_coo_prepared_non(prepared, x)
-    else:
-        spmv_op = lambda: _run_flagsparse_coo_runtime_op(
+    op = str(op).lower()
+
+    def prepare():
+        return _build_flagsparse_coo_launch(
             data,
             row,
             col,
-            x,
             shape,
-            sort_by_row,
+            True,
             op,
         )
-    y = spmv_op()
-    torch.cuda.synchronize()
-    for _ in range(warmup):
-        spmv_op()
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(True)
-    e1 = torch.cuda.Event(True)
-    e0.record()
-    for _ in range(iters):
-        y = spmv_op()
-    e1.record()
-    torch.cuda.synchronize()
-    return y, e0.elapsed_time(e1) / iters
+
+    def full_op():
+        launch = prepare()
+        return _run_flagsparse_coo_launch(launch, x)
+
+    y, gpu_ms = _cuda_event_benchmark(full_op, warmup, iters)
+    process_gpu_ms = None
+    compute_ms = None
+    total_ms = gpu_ms
+    if timing:
+        launch, process_gpu_ms = _cuda_event_benchmark(prepare, warmup, iters)
+        y, compute_ms = _cuda_event_benchmark(
+            lambda: _run_flagsparse_coo_launch(launch, x),
+            warmup,
+            iters,
+        )
+        total_ms = process_gpu_ms + compute_ms
+    return {
+        "out": y,
+        "ms": total_ms,
+        "gpu_ms": gpu_ms,
+        "process_cpu_ms": 0.0,
+        "process_gpu_ms": process_gpu_ms,
+        "compute_ms": compute_ms,
+    }
+
+
+def _time_flagsparse_coo_atomic(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    op,
+    warmup,
+    iters,
+    timing=False,
+):
+    launch = _build_flagsparse_coo_launch(
+        data,
+        row,
+        col,
+        shape,
+        False,
+        str(op).lower(),
+    )
+    y, gpu_ms = _cuda_event_benchmark(
+        lambda: _run_flagsparse_coo_launch(launch, x),
+        warmup,
+        iters,
+    )
+    return {
+        "out": y,
+        "ms": gpu_ms,
+        "gpu_ms": gpu_ms,
+        "process_cpu_ms": 0.0,
+        "process_gpu_ms": 0.0 if timing else None,
+        "compute_ms": gpu_ms if timing else None,
+    }
 
 
 def _timed_flagsparse_coo_tocsr_runtime(
@@ -337,54 +449,13 @@ def _timed_flagsparse_coo_tocsr_prepared(
     return y, e0.elapsed_time(e1) / iters
 
 
-def _run_flagsparse_coo_prepared_non(
-    prepared,
-    x,
-):
-    return fs.flagsparse_spmv_coo(
-        x=x,
-        prepared=prepared,
-        op="non",
-        return_time=False,
-        block_inner=COO_SEG_BLOCK_INNER,
-        block_size=COO_ATOMIC_BLOCK,
-        num_warps=COO_ATOMIC_WARPS,
-    )
-
-
-def _run_flagsparse_coo_runtime_op(
-    data,
-    row,
-    col,
-    x,
-    shape,
-    sort_by_row,
-    op,
-):
-    launch = spmv_coo_mod._prepare_spmv_coo_launch_from_raw(
-        data=data,
-        row=row,
-        col=col,
-        shape=shape,
-        sort_by_row=sort_by_row,
-        op=op,
-    )
-    x = spmv_coo_mod._validate_x_coo(x, launch)
-    return spmv_coo_mod._run_spmv_coo_prepared_with_fallback(
-        launch,
-        x,
-        block_size=COO_ATOMIC_BLOCK,
-        num_warps=COO_ATOMIC_WARPS,
-        block_inner=COO_SEG_BLOCK_INNER,
-    )
-
-
 def run_synthetic(
     value_dtypes=None,
     index_dtypes=None,
     ops=None,
     warmup=WARMUP,
     iters=ITERS,
+    timing=False,
 ):
     if not torch.cuda.is_available():
         print("CUDA is not available. Please run on a GPU-enabled system.")
@@ -410,14 +481,13 @@ def run_synthetic(
                     f"dtype: {_dtype_name(dtype)}  index_dtype: {_dtype_name(index_dtype)}  op: {op}"
                 )
                 print(COO_SEP)
-                print(
-                    "FlagSparse: prepare_spmv_coo + Triton COO SpMV (no CSR). "
-                    "non = compute only; trans/conj = op processing + compute."
-                )
-                print("Base(ms) = row-run (seg) kernel; Opt(ms) = NNZ atomic kernel.")
+                print("FlagSparse: native COO Triton only (no CSR).")
+                print("Base(ms)=BaseCPU+BaseGPU; BaseGPU wraps row-run sort + seg_starts + segmented kernel.")
+                print("Opt(ms)=OptCPU+OptGPU; atomic has no segment/bucket preprocessing.")
+                print("--timing splits row-run GPU work into BasePGPU + BaseComp; atomic OptPGPU is zero.")
                 print("Speedups use Opt(ms) as the Triton comparison path; Base(ms) is reported separately.")
                 print(COO_SEP)
-                print(COO_HEADER)
+                print(_coo_header(timing=timing))
                 print(COO_SEP)
                 for m, n in TEST_SIZES:
                     A = _random_values((m, n), dtype, device)
@@ -436,8 +506,9 @@ def run_synthetic(
                         matrix_name=f"{m}x{n}",
                         warmup=warmup,
                         iters=iters,
+                        timing=timing,
                     )
-                    _print_coo_result(result)
+                    _print_coo_result(result, timing=timing)
                 print(COO_SEP)
                 print()
 
@@ -453,41 +524,36 @@ def _run_one_coo_case(
     matrix_name,
     warmup,
     iters,
+    timing=False,
 ):
     row = row.to(index_dtype).contiguous()
     col = col.to(index_dtype).contiguous()
     x = _random_values((_x_size_for_op(shape, op),), dtype, data.device)
     atol, rtol = _tol_for_dtype(dtype)
-    prepared_seg_non = fs.prepare_spmv_coo(
-        data, row, col, shape, sort_by_row=True, op="non"
-    )
-    prepared_at_non = fs.prepare_spmv_coo(
-        data, row, col, shape, sort_by_row=False, op="non"
-    )
-    y_base, base_ms = _timed_flagsparse_coo(
-        prepared_seg_non,
+    base = _time_flagsparse_coo_row_run(
         data,
         row,
         col,
         x,
         shape,
-        True,
         op,
         warmup,
         iters,
+        timing=timing,
     )
-    y_opt, opt_ms = _timed_flagsparse_coo(
-        prepared_at_non,
+    opt = _time_flagsparse_coo_atomic(
         data,
         row,
         col,
         x,
         shape,
-        False,
         op,
         warmup,
         iters,
+        timing=timing,
     )
+    y_base = base["out"]
+    y_opt = opt["out"]
     y_ref = _pytorch_coo_reference(data, row, col, x, shape, dtype, op=op)
     err_base = _allclose_error_ratio(y_base, y_ref, atol, rtol)
     err_opt = _allclose_error_ratio(y_opt, y_ref, atol, rtol)
@@ -528,12 +594,20 @@ def _run_one_coo_case(
         "n_rows": n_rows,
         "n_cols": n_cols,
         "nnz": int(data.numel()),
-        "base_ms": base_ms,
-        "opt_ms": opt_ms,
+        "base_ms": base["ms"],
+        "opt_ms": opt["ms"],
+        "base_gpu_ms": base["gpu_ms"],
+        "base_process_cpu_ms": base["process_cpu_ms"],
+        "base_process_gpu_ms": base["process_gpu_ms"],
+        "base_compute_ms": base["compute_ms"],
+        "opt_gpu_ms": opt["gpu_ms"],
+        "opt_process_cpu_ms": opt["process_cpu_ms"],
+        "opt_process_gpu_ms": opt["process_gpu_ms"],
+        "opt_compute_ms": opt["compute_ms"],
         "cusparse_ms": cu_ms,
         "pytorch_ms": pt_ms,
-        "opt_speedup_vs_cusparse": _speedup_ratio(cu_ms, opt_ms),
-        "opt_speedup_vs_pytorch": _speedup_ratio(pt_ms, opt_ms),
+        "opt_speedup_vs_cusparse": _speedup_ratio(cu_ms, opt["ms"]),
+        "opt_speedup_vs_pytorch": _speedup_ratio(pt_ms, opt["ms"]),
         "pt_status": _status_str(triton_ok_pt, err_pt is not None),
         "cu_status": _status_str(triton_ok_cu, err_cu is not None),
         "status": status,
@@ -712,14 +786,24 @@ def _run_cupy_runtime_op(data, row, col, x, shape, op):
     return A_cp @ x
 
 
-def _print_coo_result(row):
+def _print_coo_result(row, timing=False):
     name = str(row["matrix"])[:27]
     if len(str(row["matrix"])) > 27:
         name += "…"
+    split_text = ""
+    if timing:
+        split_text = (
+            f" {_fmt_ms(row.get('base_process_gpu_ms')):>9}"
+            f" {_fmt_ms(row.get('base_compute_ms')):>9}"
+            f" {_fmt_ms(row.get('opt_process_gpu_ms')):>9}"
+            f" {_fmt_ms(row.get('opt_compute_ms')):>9}"
+        )
     print(
         f"{name:<28} {row['op']:>5} {row['out_size']:>7} "
         f"{row['n_rows']:>7} {row['n_cols']:>7} {row['nnz']:>10}  "
-        f"{_fmt_ms(row['base_ms']):>9} {_fmt_ms(row['opt_ms']):>9} "
+        f"{_fmt_ms(row['base_ms']):>9} {_fmt_ms(row.get('base_gpu_ms')):>9} {_fmt_ms(row.get('base_process_cpu_ms')):>9} "
+        f"{_fmt_ms(row['opt_ms']):>9} {_fmt_ms(row.get('opt_gpu_ms')):>9} {_fmt_ms(row.get('opt_process_cpu_ms')):>9}"
+        f"{split_text} "
         f"{_fmt_ms(row['pytorch_ms']):>9} {_fmt_ms(row['cusparse_ms']):>9}  "
         f"{_spd(row['base_ms'], row['opt_ms']):>8} "
         f"{_spd(row['pytorch_ms'], row['opt_ms']):>8} "
@@ -868,6 +952,14 @@ def _error_row(path, dtype, index_dtype, op):
         "nnz": "ERR",
         "base_ms": None,
         "opt_ms": None,
+        "base_gpu_ms": None,
+        "base_process_cpu_ms": None,
+        "base_process_gpu_ms": None,
+        "base_compute_ms": None,
+        "opt_gpu_ms": None,
+        "opt_process_cpu_ms": None,
+        "opt_process_gpu_ms": None,
+        "opt_compute_ms": None,
         "cusparse_ms": None,
         "pytorch_ms": None,
         "opt_speedup_vs_cusparse": None,
@@ -917,6 +1009,7 @@ def run_all_dtypes_coo_csv(
     ops=None,
     warmup=WARMUP,
     iters=ITERS,
+    timing=False,
 ):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
@@ -930,12 +1023,13 @@ def run_all_dtypes_coo_csv(
     print("Input: MatrixMarket -> COO. FlagSparse: native COO Triton only (seg + atomic), no CSR.")
     print("PyTorch = COO sparse.mm; CuPy = COO matvec (coo_matrix @ x, no tocsr).")
     print(
-        "Timing policy: non = compute only; trans/conj = op processing + compute. "
+        "Timing policy: Base/Opt ms = process_cpu_ms + GPU event time. "
+        "Row-run sort + seg_starts are GPU process; atomic has no process. "
         "PyTorch/CuPy timings use original dtype."
     )
     print(
-        f"prepare_spmv_coo once per variant + {warmup} warmup + "
-        f"{iters} CUDA-event-averaged SpMV per backend."
+        f"{warmup} warmup + {iters} averaged iterations. "
+        "--timing splits process_gpu_ms and compute_ms for native COO."
     )
     print("=" * 200)
     for dtype in value_dtypes:
@@ -946,7 +1040,7 @@ def run_all_dtypes_coo_csv(
                     f"Value dtype: {_dtype_name(dtype)} | Index dtype: {_dtype_name(index_dtype)} | op: {op}"
                 )
                 print(COO_SEP)
-                print(COO_HEADER)
+                print(_coo_header(timing=timing))
                 print(COO_SEP)
                 for path in mtx_paths:
                     try:
@@ -964,13 +1058,14 @@ def run_all_dtypes_coo_csv(
                             matrix_name=os.path.basename(path),
                             warmup=warmup,
                             iters=iters,
+                            timing=timing,
                         )
                         rows_out.append(result)
-                        _print_coo_result(result)
+                        _print_coo_result(result, timing=timing)
                     except Exception as e:
                         row_out = _error_row(path, dtype, index_dtype, op)
                         rows_out.append(row_out)
-                        _print_coo_result(row_out)
+                        _print_coo_result(row_out, timing=timing)
                         print(f"  ERROR: {e}")
                 print(COO_SEP)
     fieldnames = [
@@ -983,7 +1078,15 @@ def run_all_dtypes_coo_csv(
         "n_cols",
         "nnz",
         "base_ms",
+        "base_gpu_ms",
+        "base_process_cpu_ms",
         "opt_ms",
+        "opt_gpu_ms",
+        "opt_process_cpu_ms",
+        "base_process_gpu_ms",
+        "base_compute_ms",
+        "opt_process_gpu_ms",
+        "opt_compute_ms",
         "cusparse_ms",
         "pytorch_ms",
         "opt_speedup_vs_cusparse",
@@ -996,8 +1099,20 @@ def run_all_dtypes_coo_csv(
         "err_pt",
         "err_cu",
     ]
+    if not timing:
+        fieldnames = [
+            field
+            for field in fieldnames
+            if field
+            not in (
+                "base_process_gpu_ms",
+                "base_compute_ms",
+                "opt_process_gpu_ms",
+                "opt_compute_ms",
+            )
+        ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         for r in rows_out:
             w.writerow(r)
@@ -1138,6 +1253,11 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help="Show/export native COO timing breakdown columns",
+    )
     args = parser.parse_args()
     value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(
@@ -1153,6 +1273,7 @@ def main():
             ops=ops,
             warmup=args.warmup,
             iters=args.iters,
+            timing=args.timing,
         )
         return
 
@@ -1176,6 +1297,7 @@ def main():
             ops=ops,
             warmup=args.warmup,
             iters=args.iters,
+            timing=args.timing,
         )
         return
 

@@ -2,10 +2,16 @@
 
 from ._common import *
 
+import ctypes
+import ctypes.util
+
 import triton
 import triton.language as tl
 
 SUPPORTED_SCATTER_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
+DEFAULT_GATHER_BLOCK_SIZE = 256
+DEFAULT_GATHER_MAX_PROGRAMS = 2
+DEFAULT_GATHER_NUM_WARPS = 8
 
 
 def _scatter_dtype_error_message():
@@ -27,12 +33,13 @@ def _gather_real_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < nnz
-    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
-    gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
-    tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
+    num_programs = tl.num_programs(axis=0)
+    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < nnz
+        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+        gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
+        tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
 
 
 @triton.jit
@@ -44,19 +51,24 @@ def _gather_complex_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < nnz
-    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+    num_programs = tl.num_programs(axis=0)
+    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < nnz
+        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
 
-    dense_offsets = indices * 2
-    sparse_offsets = offsets * 2
+        dense_offsets = indices * 2
+        sparse_offsets = offsets * 2
 
-    gathered_real = tl.load(dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0)
-    gathered_imag = tl.load(dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0)
+        gathered_real = tl.load(
+            dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
+        )
+        gathered_imag = tl.load(
+            dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
+        )
 
-    tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
-    tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
+        tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
+        tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
 
 
 @triton.jit
@@ -101,25 +113,55 @@ def _scatter_complex_kernel(
     tl.store(dense_values_ri_ptr + dense_offsets + 1, values_imag, mask=mask)
 
 
-def _triton_gather_impl(dense_vector, kernel_indices, block_size=1024):
+def _triton_gather_impl(
+    dense_vector,
+    kernel_indices,
+    out=None,
+    block_size=DEFAULT_GATHER_BLOCK_SIZE,
+):
     nnz = kernel_indices.numel()
     if nnz == 0:
-        return torch.empty(0, dtype=dense_vector.dtype, device=dense_vector.device)
+        if out is None:
+            return torch.empty(0, dtype=dense_vector.dtype, device=dense_vector.device)
+        if out.shape != (0,):
+            raise ValueError("out shape must match gather output shape")
+        if out.dtype != dense_vector.dtype:
+            raise TypeError("out dtype must match gather output dtype")
+        return out
 
-    grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (
+        min(DEFAULT_GATHER_MAX_PROGRAMS, triton.cdiv(nnz, meta["BLOCK_SIZE"])),
+    )
 
     if not _is_complex_dtype(dense_vector.dtype):
-        sparse_values = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
+        sparse_values = out
+        if sparse_values is None:
+            sparse_values = torch.empty(
+                nnz, dtype=dense_vector.dtype, device=dense_vector.device
+            )
+        else:
+            if sparse_values.shape != (nnz,):
+                raise ValueError("out shape must match gather output shape")
+            if sparse_values.dtype != dense_vector.dtype:
+                raise TypeError("out dtype must match gather output dtype")
         _gather_real_kernel[grid](
             sparse_values,
             dense_vector,
             kernel_indices,
             nnz,
             BLOCK_SIZE=block_size,
+            num_warps=DEFAULT_GATHER_NUM_WARPS,
         )
         return sparse_values
 
-    sparse_values = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
+    sparse_values = out
+    if sparse_values is None:
+        sparse_values = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
+    else:
+        if sparse_values.shape != (nnz,):
+            raise ValueError("out shape must match gather output shape")
+        if sparse_values.dtype != dense_vector.dtype:
+            raise TypeError("out dtype must match gather output dtype")
     dense_values_ri = torch.view_as_real(dense_vector).reshape(-1)
     sparse_values_ri = torch.view_as_real(sparse_values).reshape(-1)
 
@@ -129,9 +171,9 @@ def _triton_gather_impl(dense_vector, kernel_indices, block_size=1024):
         kernel_indices,
         nnz,
         BLOCK_SIZE=block_size,
+        num_warps=DEFAULT_GATHER_NUM_WARPS,
     )
     return sparse_values
-
 
 def _triton_scatter_impl(
     sparse_values,
@@ -243,6 +285,245 @@ def _validate_gather_value_dtype(dense_vector, op_name):
     return None
 
 
+_CUSPARSE_STATUS_SUCCESS = 0
+_CUSPARSE_INDEX_BASE_ZERO = 0
+_CUSPARSE_INDEX_32I = 2
+_CUSPARSE_INDEX_64I = 3
+_CUDA_R_32F = 0
+_CUDA_R_64F = 1
+_CUDA_R_16F = 2
+_CUDA_C_32F = 4
+_CUDA_C_64F = 5
+_CUSPARSE_LIB = None
+_CUSPARSE_LIB_LOAD_ERROR = None
+
+
+def _cusparse_native_gather_skip_reason(value_dtype):
+    if value_dtype == torch.bfloat16:
+        return "bfloat16 is not supported by native cusparseGather; skipped"
+    return None
+
+
+def _cuda_data_type_from_torch(torch_dtype):
+    mapping = {
+        torch.float16: _CUDA_R_16F,
+        torch.float32: _CUDA_R_32F,
+        torch.float64: _CUDA_R_64F,
+        torch.complex64: _CUDA_C_32F,
+        torch.complex128: _CUDA_C_64F,
+    }
+    if torch_dtype not in mapping:
+        raise TypeError(f"Unsupported cuSPARSE native gather dtype: {torch_dtype}")
+    return mapping[torch_dtype]
+
+
+def _cusparse_index_type_from_torch(index_dtype):
+    if index_dtype == torch.int32:
+        return _CUSPARSE_INDEX_32I
+    if index_dtype == torch.int64:
+        return _CUSPARSE_INDEX_64I
+    raise TypeError(f"Unsupported cuSPARSE native gather index dtype: {index_dtype}")
+
+
+def _load_cusparse_library():
+    global _CUSPARSE_LIB, _CUSPARSE_LIB_LOAD_ERROR
+    if _CUSPARSE_LIB is not None:
+        return _CUSPARSE_LIB
+    if _CUSPARSE_LIB_LOAD_ERROR is not None:
+        raise RuntimeError(_CUSPARSE_LIB_LOAD_ERROR)
+
+    candidate_names = []
+    found_name = ctypes.util.find_library("cusparse")
+    if found_name:
+        candidate_names.append(found_name)
+    candidate_names.extend(["libcusparse.so", "libcusparse.so.12", "libcusparse.so.11"])
+
+    load_error = None
+    for name in candidate_names:
+        try:
+            lib = ctypes.CDLL(name)
+            lib.cusparseCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+            lib.cusparseCreate.restype = ctypes.c_int
+            lib.cusparseDestroy.argtypes = [ctypes.c_void_p]
+            lib.cusparseDestroy.restype = ctypes.c_int
+            lib.cusparseCreateDnVec.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_int64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            lib.cusparseCreateDnVec.restype = ctypes.c_int
+            lib.cusparseDestroyDnVec.argtypes = [ctypes.c_void_p]
+            lib.cusparseDestroyDnVec.restype = ctypes.c_int
+            lib.cusparseCreateSpVec.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            lib.cusparseCreateSpVec.restype = ctypes.c_int
+            lib.cusparseDestroySpVec.argtypes = [ctypes.c_void_p]
+            lib.cusparseDestroySpVec.restype = ctypes.c_int
+            lib.cusparseGather.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            lib.cusparseGather.restype = ctypes.c_int
+            if hasattr(lib, "cusparseSetStream"):
+                lib.cusparseSetStream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                lib.cusparseSetStream.restype = ctypes.c_int
+            _CUSPARSE_LIB = lib
+            return lib
+        except Exception as exc:
+            load_error = exc
+
+    _CUSPARSE_LIB_LOAD_ERROR = (
+        "Failed to load libcusparse for native gather baseline"
+        + (f": {load_error}" if load_error is not None else "")
+    )
+    raise RuntimeError(_CUSPARSE_LIB_LOAD_ERROR)
+
+
+def _check_cusparse_status(status, op_name):
+    if int(status) != _CUSPARSE_STATUS_SUCCESS:
+        raise RuntimeError(f"{op_name} failed with cuSPARSE status {int(status)}")
+
+
+def _set_cusparse_stream(lib, handle, *, strict=False):
+    if not hasattr(lib, "cusparseSetStream"):
+        if strict:
+            raise RuntimeError("Loaded cuSPARSE library does not export cusparseSetStream")
+        return
+    try:
+        stream = torch.cuda.current_stream()
+        stream_ptr = getattr(stream, "cuda_stream", None)
+        if stream_ptr is None:
+            if strict:
+                raise RuntimeError("Could not obtain the current CUDA stream pointer")
+            return
+        _check_cusparse_status(
+            lib.cusparseSetStream(handle, ctypes.c_void_p(int(stream_ptr))),
+            "cusparseSetStream",
+        )
+    except Exception:
+        if strict:
+            raise
+        return
+
+
+class _PreparedCusparseNativeGather:
+    def __init__(self, dense_vector, indices, out=None):
+        dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
+        _validate_gather_value_dtype(dense_vector, "cusparse_native_gather")
+        skip_reason = _cusparse_native_gather_skip_reason(dense_vector.dtype)
+        if skip_reason:
+            raise RuntimeError(skip_reason)
+
+        nnz = int(indices.numel())
+        if out is None:
+            sparse_values = torch.empty(
+                nnz, dtype=dense_vector.dtype, device=dense_vector.device
+            )
+        else:
+            sparse_values = out
+            if sparse_values.shape != (nnz,):
+                raise ValueError("out shape must match gather output shape")
+            if sparse_values.dtype != dense_vector.dtype:
+                raise TypeError("out dtype must match gather output dtype")
+
+        self.lib = _load_cusparse_library()
+        self.handle = ctypes.c_void_p()
+        self.dn_desc = ctypes.c_void_p()
+        self.sp_desc = ctypes.c_void_p()
+        self.dense_vector = dense_vector
+        self.indices = indices
+        self.sparse_values = sparse_values
+        self.nnz = nnz
+        self.closed = False
+
+        if self.nnz == 0:
+            return
+
+        try:
+            _check_cusparse_status(
+                self.lib.cusparseCreate(ctypes.byref(self.handle)),
+                "cusparseCreate",
+            )
+            _set_cusparse_stream(self.lib, self.handle)
+            _check_cusparse_status(
+                self.lib.cusparseCreateDnVec(
+                    ctypes.byref(self.dn_desc),
+                    ctypes.c_int64(int(self.dense_vector.numel())),
+                    ctypes.c_void_p(int(self.dense_vector.data_ptr())),
+                    ctypes.c_int(_cuda_data_type_from_torch(self.dense_vector.dtype)),
+                ),
+                "cusparseCreateDnVec",
+            )
+            _check_cusparse_status(
+                self.lib.cusparseCreateSpVec(
+                    ctypes.byref(self.sp_desc),
+                    ctypes.c_int64(int(self.dense_vector.numel())),
+                    ctypes.c_int64(self.nnz),
+                    ctypes.c_void_p(int(self.indices.data_ptr())),
+                    ctypes.c_void_p(int(self.sparse_values.data_ptr())),
+                    ctypes.c_int(_cusparse_index_type_from_torch(self.indices.dtype)),
+                    ctypes.c_int(_CUSPARSE_INDEX_BASE_ZERO),
+                    ctypes.c_int(_cuda_data_type_from_torch(self.dense_vector.dtype)),
+                ),
+                "cusparseCreateSpVec",
+            )
+        except Exception:
+            self.close()
+            raise
+
+    def run(self):
+        if self.closed:
+            raise RuntimeError("Prepared cuSPARSE gather plan is already closed")
+        if self.nnz == 0:
+            return self.sparse_values
+        _check_cusparse_status(
+            self.lib.cusparseGather(self.handle, self.dn_desc, self.sp_desc),
+            "cusparseGather",
+        )
+        return self.sparse_values
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.sp_desc.value:
+            try:
+                self.lib.cusparseDestroySpVec(self.sp_desc)
+            except Exception:
+                pass
+            self.sp_desc = ctypes.c_void_p()
+        if self.dn_desc.value:
+            try:
+                self.lib.cusparseDestroyDnVec(self.dn_desc)
+            except Exception:
+                pass
+            self.dn_desc = ctypes.c_void_p()
+        if self.handle.value:
+            try:
+                self.lib.cusparseDestroy(self.handle)
+            except Exception:
+                pass
+            self.handle = ctypes.c_void_p()
+
+
+def _cusparse_native_gather(dense_vector, indices, out=None):
+    plan = _PreparedCusparseNativeGather(dense_vector, indices, out=out)
+    try:
+        return plan.run()
+    finally:
+        plan.close()
+
+
 def _cusparse_spmv(selector_matrix, dense_vector):
     if cp is not None and cpx_sparse is not None and isinstance(selector_matrix, cpx_sparse.spmatrix):
         if torch.is_tensor(dense_vector):
@@ -339,7 +620,14 @@ def _pytorch_scatter_impl(sparse_values, indices, dense_size, out=None, reset_ou
     return dense_values
 
 
-def flagsparse_gather(a, indices, out=None, mode="raise", block_size=1024, return_time=False):
+def flagsparse_gather(
+    a,
+    indices,
+    out=None,
+    mode="raise",
+    block_size=DEFAULT_GATHER_BLOCK_SIZE,
+    return_time=False,
+):
     """CuPy-style gather (take): out = a[indices]."""
     if mode != "raise":
         raise NotImplementedError("Only mode='raise' is currently supported")
@@ -348,20 +636,26 @@ def flagsparse_gather(a, indices, out=None, mode="raise", block_size=1024, retur
     indices_tensor, _ = _to_torch_tensor(indices, "indices")
     dense_vector, indices_tensor, kernel_indices = _prepare_inputs(dense_vector, indices_tensor)
     _validate_gather_value_dtype(dense_vector, "flagsparse_gather")
+    out_tensor = None
+    if out is not None:
+        out_tensor, _ = _to_torch_tensor(out, "out")
+        if out_tensor.shape != (int(indices_tensor.numel()),):
+            raise ValueError("out shape must match gather output shape")
+        if out_tensor.dtype != dense_vector.dtype:
+            raise TypeError("out dtype must match gather output dtype")
 
     torch.cuda.synchronize()
     start_time = time.perf_counter()
-    sparse_values = _triton_gather_impl(dense_vector, kernel_indices, block_size=block_size)
+    sparse_values = _triton_gather_impl(
+        dense_vector,
+        kernel_indices,
+        out=out_tensor,
+        block_size=block_size,
+    )
     torch.cuda.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
 
     if out is not None:
-        out_tensor, _ = _to_torch_tensor(out, "out")
-        if out_tensor.shape != sparse_values.shape:
-            raise ValueError("out shape must match gather output shape")
-        if out_tensor.dtype != sparse_values.dtype:
-            raise TypeError("out dtype must match gather output dtype")
-        out_tensor.copy_(sparse_values)
         result = out if dense_backend == "cupy" else out_tensor
     else:
         result = _to_backend_like(sparse_values, a)
@@ -422,7 +716,9 @@ def flagsparse_scatter(
 
 
 # Backward compatibility wrappers.
-def triton_cusparse_gather(dense_vector, indices, block_size=1024):
+def triton_cusparse_gather(
+    dense_vector, indices, block_size=DEFAULT_GATHER_BLOCK_SIZE
+):
     return flagsparse_gather(
         dense_vector, indices, block_size=block_size, return_time=True
     )
@@ -519,6 +815,23 @@ def cusparse_spmv_gather(dense_vector, indices, selector_matrix=None):
         ) from exc
 
     return sparse_values, execution_time_ms, selector_matrix
+
+
+def cusparse_native_gather(dense_vector, indices, out=None):
+    """Native cuSPARSE gather baseline via SpVec/DnVec descriptors."""
+    dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
+    try:
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        sparse_values = _cusparse_native_gather(dense_vector, indices, out=out)
+        torch.cuda.synchronize()
+        execution_time_ms = (time.perf_counter() - start_time) * 1000.0
+    except Exception as exc:
+        raise RuntimeError(
+            "Native cuSPARSE gather baseline is unavailable in this PyTorch/CUDA environment"
+        ) from exc
+
+    return sparse_values, execution_time_ms
 
 
 def cusparse_spmv_scatter(
