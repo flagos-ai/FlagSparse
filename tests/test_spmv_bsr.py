@@ -49,6 +49,9 @@ def _print_baseline_notes(run_cusparse=True):
         "FlagSparse BSR follows AlphaSparse/cuSPARSE-style padded block-grid semantics; native output is padded and correctness checks slice back to logical rows."
     )
     print(
+        "Accuracy reference: Ref=spmv-coo expands the same BSR arrays to COO and runs sparse matvec; PyTorch BSR is a baseline, not the reference."
+    )
+    print(
         "PyTorch baseline: PT(ms) uses torch.sparse_bsr_tensor only when shape is divisible by block_dim; "
         "PTPad(ms) uses padded shape and slices back to logical rows for diagnostics."
     )
@@ -278,7 +281,7 @@ def _bsr_to_torch_coo(data, indices, indptr, shape, block_dim):
     ).coalesce()
 
 
-def _pytorch_reference(data, indices, indptr, x, shape, dtype, block_dim):
+def _spmv_coo_reference(data, indices, indptr, x, shape, dtype, block_dim):
     ref_dtype = _reference_dtype(dtype)
     A = _bsr_to_torch_coo(
         data.to(ref_dtype),
@@ -469,10 +472,10 @@ def _status(ok):
 def _header(timing=False):
     split = f" {'ProcGPU':>9} {'Compute':>9}" if timing else ""
     return (
-        f"{'Matrix':<28} {'Op':>5} {'BDim':>5} {'Out':>7} {'PadOut':>7} {'PadRows':>7} {'Rows':>7} {'Cols':>7} {'NNZB':>9} {'Pad':>7}  "
+        f"{'Matrix':<28} {'Op':>5} {'BDim':>5} {'Ref':>8} {'Out':>7} {'PadOut':>7} {'PadRows':>7} {'Rows':>7} {'Cols':>7} {'NNZB':>9} {'Pad':>7}  "
         f"{'BSR(ms)':>9} {'BSRGPU':>9} {'CPUProc':>9}{split} "
         f"{'PT(ms)':>9} {'PTPad':>9} {'CU(ms)':>9}  {'BSR/PT':>8} {'BSR/CU':>8} "
-        f"{'Err':>10} {'Status':>6}"
+        f"{'BSRErr':>10} {'PTPadErr':>10} {'Status':>6}"
     )
 
 
@@ -490,18 +493,18 @@ def _print_row(row, timing=False):
         else ""
     )
     print(
-        f"{name:<28} {row['op']:>5} {row['block_dim']:>5} {row['out_size']:>7} {row['padded_out_size']:>7} {row['pad_rows']:>7} {row['n_rows']:>7} {row['n_cols']:>7} {row['nnzb']:>9} {row['padding_ratio']:>7}  "
+        f"{name:<28} {row['op']:>5} {row['block_dim']:>5} {row['reference']:>8} {row['out_size']:>7} {row['padded_out_size']:>7} {row['pad_rows']:>7} {row['n_rows']:>7} {row['n_cols']:>7} {row['nnzb']:>9} {row['padding_ratio']:>7}  "
         f"{_fmt(row['bsr_ms']):>9} {_fmt(row['bsr_gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9}{split} "
         f"{_fmt(row['pytorch_ms']):>9} {_fmt(row['pytorch_padded_ms']):>9} {_fmt(row['cusparse_ms']):>9}  "
         f"{_spd(row['pytorch_ms'], row['bsr_ms']):>8} {_spd(row['cusparse_ms'], row['bsr_ms']):>8} "
-        f"{_fmt_err(row['err']):>10} {row['status']:>6}"
+        f"{_fmt_err(row['err']):>10} {_fmt_err(row.get('pytorch_padded_err')):>10} {row['status']:>6}"
     )
     error = row.get("error")
     if error:
         print(f"  error: {str(error)[:240]}")
-    if row.get("pytorch_ms") is None and row.get("pytorch_error"):
+    if row.get("pytorch_error"):
         print(f"  pt: {str(row['pytorch_error'])[:240]}")
-    if row.get("pytorch_padded_ms") is None and row.get("pytorch_padded_error"):
+    if row.get("pytorch_padded_error"):
         print(f"  pt_padded: {str(row['pytorch_padded_error'])[:240]}")
     if row.get("status") == "FAIL":
         print(
@@ -536,6 +539,7 @@ def _base_row(
         "value_dtype": _dtype_name(dtype),
         "index_dtype": _dtype_name(index_dtype),
         "op": op,
+        "reference": "spmv-coo",
         "block_dim": int(block_dim),
         "out_size": int(shape[0]) if op == "non" else "UNSUP",
         "padded_out_size": padded_rows if op == "non" else "UNSUP",
@@ -558,6 +562,7 @@ def _base_row(
         "pytorch_padded_err": None,
         "cusparse_ms": None,
         "cusparse_error": None,
+        "bsr_err": None,
         "err": None,
         "max_abs_err": None,
         "max_rel_err": None,
@@ -584,6 +589,7 @@ def _skip_row(matrix_name, dtype, index_dtype, op, shape, block_dim, logical_nnz
         "value_dtype": _dtype_name(dtype),
         "index_dtype": _dtype_name(index_dtype),
         "op": op,
+        "reference": "spmv-coo",
         "block_dim": block_dim_value,
         "out_size": int(shape[0]) if op == "non" else "UNSUP",
         "padded_out_size": padded_rows if op == "non" else "UNSUP",
@@ -606,6 +612,7 @@ def _skip_row(matrix_name, dtype, index_dtype, op, shape, block_dim, logical_nnz
         "pytorch_padded_err": None,
         "cusparse_ms": None,
         "cusparse_error": None,
+        "bsr_err": None,
         "err": None,
         "max_abs_err": None,
         "max_rel_err": None,
@@ -669,7 +676,7 @@ def _run_one_case(
         }
     )
     try:
-        y_ref = _pytorch_reference(data, indices, indptr, x, shape, dtype, block_dim)
+        y_ref = _spmv_coo_reference(data, indices, indptr, x, shape, dtype, block_dim)
         row["padded_out_size"] = int(bsr["out"].numel())
         row["pad_rows"] = max(0, int(bsr["out"].numel()) - int(shape[0]))
         y_bsr = bsr["out"][: int(shape[0])]
@@ -678,6 +685,7 @@ def _run_one_case(
         row.update(
             {
                 "err": err,
+                "bsr_err": err,
                 "max_abs_err": stats["max_abs"],
                 "max_rel_err": stats["max_rel"],
                 "max_err_index": stats["index"],
@@ -918,6 +926,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                             "value_dtype": _dtype_name(dtype),
                             "index_dtype": _dtype_name(index_dtype),
                             "op": op,
+                            "reference": "spmv-coo",
                             "block_dim": "ERR",
                             "out_size": "ERR",
                             "padded_out_size": "ERR",
@@ -940,6 +949,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                             "pytorch_padded_err": None,
                             "cusparse_ms": None,
                             "cusparse_error": None,
+                            "bsr_err": None,
                             "err": None,
                             "status": "ERROR",
                             "error": str(exc),
@@ -952,6 +962,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
         "value_dtype",
         "index_dtype",
         "op",
+        "reference",
         "block_dim",
         "out_size",
         "padded_out_size",
@@ -980,6 +991,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
         "expected_at_max",
         "cusparse_ms",
         "cusparse_error",
+        "bsr_err",
         "err",
         "status",
         "error",
