@@ -33,7 +33,17 @@ from .gather_scatter import (
 )
 from .sddmm_csr import SDDMMPrepared, benchmark_sddmm_case, flagsparse_sddmm_csr, prepare_sddmm_csr
 from .spgemm_csr import SpGEMMPrepared, benchmark_spgemm_case, flagsparse_spgemm_csr, prepare_spgemm_csr
-from .spmm_coo import flagsparse_spmm_coo
+from .spmm_coo import (
+    PreparedCooSpmmRoute,
+    SPMM_COO_ALGORITHMS,
+    SpmmCooAlgorithm,
+    SpmmCooAlgorithmUnavailable,
+    flagsparse_spmm_coo,
+    flagsparse_spmm_coo_run,
+    list_spmm_coo_algorithms,
+    prepare_spmm_coo_route,
+    resolve_spmm_coo_algorithm,
+)
 from .spmm_csr import (
     PreparedCsrSpmmOpt,
     PreparedCsrSpmmRoute,
@@ -64,6 +74,8 @@ from .spmm_csr_opt_alg2 import (
     prepare_spmm_csr_opt_alg2_preprocess,
 )
 from .spmv_coo import PreparedCoo, flagsparse_spmv_coo, prepare_spmv_coo
+from .spmv_bsr import PreparedBsrSpmv, flagsparse_spmv_bsr, prepare_spmv_bsr
+from .spmv_csc import PreparedCscSpmv, flagsparse_spmv_csc, prepare_spmv_csc
 from .spmv_csr import (
     PreparedCsrSpmv,
     flagsparse_spmv_coo_tocsr,
@@ -90,6 +102,7 @@ from .spsv import (
     flagsparse_spsv_coo,
     flagsparse_spsv_create_workspace,
     flagsparse_spsv_csr,
+    flagsparse_spsv_sell,
     flagsparse_spsv_preprocess_coo,
     flagsparse_spsv_preprocess_csr,
     flagsparse_spsv_solve_ex,
@@ -109,8 +122,11 @@ _BENCHMARK_EXPORTS = {
 
 __all__ = [
     "PreparedCoo",
+    "PreparedCooSpmmRoute",
     "PreparedAlphaSpmmAlg1",
+    "PreparedBsrSpmv",
     "PreparedCsrSpmv",
+    "PreparedCscSpmv",
     "PreparedCsrSpmmOpt",
     "PreparedCsrSpmmRoute",
     "PreparedCsrSpmmOptAlg2",
@@ -121,6 +137,8 @@ __all__ = [
     "FlagSparseDnVecDescr",
     "SpmmCsrAlgorithm",
     "SpmmCsrAlgorithmUnavailable",
+    "SpmmCooAlgorithm",
+    "SpmmCooAlgorithmUnavailable",
     "FlagSparseSpMatDescr",
     "FlagSparseSpSVDescr",
     "FlagSparseSpSVHandle",
@@ -150,6 +168,7 @@ __all__ = [
     "flagsparse_sddmm_csr",
     "flagsparse_spgemm_csr",
     "flagsparse_spmm_coo",
+    "flagsparse_spmm_coo_run",
     "flagsparse_spmm_csr",
     "flagsparse_spmm_csr_run",
     "flagsparse_spmm_csr_opt",
@@ -158,7 +177,9 @@ __all__ = [
     "flagsparse_spmm_csr_opt_alg2",
     "flagsparse_spmm_csr_opt_alg2_preprocess",
     "flagsparse_spmv_coo",
+    "flagsparse_spmv_bsr",
     "flagsparse_spmv_coo_tocsr",
+    "flagsparse_spmv_csc",
     "flagsparse_spmv_csr",
     "flagsparse_spsm_coo",
     "flagsparse_spsm_csr",
@@ -174,12 +195,14 @@ __all__ = [
     "flagsparse_spsv_coo",
     "flagsparse_spsv_create_workspace",
     "flagsparse_spsv_csr",
+    "flagsparse_spsv_sell",
     "flagsparse_spsv_preprocess_coo",
     "flagsparse_spsv_preprocess_csr",
     "flagsparse_spsv_solve_ex",
     "flagsparse_spsv_solve_coo",
     "flagsparse_spsv_solve_csr",
     "list_spmm_csr_algorithms",
+    "list_spmm_coo_algorithms",
     "prepare_sddmm_csr",
     "build_alpha_spmm_alg1_tle_opt_meta",
     "build_alpha_spmm_alg1_tle_opt2_meta",
@@ -198,12 +221,17 @@ __all__ = [
     "prepare_spmm_csr_opt_alg1",
     "prepare_spmm_csr_opt_alg1_preprocess",
     "prepare_spmm_csr_route",
+    "prepare_spmm_coo_route",
     "prepare_spmm_csr_opt_alg2",
     "prepare_spmm_csr_opt_alg2_preprocess",
     "prepare_spmv_coo",
+    "prepare_spmv_bsr",
     "prepare_spmv_coo_tocsr",
+    "prepare_spmv_csc",
     "prepare_spmv_csr",
     "resolve_spmm_csr_algorithm",
+    "resolve_spmm_coo_algorithm",
+    "SPMM_COO_ALGORITHMS",
     "SPMM_CSR_ALGORITHMS",
     "pytorch_index_gather",
     "pytorch_index_scatter",

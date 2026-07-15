@@ -20,9 +20,12 @@ SCRIPTS = [
     "run_flagsparse_pytest.py",
     "tests/test_spmv.py",
     "tests/test_spmv_coo.py",
+    "tests/test_spmv_csc.py",
+    "tests/test_spmv_bsr.py",
     "tests/test_spmm.py",
     "tests/test_spgemm.py",
     "tests/test_spsv.py",
+    "tests/test_spsv_sell.py",
     "tests/test_spsm.py",
 ]
 

@@ -204,15 +204,39 @@ class BSRMatrix:
 
 class SELLMatrix:
     """
-    Sliced ELLPACK format. Stores: values, indices (column), slice_ptr, rows_per_slice.
-    CuPy-compatible interface; backend uses CuPy arrays.
+    cuSPARSE-compatible Sliced ELLPACK format.
+
+    Entries inside every slice use column-major SELL order::
+
+        offset + slot * slice_size + row_in_slice
+
+    The column index ``-1`` denotes padding.  ``rows_per_slice`` is retained
+    for the high-level conversion helpers; the physical stride is always
+    ``slice_size``, including the final partial slice.
     """
-    def __init__(self, values, indices, slice_ptr, rows_per_slice, shape, dtype=None):
+    def __init__(
+        self,
+        values,
+        indices,
+        slice_ptr,
+        rows_per_slice,
+        shape,
+        dtype=None,
+        slice_size=None,
+    ):
         self._values = _to_cupy_array(values, dtype=_resolve_dtype(dtype))
         self._indices = _to_cupy_array(indices, dtype=cp.int64)
         self._slice_ptr = _to_cupy_array(slice_ptr, dtype=cp.int64)
         self._rows_per_slice = _to_cupy_array(rows_per_slice, dtype=cp.int64)
         self._shape = tuple(shape)
+        if slice_size is None:
+            if self._rows_per_slice.size:
+                slice_size = int(cp.max(self._rows_per_slice).item())
+            else:
+                slice_size = 1
+        self._slice_size = int(slice_size)
+        if self._slice_size <= 0:
+            raise ValueError("slice_size must be a positive integer")
 
     @property
     def values(self):
@@ -229,6 +253,10 @@ class SELLMatrix:
     @property
     def rows_per_slice(self):
         return self._rows_per_slice
+
+    @property
+    def slice_size(self):
+        return self._slice_size
 
     @property
     def shape(self):
@@ -365,11 +393,12 @@ def _sell_to_coo(sell_mat):
         if rps <= 0:
             base_row += rps
             continue
-        max_nnz = (end - start) // rps
+        slice_size = int(sell_mat.slice_size)
+        max_nnz = (end - start) // slice_size
         for r in range(rps):
             row = base_row + r
             for k in range(max_nnz):
-                idx = start + r * max_nnz + k
+                idx = start + k * slice_size + r
                 col = int(indices[idx])
                 val = values[idx]
                 nonzero = (val != 0).item() if hasattr(val, "item") else (val != 0)
@@ -461,10 +490,10 @@ def _coo_to_sell_impl(rows, cols, data, shape, slice_size):
             max_nnz = int(cp.max(nnz_per_row[r0:r1]))
         else:
             max_nnz = 0
-        total_entries += rps * max_nnz
+        total_entries += slice_size * max_nnz
         slice_ptr[s + 1] = total_entries
     values = cp.zeros(total_entries, dtype=data.dtype)
-    indices = cp.zeros(total_entries, dtype=cp.int64)
+    indices = cp.full(total_entries, -1, dtype=cp.int64)
     row_start = cp.zeros(n_rows + 1, dtype=cp.int64)
     row_start[1:] = cp.cumsum(nnz_per_row)
     base = 0
@@ -474,18 +503,26 @@ def _coo_to_sell_impl(rows, cols, data, shape, slice_size):
         rps = int(rows_per_slice[s])
         if rps == 0:
             continue
-        max_nnz = (int(slice_ptr[s + 1]) - int(slice_ptr[s])) // rps
+        max_nnz = (int(slice_ptr[s + 1]) - int(slice_ptr[s])) // slice_size
         for r in range(rps):
             row = r0 + r
             start = int(row_start[row])
             end = int(row_start[row + 1])
             nnz = end - start
-            dst_start = base + r * max_nnz
             if nnz > 0:
-                values[dst_start : dst_start + nnz] = data[start:end]
-                indices[dst_start : dst_start + nnz] = cols[start:end]
+                dst = base + cp.arange(nnz, dtype=cp.int64) * slice_size + r
+                values[dst] = data[start:end]
+                indices[dst] = cols[start:end]
         base = int(slice_ptr[s + 1])
-    return SELLMatrix(values, indices, slice_ptr, rows_per_slice, shape, dtype=data.dtype)
+    return SELLMatrix(
+        values,
+        indices,
+        slice_ptr,
+        rows_per_slice,
+        shape,
+        dtype=data.dtype,
+        slice_size=slice_size,
+    )
 
 
 def _coo_to_blocked_ell_impl(rows, cols, data, shape, block_shape):
@@ -590,10 +627,24 @@ def create_bsr_matrix(data, indices, indptr, shape, blocksize, dtype=None):
     return BSRMatrix(data, indices, indptr, shape, blocksize=blocksize, dtype=dtype)
 
 
-def create_sell_matrix(values, indices, slice_ptr, rows_per_slice, shape, dtype=None):
+def create_sell_matrix(
+    values,
+    indices,
+    slice_ptr,
+    rows_per_slice,
+    shape,
+    dtype=None,
+    slice_size=None,
+):
     """Create SELL from values, indices, slice_ptr, rows_per_slice, shape."""
     return SELLMatrix(
-        values, indices, slice_ptr, rows_per_slice, shape, dtype=dtype
+        values,
+        indices,
+        slice_ptr,
+        rows_per_slice,
+        shape,
+        dtype=dtype,
+        slice_size=slice_size,
     )
 
 

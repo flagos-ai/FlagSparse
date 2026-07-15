@@ -1,4 +1,4 @@
-"""Sparse triangular solve (SpSV) CSR/COO."""
+"""Sparse triangular solve (SpSV) for CSR, COO, and SELL matrices."""
 
 from ._common import *
 
@@ -318,6 +318,66 @@ def _prepare_spsv_inputs(data, indices, indptr, b, shape):
         n_rows,
         n_cols,
     )
+
+
+def _prepare_spsv_sell_inputs(
+    values,
+    col_indices,
+    slice_offsets,
+    b,
+    shape,
+    slice_size,
+):
+    """Validate cuSPARSE-compatible column-major SELL inputs."""
+
+    tensors = (values, col_indices, slice_offsets, b)
+    if not all(torch.is_tensor(t) for t in tensors):
+        raise TypeError("SELL SpSV inputs must be torch.Tensor")
+    if any(not t.is_cuda or t.ndim != 1 for t in tensors):
+        raise ValueError("SELL SpSV inputs must be 1D CUDA tensors")
+    if len({t.device for t in tensors}) != 1:
+        raise ValueError("SELL SpSV inputs must use one CUDA device")
+
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if n_rows != n_cols:
+        raise ValueError("SELL SpSV requires a square matrix")
+    slice_size = int(slice_size)
+    if slice_size <= 0:
+        raise ValueError("slice_size must be positive")
+    n_slices = (n_rows + slice_size - 1) // slice_size
+    if slice_offsets.numel() != n_slices + 1:
+        raise ValueError("invalid slice_offsets length")
+    if values.numel() != col_indices.numel() or b.numel() != n_rows:
+        raise ValueError("invalid SELL values, columns, or right-hand-side length")
+    if values.dtype not in (torch.float32, torch.float64):
+        raise TypeError("SELL values must be float32 or float64")
+    if (
+        col_indices.dtype not in (torch.int32, torch.int64)
+        or slice_offsets.dtype != col_indices.dtype
+    ):
+        raise TypeError("SELL columns and offsets must share int32 or int64 dtype")
+    if b.dtype != values.dtype:
+        raise TypeError("b dtype must match SELL values")
+
+    offsets = slice_offsets.contiguous()
+    cols = col_indices.contiguous()
+    slice_lengths = offsets[1:] - offsets[:-1]
+    if (
+        int(offsets[0].item()) != 0
+        or int(offsets[-1].item()) != values.numel()
+        or bool(torch.any(slice_lengths < 0).item())
+        or bool(torch.any(slice_lengths % slice_size != 0).item())
+    ):
+        raise ValueError("invalid SELL slice offsets")
+    if cols.numel() > 0:
+        if bool(torch.any(cols < -1).item()):
+            raise IndexError("SELL padding must use column index -1")
+        valid_cols = cols >= 0
+        if bool(torch.any(cols[valid_cols] >= n_cols).item()):
+            raise IndexError("SELL column index is out of range")
+
+    return values.contiguous(), cols, offsets, b.contiguous(), n_rows, slice_size
+
 
 def _spsv_diag_eps_for_dtype(value_dtype):
     return 1e-12 if value_dtype in (torch.float64, torch.complex128) else 1e-6
@@ -1988,6 +2048,68 @@ def _spsv_csr_cw_kernel_complex(
 
 
 @triton.jit
+def _spsv_sell_cw_kernel(
+    values_ptr,
+    col_indices_ptr,
+    slice_offsets_ptr,
+    b_ptr,
+    x_ptr,
+    ready_ptr,
+    row_counter_ptr,
+    n_rows,
+    SLICE_SIZE: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+):
+    """Persistent dependency solve over cuSPARSE column-major SELL storage."""
+
+    logical_row = tl.atomic_add(row_counter_ptr, 1)
+    while logical_row < n_rows:
+        row = logical_row
+        slice_id = row // SLICE_SIZE
+        row_in_slice = row - slice_id * SLICE_SIZE
+        slice_start = tl.load(slice_offsets_ptr + slice_id)
+        slice_end = tl.load(slice_offsets_ptr + slice_id + 1)
+        width = (slice_end - slice_start) // SLICE_SIZE
+        if USE_FP64_ACC:
+            rhs = tl.load(b_ptr + row).to(tl.float64)
+            tmp_sum = tl.zeros((), dtype=tl.float64)
+            diag = tl.zeros((), dtype=tl.float64)
+        else:
+            rhs = tl.load(b_ptr + row).to(tl.float32)
+            tmp_sum = tl.zeros((), dtype=tl.float32)
+            diag = tl.zeros((), dtype=tl.float32)
+        slot = 0
+        while slot < width:
+            offset = slice_start + slot * SLICE_SIZE + row_in_slice
+            col = tl.load(col_indices_ptr + offset)
+            valid = (col >= 0) & (col < n_rows)
+            if valid:
+                if col == row:
+                    if USE_FP64_ACC:
+                        diag = tl.load(values_ptr + offset).to(tl.float64)
+                    else:
+                        diag = tl.load(values_ptr + offset).to(tl.float32)
+                else:
+                    is_dependency = col < row
+                    if is_dependency:
+                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        while dep_ready != 1:
+                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        if USE_FP64_ACC:
+                            a = tl.load(values_ptr + offset).to(tl.float64)
+                            x_dep = tl.load(x_ptr + col).to(tl.float64)
+                        else:
+                            a = tl.load(values_ptr + offset).to(tl.float32)
+                            x_dep = tl.load(x_ptr + col).to(tl.float32)
+                        tmp_sum += a * x_dep
+            slot += 1
+        x_row = (rhs - tmp_sum) / diag
+        tl.store(x_ptr + row, x_row)
+        _publish_ready_flag_i32(ready_ptr, row)
+        logical_row = tl.atomic_add(row_counter_ptr, 1)
+
+
+@triton.jit
 def _spsv_csr_transpose_cw_kernel(
     data_ptr,
     indices_ptr,
@@ -2956,6 +3078,38 @@ def _triton_spsv_csr_cw_vector_complex(
         DIAG_EPS=diag_eps,
     )
     return x
+
+
+def _launch_spsv_sell(
+    values,
+    col_indices,
+    slice_offsets,
+    b_vec,
+    n_rows,
+    *,
+    slice_size,
+    out,
+    ready,
+    row_counter,
+):
+    ready.zero_()
+    row_counter.zero_()
+    if n_rows == 0:
+        return out
+    worker_count = _snap_cw_worker_count(min(n_rows, 32), n_rows)
+    _spsv_sell_cw_kernel[(int(worker_count),)](
+        values,
+        col_indices,
+        slice_offsets,
+        b_vec,
+        out,
+        ready,
+        row_counter,
+        n_rows,
+        SLICE_SIZE=int(slice_size),
+        USE_FP64_ACC=values.dtype == torch.float64,
+    )
+    return out
 
 
 def _triton_spsv_csr_u_lo_cw_vector(*args, **kwargs):
@@ -4527,6 +4681,35 @@ def flagsparse_spsv_solve_ex(
             storage_view=storage_view,
         )
     raise ValueError("matA.format must be 'csr' or 'coo'")
+
+
+def flagsparse_spsv_sell(
+    values,
+    col_indices,
+    slice_offsets,
+    b,
+    shape,
+    *,
+    slice_size,
+):
+    """Solve a real non-unit lower triangle in column-major SELL format."""
+
+    values, cols, offsets, b, n_rows, slice_size = (
+        _prepare_spsv_sell_inputs(
+            values, col_indices, slice_offsets, b, shape, slice_size
+        )
+    )
+    return _launch_spsv_sell(
+        values,
+        cols,
+        offsets,
+        b,
+        n_rows,
+        slice_size=slice_size,
+        out=torch.empty_like(b),
+        ready=torch.empty(n_rows, dtype=torch.int32, device=b.device),
+        row_counter=torch.empty(1, dtype=torch.int32, device=b.device),
+    )
 
 
 def flagsparse_spsv_csr(

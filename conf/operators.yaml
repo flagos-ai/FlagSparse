@@ -63,6 +63,40 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: spmv_csc
+    description: |
+      Computes sparse matrix-vector multiplication for a CSC matrix.
+    for:
+      - flagsparse_spmv_csc
+      - prepare_spmv_csc
+    labels:
+      - flagsparse
+      - sparse
+      - csc
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spmv_bsr
+    description: |
+      Computes sparse matrix-vector multiplication for a BSR matrix.
+    for:
+      - flagsparse_spmv_bsr
+      - prepare_spmv_bsr
+    labels:
+      - flagsparse
+      - sparse
+      - bsr
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
   - id: spmv_coo_tocsr
     description: |
       Computes COO SpMV through a COO-to-CSR preparation path.
@@ -254,6 +288,23 @@ ops:
       - flagsparse
       - sparse
       - coo
+      - triton
+      - public-api
+    kind:
+      - SparseSolver
+    stages:
+      - beta: "1.0"
+
+  - id: spsv_sell
+    description: |
+      Solves sparse triangular systems represented in cuSPARSE-compatible
+      column-major Sliced ELLPACK format using a native Triton kernel.
+    for:
+      - flagsparse_spsv_sell
+    labels:
+      - flagsparse
+      - sparse
+      - sell
       - triton
       - public-api
     kind:
