@@ -295,6 +295,23 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: spsv_sell
+    description: |
+      Solves sparse triangular systems represented in cuSPARSE-compatible
+      column-major Sliced ELLPACK format using a native Triton kernel.
+    for:
+      - flagsparse_spsv_sell
+    labels:
+      - flagsparse
+      - sparse
+      - sell
+      - triton
+      - public-api
+    kind:
+      - SparseSolver
+    stages:
+      - beta: "1.0"
+
   - id: spsv_descriptor_api
     description: |
       Provides descriptor, buffer-size, analysis, preprocess, and solve APIs for SpSV workflows.

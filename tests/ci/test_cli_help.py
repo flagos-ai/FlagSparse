@@ -25,6 +25,7 @@ SCRIPTS = [
     "tests/test_spmm.py",
     "tests/test_spgemm.py",
     "tests/test_spsv.py",
+    "tests/test_spsv_sell.py",
     "tests/test_spsm.py",
 ]
 

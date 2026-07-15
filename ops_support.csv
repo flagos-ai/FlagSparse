@@ -279,3 +279,7 @@ spsv,CSR,int64,complex64,non,triton,SUPPORTED
 spsv,CSR,int64,complex64,trans,triton,SUPPORTED
 spsv,CSR,int64,complex128,non,triton,SUPPORTED
 spsv,CSR,int64,complex128,trans,triton,SUPPORTED
+spsv,SELL,int32,float32,non,triton,SUPPORTED
+spsv,SELL,int32,float64,non,triton,SUPPORTED
+spsv,SELL,int64,float32,non,triton,SUPPORTED
+spsv,SELL,int64,float64,non,triton,SUPPORTED

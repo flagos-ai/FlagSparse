@@ -304,6 +304,16 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "--iters",
         "{iters}",
     ),
+    "spsv_sell": (
+        "tests/test_spsv_sell.py",
+        "{input}",
+        "--csv",
+        "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
     "spsm_csr": (
         "tests/test_spsm.py",
         "{input}",
@@ -355,6 +365,7 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     "sddmm_csr": OperatorTestConfig("sddmm_csr", PERFORMANCE_COMMANDS["sddmm_csr"]),
     "spsv_csr": OperatorTestConfig("spsv_csr", PERFORMANCE_COMMANDS["spsv_csr"]),
     "spsv_coo": OperatorTestConfig("spsv_coo", PERFORMANCE_COMMANDS["spsv_coo"]),
+    "spsv_sell": OperatorTestConfig("spsv_sell", PERFORMANCE_COMMANDS["spsv_sell"]),
     "spsm_csr": OperatorTestConfig("spsm_csr", PERFORMANCE_COMMANDS["spsm_csr"]),
     "spsm_coo": OperatorTestConfig("spsm_coo", PERFORMANCE_COMMANDS["spsm_coo"]),
 }

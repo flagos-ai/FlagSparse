@@ -17,6 +17,7 @@ EXPECTED_TOP_LEVEL = {
     "flagsparse_sddmm_csr",
     "flagsparse_spsv_csr",
     "flagsparse_spsv_coo",
+    "flagsparse_spsv_sell",
     "flagsparse_spsm_csr",
     "flagsparse_spsm_coo",
     "create_csr_matrix",
