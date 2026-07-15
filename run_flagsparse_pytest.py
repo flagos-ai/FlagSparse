@@ -437,6 +437,73 @@ def collect_env_info(project_root: Path) -> dict[str, object]:
     return env
 
 
+def _flag_gems_env_info(env_info: dict[str, object]) -> dict[str, object]:
+    """Project rich runner metadata onto the strict FlagGems env schema."""
+    python_info = env_info.get("python")
+    platform_info = env_info.get("platform")
+    packages = env_info.get("packages")
+    cuda = env_info.get("cuda")
+    python_info = python_info if isinstance(python_info, dict) else {}
+    platform_info = platform_info if isinstance(platform_info, dict) else {}
+    packages = packages if isinstance(packages, dict) else {}
+    cuda = cuda if isinstance(cuda, dict) else {}
+
+    try:
+        os_release = platform.freedesktop_os_release()
+    except (AttributeError, OSError):
+        os_release = {}
+
+    torch_package = packages.get("torch")
+    triton_package = packages.get("triton")
+    flagsparse_package = packages.get("flagsparse")
+    torch_package = torch_package if isinstance(torch_package, dict) else {}
+    triton_package = triton_package if isinstance(triton_package, dict) else {}
+    flagsparse_package = (
+        flagsparse_package if isinstance(flagsparse_package, dict) else {}
+    )
+
+    devices = cuda.get("devices")
+    devices = devices if isinstance(devices, list) else []
+    first_device = devices[0] if devices and isinstance(devices[0], dict) else {}
+    cuda_available = bool(cuda.get("available"))
+
+    try:
+        triton = importlib.import_module("triton")
+        triton_has_config = hasattr(triton, "Config")
+    except Exception:
+        triton_has_config = False
+
+    return {
+        "architecture": str(platform_info.get("machine") or ""),
+        "os_name": str(
+            os_release.get("ID") or platform_info.get("system") or ""
+        ).lower(),
+        "os_release": str(
+            os_release.get("VERSION_ID") or platform_info.get("release") or ""
+        ),
+        "python": str(python_info.get("version") or ""),
+        "torch": {
+            "version": str(torch_package.get("version") or ""),
+            "cuda_available": cuda_available,
+            "device_name": str(first_device.get("name") or ""),
+            "device_count": int(cuda.get("device_count") or 0),
+        },
+        # The reference FlagGems summary reserves this field but emits null.
+        "flagtree": None,
+        "triton": {
+            "version": str(triton_package.get("version") or ""),
+            "has_config": triton_has_config,
+        },
+        "flag_gems": {
+            # FlagSparse is the package under test; retain the FlagGems field name
+            # required by the external summary contract.
+            "version": str(flagsparse_package.get("version") or ""),
+            "vendor": "nvidia" if cuda_available else "cpu",
+            "device": "cuda" if cuda_available else "cpu",
+        },
+    }
+
+
 def load_operator_catalog(path: Path) -> list[dict[str, object]]:
     text = path.read_text(encoding="utf-8")
     if yaml is None:
@@ -531,6 +598,23 @@ def read_ops(
             continue
         result.append(op_id)
     return result
+
+
+def read_operator_metadata(
+    *, project_root: Path, operators_yaml: str
+) -> dict[str, dict[str, object]]:
+    yaml_path = Path(operators_yaml)
+    if not yaml_path.is_absolute():
+        yaml_path = project_root / yaml_path
+    metadata: dict[str, dict[str, object]] = {}
+    for item in load_operator_catalog(yaml_path):
+        op_id = str(item["id"]).strip()
+        labels = item.get("labels")
+        metadata[op_id] = {
+            "customized": True,
+            "labels": list(labels) if isinstance(labels, list) else [],
+        }
+    return metadata
 
 
 def parse_gpus(value: str) -> list[int]:
@@ -739,38 +823,72 @@ def _phase_summary(phase_result: dict[str, object]) -> dict[str, object]:
 
 def _flaggems_accuracy_result(phase_result: dict[str, object]) -> dict[str, object]:
     status = str(phase_result.get("status") or "UNKNOWN")
-    result = {
-        "total": phase_result.get("total", 0),
-        "skipped": phase_result.get("skipped", 0),
-        "failed": phase_result.get("failed", 0),
-        "passed": phase_result.get("passed", 0),
+    return {
+        "total": int(phase_result.get("total") or 0),
+        "skipped": int(phase_result.get("skipped") or 0),
+        "failed": int(phase_result.get("failed") or 0),
+        "passed": int(phase_result.get("passed") or 0),
         "details": _accuracy_details(phase_result),
         "status": _flaggems_status(status),
-        "duration": _duration(phase_result),
-        "exit_code": _exit_code(phase_result),
+        "exit_code": int(_exit_code(phase_result) or 0),
+        "duration": float(_duration(phase_result) or 0.0),
+        "data_file": str(_json_data_file(phase_result) or ""),
     }
-    if phase_result.get("errors"):
-        result["errors"] = phase_result.get("errors")
-    if "data_file" in phase_result:
-        result["data_file"] = _json_data_file(phase_result)
-    return result
+
+
+def _flag_gems_dtype(dtype: object) -> str:
+    value = str(dtype)
+    aliases = {
+        "float16": "fp16",
+        "torch.float16": "fp16",
+        "half": "fp16",
+        "float32": "fp32",
+        "torch.float32": "fp32",
+        "float": "fp32",
+        "float64": "fp64",
+        "torch.float64": "fp64",
+        "double": "fp64",
+        "bfloat16": "bf16",
+        "torch.bfloat16": "bf16",
+    }
+    return aliases.get(value, value)
+
+
+def _strict_flag_gems_perf_data(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, object] = {}
+    for dtype, dtype_value in value.items():
+        if not isinstance(dtype_value, dict):
+            continue
+        details_value = dtype_value.get("details")
+        details_value = details_value if isinstance(details_value, dict) else {}
+        details: dict[str, object] = {}
+        for shape, metrics_value in details_value.items():
+            metrics = metrics_value if isinstance(metrics_value, dict) else {}
+            details[str(shape)] = {
+                "base": float(metrics.get("base") or 0.0),
+                "gems": float(metrics.get("gems") or 0.0),
+                "speedup": float(metrics.get("speedup") or 0.0),
+            }
+        normalized[_flag_gems_dtype(dtype)] = {
+            "result": str(dtype_value.get("result") or "Unknown"),
+            "details": details,
+            "speedup": float(dtype_value.get("speedup") or 0.0),
+        }
+    return normalized
 
 
 def _flaggems_performance_result(phase_result: dict[str, object]) -> dict[str, object]:
     status = str(phase_result.get("status") or "UNKNOWN")
-    result = {
-        "duration": _duration(phase_result),
-        "exit_code": _exit_code(phase_result),
-        "data": phase_result.get("data", {}),
+    return {
+        "duration": float(_duration(phase_result) or 0.0),
+        "exit_code": int(_exit_code(phase_result) or 0),
+        "data_file": str(_json_data_file(phase_result) or ""),
+        "data": _strict_flag_gems_perf_data(phase_result.get("data")),
         "status": _flaggems_status(status),
+        "test_case": str(phase_result.get("test_case") or "Unknown"),
     }
-    if "data_file" in phase_result:
-        result["data_file"] = _json_data_file(phase_result)
-    if phase_result.get("test_case") is not None:
-        result["test_case"] = phase_result.get("test_case")
-    if phase_result.get("reason"):
-        result["reason"] = phase_result.get("reason")
-    return result
 
 
 def _flaggems_phase_result(phase_result: dict[str, object]) -> dict[str, object]:
@@ -1559,6 +1677,7 @@ def run_gpu_ops(
     extra_pytest_args: list[str],
     extra_benchmark_args: list[str],
     env_info: dict[str, object],
+    operator_metadata: dict[str, dict[str, object]],
     results: list[dict[str, object]],
 ) -> None:
     for op in ops:
@@ -1576,6 +1695,7 @@ def run_gpu_ops(
             extra_pytest_args=extra_pytest_args,
             extra_benchmark_args=extra_benchmark_args,
         )
+        result.update(operator_metadata.get(op, {"customized": True, "labels": []}))
         with SUMMARY_LOCK:
             results.append(result)
             write_summary(results, results_dir, env_info)
@@ -1638,12 +1758,24 @@ def _totals(rows: list[dict[str, object]]) -> dict[str, object]:
 
 
 def _operator_summary(result: dict[str, object]) -> dict[str, object]:
-    entry: dict[str, object] = {"customized": False}
+    entry: dict[str, object] = {"customized": bool(result.get("customized", True))}
+    operator = str(result.get("operator") or "")
     for phase in ("accuracy", "performance"):
         phase_result = result.get(phase)
         if not isinstance(phase_result, dict):
-            continue
+            phase_result = {
+                "operator": operator,
+                "phase": phase,
+                "status": "NOT_CONFIGURED",
+                "duration": 0.0,
+                "exit_code": 0,
+                "data_file": "",
+            }
         entry[phase] = _flaggems_phase_result(phase_result)
+    labels = result.get("labels")
+    entry["labels"] = (
+        [str(label) for label in labels] if isinstance(labels, list) else []
+    )
     return entry
 
 
@@ -1653,11 +1785,11 @@ def _flaggems_summary(
     rows: list[dict[str, object]],
     env_info: dict[str, object],
 ) -> dict[str, object]:
-    generated_at = _dt.datetime.now().isoformat(timespec="seconds")
+    generated_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ordered = sorted(results, key=lambda item: str(item["operator"]))
     return {
         "timestamp": generated_at,
-        "env": env_info,
+        "env": _flag_gems_env_info(env_info),
         "result": {
             str(result["operator"]): _operator_summary(result) for result in ordered
         },
@@ -2278,8 +2410,8 @@ def write_summary(
         json.dumps(
             _flaggems_summary(results=ordered, rows=rows, env_info=env_info),
             indent=2,
-            sort_keys=True,
-        ),
+        )
+        + "\n",
         encoding="utf-8",
     )
     compat_json_path = results_dir / "summary_flat.json"
@@ -2454,6 +2586,9 @@ def main(
         stages_arg=args.stages,
         start=args.start,
     )
+    operator_metadata = read_operator_metadata(
+        project_root=project_root, operators_yaml=args.operators_yaml
+    )
     if not ops:
         raise SystemExit("no operators to run")
     if args.list_ops:
@@ -2510,6 +2645,7 @@ def main(
                 extra_pytest_args=extra_pytest_args,
                 extra_benchmark_args=extra_benchmark_args,
                 env_info=env_info,
+                operator_metadata=operator_metadata,
                 results=results,
             )
             for gpu, gpu_ops in tasks.items()

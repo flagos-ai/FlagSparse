@@ -2,6 +2,7 @@
 
 import csv
 import json
+import re
 
 import run_flagsparse_pytest as runner
 
@@ -11,6 +12,8 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
         {
             "operator": "gather",
             "gpu": 0,
+            "customized": True,
+            "labels": ["flagsparse", "sparse"],
             "accuracy": {
                 "operator": "gather",
                 "phase": "accuracy",
@@ -49,19 +52,57 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
                 "data_path": "gather/performance.csv",
                 "data_file": "gather/performance_result.json",
                 "row_count": 0,
+                "test_case": "csv",
             },
         }
     ]
-    env = {"python": {"version": "3.test"}}
+    env = {
+        "python": {"version": "3.test"},
+        "platform": {
+            "system": "Linux",
+            "release": "test-release",
+            "machine": "x86_64",
+        },
+        "packages": {
+            "torch": {"version": "2.test"},
+            "triton": {"version": "3.test"},
+            "flagsparse": {"version": "1.test"},
+        },
+        "cuda": {
+            "available": True,
+            "device_count": 1,
+            "devices": [{"name": "Test GPU"}],
+        },
+    }
 
     runner.write_summary(results, tmp_path, env)
 
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
-    assert set(summary) == {"timestamp", "env", "result"}
-    assert summary["env"] == env
+    assert list(summary) == ["timestamp", "env", "result"]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", summary["timestamp"])
+    assert set(summary["env"]) == {
+        "architecture",
+        "os_name",
+        "os_release",
+        "python",
+        "torch",
+        "flagtree",
+        "triton",
+        "flag_gems",
+    }
+    assert summary["env"]["python"] == "3.test"
+    assert set(summary["env"]["torch"]) == {
+        "version",
+        "cuda_available",
+        "device_name",
+        "device_count",
+    }
+    assert set(summary["env"]["triton"]) == {"version", "has_config"}
+    assert set(summary["env"]["flag_gems"]) == {"version", "vendor", "device"}
     gather = summary["result"]["gather"]
-    assert set(gather) == {"customized", "accuracy", "performance"}
-    assert gather["customized"] is False
+    assert list(gather) == ["customized", "accuracy", "performance", "labels"]
+    assert gather["customized"] is True
+    assert gather["labels"] == ["flagsparse", "sparse"]
 
     accuracy = gather["accuracy"]
     assert set(accuracy) == {
@@ -87,9 +128,11 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
         "data",
         "status",
         "data_file",
+        "test_case",
     }
     assert performance["status"] == "Skipped"
     assert performance["data_file"] == "gather/performance_result.json"
+    assert performance["test_case"] == "csv"
 
     compat_summary = json.loads(
         (tmp_path / "summary_flat.json").read_text(encoding="utf-8")
@@ -118,6 +161,65 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
     assert "sortTable(5, 'asc')" in html_report
     assert "gather" in html_report
     assert "accuracy_result.json" in html_report
+
+
+def test_flaggems_summary_schema_does_not_change_on_errors():
+    accuracy = runner._flaggems_accuracy_result(
+        {
+            "status": "CRASH",
+            "errors": 2,
+            "reason": "worker crashed",
+            "exit_code": 17,
+        }
+    )
+    performance = runner._flaggems_performance_result(
+        {
+            "status": "CRASH",
+            "reason": "benchmark crashed",
+            "exit_code": 18,
+        }
+    )
+
+    assert set(accuracy) == {
+        "total",
+        "skipped",
+        "failed",
+        "passed",
+        "details",
+        "status",
+        "exit_code",
+        "duration",
+        "data_file",
+    }
+    assert set(performance) == {
+        "duration",
+        "exit_code",
+        "data_file",
+        "data",
+        "status",
+        "test_case",
+    }
+    assert "errors" not in accuracy
+    assert "reason" not in performance
+
+
+def test_flaggems_operator_schema_is_fixed_for_single_phase_runs():
+    summary = runner._operator_summary(
+        {
+            "operator": "gather",
+            "accuracy": {"phase": "accuracy", "status": "PASS"},
+        }
+    )
+
+    assert list(summary) == ["customized", "accuracy", "performance", "labels"]
+    assert summary["performance"] == {
+        "duration": 0.0,
+        "exit_code": 0,
+        "data_file": "",
+        "data": {},
+        "status": "NotFound",
+        "test_case": "Unknown",
+    }
 
 
 def test_runner_writes_per_operator_phase_result(tmp_path):
