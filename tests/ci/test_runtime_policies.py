@@ -152,12 +152,14 @@ def test_spmv_bsr_op_transpose_contract(op):
         )
 
 
-@pytest.mark.parametrize("op", ["trans", "conj"])
-def test_spmv_bsr_unsupported_ops_rejected_by_policy(op):
-    with pytest.raises(NotImplementedError, match="only supports op='non'"):
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmv_bsr_supported_ops_accepted_by_policy(op):
+    assert (
         spmv_bsr_ops._ensure_spmv_bsr_supported_op(
             spmv_bsr_ops._normalize_spmv_bsr_op(op)
         )
+        is None
+    )
 
 
 def test_scatter_policy_validator_rejects_unknown_policy():

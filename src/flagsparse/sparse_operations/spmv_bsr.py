@@ -21,7 +21,7 @@ SPMV_BSR_OP_NAMES = {
     SPMV_BSR_OP_TRANS: "trans",
     SPMV_BSR_OP_CONJ_TRANS: "conj",
 }
-SPMV_BSR_SUPPORTED_OP_NAMES = ("non",)
+SPMV_BSR_SUPPORTED_OP_NAMES = ("non", "trans", "conj")
 _SPMV_BSR_OP_NAME_TO_CODE = {
     name: code for code, name in SPMV_BSR_OP_NAMES.items()
 }
@@ -60,10 +60,7 @@ def _spmv_bsr_op_transposes(op):
 
 
 def _ensure_spmv_bsr_supported_op(op_code):
-    if op_code != SPMV_BSR_OP_NON:
-        raise NotImplementedError(
-            "BSR SpMV v1 only supports op='non'; trans/conj are reserved for a future native BSR kernel"
-        )
+    _normalize_spmv_bsr_op(op_code)
 
 
 def _normalize_spmv_bsr_index_fallback_policy(index_fallback_policy):
@@ -238,6 +235,79 @@ def _spmv_bsr_non_complex_kernel(
     tl.atomic_add(y_ri_ptr + row * 2 + 1, acc_im)
 
 
+@triton.jit
+def _spmv_bsr_trans_real_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    x_ptr,
+    y_ptr,
+    n_block_rows,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    SEG: tl.constexpr,
+):
+    brow = tl.program_id(0)
+    inner_row = tl.program_id(1)
+    if brow >= n_block_rows:
+        return
+    row = brow * BLOCK_DIM + inner_row
+    x_val = tl.load(x_ptr + row)
+    start = tl.load(indptr_ptr + brow)
+    end = tl.load(indptr_ptr + brow + 1)
+    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
+    for inner_col in tl.static_range(0, BLOCK_DIM):
+        col = bcols * BLOCK_DIM + inner_col
+        vals = tl.load(
+            data_ptr + offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col,
+            mask=mask,
+            other=0.0,
+        )
+        tl.atomic_add(y_ptr + col, vals * x_val, mask=mask)
+
+
+@triton.jit
+def _spmv_bsr_trans_complex_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    x_ri_ptr,
+    y_ri_ptr,
+    n_block_rows,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    SEG: tl.constexpr,
+    CONJ: tl.constexpr,
+):
+    brow = tl.program_id(0)
+    inner_row = tl.program_id(1)
+    if brow >= n_block_rows:
+        return
+    row = brow * BLOCK_DIM + inner_row
+    x_re = tl.load(x_ri_ptr + row * 2)
+    x_im = tl.load(x_ri_ptr + row * 2 + 1)
+    start = tl.load(indptr_ptr + brow)
+    end = tl.load(indptr_ptr + brow + 1)
+    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
+    for inner_col in tl.static_range(0, BLOCK_DIM):
+        col = bcols * BLOCK_DIM + inner_col
+        elem = offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col
+        a_re = tl.load(data_ri_ptr + elem * 2, mask=mask, other=0.0)
+        a_im_raw = tl.load(data_ri_ptr + elem * 2 + 1, mask=mask, other=0.0)
+        if CONJ:
+            a_im = -a_im_raw
+        else:
+            a_im = a_im_raw
+        prod_re = a_re * x_re - a_im * x_im
+        prod_im = a_re * x_im + a_im * x_re
+        tl.atomic_add(y_ri_ptr + col * 2, prod_re, mask=mask)
+        tl.atomic_add(y_ri_ptr + col * 2 + 1, prod_im, mask=mask)
+
+
 def _prepare_spmv_bsr_matrix(data, indices, indptr, shape, block_dim):
     if not all(torch.is_tensor(t) for t in (data, indices, indptr)):
         raise TypeError("data, indices, indptr must all be torch.Tensor")
@@ -390,7 +460,9 @@ def _validate_spmv_bsr_x(x, prepared, op_code):
 def _triton_spmv_bsr_kernel(prepared, x, op_code):
     _ensure_spmv_bsr_supported_op(op_code)
     dtype = prepared.data.dtype
-    y = torch.zeros(prepared.padded_n_rows, dtype=dtype, device=prepared.data.device)
+    trans = _spmv_bsr_op_transposes(op_code)
+    out_len = prepared.padded_n_cols if trans else prepared.padded_n_rows
+    y = torch.zeros(out_len, dtype=dtype, device=prepared.data.device)
     if prepared.nnzb == 0:
         return y
     for seg in range(prepared.max_segments):
@@ -399,33 +471,60 @@ def _triton_spmv_bsr_kernel(prepared, x, op_code):
             data_ri = torch.view_as_real(prepared.data).reshape(-1)
             x_ri = torch.view_as_real(x).reshape(-1)
             y_ri = torch.view_as_real(y).reshape(-1)
-            _spmv_bsr_non_complex_kernel[grid](
-                data_ri,
-                prepared.kernel_indices,
-                prepared.kernel_indptr,
-                x_ri,
-                y_ri,
-                prepared.padded_n_rows,
-                prepared.padded_n_cols,
-                prepared.n_block_rows,
-                BLOCK_DIM=prepared.block_dim,
-                BLOCK_NNZ=prepared.block_nnz,
-                SEG=seg,
-            )
+            if trans:
+                _spmv_bsr_trans_complex_kernel[grid](
+                    data_ri,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    x_ri,
+                    y_ri,
+                    prepared.n_block_rows,
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                    CONJ=(op_code == SPMV_BSR_OP_CONJ_TRANS),
+                )
+            else:
+                _spmv_bsr_non_complex_kernel[grid](
+                    data_ri,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    x_ri,
+                    y_ri,
+                    prepared.padded_n_rows,
+                    prepared.padded_n_cols,
+                    prepared.n_block_rows,
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                )
         else:
-            _spmv_bsr_non_real_kernel[grid](
-                prepared.data,
-                prepared.kernel_indices,
-                prepared.kernel_indptr,
-                x,
-                y,
-                prepared.padded_n_rows,
-                prepared.padded_n_cols,
-                prepared.n_block_rows,
-                BLOCK_DIM=prepared.block_dim,
-                BLOCK_NNZ=prepared.block_nnz,
-                SEG=seg,
-            )
+            if trans:
+                _spmv_bsr_trans_real_kernel[grid](
+                    prepared.data,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    x,
+                    y,
+                    prepared.n_block_rows,
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                )
+            else:
+                _spmv_bsr_non_real_kernel[grid](
+                    prepared.data,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    x,
+                    y,
+                    prepared.padded_n_rows,
+                    prepared.padded_n_cols,
+                    prepared.n_block_rows,
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                )
     return y
 
 

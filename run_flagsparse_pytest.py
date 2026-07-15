@@ -183,6 +183,8 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv-bsr",
         "{csv}",
+        "--ops",
+        "non,trans,conj",
         "--warmup",
         "{warmup}",
         "--iters",

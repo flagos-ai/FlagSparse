@@ -74,6 +74,14 @@ python tests/test_spmv_opt.py <dir_or_file.mtx> [...]
 python tests/test_spmv_opt.py <dir/> --csv out.csv
 ```
 
+**test_spmv_bsr.py** - native BSR SpMV with padded block-grid output:
+
+```bash
+python tests/test_spmv_bsr.py --synthetic --ops non,trans,conj
+python tests/test_spmv_bsr.py <dir/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj
+# correctness uses BSR-expanded COO as the exact reference; PyTorch BSR is a baseline only.
+```
+
 **test_spmm.py** - CSR SpMM (`.mtx` batch, synthetic, or `--csv`):
 
 ```bash

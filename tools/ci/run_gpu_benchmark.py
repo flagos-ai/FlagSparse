@@ -107,6 +107,8 @@ def _command_specs(
         "spmv-bsr": [
             "tests/test_spmv_bsr.py",
             "--synthetic",
+            "--ops",
+            "non,trans,conj",
             "--warmup",
             str(args.warmup),
             "--iters",
