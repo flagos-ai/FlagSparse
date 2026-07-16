@@ -30,10 +30,15 @@ VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 INDEX_DTYPES = (torch.int32, torch.int64)
 OPS = ("non", "trans", "conj")
 SUPPORTED_OPS = OPS
+ALGS = ("base", "blockrow_reduce", "compare", "auto")
 TEST_SIZES = ((64, 96), (160, 1024), (128, 256))
 DEFAULT_BLOCK_DIMS = (4,)
 WARMUP = 10
 ITERS = 50
+PYTORCH_BSR_TRANSPOSE_UNSUPPORTED = (
+    "PyTorch CUDA BSR transpose/conjugate-transpose matvec is unsupported: "
+    "A.transpose(0, 1) produces SparseBsc, and SparseBsc @ Strided is not implemented"
+)
 
 
 def _cupy_bsr_unavailable_reason():
@@ -46,14 +51,17 @@ def _cupy_bsr_unavailable_reason():
 
 def _print_baseline_notes(run_cusparse=True):
     print(
-        "FlagSparse BSR follows AlphaSparse/cuSPARSE-style padded block-grid semantics; native output is padded and correctness checks slice back to logical rows."
+        "FlagSparse BSR follows AlphaSparse/cuSPARSE-style padded block-grid semantics; native output is padded and correctness checks slice back to the logical output length."
     )
     print(
         "Accuracy reference: Ref=spmv-coo expands the same BSR arrays to COO and runs sparse matvec; PyTorch BSR is a baseline, not the reference."
     )
     print(
         "PyTorch baseline: PT(ms) uses torch.sparse_bsr_tensor only when shape is divisible by block_dim; "
-        "PTPad(ms) uses padded shape and slices back to logical rows for diagnostics."
+        "PTPad(ms) uses padded shape and slices back to the logical output length for diagnostics."
+    )
+    print(
+        "PyTorch BSR trans/conj baseline: unsupported on CUDA because BSR transpose becomes SparseBsc; PT(ms)/PTPad(ms)=N/A for those ops."
     )
     if run_cusparse:
         reason = _cupy_bsr_unavailable_reason()
@@ -95,6 +103,33 @@ def _parse_ops(value):
     if not ops or invalid:
         raise ValueError(f"unsupported --ops: {', '.join(invalid or ops)}")
     return ops
+
+
+def _parse_algs(value):
+    token = "base" if value is None else str(value).strip().lower().replace("-", "_")
+    algs = [item.strip().lower().replace("-", "_") for item in token.split(",") if item.strip()]
+    invalid = [alg for alg in algs if alg not in ALGS]
+    if not algs or invalid:
+        raise ValueError(f"unsupported --alg: {', '.join(invalid or algs)}")
+    return algs
+
+
+def _expand_algs(algs, op):
+    expanded = []
+    for alg in algs:
+        if alg == "compare":
+            expanded.extend(["base", "blockrow_reduce"] if op == "non" else ["base"])
+        elif alg == "auto":
+            expanded.append("blockrow_reduce" if op == "non" else "base")
+        elif alg == "blockrow_reduce" and op != "non":
+            expanded.append("base")
+        else:
+            expanded.append(alg)
+    out = []
+    for alg in expanded:
+        if alg not in out:
+            out.append(alg)
+    return out
 
 
 def _parse_block_dims(value):
@@ -368,21 +403,37 @@ def _cuda_event_benchmark(op, warmup, iters):
     return out, start.elapsed_time(end) / count
 
 
-def _time_flagsparse_bsr(data, indices, indptr, x, shape, block_dim, op, warmup, iters, timing=False):
+def _time_flagsparse_bsr(data, indices, indptr, x, shape, block_dim, op, alg, warmup, iters, timing=False):
+    use_opt = alg == "blockrow_reduce"
     prepared = fs.prepare_spmv_bsr(data, indices, indptr, shape, block_dim, op=op)
     x_for_bsr = _pad_vector(x, _padded_x_size(shape, block_dim, op))
     out, gpu_ms = _cuda_event_benchmark(
-        lambda: fs.flagsparse_spmv_bsr(x=x_for_bsr, prepared=prepared),
+        lambda: fs.flagsparse_spmv_bsr(x=x_for_bsr, prepared=prepared, use_opt=use_opt),
         warmup,
         iters,
     )
+    process_gpu_ms = 0.0
+    compute_ms = gpu_ms
+    if timing:
+        try:
+            _timed_out, meta = fs.flagsparse_spmv_bsr(
+                x=x_for_bsr,
+                prepared=prepared,
+                use_opt=use_opt,
+                return_meta=True,
+            )
+            process_gpu_ms = meta.get("process_gpu_ms") or 0.0
+            compute_ms = meta.get("compute_ms") or gpu_ms
+        except Exception:
+            process_gpu_ms = 0.0
+            compute_ms = gpu_ms
     return {
         "out": out,
         "ms": gpu_ms,
         "gpu_ms": gpu_ms,
         "process_cpu_ms": 0.0,
-        "process_gpu_ms": 0.0 if timing else None,
-        "compute_ms": gpu_ms if timing else None,
+        "process_gpu_ms": process_gpu_ms if timing else None,
+        "compute_ms": compute_ms if timing else None,
     }
 
 
@@ -395,6 +446,8 @@ def _apply_pytorch_op(A, x, op):
 
 
 def _time_pytorch(data, indices, indptr, x, shape, block_dim, op, warmup, iters):
+    if _op_transposes(op):
+        return None, PYTORCH_BSR_TRANSPOSE_UNSUPPORTED, None
     if int(shape[0]) % int(block_dim) != 0 or int(shape[1]) % int(block_dim) != 0:
         return (
             None,
@@ -421,6 +474,8 @@ def _time_pytorch(data, indices, indptr, x, shape, block_dim, op, warmup, iters)
 
 
 def _time_pytorch_padded(data, indices, indptr, x, shape, block_dim, op, warmup, iters):
+    if _op_transposes(op):
+        return None, PYTORCH_BSR_TRANSPOSE_UNSUPPORTED, None
     padded_shape = _padded_shape(shape, block_dim)
     padded_x = _pad_vector(x, padded_shape[0] if _op_transposes(op) else padded_shape[1])
     with warnings.catch_warnings():
@@ -510,7 +565,7 @@ def _status(ok):
 def _header(timing=False):
     split = f" {'ProcGPU':>9} {'Compute':>9}" if timing else ""
     return (
-        f"{'Matrix':<28} {'Op':>5} {'BDim':>5} {'Ref':>8} {'Out':>7} {'PadOut':>7} {'PadRows':>7} {'Rows':>7} {'Cols':>7} {'NNZB':>9} {'Pad':>7}  "
+        f"{'Matrix':<28} {'Alg':>15} {'Op':>5} {'BDim':>5} {'Ref':>8} {'Out':>7} {'PadOut':>7} {'PadRows':>7} {'Rows':>7} {'Cols':>7} {'NNZB':>9} {'Pad':>7}  "
         f"{'BSR(ms)':>9} {'BSRGPU':>9} {'CPUProc':>9}{split} "
         f"{'PT(ms)':>9} {'PTPad':>9} {'PTPMode':>9} {'CU(ms)':>9}  {'BSR/PT':>8} {'BSR/CU':>8} "
         f"{'BSRErr':>10} {'PTPadErr':>10} {'B/PT':>10} {'B/PTPad':>10} {'Status':>6}"
@@ -518,7 +573,7 @@ def _header(timing=False):
 
 
 def _sep(timing=False):
-    return "-" * (158 if timing else 138)
+    return "-" * (176 if timing else 156)
 
 
 def _print_row(row, timing=False):
@@ -531,7 +586,7 @@ def _print_row(row, timing=False):
         else ""
     )
     print(
-        f"{name:<28} {row['op']:>5} {row['block_dim']:>5} {row['reference']:>8} {row['out_size']:>7} {row['padded_out_size']:>7} {row['pad_rows']:>7} {row['n_rows']:>7} {row['n_cols']:>7} {row['nnzb']:>9} {row['padding_ratio']:>7}  "
+        f"{name:<28} {row.get('algorithm', 'base')[:15]:>15} {row['op']:>5} {row['block_dim']:>5} {row['reference']:>8} {row['out_size']:>7} {row['padded_out_size']:>7} {row['pad_rows']:>7} {row['n_rows']:>7} {row['n_cols']:>7} {row['nnzb']:>9} {row['padding_ratio']:>7}  "
         f"{_fmt(row['bsr_ms']):>9} {_fmt(row['bsr_gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9}{split} "
         f"{_fmt(row['pytorch_ms']):>9} {_fmt(row['pytorch_padded_ms']):>9} {str(row.get('pytorch_padded_mode') or 'N/A')[:9]:>9} {_fmt(row['cusparse_ms']):>9}  "
         f"{_spd(row['pytorch_ms'], row['bsr_ms']):>8} {_spd(row['cusparse_ms'], row['bsr_ms']):>8} "
@@ -542,9 +597,11 @@ def _print_row(row, timing=False):
     if error:
         print(f"  error: {str(error)[:240]}")
     if row.get("pytorch_error"):
-        print(f"  pt: {str(row['pytorch_error'])[:240]}")
+        if row["pytorch_error"] != PYTORCH_BSR_TRANSPOSE_UNSUPPORTED:
+            print(f"  pt: {str(row['pytorch_error'])[:240]}")
     if row.get("pytorch_padded_error"):
-        print(f"  pt_padded: {str(row['pytorch_padded_error'])[:240]}")
+        if row["pytorch_padded_error"] != PYTORCH_BSR_TRANSPOSE_UNSUPPORTED:
+            print(f"  pt_padded: {str(row['pytorch_padded_error'])[:240]}")
     if row.get("status") == "FAIL":
         print(
             "  debug: "
@@ -565,6 +622,7 @@ def _base_row(
     dtype,
     index_dtype,
     op,
+    alg,
     shape,
     data,
     block_dim,
@@ -581,6 +639,7 @@ def _base_row(
         "value_dtype": _dtype_name(dtype),
         "index_dtype": _dtype_name(index_dtype),
         "op": op,
+        "algorithm": alg,
         "reference": "spmv-coo",
         "block_dim": int(block_dim),
         "out_size": logical_out,
@@ -638,6 +697,7 @@ def _skip_row(matrix_name, dtype, index_dtype, op, shape, block_dim, logical_nnz
         "value_dtype": _dtype_name(dtype),
         "index_dtype": _dtype_name(index_dtype),
         "op": op,
+        "algorithm": "base",
         "reference": "spmv-coo",
         "block_dim": block_dim_value,
         "out_size": logical_out,
@@ -685,6 +745,7 @@ def _run_one_case(
     dtype,
     index_dtype,
     op,
+    alg,
     matrix_name,
     block_dim,
     warmup,
@@ -701,6 +762,7 @@ def _run_one_case(
         dtype,
         index_dtype,
         op,
+        alg,
         shape,
         data,
         block_dim,
@@ -714,7 +776,7 @@ def _run_one_case(
     x = _random_values((_logical_x_size(shape, op),), dtype, data.device)
     atol, rtol = _reference_tolerance(dtype)
     try:
-        bsr = _time_flagsparse_bsr(data, indices, indptr, x, shape, block_dim, op, warmup, iters, timing=timing)
+        bsr = _time_flagsparse_bsr(data, indices, indptr, x, shape, block_dim, op, alg, warmup, iters, timing=timing)
     except Exception as exc:
         row["error"] = f"flagsparse_spmv_bsr failed: {exc}"
         return row
@@ -899,7 +961,7 @@ def _resolve_block_dims(block_dims, entries, shape):
     return block_dims
 
 
-def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True):
+def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, algs=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
         return
@@ -908,6 +970,7 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=Non
     index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
     block_dims = list(DEFAULT_BLOCK_DIMS) if block_dims is None else block_dims
     ops = SUPPORTED_OPS if ops is None else ops
+    algs = ["base"] if algs is None else algs
     print("=" * 140)
     print("FLAGSPARSE SpMV BSR BENCHMARK (native BSR Triton)")
     print("=" * 140)
@@ -919,8 +982,9 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=Non
                 if block_dim == "auto":
                     block_dim = 4
                 for op in ops:
+                    op_algs = _expand_algs(algs, op)
                     print(_sep(timing))
-                    print(f"dtype: {_dtype_name(dtype)} | index_dtype: {_dtype_name(index_dtype)} | block_dim: {block_dim} | op: {op}")
+                    print(f"dtype: {_dtype_name(dtype)} | index_dtype: {_dtype_name(index_dtype)} | block_dim: {block_dim} | op: {op} | alg: {','.join(op_algs)}")
                     print(_sep(timing))
                     print(_header(timing))
                     print(_sep(timing))
@@ -929,28 +993,30 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=Non
                         dense *= (torch.rand(m, n, device=device) < 0.1).to(dtype=dtype)
                         logical_nnz = int(torch.count_nonzero(dense).item())
                         data, indices, indptr = _dense_to_bsr(dense, index_dtype, int(block_dim))
-                        row = _run_one_case(
-                            data,
-                            indices,
-                            indptr,
-                            (m, n),
-                            dtype,
-                            index_dtype,
-                            op,
-                            f"{m}x{n}",
-                            int(block_dim),
-                            warmup,
-                            iters,
-                            timing=timing,
-                            run_cusparse=run_cusparse,
-                            logical_nnz=logical_nnz,
-                        )
-                        _print_row(row, timing=timing)
+                        for alg in op_algs:
+                            row = _run_one_case(
+                                data,
+                                indices,
+                                indptr,
+                                (m, n),
+                                dtype,
+                                index_dtype,
+                                op,
+                                alg,
+                                f"{m}x{n}",
+                                int(block_dim),
+                                warmup,
+                                iters,
+                                timing=timing,
+                                run_cusparse=run_cusparse,
+                                logical_nnz=logical_nnz,
+                            )
+                            _print_row(row, timing=timing)
                     print(_sep(timing))
                     print()
 
 
-def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True, fail_fast=False):
+def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, algs=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True, fail_fast=False):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
         return
@@ -959,13 +1025,15 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
     index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
     block_dims = list(DEFAULT_BLOCK_DIMS) if block_dims is None else block_dims
     ops = SUPPORTED_OPS if ops is None else ops
+    algs = ["base"] if algs is None else algs
     rows = []
     _print_baseline_notes(run_cusparse=run_cusparse)
     for dtype in value_dtypes:
         for index_dtype in index_dtypes:
             for op in ops:
+                op_algs = _expand_algs(algs, op)
                 print(_sep(timing))
-                print(f"Value dtype: {_dtype_name(dtype)} | Index dtype: {_dtype_name(index_dtype)} | op: {op}")
+                print(f"Value dtype: {_dtype_name(dtype)} | Index dtype: {_dtype_name(index_dtype)} | op: {op} | alg: {','.join(op_algs)}")
                 print(_sep(timing))
                 print(_header(timing))
                 print(_sep(timing))
@@ -977,26 +1045,28 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                             data, indices, indptr = _entries_to_bsr_torch(
                                 entries, shape, dtype, index_dtype, int(block_dim), device
                             )
-                            row = _run_one_case(
-                                data,
-                                indices,
-                                indptr,
-                                shape,
-                                dtype,
-                                index_dtype,
-                                op,
-                                os.path.basename(path),
-                                int(block_dim),
-                                warmup,
-                                iters,
-                                timing=timing,
-                                run_cusparse=run_cusparse,
-                                logical_nnz=len(entries),
-                            )
-                            if fail_fast and row.get("status") == "ERROR":
-                                raise RuntimeError(row.get("error") or "BSR SpMV case failed")
-                            rows.append(row)
-                            _print_row(row, timing=timing)
+                            for alg in op_algs:
+                                row = _run_one_case(
+                                    data,
+                                    indices,
+                                    indptr,
+                                    shape,
+                                    dtype,
+                                    index_dtype,
+                                    op,
+                                    alg,
+                                    os.path.basename(path),
+                                    int(block_dim),
+                                    warmup,
+                                    iters,
+                                    timing=timing,
+                                    run_cusparse=run_cusparse,
+                                    logical_nnz=len(entries),
+                                )
+                                if fail_fast and row.get("status") == "ERROR":
+                                    raise RuntimeError(row.get("error") or "BSR SpMV case failed")
+                                rows.append(row)
+                                _print_row(row, timing=timing)
                     except Exception as exc:
                         if fail_fast:
                             raise
@@ -1005,6 +1075,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                             "value_dtype": _dtype_name(dtype),
                             "index_dtype": _dtype_name(index_dtype),
                             "op": op,
+                            "algorithm": "base",
                             "reference": "spmv-coo",
                             "block_dim": "ERR",
                             "out_size": "ERR",
@@ -1044,6 +1115,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
         "value_dtype",
         "index_dtype",
         "op",
+        "algorithm",
         "reference",
         "block_dim",
         "out_size",
@@ -1107,6 +1179,7 @@ def main():
     parser.add_argument("--index-dtypes", default="int32,int64")
     parser.add_argument("--block-dims", default="4")
     parser.add_argument("--ops", default="non")
+    parser.add_argument("--alg", default="base", help="BSR algorithm: base, blockrow_reduce, auto, compare, or comma-separated values")
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--timing", action="store_true")
@@ -1118,6 +1191,7 @@ def main():
         index_dtypes = _parse_csv_tokens(args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes")
         block_dims = _parse_block_dims(args.block_dims)
         ops = _parse_ops(args.ops)
+        algs = _parse_algs(args.alg)
     except ValueError as exc:
         parser.error(str(exc))
     if args.synthetic:
@@ -1126,6 +1200,7 @@ def main():
             index_dtypes=index_dtypes,
             block_dims=block_dims,
             ops=ops,
+            algs=algs,
             warmup=args.warmup,
             iters=args.iters,
             timing=args.timing,
@@ -1151,6 +1226,7 @@ def main():
             index_dtypes=index_dtypes,
             block_dims=block_dims,
             ops=ops,
+            algs=algs,
             warmup=args.warmup,
             iters=args.iters,
             timing=args.timing,
@@ -1168,6 +1244,7 @@ def main():
         index_dtypes=index_dtypes,
         block_dims=block_dims,
         ops=ops,
+        algs=algs,
         warmup=args.warmup,
         iters=args.iters,
         timing=args.timing,

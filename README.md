@@ -78,8 +78,9 @@ python tests/test_spmv_opt.py <dir/> --csv out.csv
 
 ```bash
 python tests/test_spmv_bsr.py --synthetic --ops non,trans,conj
-python tests/test_spmv_bsr.py <dir/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj
+python tests/test_spmv_bsr.py <dir/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj --alg compare
 # correctness uses BSR-expanded COO as the exact reference; PyTorch BSR is a baseline only.
+# --alg blockrow_reduce runs the non-only block-row tile reduction path; compare keeps trans/conj on base.
 ```
 
 **test_spmm.py** - CSR SpMM (`.mtx` batch, synthetic, or `--csv`):

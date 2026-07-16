@@ -185,6 +185,8 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{csv}",
         "--ops",
         "non,trans,conj",
+        "--alg",
+        "compare",
         "--warmup",
         "{warmup}",
         "--iters",
