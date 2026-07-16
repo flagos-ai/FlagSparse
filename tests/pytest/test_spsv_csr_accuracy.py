@@ -306,7 +306,7 @@ def test_spsv_csr_unit_transpose_family_supported_combos(
 
 
 @pytest.mark.spsv
-def test_spsv_csr_complex_non_trans_defaults_to_cw_route():
+def test_spsv_csr_complex_non_trans_defaults_to_smblk_route():
     device = torch.device("cuda")
     n = SPSV_N[0]
     dtype = torch.complex64
@@ -321,7 +321,7 @@ def test_spsv_csr_complex_non_trans_defaults_to_cw_route():
         data, indices, indptr, b, (n, n), True, False, False
     )
     selected = fs_spsv_impl._select_spsv_runtime_plan(solve_plan, trans_mode)
-    assert selected["solve_kind"] == "csr_cw"
+    assert selected["solve_kind"] == "csr_smblk"
 
 
 @pytest.mark.spsv
@@ -393,7 +393,7 @@ def test_spsv_auto_route_promotes_dense_real_lower_to_nnz_balance():
         unit_diagonal=False,
         value_dtype=torch.float64,
     )
-    assert route == "csr_nnz_balance"
+    assert route == "csr_smblk"
 
 
 @pytest.mark.spsv
@@ -526,7 +526,7 @@ def test_spsv_auto_route_promotes_wide_frontier_real_lower_to_levelschd():
         unit_diagonal=False,
         value_dtype=torch.float32,
     )
-    assert route == "csr_cw_levelschd"
+    assert route == "csr_smblk"
 
 
 @pytest.mark.spsv

@@ -436,6 +436,9 @@ def collect_env_info(project_root: Path) -> dict[str, object]:
             "torch": _module_version("torch"),
             "triton": _module_version("triton"),
             "flagsparse": _module_version("flagsparse"),
+            # FlagTree ships the ``triton`` module, so its own version only lives
+            # in the ``flagtree`` distribution metadata (no importable module).
+            "flagtree": _module_version("flagtree"),
         },
         "git": {
             "commit": _capture_text(["git", "rev-parse", "HEAD"], cwd=project_root),
@@ -497,11 +500,13 @@ def _flag_gems_env_info(env_info: dict[str, object]) -> dict[str, object]:
     torch_package = packages.get("torch")
     triton_package = packages.get("triton")
     flagsparse_package = packages.get("flagsparse")
+    flagtree_package = packages.get("flagtree")
     torch_package = torch_package if isinstance(torch_package, dict) else {}
     triton_package = triton_package if isinstance(triton_package, dict) else {}
     flagsparse_package = (
         flagsparse_package if isinstance(flagsparse_package, dict) else {}
     )
+    flagtree_package = flagtree_package if isinstance(flagtree_package, dict) else {}
 
     devices = cuda.get("devices")
     devices = devices if isinstance(devices, list) else []
@@ -529,8 +534,13 @@ def _flag_gems_env_info(env_info: dict[str, object]) -> dict[str, object]:
             "device_name": str(first_device.get("name") or ""),
             "device_count": int(cuda.get("device_count") or 0),
         },
-        # The reference FlagGems summary reserves this field but emits null.
-        "flagtree": None,
+        # FlagTree distribution version (reserved as null by the reference
+        # FlagGems summary); emit the real version when the package is present.
+        "flagtree": (
+            str(flagtree_package.get("version"))
+            if flagtree_package.get("version")
+            else None
+        ),
         "triton": {
             "version": str(triton_package.get("version") or ""),
             "has_config": triton_has_config,

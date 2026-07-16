@@ -117,6 +117,13 @@ def _prepare_spsm_coo_inputs(data, row, col, B, shape, opA, opB, major):
 
 
 def _complex_interleaved_view(tensor):
+    # Tensor.values() of a sparse CSR matrix is a strided *view* whose base is the
+    # sparse tensor; torch.view_as_real can't derive strides through a sparse base
+    # (it raises "Sparse CSR tensors do not have strides"), and .contiguous()
+    # returns the same view when already contiguous. Materialize an owned copy.
+    base = tensor._base
+    if base is not None and base.layout != torch.strided:
+        tensor = tensor.clone()
     return torch.view_as_real(tensor.contiguous()).reshape(-1).contiguous()
 
 
