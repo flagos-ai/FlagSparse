@@ -51,6 +51,8 @@ def test_operator_registry_interfaces_are_public_exports():
         "public-api",
         "csr",
         "coo",
+        "csc",
+        "bsr",
         "sell",
         "optimized",
         "alpha-sparse",
