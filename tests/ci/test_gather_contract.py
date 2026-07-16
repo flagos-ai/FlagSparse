@@ -5,7 +5,9 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-BENCHMARKS_PATH = PROJECT_ROOT / "src" / "flagsparse" / "sparse_operations" / "benchmarks.py"
+BENCHMARKS_PATH = (
+    PROJECT_ROOT / "src" / "flagsparse" / "sparse_operations" / "benchmarks.py"
+)
 GATHER_TEST_PATH = PROJECT_ROOT / "tests" / "test_gather.py"
 
 
