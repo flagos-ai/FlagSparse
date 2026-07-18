@@ -37,7 +37,12 @@ def _registered_interfaces(text):
 
 def test_operator_registry_uses_flagext_style_shape():
     text = _registry_text()
-    assert text.startswith("ops:\n")
+    # Strip copyright/comment lines and leading blanks before checking
+    lines = [line for line in text.splitlines() if not line.startswith("#")]
+    while lines and lines[0] == "":
+        lines.pop(0)
+    cleaned = chr(10).join(lines)
+    assert cleaned.startswith("ops:\n")
     for snippet in [
         "description: |",
         "for:",
