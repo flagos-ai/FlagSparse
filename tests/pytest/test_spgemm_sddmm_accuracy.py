@@ -27,7 +27,6 @@ from tests.pytest.param_shapes import (
     SPGEMM_MNK_SHAPES,
 )
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 _SYNTHETIC_VALUE_SCALE = 0.125

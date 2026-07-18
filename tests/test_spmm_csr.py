@@ -43,7 +43,6 @@ from test_spmm import (
     load_mtx_to_csr_torch,
 )
 
-
 DTYPE_MAP = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
@@ -168,7 +167,16 @@ def _normalize_layout_name(layout):
     token = str(layout).strip().lower()
     if token in ("row", "row_major", "row-major", "c", "c_order"):
         return "row"
-    if token in ("col", "column", "col_major", "column_major", "col-major", "column-major", "f", "fortran"):
+    if token in (
+        "col",
+        "column",
+        "col_major",
+        "column_major",
+        "col-major",
+        "column-major",
+        "f",
+        "fortran",
+    ):
         return "col"
     raise ValueError("layout must be one of: row, col, all")
 
@@ -315,7 +323,9 @@ def _cupy_event_benchmark(op, warmup, iters):
     return out, cp.cuda.get_elapsed_time(start, end) / max(1, int(iters))
 
 
-def _time_route(prepared, B, alg, warmup, iters, timing=False, diagnose=False, layout="row"):
+def _time_route(
+    prepared, B, alg, warmup, iters, timing=False, diagnose=False, layout="row"
+):
     out, gpu_ms = _cuda_event_benchmark(
         lambda: fs.flagsparse_spmm_csr_run(prepared, B, alg=alg, dense_layout=layout),
         warmup,
@@ -415,7 +425,9 @@ def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters, layout="r
         return None, None, f"CuPy/cuSPARSE unavailable: {exc}"
     try:
         data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-        indices_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
+        indices_cp = cp.from_dlpack(
+            torch.utils.dlpack.to_dlpack(indices.to(torch.int64))
+        )
         indptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
         B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
         A = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
@@ -452,7 +464,9 @@ def run_one_case(
     diagnose,
 ):
     device = torch.device("cuda")
-    data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
+    data, indices, indptr, shape = load_mtx_to_csr_torch(
+        path, dtype=dtype, device=device
+    )
     indices = indices.to(index_dtype)
     indptr = indptr.to(index_dtype)
     n_rows, n_cols = shape
@@ -462,7 +476,9 @@ def run_one_case(
         layout,
     )
     b_stride = _stride_string(B)
-    ref, torch_op, _torch_format = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
+    ref, torch_op, _torch_format = _build_pytorch_reference(
+        data, indices, indptr, shape, B, op=op
+    )
     _torch_out, torch_ms = _cuda_event_benchmark(torch_op, warmup, iters)
     cusparse_out = None
     cusparse_ms = None
@@ -474,7 +490,9 @@ def run_one_case(
 
     rows = []
     diag_rows = []
-    prepared = fs.prepare_spmm_csr_route(data, indices, indptr, shape, op=op, alg="auto")
+    prepared = fs.prepare_spmm_csr_route(
+        data, indices, indptr, shape, op=op, alg="auto"
+    )
     for alg in _expand_algs(alg_names, op, dtype):
         try:
             resolved = fs.resolve_spmm_csr_algorithm(alg, op, dtype)
@@ -585,7 +603,13 @@ def _best_rows(rows):
     for row in rows:
         if row.get("status") != "PASS" or row.get("ms") is None:
             continue
-        key = (row["matrix"], row["dtype"], row["index_dtype"], row["op"], row["layout"])
+        key = (
+            row["matrix"],
+            row["dtype"],
+            row["index_dtype"],
+            row["op"],
+            row["layout"],
+        )
         groups.setdefault(key, []).append(row)
     best = []
     for (matrix, dtype, index_dtype, op, layout), group in sorted(groups.items()):
@@ -625,9 +649,13 @@ def _print_row(row):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AlphaSparse-style CSR SpMM route benchmark.")
+    parser = argparse.ArgumentParser(
+        description="AlphaSparse-style CSR SpMM route benchmark."
+    )
     parser.add_argument("input", nargs="+", help=".mtx file(s) or directories")
-    parser.add_argument("--alg", default="auto", help="auto, all, or comma-separated algorithms")
+    parser.add_argument(
+        "--alg", default="auto", help="auto, all, or comma-separated algorithms"
+    )
     parser.add_argument(
         "--dtype",
         default=",".join(DEFAULT_RUN_DTYPE_NAMES),
@@ -636,7 +664,9 @@ def main():
             "all runs float32,float64,complex64,complex128; float16/bfloat16 are opt-in."
         ),
     )
-    parser.add_argument("--op", default="all", help="all or comma-separated ops: non,trans,conj")
+    parser.add_argument(
+        "--op", default="all", help="all or comma-separated ops: non,trans,conj"
+    )
     parser.add_argument("--index-dtype", default="all", help="int32, int64, or all")
     parser.add_argument("--layout", default="row", help="row, col, or all")
     parser.add_argument("--dense-cols", type=int, default=32)
@@ -644,9 +674,15 @@ def main():
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", default=None, help="Performance CSV path")
-    parser.add_argument("--no-cusparse", action="store_true", help="Disable cuSPARSE reference")
-    parser.add_argument("--timing", action="store_true", help="Add process_gpu_ms/compute_ms columns")
-    parser.add_argument("--diagnose", action="store_true", help="Write separate diagnose metadata CSV")
+    parser.add_argument(
+        "--no-cusparse", action="store_true", help="Disable cuSPARSE reference"
+    )
+    parser.add_argument(
+        "--timing", action="store_true", help="Add process_gpu_ms/compute_ms columns"
+    )
+    parser.add_argument(
+        "--diagnose", action="store_true", help="Write separate diagnose metadata CSV"
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():

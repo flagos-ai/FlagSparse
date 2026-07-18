@@ -30,7 +30,6 @@ from tests.pytest.param_shapes import (
     SPMV_MN_SHAPES,
 )
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
@@ -99,13 +98,17 @@ def _apply_dense_op(dense, op):
 def _assert_close(actual, expected, dtype):
     rtol, atol = _tol(dtype)
     ref_dtype = _reference_dtype(dtype)
-    assert torch.allclose(actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(
+        actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol
+    )
 
 
 @pytest.mark.spmv_coo
 @pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
 @pytest.mark.parametrize("dtype", SPMV_COO_DTYPES, ids=SPMV_COO_DTYPE_IDS)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op):
     device = torch.device("cuda")

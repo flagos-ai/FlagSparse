@@ -85,7 +85,9 @@ def _reference_max_relative_error(answer, result):
         return 0.0
     diff = torch.abs(answer - result)
     result_cmp = torch.abs(answer)
-    if not bool(torch.isfinite(diff).all().item()) or not bool(torch.isfinite(result_cmp).all().item()):
+    if not bool(torch.isfinite(diff).all().item()) or not bool(
+        torch.isfinite(result_cmp).all().item()
+    ):
         return float("inf")
     max_error = torch.max(diff)
     max_result = torch.max(result_cmp)
@@ -190,7 +192,9 @@ def _build_triangular_case(n=512, n_rhs=1024, value_dtype=torch.float32):
     device = torch.device("cuda")
     A = torch.tril(torch.randn((n, n), dtype=value_dtype, device=device) * 0.02)
     diag_base_dtype = torch.float32 if value_dtype == torch.complex64 else torch.float64
-    diag = (torch.rand((n,), dtype=diag_base_dtype, device=device) + 2.0).to(value_dtype)
+    diag = (torch.rand((n,), dtype=diag_base_dtype, device=device) + 2.0).to(
+        value_dtype
+    )
     A = A + torch.diag(diag)
     coo = A.to_sparse().coalesce()
     row = coo.indices()[0].to(torch.int64)
@@ -256,9 +260,7 @@ def _stabilize_lower_triangular_csr(data, indices, indptr, shape):
         if data.dtype in (torch.float32, torch.complex64)
         else torch.float64
     )
-    offdiag_abs_sum = torch.zeros(
-        n_rows, dtype=real_dtype, device=data.device
-    )
+    offdiag_abs_sum = torch.zeros(n_rows, dtype=real_dtype, device=data.device)
     if bool(torch.any(offdiag_mask).item()):
         offdiag_abs_sum.index_add_(
             0,
@@ -274,9 +276,9 @@ def _stabilize_lower_triangular_csr(data, indices, indptr, shape):
         data_stable[diag_mask] = stable_diag[diag_rows]
         diag_present[diag_rows] = True
 
-    missing_diag = torch.nonzero(
-        ~diag_present, as_tuple=False
-    ).reshape(-1).to(torch.int64)
+    missing_diag = (
+        torch.nonzero(~diag_present, as_tuple=False).reshape(-1).to(torch.int64)
+    )
     if missing_diag.numel() > 0:
         row = torch.cat((row, missing_diag))
         col = torch.cat((col, missing_diag))
@@ -287,9 +289,7 @@ def _stabilize_lower_triangular_csr(data, indices, indptr, shape):
     col = col[order]
     data_stable = data_stable[order]
     counts = torch.bincount(row, minlength=n_rows)
-    indptr_stable = torch.zeros(
-        n_rows + 1, dtype=torch.int64, device=data.device
-    )
+    indptr_stable = torch.zeros(n_rows + 1, dtype=torch.int64, device=data.device)
     indptr_stable[1:] = torch.cumsum(counts, dim=0)
     return data_stable, col.to(torch.int64), indptr_stable
 
@@ -381,23 +381,49 @@ def _configure_cusparse_spsm_api(lib):
     lib.cusparseSetStream.argtypes = [void_p, void_p]
     lib.cusparseSetStream.restype = cint
     lib.cusparseCreateCsr.argtypes = [
-        void_pp, int64, int64, int64, void_p, void_p, void_p,
-        cint, cint, cint, cint,
+        void_pp,
+        int64,
+        int64,
+        int64,
+        void_p,
+        void_p,
+        void_p,
+        cint,
+        cint,
+        cint,
+        cint,
     ]
     lib.cusparseCreateCsr.restype = cint
     lib.cusparseCreateCoo.argtypes = [
-        void_pp, int64, int64, int64, void_p, void_p, void_p,
-        cint, cint, cint,
+        void_pp,
+        int64,
+        int64,
+        int64,
+        void_p,
+        void_p,
+        void_p,
+        cint,
+        cint,
+        cint,
     ]
     lib.cusparseCreateCoo.restype = cint
     lib.cusparseDestroySpMat.argtypes = [void_p]
     lib.cusparseDestroySpMat.restype = cint
     lib.cusparseSpMatSetAttribute.argtypes = [
-        void_p, cint, void_p, ctypes.c_size_t,
+        void_p,
+        cint,
+        void_p,
+        ctypes.c_size_t,
     ]
     lib.cusparseSpMatSetAttribute.restype = cint
     lib.cusparseCreateDnMat.argtypes = [
-        void_pp, int64, int64, int64, void_p, cint, cint,
+        void_pp,
+        int64,
+        int64,
+        int64,
+        void_p,
+        cint,
+        cint,
     ]
     lib.cusparseCreateDnMat.restype = cint
     lib.cusparseDestroyDnMat.argtypes = [void_p]
@@ -407,18 +433,44 @@ def _configure_cusparse_spsm_api(lib):
     lib.cusparseSpSM_destroyDescr.argtypes = [void_p]
     lib.cusparseSpSM_destroyDescr.restype = cint
     lib.cusparseSpSM_bufferSize.argtypes = [
-        void_p, cint, cint, void_p, void_p, void_p, void_p,
-        cint, cint, void_p, ctypes.POINTER(ctypes.c_size_t),
+        void_p,
+        cint,
+        cint,
+        void_p,
+        void_p,
+        void_p,
+        void_p,
+        cint,
+        cint,
+        void_p,
+        ctypes.POINTER(ctypes.c_size_t),
     ]
     lib.cusparseSpSM_bufferSize.restype = cint
     lib.cusparseSpSM_analysis.argtypes = [
-        void_p, cint, cint, void_p, void_p, void_p, void_p,
-        cint, cint, void_p, void_p,
+        void_p,
+        cint,
+        cint,
+        void_p,
+        void_p,
+        void_p,
+        void_p,
+        cint,
+        cint,
+        void_p,
+        void_p,
     ]
     lib.cusparseSpSM_analysis.restype = cint
     lib.cusparseSpSM_solve.argtypes = [
-        void_p, cint, cint, void_p, void_p, void_p, void_p,
-        cint, cint, void_p,
+        void_p,
+        cint,
+        cint,
+        void_p,
+        void_p,
+        void_p,
+        void_p,
+        cint,
+        cint,
+        void_p,
     ]
     lib.cusparseSpSM_solve.restype = cint
 
@@ -444,9 +496,8 @@ def _load_cusparse_spsm_library():
             return lib
         except Exception as exc:
             load_error = exc
-    _CUSPARSE_LIB_LOAD_ERROR = (
-        "Failed to load native cuSPARSE SpSM API"
-        + (f": {load_error}" if load_error is not None else "")
+    _CUSPARSE_LIB_LOAD_ERROR = "Failed to load native cuSPARSE SpSM API" + (
+        f": {load_error}" if load_error is not None else ""
     )
     raise RuntimeError(_CUSPARSE_LIB_LOAD_ERROR)
 
@@ -759,9 +810,7 @@ def _normalized_solution_residual(data, indices, indptr, shape, X, B):
         else torch.float64
     )
     data_check = data.to(check_dtype)
-    row_abs_sum = torch.zeros(
-        n_rows, dtype=torch.float64, device=data.device
-    )
+    row_abs_sum = torch.zeros(n_rows, dtype=torch.float64, device=data.device)
     row_abs_sum.index_add_(0, row, torch.abs(data_check).to(torch.float64))
     a_norm = torch.max(row_abs_sum)
 
@@ -773,13 +822,11 @@ def _normalized_solution_residual(data, indices, indptr, shape, X, B):
         end = min(start + rhs_chunk, int(B.shape[1]))
         X_chunk = X[:, start:end].to(check_dtype)
         B_chunk = B[:, start:end].to(check_dtype)
-        B_recon = torch.zeros(
-            (n_rows, end - start), dtype=check_dtype, device=X.device
-        )
+        B_recon = torch.zeros((n_rows, end - start), dtype=check_dtype, device=X.device)
         B_recon.index_add_(0, row, data_check[:, None] * X_chunk[col])
-        residual_row_sum += torch.sum(
-            torch.abs(B_recon - B_chunk), dim=1
-        ).to(torch.float64)
+        residual_row_sum += torch.sum(torch.abs(B_recon - B_chunk), dim=1).to(
+            torch.float64
+        )
         x_row_sum += torch.sum(torch.abs(X_chunk), dim=1).to(torch.float64)
         b_row_sum += torch.sum(torch.abs(B_chunk), dim=1).to(torch.float64)
 
@@ -820,20 +867,27 @@ def _benchmark_flagsparse_spsm_csr_total(data, indices, indptr, B, shape):
         data.numel(), B.shape[1], data.dtype, fmt="csr"
     )
     analyze_call = lambda: fs_spsm_impl._analyze_spsm_csr(
-        data, indices, indptr, B, shape,
-        lower=True, unit_diagonal=False, clear_cache=False, return_time=False,
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        lower=True,
+        unit_diagonal=False,
+        clear_cache=False,
+        return_time=False,
     )
     solve_call = lambda: fs.flagsparse_spsm_csr(
-            data,
-            indices,
-            indptr,
-            B,
-            shape,
-            lower=True,
-            unit_diagonal=False,
-            opA="NON_TRANS",
-            opB="NON_TRANS",
-            major="row",
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        lower=True,
+        unit_diagonal=False,
+        opA="NON_TRANS",
+        opB="NON_TRANS",
+        major="row",
     )
     return _benchmark_flagsparse_full_round(
         fs_spsm_impl._clear_spsm_preprocess_cache,
@@ -849,20 +903,27 @@ def _benchmark_flagsparse_spsm_coo_total(data, row, col, B, shape):
         data.numel(), B.shape[1], data.dtype, fmt="coo"
     )
     analyze_call = lambda: fs_spsm_impl._analyze_spsm_coo(
-        data, row, col, B, shape,
-        lower=True, unit_diagonal=False, clear_cache=False, return_time=False,
+        data,
+        row,
+        col,
+        B,
+        shape,
+        lower=True,
+        unit_diagonal=False,
+        clear_cache=False,
+        return_time=False,
     )
     solve_call = lambda: fs.flagsparse_spsm_coo(
-            data,
-            row,
-            col,
-            B,
-            shape,
-            lower=True,
-            unit_diagonal=False,
-            opA="NON_TRANS",
-            opB="NON_TRANS",
-            major="row",
+        data,
+        row,
+        col,
+        B,
+        shape,
+        lower=True,
+        unit_diagonal=False,
+        opA="NON_TRANS",
+        opB="NON_TRANS",
+        major="row",
     )
     return _benchmark_flagsparse_full_round(
         fs_spsm_impl._clear_spsm_preprocess_cache,
@@ -924,7 +985,9 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
         c = int(parts[1]) - 1
         if mm_field == "complex":
             if len(parts) < 4:
-                raise ValueError("MatrixMarket complex entry requires real and imag parts")
+                raise ValueError(
+                    "MatrixMarket complex entry requires real and imag parts"
+                )
             v = complex(float(parts[2]), float(parts[3]))
         elif len(parts) >= 3:
             v = float(parts[2])
@@ -954,7 +1017,9 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
     return data, indices, indptr, (n_rows, n_cols)
 
 
-def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n_rhs, fmt):
+def _run_one_spsm_case(
+    data, indices, indptr, shape, value_dtype, index_dtype, n_rhs, fmt
+):
     n_rows = int(shape[0])
     B = torch.randn((n_rows, n_rhs), dtype=value_dtype, device=data.device).contiguous()
     data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
@@ -1032,9 +1097,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         "n_rhs": int(n_rhs),
         "FlagSparse_ms": flagsparse_ms,
         "cuSPARSE_ms": cusparse_ms,
-        "FlagSparse_vs_cuSPARSE_speedup": _safe_ratio(
-            cusparse_ms, flagsparse_ms
-        ),
+        "FlagSparse_vs_cuSPARSE_speedup": _safe_ratio(cusparse_ms, flagsparse_ms),
         "status": status,
         "err_ref": err_ref,
         "err_res": err_res,
@@ -1055,9 +1118,7 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
     print("=" * 138)
     print("FLAGSPARSE SpSM synthetic test")
     print("=" * 138)
-    print(
-        "Every timed round performs analysis/preparation + solve."
-    )
+    print("Every timed round performs analysis/preparation + solve.")
     print(
         f"{'Fmt':>5} {'dtype':>9} {'index':>7} {'N':>6} {'RHS':>6} {'NNZ':>10} "
         f"{'FS(ms)':>10} {'CU(ms)':>10} {'FS/CU':>10} "
@@ -1096,7 +1157,9 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
                 )
                 if one["status"] in ("FAIL", "REF_FAIL"):
                     if one["cusparse_reason"]:
-                        print(f"  NOTE: native cuSPARSE unavailable: {one['cusparse_reason']}")
+                        print(
+                            f"  NOTE: native cuSPARSE unavailable: {one['cusparse_reason']}"
+                        )
                     if one["pytorch_reason"]:
                         print(f"  NOTE: {one['pytorch_reason']}")
     print("-" * 138)
@@ -1164,7 +1227,9 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                     )
                     record = {**base, **record}
                     records_out.append(record)
-                    short = base["matrix"][:27] + ("…" if len(base["matrix"]) > 27 else "")
+                    short = base["matrix"][:27] + (
+                        "…" if len(base["matrix"]) > 27 else ""
+                    )
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{record['n_rows']:>7} {record['n_rhs']:>6} {record['nnz']:>10} "
@@ -1190,7 +1255,11 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                             "and rerun the single failing matrix with CUDA_LAUNCH_BLOCKING=1."
                         )
                         raise
-                    status = "SKIP" if "SpSM requires square matrices" in err_msg else "ERROR"
+                    status = (
+                        "SKIP"
+                        if "SpSM requires square matrices" in err_msg
+                        else "ERROR"
+                    )
                     record = {
                         **base,
                         "format": fmt,
@@ -1211,7 +1280,9 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                         "error": err_msg,
                     }
                     records_out.append(record)
-                    short = base["matrix"][:27] + ("…" if len(base["matrix"]) > 27 else "")
+                    short = base["matrix"][:27] + (
+                        "…" if len(base["matrix"]) > 27 else ""
+                    )
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{'ERR':>7} {int(n_rhs):>6} {'ERR':>10} "
@@ -1261,7 +1332,9 @@ def main():
         nargs="*",
         help=".mtx file path(s), or directory(ies) to glob for *.mtx",
     )
-    parser.add_argument("--synthetic", action="store_true", help="Run synthetic triangular tests")
+    parser.add_argument(
+        "--synthetic", action="store_true", help="Run synthetic triangular tests"
+    )
     parser.add_argument("--n", type=int, default=512, help="matrix size (synthetic)")
     parser.add_argument(
         "--rhs",

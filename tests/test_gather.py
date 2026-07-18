@@ -19,7 +19,6 @@ import os
 import sys
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if SRC_ROOT.is_dir():
@@ -28,7 +27,6 @@ if SRC_ROOT.is_dir():
 import torch
 
 import flagsparse as ast
-
 
 DEFAULT_CASES = [
     (32_768, 1_024),
@@ -289,7 +287,9 @@ def run_cli(args):
                         "value_dtype_compute": str(params.get("value_dtype")).replace(
                             "torch.", ""
                         ),
-                        "index_dtype": str(params.get("index_dtype")).replace("torch.", ""),
+                        "index_dtype": str(params.get("index_dtype")).replace(
+                            "torch.", ""
+                        ),
                         "dense_size": int(params.get("dense_size")),
                         "nnz": int(params.get("nnz")),
                         "mode": "gather_triton",
@@ -298,15 +298,21 @@ def run_cli(args):
                         "triton_ms": perf.get("triton_ms"),
                         "pytorch_ms": perf.get("pytorch_ms"),
                         "cusparse_ms": perf.get("cusparse_ms"),
-                        "triton_speedup_vs_pytorch": perf.get("triton_speedup_vs_pytorch"),
-                        "triton_speedup_vs_cusparse": perf.get("triton_speedup_vs_cusparse"),
+                        "triton_speedup_vs_pytorch": perf.get(
+                            "triton_speedup_vs_pytorch"
+                        ),
+                        "triton_speedup_vs_cusparse": perf.get(
+                            "triton_speedup_vs_cusparse"
+                        ),
                         "kernel_timing_method": timing_method,
                         "kernel_graph_batch": graph_batch,
                         "triton_match_pytorch": verify.get("triton_match_pytorch"),
                         "cusparse_match_pytorch": verify.get("cusparse_match_pytorch"),
                         "triton_max_error": verify.get("triton_max_error"),
                         "cusparse_max_error": verify.get("cusparse_max_error"),
-                        "cusparse_unavailable_reason": backend.get("cusparse_unavailable_reason"),
+                        "cusparse_unavailable_reason": backend.get(
+                            "cusparse_unavailable_reason"
+                        ),
                         "index_fallback_reason": None,
                         "status": status,
                     }
@@ -418,7 +424,9 @@ def build_parser():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--no-cusparse", action="store_true")
-    parser.add_argument("--index-fallback-policy", choices=["auto", "strict"], default="auto")
+    parser.add_argument(
+        "--index-fallback-policy", choices=["auto", "strict"], default="auto"
+    )
     parser.add_argument("--csv-summary", default=None)
     parser.add_argument("--csv-samples", default=None)
     parser.add_argument("--sample-limit", type=int, default=32)

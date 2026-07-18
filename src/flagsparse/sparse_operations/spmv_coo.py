@@ -29,7 +29,6 @@ import time
 import triton
 import triton.language as tl
 
-
 SUPPORTED_SPMV_COO_VALUE_DTYPES = (
     torch.float32,
     torch.float64,
@@ -373,7 +372,11 @@ def _sort_coo_lex_inplace(data, row, col, n_cols):
     col64 = col.to(torch.int64)
     index_dtype = torch.promote_types(row.dtype, col.dtype)
     if data.numel() == 0:
-        return data.contiguous(), row.to(index_dtype).contiguous(), col.to(index_dtype).contiguous()
+        return (
+            data.contiguous(),
+            row.to(index_dtype).contiguous(),
+            col.to(index_dtype).contiguous(),
+        )
     key = row64 * max(1, int(n_cols)) + col64
     order = torch.argsort(key)
     return (
@@ -578,17 +581,13 @@ def _validate_x_coo(x, prepared):
     if x.dtype != prepared.data.dtype:
         raise TypeError("x dtype must match sparse matrix dtype")
     if x.numel() != prepared.n_cols:
-        raise ValueError(
-            f"x length must be n_cols={prepared.n_cols}, got {x.numel()}"
-        )
+        raise ValueError(f"x length must be n_cols={prepared.n_cols}, got {x.numel()}")
     if x.device != prepared.data.device:
         raise ValueError("x must be on the same device as sparse matrix data")
     return x.contiguous()
 
 
-def _triton_spmv_coo_kernel(
-    prepared, x, block_size, num_warps, block_inner
-):
+def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
     dtype = prepared.data.dtype
     y = torch.zeros(prepared.n_rows, dtype=dtype, device=prepared.data.device)
     nnz = prepared.nnz
@@ -663,8 +662,7 @@ def _spmv_coo_uses_int64_indices(prepared):
         prepared.row.dtype == torch.int64
         or prepared.col.dtype == torch.int64
         or (
-            prepared.seg_starts is not None
-            and prepared.seg_starts.dtype == torch.int64
+            prepared.seg_starts is not None and prepared.seg_starts.dtype == torch.int64
         )
     )
 
@@ -712,7 +710,9 @@ def _spmv_coo_prepared_with_int32_indices(prepared, reason):
     )
 
 
-def _run_spmv_coo_prepared_with_fallback(prepared, x, block_size, num_warps, block_inner):
+def _run_spmv_coo_prepared_with_fallback(
+    prepared, x, block_size, num_warps, block_inner
+):
     try:
         return _triton_spmv_coo_kernel(
             prepared,
@@ -762,13 +762,15 @@ def flagsparse_spmv_coo(
     transpose_flag = False if transpose is None else bool(transpose)
     op_explicit = op is not None
     op_code = _normalize_spmv_coo_op(op, transpose=transpose_flag)
-    if op_explicit and transpose is not None and bool(transpose) != _spmv_coo_op_transposes(op_code):
+    if (
+        op_explicit
+        and transpose is not None
+        and bool(transpose) != _spmv_coo_op_transposes(op_code)
+    ):
         raise ValueError("transpose conflicts with op")
     if prepared is None:
         if any(a is None for a in (data, row, col, x, shape)):
-            raise ValueError(
-                "data, row, col, x, shape required when prepared is None"
-            )
+            raise ValueError("data, row, col, x, shape required when prepared is None")
         prepared = prepare_spmv_coo(
             data,
             row,

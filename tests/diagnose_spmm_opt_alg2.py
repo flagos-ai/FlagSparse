@@ -42,7 +42,6 @@ from test_spmm_opt_alg2 import (
     run_one_case,
 )
 
-
 BUCKET_FIELDS = [
     "matrix",
     "bucket_label",
@@ -92,7 +91,9 @@ def _write_csv(path, rows, fieldnames):
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+            writer.writerow(
+                {key: ("" if value is None else value) for key, value in row.items()}
+            )
 
 
 def _fmt_speed(value):
@@ -113,7 +114,9 @@ def _build_bucket_rows(matrix_name, prepared, meta):
         bucket_rows = bucket["rows"].to(torch.int64)
         if bucket_rows.numel() == 0:
             continue
-        row_nnz = prepared.row_lengths.index_select(0, bucket_rows.to(prepared.row_lengths.device)).to(torch.float64)
+        row_nnz = prepared.row_lengths.index_select(
+            0, bucket_rows.to(prepared.row_lengths.device)
+        ).to(torch.float64)
         rows.append(
             {
                 "matrix": matrix_name,
@@ -176,11 +179,21 @@ def _build_worst_rows(matrix_name, prepared, profiles, top_rows):
                 "row": row_id,
                 "row_nnz": int(row_lengths[row_id].item()),
                 "bucket_label": label_map.get(row_id, "unassigned"),
-                "opt_vs_torch_row_err": float(opt_vs_torch[row_id].item()) if opt_vs_torch is not None else None,
-                "opt_vs_cusparse_row_err": float(opt_vs_cusparse[row_id].item()) if opt_vs_cusparse is not None else None,
+                "opt_vs_torch_row_err": (
+                    float(opt_vs_torch[row_id].item())
+                    if opt_vs_torch is not None
+                    else None
+                ),
+                "opt_vs_cusparse_row_err": (
+                    float(opt_vs_cusparse[row_id].item())
+                    if opt_vs_cusparse is not None
+                    else None
+                ),
                 "opt_alg2_vs_torch_row_err": float(alg2_vs_torch[row_id].item()),
                 "opt_alg2_vs_cusparse_row_err": (
-                    float(alg2_vs_cusparse[row_id].item()) if alg2_vs_cusparse is not None else None
+                    float(alg2_vs_cusparse[row_id].item())
+                    if alg2_vs_cusparse is not None
+                    else None
                 ),
             }
         )
@@ -203,7 +216,9 @@ def _run_diagnose_for_dtype(args, paths, dtype_name, with_cusparse):
     launch_rows = []
     worst_rows = []
     for path in paths:
-        data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
+        data, indices, indptr, shape = load_mtx_to_csr_torch(
+            path, dtype=dtype, device=device
+        )
         indices = indices.to(index_dtype)
         result = run_one_case(
             os.path.basename(path),
@@ -222,9 +237,21 @@ def _run_diagnose_for_dtype(args, paths, dtype_name, with_cusparse):
         )
         matrix_name = result["summary"]["matrix"]
         summary_rows.append(result["summary"])
-        bucket_rows.extend(_build_bucket_rows(matrix_name, result["prepared_alg2"], result["alg2_meta"]))
-        launch_rows.extend(_build_launch_rows(matrix_name, dtype_name, args.dense_cols, result["alg2_meta"]))
-        worst_rows.extend(_build_worst_rows(matrix_name, result["prepared_alg2"], result["profiles"], args.top_rows))
+        bucket_rows.extend(
+            _build_bucket_rows(
+                matrix_name, result["prepared_alg2"], result["alg2_meta"]
+            )
+        )
+        launch_rows.extend(
+            _build_launch_rows(
+                matrix_name, dtype_name, args.dense_cols, result["alg2_meta"]
+            )
+        )
+        worst_rows.extend(
+            _build_worst_rows(
+                matrix_name, result["prepared_alg2"], result["profiles"], args.top_rows
+            )
+        )
         print(
             f"[{suffix}] "
             f"{matrix_name}: matrix_status={result['summary']['matrix_status']}  "
@@ -242,25 +269,43 @@ def _run_diagnose_for_dtype(args, paths, dtype_name, with_cusparse):
             f"opt_alg2_vs_torch_err={result['summary']['opt_alg2_vs_torch_err']}"
         )
 
-    _write_csv(os.path.join(out_dir, f"summary_{suffix}.csv"), summary_rows, SUMMARY_FIELDS)
-    _write_csv(os.path.join(out_dir, f"bucket_stats_{suffix}.csv"), bucket_rows, BUCKET_FIELDS)
-    _write_csv(os.path.join(out_dir, f"launch_stats_{suffix}.csv"), launch_rows, LAUNCH_FIELDS)
-    _write_csv(os.path.join(out_dir, f"worst_rows_{suffix}.csv"), worst_rows, WORST_ROW_FIELDS)
+    _write_csv(
+        os.path.join(out_dir, f"summary_{suffix}.csv"), summary_rows, SUMMARY_FIELDS
+    )
+    _write_csv(
+        os.path.join(out_dir, f"bucket_stats_{suffix}.csv"), bucket_rows, BUCKET_FIELDS
+    )
+    _write_csv(
+        os.path.join(out_dir, f"launch_stats_{suffix}.csv"), launch_rows, LAUNCH_FIELDS
+    )
+    _write_csv(
+        os.path.join(out_dir, f"worst_rows_{suffix}.csv"), worst_rows, WORST_ROW_FIELDS
+    )
     print(f"Wrote {dtype_name} diagnostics to {os.path.abspath(out_dir)}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Diagnose CSR SpMM opt_alg2 with protected comparisons.")
+    parser = argparse.ArgumentParser(
+        description="Diagnose CSR SpMM opt_alg2 with protected comparisons."
+    )
     parser.add_argument("input_path", help=".mtx file or directory")
-    parser.add_argument("--out-dir", required=True, help="Base directory name for dtype-suffixed diagnostics")
+    parser.add_argument(
+        "--out-dir",
+        required=True,
+        help="Base directory name for dtype-suffixed diagnostics",
+    )
     parser.add_argument("--dtype", default="all", choices=["all", "float32", "float64"])
     parser.add_argument("--dense-cols", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no-cusparse", action="store_true", help="Disable cuSPARSE reference timing")
+    parser.add_argument(
+        "--no-cusparse", action="store_true", help="Disable cuSPARSE reference timing"
+    )
     parser.add_argument("--with-cusparse", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--top-rows", type=int, default=512, help="Top rows by opt_alg2_vs_torch error")
+    parser.add_argument(
+        "--top-rows", type=int, default=512, help="Top rows by opt_alg2_vs_torch error"
+    )
     args = parser.parse_args()
 
     paths = _resolve_input_paths([args.input_path])

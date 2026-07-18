@@ -77,6 +77,7 @@ __all__ = (
     "tl",
 )
 
+
 def _is_complex_dtype(value_dtype):
     return value_dtype in (torch.complex64, torch.complex128)
 
@@ -260,14 +261,21 @@ def _prepare_inputs(dense_vector, indices):
 
 
 def _prepare_scatter_inputs(
-    sparse_values, indices, dense_size=None, out=None, dtype_policy="auto", return_metadata=False
+    sparse_values,
+    indices,
+    dense_size=None,
+    out=None,
+    dtype_policy="auto",
+    return_metadata=False,
 ):
     if sparse_values.ndim != 1:
         raise ValueError("sparse_values must be a 1D tensor")
     if indices.ndim != 1:
         raise ValueError("indices must be a 1D tensor")
     if sparse_values.numel() != indices.numel():
-        raise ValueError("sparse_values and indices must have the same number of elements")
+        raise ValueError(
+            "sparse_values and indices must have the same number of elements"
+        )
     if not sparse_values.is_cuda or not indices.is_cuda:
         raise ValueError("sparse_values and indices must both be CUDA tensors")
     if sparse_values.dtype not in SUPPORTED_VALUE_DTYPES:
@@ -278,8 +286,8 @@ def _prepare_scatter_inputs(
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
 
     requested_value_dtype = sparse_values.dtype
-    effective_value_dtype, fallback_applied, fallback_reason = _resolve_scatter_value_dtype(
-        requested_value_dtype, dtype_policy=dtype_policy
+    effective_value_dtype, fallback_applied, fallback_reason = (
+        _resolve_scatter_value_dtype(requested_value_dtype, dtype_policy=dtype_policy)
     )
     if effective_value_dtype != sparse_values.dtype:
         sparse_values = sparse_values.to(effective_value_dtype)

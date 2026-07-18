@@ -23,7 +23,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
-
 DEFAULT_METRICS = ("latency_base", "latency", "speedup")
 
 

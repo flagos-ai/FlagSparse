@@ -41,7 +41,6 @@ from tests.pytest.test_spsv_csr_accuracy import (
     TRANS_CONJ_MODES,
 )
 
-
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.spsv_coo,

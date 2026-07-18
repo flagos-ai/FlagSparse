@@ -1803,9 +1803,11 @@ def _phase_rows(results: list[dict[str, object]]) -> list[dict[str, object]]:
                     "stderr_log_path": phase_result.get("stderr_log_path", ""),
                     "data_path": phase_result.get("data_path", ""),
                     "reason": phase_result.get("reason", ""),
-                    "command": shlex.join(phase_result.get("command", []))
-                    if phase_result.get("command")
-                    else "",
+                    "command": (
+                        shlex.join(phase_result.get("command", []))
+                        if phase_result.get("command")
+                        else ""
+                    ),
                 }
             )
     return rows

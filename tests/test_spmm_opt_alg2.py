@@ -43,7 +43,6 @@ import flagsparse.sparse_operations.spmm_csr_opt_alg2 as spmm_alg2_mod
 
 from test_spmm_opt import _seeded_dense_matrix, load_mtx_to_csr_torch
 
-
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
 WARMUP = 10
@@ -125,8 +124,12 @@ def _error_profile(candidate, reference, dtype):
         }
     atol, rtol = _reference_tolerance(dtype)
     if candidate.numel() == 0:
-        row_max_ratio = torch.zeros((candidate.shape[0],), dtype=torch.float64, device=candidate.device)
-        row_worst_col = torch.zeros((candidate.shape[0],), dtype=torch.int64, device=candidate.device)
+        row_max_ratio = torch.zeros(
+            (candidate.shape[0],), dtype=torch.float64, device=candidate.device
+        )
+        row_worst_col = torch.zeros(
+            (candidate.shape[0],), dtype=torch.int64, device=candidate.device
+        )
         return {
             "global_err": 0.0,
             "status": "PASS",
@@ -137,7 +140,9 @@ def _error_profile(candidate, reference, dtype):
     denom = (atol + rtol * torch.abs(reference)).to(torch.float64)
     ratio = diff / denom
     row_max_ratio, row_worst_col = torch.max(ratio, dim=1)
-    global_err = float(torch.max(row_max_ratio).item()) if row_max_ratio.numel() > 0 else 0.0
+    global_err = (
+        float(torch.max(row_max_ratio).item()) if row_max_ratio.numel() > 0 else 0.0
+    )
     return {
         "global_err": global_err,
         "status": _status_from_error(global_err),
@@ -172,9 +177,7 @@ def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
     preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
 
     def op():
-        out, _ = spmm_csr_mod._triton_spmm_csr_impl_opt_prepared(
-            runtime_prepared, B
-        )
+        out, _ = spmm_csr_mod._triton_spmm_csr_impl_opt_prepared(runtime_prepared, B)
         return out
 
     out = op()
@@ -271,7 +274,9 @@ def _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters
 
 
 def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enabled):
-    backend_name = "hipsparse_ref" if getattr(torch.version, "hip", None) else "cusparse_ref"
+    backend_name = (
+        "hipsparse_ref" if getattr(torch.version, "hip", None) else "cusparse_ref"
+    )
     if not enabled:
         return None, None, backend_name, "disabled"
     try:
@@ -309,7 +314,9 @@ def _benchmark(op, warmup, iters):
     return out, start.elapsed_time(end) / max(1, int(iters))
 
 
-def _build_csr_from_row_lengths(row_lengths, n_cols, dtype, index_dtype, device, pattern="random"):
+def _build_csr_from_row_lengths(
+    row_lengths, n_cols, dtype, index_dtype, device, pattern="random"
+):
     data_parts = []
     col_parts = []
     indptr = [0]
@@ -444,24 +451,40 @@ def run_one_case(
         warmup,
         iters,
     )
-    torch_ref, torch_ms = _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters)
-    cusparse_ref, cusparse_ms, sparse_backend_name, sparse_backend_reason = _timed_sparse_backend(
-        data,
-        indices,
-        indptr,
-        B,
-        shape,
-        warmup,
-        iters,
-        with_cusparse,
+    torch_ref, torch_ms = _timed_torch_reference(
+        data, indices, indptr, B, shape, dtype, warmup, iters
+    )
+    cusparse_ref, cusparse_ms, sparse_backend_name, sparse_backend_reason = (
+        _timed_sparse_backend(
+            data,
+            indices,
+            indptr,
+            B,
+            shape,
+            warmup,
+            iters,
+            with_cusparse,
+        )
     )
 
     base_vs_torch = _error_profile(base_out, torch_ref, dtype)
     opt_vs_torch = _error_profile(opt_out, torch_ref, dtype)
     alg2_vs_torch = _error_profile(alg2_out, torch_ref, dtype)
-    base_vs_cusparse = _error_profile(base_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(base_out, None, dtype)
-    opt_vs_cusparse = _error_profile(opt_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(opt_out, None, dtype)
-    alg2_vs_cusparse = _error_profile(alg2_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(alg2_out, None, dtype)
+    base_vs_cusparse = (
+        _error_profile(base_out, cusparse_ref, dtype)
+        if cusparse_ref is not None
+        else _error_profile(base_out, None, dtype)
+    )
+    opt_vs_cusparse = (
+        _error_profile(opt_out, cusparse_ref, dtype)
+        if cusparse_ref is not None
+        else _error_profile(opt_out, None, dtype)
+    )
+    alg2_vs_cusparse = (
+        _error_profile(alg2_out, cusparse_ref, dtype)
+        if cusparse_ref is not None
+        else _error_profile(alg2_out, None, dtype)
+    )
     row_lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
     max_row_nnz = int(row_lengths.max().item()) if row_lengths.numel() > 0 else 0
 
@@ -489,31 +512,45 @@ def run_one_case(
             base_ms / opt_ms if opt_ms is not None and opt_ms > 0 else None
         ),
         "torch_vs_alg1_speedup": (
-            torch_ms / opt_ms if torch_ms is not None and opt_ms is not None and opt_ms > 0 else None
+            torch_ms / opt_ms
+            if torch_ms is not None and opt_ms is not None and opt_ms > 0
+            else None
         ),
         "cusparse_vs_alg1_speedup": (
-            cusparse_ms / opt_ms if cusparse_ms is not None and opt_ms is not None and opt_ms > 0 else None
+            cusparse_ms / opt_ms
+            if cusparse_ms is not None and opt_ms is not None and opt_ms > 0
+            else None
         ),
         "base_vs_alg2_speedup": (
             base_ms / alg2_ms if alg2_ms is not None and alg2_ms > 0 else None
         ),
         "torch_vs_alg2_speedup": (
-            torch_ms / alg2_ms if torch_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+            torch_ms / alg2_ms
+            if torch_ms is not None and alg2_ms is not None and alg2_ms > 0
+            else None
         ),
         "cusparse_vs_alg2_speedup": (
-            cusparse_ms / alg2_ms if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+            cusparse_ms / alg2_ms
+            if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0
+            else None
         ),
         "alg1_vs_alg2_speedup": (
-            opt_ms / alg2_ms if opt_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+            opt_ms / alg2_ms
+            if opt_ms is not None and alg2_ms is not None and alg2_ms > 0
+            else None
         ),
         "base_vs_opt_alg2_speedup": (
             base_ms / alg2_ms if alg2_ms is not None and alg2_ms > 0 else None
         ),
         "torch_vs_opt_alg2_speedup": (
-            torch_ms / alg2_ms if torch_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+            torch_ms / alg2_ms
+            if torch_ms is not None and alg2_ms is not None and alg2_ms > 0
+            else None
         ),
         "cusparse_vs_opt_alg2_speedup": (
-            cusparse_ms / alg2_ms if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
+            cusparse_ms / alg2_ms
+            if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0
+            else None
         ),
         "base_vs_torch_err": base_vs_torch["global_err"],
         "base_vs_cusparse_err": base_vs_cusparse["global_err"],
@@ -587,12 +624,16 @@ def print_row(row):
     )
 
 
-def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed, with_cusparse):
+def run_batch(
+    paths, dtype, index_dtype, dense_cols, warmup, iters, seed, with_cusparse
+):
     device = torch.device("cuda")
     results = []
     for path in paths:
         try:
-            data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
+            data, indices, indptr, shape = load_mtx_to_csr_torch(
+                path, dtype=dtype, device=device
+            )
             indices = indices.to(index_dtype)
             result = run_one_case(
                 os.path.basename(path),
@@ -617,11 +658,15 @@ def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed, with_c
     return results
 
 
-def run_synthetic(case_names, dtype, index_dtype, dense_cols, warmup, iters, seed, with_cusparse):
+def run_synthetic(
+    case_names, dtype, index_dtype, dense_cols, warmup, iters, seed, with_cusparse
+):
     device = torch.device("cuda")
     results = []
     for case_name in case_names:
-        data, indices, indptr, shape = build_synthetic_case(case_name, dtype, index_dtype, device)
+        data, indices, indptr, shape = build_synthetic_case(
+            case_name, dtype, index_dtype, device
+        )
         result = run_one_case(
             case_name,
             data,
@@ -644,23 +689,40 @@ def run_synthetic(case_names, dtype, index_dtype, dense_cols, warmup, iters, see
 
 def _write_csv(csv_path, rows):
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+        writer = csv.DictWriter(
+            handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore"
+        )
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+            writer.writerow(
+                {key: ("" if value is None else value) for key, value in row.items()}
+            )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Protected CSR SpMM benchmark with alg1 and alg2.")
+    parser = argparse.ArgumentParser(
+        description="Protected CSR SpMM benchmark with alg1 and alg2."
+    )
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
-    parser.add_argument("--synthetic", action="store_true", help="Run built-in synthetic cases")
+    parser.add_argument(
+        "--synthetic", action="store_true", help="Run built-in synthetic cases"
+    )
     parser.add_argument(
         "--synthetic-cases",
         nargs="*",
-        default=["short_uniform", "medium_uniform", "long_uniform", "heavy_tail", "banded_regular", "powerlaw_irregular"],
+        default=[
+            "short_uniform",
+            "medium_uniform",
+            "long_uniform",
+            "heavy_tail",
+            "banded_regular",
+            "powerlaw_irregular",
+        ],
         help="Subset of synthetic cases to run",
     )
-    parser.add_argument("--csv", type=str, default=None, metavar="FILE", help="Export summary CSV")
+    parser.add_argument(
+        "--csv", type=str, default=None, metavar="FILE", help="Export summary CSV"
+    )
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     parser.add_argument("--dense-cols", type=int, default=DEFAULT_DENSE_COLS)
     parser.add_argument("--warmup", type=int, default=WARMUP)
@@ -684,7 +746,9 @@ def main():
         f"{'B/A1':>8} {'B/A2':>8} {'A1/A2':>8} {'T/A2':>8} {'CU/A2':>8}  "
         f"{'Err(A1/T)':>10} {'Err(A1/CU)':>10} {'Err(A2/T)':>10} {'Err(A2/CU)':>10} {'Status':>6}"
     )
-    print("A*Prep columns are CPU wall time; A*Comp columns are CUDA event compute time.")
+    print(
+        "A*Prep columns are CPU wall time; A*Comp columns are CUDA event compute time."
+    )
     print("=" * 220)
 
     rows = []

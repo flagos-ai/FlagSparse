@@ -45,8 +45,18 @@ from .gather_scatter import (
     triton_cusparse_gather,
     triton_cusparse_scatter,
 )
-from .sddmm_csr import SDDMMPrepared, benchmark_sddmm_case, flagsparse_sddmm_csr, prepare_sddmm_csr
-from .spgemm_csr import SpGEMMPrepared, benchmark_spgemm_case, flagsparse_spgemm_csr, prepare_spgemm_csr
+from .sddmm_csr import (
+    SDDMMPrepared,
+    benchmark_sddmm_case,
+    flagsparse_sddmm_csr,
+    prepare_sddmm_csr,
+)
+from .spgemm_csr import (
+    SpGEMMPrepared,
+    benchmark_spgemm_case,
+    flagsparse_spgemm_csr,
+    prepare_spgemm_csr,
+)
 from .spmm_coo import (
     PreparedCooSpmmRoute,
     SPMM_COO_ALGORITHMS,

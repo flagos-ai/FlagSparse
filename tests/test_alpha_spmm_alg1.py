@@ -42,7 +42,6 @@ from flagsparse.sparse_operations.spmm_csr import (
 )
 from test_spmm_opt import _seeded_dense_matrix, load_mtx_to_csr_torch
 
-
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
 WARMUP = 10
@@ -198,7 +197,9 @@ def _benchmark(op, warmup, iters):
 def _prepare_base_inputs(data, indices, indptr, B, shape):
     prepared_inputs = _prepare_spmm_csr_inputs(data, indices, indptr, B, shape)
     data_p, indices_p, indptr_p, B_p, n_rows, _n_cols, n_dense_cols = prepared_inputs
-    max_row_nnz = int(torch.max(indptr_p[1:] - indptr_p[:-1]).item()) if n_rows > 0 else 0
+    max_row_nnz = (
+        int(torch.max(indptr_p[1:] - indptr_p[:-1]).item()) if n_rows > 0 else 0
+    )
     device_props = _normalize_spmm_base_device_props(data_p.device)
     launch = _resolve_spmm_base_triton_launch(
         data_p.dtype,
@@ -241,12 +242,22 @@ def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
 
 def _timed_alpha_spmm_alg1_tle_opt(data, indices, indptr, B, shape, warmup, iters):
     if not fs.is_alpha_spmm_alg1_tle_opt_available():
-        return None, None, None, None, None, None, fs.alpha_spmm_alg1_tle_opt_unavailable_reason()
+        return (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            fs.alpha_spmm_alg1_tle_opt_unavailable_reason(),
+        )
     try:
         prepared = fs.prepare_alpha_spmm_alg1_tle_opt(data, indices, indptr, shape)
         meta = fs.build_alpha_spmm_alg1_tle_opt_meta(prepared, B)
         out, compute_ms = _benchmark(
-            lambda: fs.flagsparse_alpha_spmm_alg1_tle_opt(B=B, prepared=prepared, meta=meta),
+            lambda: fs.flagsparse_alpha_spmm_alg1_tle_opt(
+                B=B, prepared=prepared, meta=meta
+            ),
             warmup,
             iters,
         )
@@ -258,12 +269,22 @@ def _timed_alpha_spmm_alg1_tle_opt(data, indices, indptr, B, shape, warmup, iter
 
 def _timed_alpha_spmm_alg1_tle_opt2(data, indices, indptr, B, shape, warmup, iters):
     if not fs.is_alpha_spmm_alg1_tle_opt2_available():
-        return None, None, None, None, None, None, fs.alpha_spmm_alg1_tle_opt2_unavailable_reason()
+        return (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            fs.alpha_spmm_alg1_tle_opt2_unavailable_reason(),
+        )
     try:
         prepared = fs.prepare_alpha_spmm_alg1_tle_opt2(data, indices, indptr, shape)
         meta = fs.build_alpha_spmm_alg1_tle_opt2_meta(prepared, B)
         out, compute_ms = _benchmark(
-            lambda: fs.flagsparse_alpha_spmm_alg1_tle_opt2(B=B, prepared=prepared, meta=meta),
+            lambda: fs.flagsparse_alpha_spmm_alg1_tle_opt2(
+                B=B, prepared=prepared, meta=meta
+            ),
             warmup,
             iters,
         )
@@ -309,9 +330,12 @@ def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enable
         return None, None, None, None, str(exc)
 
     try:
+
         def prepare():
             data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-            ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
+            ind_cp = cp.from_dlpack(
+                torch.utils.dlpack.to_dlpack(indices.to(torch.int64))
+            )
             ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
             B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
             return cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape), B_cp
@@ -325,7 +349,9 @@ def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enable
     return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, None
 
 
-def _build_csr_from_row_lengths(row_lengths, n_cols, dtype, index_dtype, device, pattern="random"):
+def _build_csr_from_row_lengths(
+    row_lengths, n_cols, dtype, index_dtype, device, pattern="random"
+):
     data_parts = []
     col_parts = []
     indptr = [0]
@@ -445,8 +471,8 @@ def run_one_case(
     device = data.device
     n_rows, n_cols = shape
     B = _seeded_dense_matrix((n_cols, dense_cols), dtype, device, seed)
-    base_out, base_symbolic_ms, base_compute_ms, base_total_ms, prepared_base = _timed_spmm_base(
-        data, indices, indptr, B, shape, warmup, iters
+    base_out, base_symbolic_ms, base_compute_ms, base_total_ms, prepared_base = (
+        _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters)
     )
     (
         opt_out,
@@ -466,20 +492,30 @@ def run_one_case(
         opt2_meta,
         opt2_reason,
     ) = _timed_alpha_spmm_alg1_tle_opt2(data, indices, indptr, B, shape, warmup, iters)
-    torch_out, torch_symbolic_ms, torch_compute_ms, torch_total_ms, torch_reason = _timed_torch_reference(
-        data, indices, indptr, B, shape, dtype, warmup, iters
+    torch_out, torch_symbolic_ms, torch_compute_ms, torch_total_ms, torch_reason = (
+        _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters)
     )
-    cupy_out, cupy_symbolic_ms, cupy_compute_ms, cupy_total_ms, cupy_reason = _timed_sparse_backend(
-        data, indices, indptr, B, shape, warmup, iters, with_cusparse
+    cupy_out, cupy_symbolic_ms, cupy_compute_ms, cupy_total_ms, cupy_reason = (
+        _timed_sparse_backend(
+            data, indices, indptr, B, shape, warmup, iters, with_cusparse
+        )
     )
 
     profiles = {
         "base_vs_torch_ref": _error_profile(base_out, torch_out, dtype),
-        "alpha_spmm_alg1_tle_opt_vs_torch_ref": _error_profile(opt_out, torch_out, dtype),
-        "alpha_spmm_alg1_tle_opt2_vs_torch_ref": _error_profile(opt2_out, torch_out, dtype),
+        "alpha_spmm_alg1_tle_opt_vs_torch_ref": _error_profile(
+            opt_out, torch_out, dtype
+        ),
+        "alpha_spmm_alg1_tle_opt2_vs_torch_ref": _error_profile(
+            opt2_out, torch_out, dtype
+        ),
         "base_vs_cupy_cusparse_ref": _error_profile(base_out, cupy_out, dtype),
-        "alpha_spmm_alg1_tle_opt_vs_cupy_cusparse_ref": _error_profile(opt_out, cupy_out, dtype),
-        "alpha_spmm_alg1_tle_opt2_vs_cupy_cusparse_ref": _error_profile(opt2_out, cupy_out, dtype),
+        "alpha_spmm_alg1_tle_opt_vs_cupy_cusparse_ref": _error_profile(
+            opt_out, cupy_out, dtype
+        ),
+        "alpha_spmm_alg1_tle_opt2_vs_cupy_cusparse_ref": _error_profile(
+            opt2_out, cupy_out, dtype
+        ),
     }
     max_row_nnz = int((indptr[1:] - indptr[:-1]).max().item()) if n_rows > 0 else 0
     summary = {
@@ -493,36 +529,86 @@ def run_one_case(
         "avg_nnz_per_row": float(data.numel()) / float(max(1, n_rows)),
         "max_row_nnz": max_row_nnz,
         **_timing_dict("base", base_symbolic_ms, base_compute_ms, base_total_ms),
-        **_timing_dict("alpha_spmm_alg1_tle_opt", opt_symbolic_ms, opt_compute_ms, opt_total_ms),
-        **_timing_dict("alpha_spmm_alg1_tle_opt2", opt2_symbolic_ms, opt2_compute_ms, opt2_total_ms),
-        **_timing_dict("torch_ref", torch_symbolic_ms, torch_compute_ms, torch_total_ms),
-        **_timing_dict("cupy_cusparse_ref", cupy_symbolic_ms, cupy_compute_ms, cupy_total_ms),
+        **_timing_dict(
+            "alpha_spmm_alg1_tle_opt", opt_symbolic_ms, opt_compute_ms, opt_total_ms
+        ),
+        **_timing_dict(
+            "alpha_spmm_alg1_tle_opt2", opt2_symbolic_ms, opt2_compute_ms, opt2_total_ms
+        ),
+        **_timing_dict(
+            "torch_ref", torch_symbolic_ms, torch_compute_ms, torch_total_ms
+        ),
+        **_timing_dict(
+            "cupy_cusparse_ref", cupy_symbolic_ms, cupy_compute_ms, cupy_total_ms
+        ),
         "torch_ref_compute_speedup_vs_base": _ratio(torch_compute_ms, base_compute_ms),
-        "torch_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(torch_compute_ms, opt_compute_ms),
-        "torch_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt2": _ratio(torch_compute_ms, opt2_compute_ms),
-        "cupy_cusparse_ref_compute_speedup_vs_base": _ratio(cupy_compute_ms, base_compute_ms),
-        "cupy_cusparse_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(cupy_compute_ms, opt_compute_ms),
-        "cupy_cusparse_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt2": _ratio(cupy_compute_ms, opt2_compute_ms),
-        "alpha_spmm_alg1_tle_opt2_compute_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(opt_compute_ms, opt2_compute_ms),
+        "torch_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(
+            torch_compute_ms, opt_compute_ms
+        ),
+        "torch_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt2": _ratio(
+            torch_compute_ms, opt2_compute_ms
+        ),
+        "cupy_cusparse_ref_compute_speedup_vs_base": _ratio(
+            cupy_compute_ms, base_compute_ms
+        ),
+        "cupy_cusparse_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(
+            cupy_compute_ms, opt_compute_ms
+        ),
+        "cupy_cusparse_ref_compute_speedup_vs_alpha_spmm_alg1_tle_opt2": _ratio(
+            cupy_compute_ms, opt2_compute_ms
+        ),
+        "alpha_spmm_alg1_tle_opt2_compute_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(
+            opt_compute_ms, opt2_compute_ms
+        ),
         "torch_ref_total_speedup_vs_base": _ratio(torch_total_ms, base_total_ms),
-        "torch_ref_total_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(torch_total_ms, opt_total_ms),
-        "torch_ref_total_speedup_vs_alpha_spmm_alg1_tle_opt2": _ratio(torch_total_ms, opt2_total_ms),
+        "torch_ref_total_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(
+            torch_total_ms, opt_total_ms
+        ),
+        "torch_ref_total_speedup_vs_alpha_spmm_alg1_tle_opt2": _ratio(
+            torch_total_ms, opt2_total_ms
+        ),
         "cupy_cusparse_ref_total_speedup_vs_base": _ratio(cupy_total_ms, base_total_ms),
-        "cupy_cusparse_ref_total_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(cupy_total_ms, opt_total_ms),
-        "cupy_cusparse_ref_total_speedup_vs_alpha_spmm_alg1_tle_opt2": _ratio(cupy_total_ms, opt2_total_ms),
-        "alpha_spmm_alg1_tle_opt2_total_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(opt_total_ms, opt2_total_ms),
+        "cupy_cusparse_ref_total_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(
+            cupy_total_ms, opt_total_ms
+        ),
+        "cupy_cusparse_ref_total_speedup_vs_alpha_spmm_alg1_tle_opt2": _ratio(
+            cupy_total_ms, opt2_total_ms
+        ),
+        "alpha_spmm_alg1_tle_opt2_total_speedup_vs_alpha_spmm_alg1_tle_opt": _ratio(
+            opt_total_ms, opt2_total_ms
+        ),
         "base_vs_torch_ref_err": profiles["base_vs_torch_ref"]["global_err"],
-        "alpha_spmm_alg1_tle_opt_vs_torch_ref_err": profiles["alpha_spmm_alg1_tle_opt_vs_torch_ref"]["global_err"],
-        "alpha_spmm_alg1_tle_opt2_vs_torch_ref_err": profiles["alpha_spmm_alg1_tle_opt2_vs_torch_ref"]["global_err"],
-        "base_vs_cupy_cusparse_ref_err": profiles["base_vs_cupy_cusparse_ref"]["global_err"],
-        "alpha_spmm_alg1_tle_opt_vs_cupy_cusparse_ref_err": profiles["alpha_spmm_alg1_tle_opt_vs_cupy_cusparse_ref"]["global_err"],
-        "alpha_spmm_alg1_tle_opt2_vs_cupy_cusparse_ref_err": profiles["alpha_spmm_alg1_tle_opt2_vs_cupy_cusparse_ref"]["global_err"],
+        "alpha_spmm_alg1_tle_opt_vs_torch_ref_err": profiles[
+            "alpha_spmm_alg1_tle_opt_vs_torch_ref"
+        ]["global_err"],
+        "alpha_spmm_alg1_tle_opt2_vs_torch_ref_err": profiles[
+            "alpha_spmm_alg1_tle_opt2_vs_torch_ref"
+        ]["global_err"],
+        "base_vs_cupy_cusparse_ref_err": profiles["base_vs_cupy_cusparse_ref"][
+            "global_err"
+        ],
+        "alpha_spmm_alg1_tle_opt_vs_cupy_cusparse_ref_err": profiles[
+            "alpha_spmm_alg1_tle_opt_vs_cupy_cusparse_ref"
+        ]["global_err"],
+        "alpha_spmm_alg1_tle_opt2_vs_cupy_cusparse_ref_err": profiles[
+            "alpha_spmm_alg1_tle_opt2_vs_cupy_cusparse_ref"
+        ]["global_err"],
         "base_status_vs_torch_ref": profiles["base_vs_torch_ref"]["status"],
-        "alpha_spmm_alg1_tle_opt_status_vs_torch_ref": profiles["alpha_spmm_alg1_tle_opt_vs_torch_ref"]["status"],
-        "alpha_spmm_alg1_tle_opt2_status_vs_torch_ref": profiles["alpha_spmm_alg1_tle_opt2_vs_torch_ref"]["status"],
-        "base_status_vs_cupy_cusparse_ref": profiles["base_vs_cupy_cusparse_ref"]["status"],
-        "alpha_spmm_alg1_tle_opt_status_vs_cupy_cusparse_ref": profiles["alpha_spmm_alg1_tle_opt_vs_cupy_cusparse_ref"]["status"],
-        "alpha_spmm_alg1_tle_opt2_status_vs_cupy_cusparse_ref": profiles["alpha_spmm_alg1_tle_opt2_vs_cupy_cusparse_ref"]["status"],
+        "alpha_spmm_alg1_tle_opt_status_vs_torch_ref": profiles[
+            "alpha_spmm_alg1_tle_opt_vs_torch_ref"
+        ]["status"],
+        "alpha_spmm_alg1_tle_opt2_status_vs_torch_ref": profiles[
+            "alpha_spmm_alg1_tle_opt2_vs_torch_ref"
+        ]["status"],
+        "base_status_vs_cupy_cusparse_ref": profiles["base_vs_cupy_cusparse_ref"][
+            "status"
+        ],
+        "alpha_spmm_alg1_tle_opt_status_vs_cupy_cusparse_ref": profiles[
+            "alpha_spmm_alg1_tle_opt_vs_cupy_cusparse_ref"
+        ]["status"],
+        "alpha_spmm_alg1_tle_opt2_status_vs_cupy_cusparse_ref": profiles[
+            "alpha_spmm_alg1_tle_opt2_vs_cupy_cusparse_ref"
+        ]["status"],
         "alpha_spmm_alg1_tle_opt_status": "SKIP" if opt_out is None else "PASS",
         "alpha_spmm_alg1_tle_opt_reason": opt_reason,
         "alpha_spmm_alg1_tle_opt2_status": "SKIP" if opt2_out is None else "PASS",
@@ -549,9 +635,17 @@ def run_one_case(
 
 def _print_header():
     opt_available = fs.is_alpha_spmm_alg1_tle_opt_available()
-    opt_status = "available" if opt_available else f"unavailable ({fs.alpha_spmm_alg1_tle_opt_unavailable_reason()})"
+    opt_status = (
+        "available"
+        if opt_available
+        else f"unavailable ({fs.alpha_spmm_alg1_tle_opt_unavailable_reason()})"
+    )
     opt2_available = fs.is_alpha_spmm_alg1_tle_opt2_available()
-    opt2_status = "available" if opt2_available else f"unavailable ({fs.alpha_spmm_alg1_tle_opt2_unavailable_reason()})"
+    opt2_status = (
+        "available"
+        if opt2_available
+        else f"unavailable ({fs.alpha_spmm_alg1_tle_opt2_unavailable_reason()})"
+    )
     print(f"TLEOpt alpha_spmm_alg1_tle_opt: {opt_status}")
     print(f"TLEOpt2 alpha_spmm_alg1_tle_opt2: {opt2_status}")
     print("-" * 174)
@@ -589,7 +683,12 @@ def _print_summary_row(summary):
         f"{_fmt_err(summary['alpha_spmm_alg1_tle_opt2_vs_torch_ref_err']):>10} "
         f"{summary['matrix_status']:>8}"
     )
-    for key in ("alpha_spmm_alg1_tle_opt", "alpha_spmm_alg1_tle_opt2", "torch_ref", "cupy_cusparse_ref"):
+    for key in (
+        "alpha_spmm_alg1_tle_opt",
+        "alpha_spmm_alg1_tle_opt2",
+        "torch_ref",
+        "cupy_cusparse_ref",
+    ):
         if summary.get(f"{key}_status") == "SKIP" and summary.get(f"{key}_reason"):
             print(f"  {key} skipped: {summary[f'{key}_reason']}")
 
@@ -602,7 +701,9 @@ def _write_csv(path, rows, fieldnames):
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+            writer.writerow(
+                {key: ("" if value is None else value) for key, value in row.items()}
+            )
 
 
 def _build_launch_row(matrix_name, route, dtype_name, dense_cols, prepared, meta):
@@ -674,16 +775,30 @@ def _check_required(args, summary):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Experimental AlphaSparse ALG1 TLEOpt SpMM benchmark.")
+    parser = argparse.ArgumentParser(
+        description="Experimental AlphaSparse ALG1 TLEOpt SpMM benchmark."
+    )
     parser.add_argument("input_path", nargs="*", help=".mtx file or directory")
     parser.add_argument("--synthetic", action="store_true")
-    parser.add_argument("--csv", type=str, default=None, help="Write summary CSV and <stem>_launch.csv")
+    parser.add_argument(
+        "--csv", type=str, default=None, help="Write summary CSV and <stem>_launch.csv"
+    )
     parser.add_argument("--dense-cols", type=int, default=DEFAULT_DENSE_COLS)
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--with-cusparse", action="store_true", default=True, help="Run CuPy/cuSPARSE reference timing (default).")
-    parser.add_argument("--no-cusparse", action="store_false", dest="with_cusparse", help="Disable CuPy/cuSPARSE reference timing.")
+    parser.add_argument(
+        "--with-cusparse",
+        action="store_true",
+        default=True,
+        help="Run CuPy/cuSPARSE reference timing (default).",
+    )
+    parser.add_argument(
+        "--no-cusparse",
+        action="store_false",
+        dest="with_cusparse",
+        help="Disable CuPy/cuSPARSE reference timing.",
+    )
     parser.add_argument("--require-tle-opt", action="store_true")
     parser.add_argument("--require-tle-opt2", action="store_true")
     args = parser.parse_args()
@@ -713,7 +828,9 @@ def main():
         for value_dtype in VALUE_DTYPES:
             for dense_cols in (4, 5, 12, 24, 48, 96):
                 for case_name in synthetic_cases:
-                    data, indices, indptr, shape = build_synthetic_case(case_name, value_dtype, torch.int32, device)
+                    data, indices, indptr, shape = build_synthetic_case(
+                        case_name, value_dtype, torch.int32, device
+                    )
                     result = run_one_case(
                         f"{case_name}_n{dense_cols}",
                         data,
@@ -740,7 +857,9 @@ def main():
         for value_dtype in VALUE_DTYPES:
             for index_dtype in INDEX_DTYPES:
                 for path in paths:
-                    data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=value_dtype, device=device)
+                    data, indices, indptr, shape = load_mtx_to_csr_torch(
+                        path, dtype=value_dtype, device=device
+                    )
                     indices = indices.to(index_dtype)
                     result = run_one_case(
                         os.path.basename(path),

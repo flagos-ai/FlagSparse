@@ -51,6 +51,8 @@ SPSV_TRANS_SUPPORTED_COMBOS = (
     (torch.complex64, torch.int64),
     (torch.complex128, torch.int64),
 )
+
+
 def _spsv_env_flag(name, default="0"):
     return str(os.environ.get(name, default)).lower() in ("1", "true", "yes", "on")
 
@@ -524,20 +526,16 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
             _workspace_entry("row_counter", 1, torch.int32),
         )
     if solve_kind == "csr_roc":
-        return (
-            _workspace_entry("ready", n_rows, torch.int32),
-        )
+        return (_workspace_entry("ready", n_rows, torch.int32),)
     if solve_kind == "csr_smblk":
-        return (
-            _workspace_entry("ready", n_rows, torch.int32),
-        )
+        return (_workspace_entry("ready", n_rows, torch.int32),)
     if solve_kind == "csr_cw_levelschd":
-        return (
-            _workspace_entry("ready", n_rows, torch.int32),
-        )
+        return (_workspace_entry("ready", n_rows, torch.int32),)
     if solve_kind == "csr_nnz_balance":
         if value_dtype is None:
-            raise ValueError("value_dtype is required for csr_nnz_balance workspace sizing")
+            raise ValueError(
+                "value_dtype is required for csr_nnz_balance workspace sizing"
+            )
         return (
             _workspace_entry("tmp_sum", n_rows, value_dtype),
             _workspace_entry("ready", n_rows, torch.int32),
@@ -545,7 +543,9 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
         )
     if solve_kind == "transpose_cw":
         if value_dtype is None:
-            raise ValueError("value_dtype is required for transpose_cw workspace sizing")
+            raise ValueError(
+                "value_dtype is required for transpose_cw workspace sizing"
+            )
         return (
             _workspace_entry("residual", n_rows, value_dtype),
             _workspace_entry("indegree", n_rows, torch.int32),
@@ -675,7 +675,15 @@ def flagsparse_spsv_create_workspace(descr, device=None):
 
 
 def _csr_preprocess_cache_key(
-    data, indices, indptr, shape, lower, trans_mode, unit_diagonal, requested_route=None, storage_view="csr_as_csc"
+    data,
+    indices,
+    indptr,
+    shape,
+    lower,
+    trans_mode,
+    unit_diagonal,
+    requested_route=None,
+    storage_view="csr_as_csc",
 ):
     return (
         "csr_preprocess",
@@ -869,11 +877,14 @@ def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs):
         target = max(4, (target * 3) // 4)
     return _snap_cw_worker_count(target, n_rows)
 
+
 def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=None):
     rhs_bucket = _cw_rhs_bucket(n_rhs)
     max_frontier = int(matrix_stats.get("max_frontier", n_rows))
     avg_frontier = float(matrix_stats.get("avg_frontier", float(max_frontier)))
-    frontier_ratio = float(matrix_stats.get("frontier_ratio", 1.0 if n_rows > 0 else 0.0))
+    frontier_ratio = float(
+        matrix_stats.get("frontier_ratio", 1.0 if n_rows > 0 else 0.0)
+    )
     num_levels = int(matrix_stats.get("num_levels", 0))
     avg_nnz_per_row = float(matrix_stats.get("avg_nnz_per_row", 0.0))
     if cached_worker_count is not None and rhs_bucket == 1:
@@ -899,6 +910,7 @@ def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=No
         target,
         n_rows,
     )
+
 
 @triton.jit
 def _spsv_csr_cw_kernel(
@@ -962,6 +974,7 @@ def _spsv_csr_cw_kernel(
         tl.store(ready_ptr + row, 1)
         row = tl.atomic_add(row_counter_ptr, 1)
 
+
 def _build_spsv_cw_matrix_stats(
     indptr64,
     n_rows,
@@ -970,7 +983,9 @@ def _build_spsv_cw_matrix_stats(
     max_nnz_per_row=None,
 ):
     if avg_nnz_per_row is None or max_nnz_per_row is None:
-        _, avg_nnz_per_row, max_nnz_per_row = _spsv_csr_row_length_summary(indptr64, n_rows)
+        _, avg_nnz_per_row, max_nnz_per_row = _spsv_csr_row_length_summary(
+            indptr64, n_rows
+        )
     return {
         "num_levels": 0,
         "max_frontier": int(n_rows),
@@ -1000,11 +1015,14 @@ def _build_spsv_nnz_balance_launch_order(indptr64, n_rows, *, lower):
     return torch.tensor(launch_order, dtype=torch.int32, device=device)
 
 
-def _supports_spsv_advanced_nontrans_routes(trans_mode, lower, unit_diagonal, value_dtype):
+def _supports_spsv_advanced_nontrans_routes(
+    trans_mode, lower, unit_diagonal, value_dtype
+):
     return (
         trans_mode == "N"
         and (not bool(unit_diagonal))
-        and value_dtype in (torch.float32, torch.float64, torch.complex64, torch.complex128)
+        and value_dtype
+        in (torch.float32, torch.float64, torch.complex64, torch.complex128)
     )
 
 
@@ -1031,7 +1049,12 @@ def _choose_spsv_nontrans_auto_route(
     # Upper NON sweeps consistently favor ALG4 (csr_smblk), so keep that as the
     # unconditional AUTO route on the upper side.
     if not lower:
-        if value_dtype in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+        if value_dtype in (
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ):
             return "csr_smblk"
         return "csr_cw"
 
@@ -1149,7 +1172,9 @@ def _build_spsv_level_schedule_metadata_lower_gpu(
     row_map32 = row_map64.to(torch.int32).contiguous()
     sorted_levels32 = levels32.index_select(0, row_map64)
     if sorted_levels32.numel() > 0:
-        _, frontier_counts64 = torch.unique_consecutive(sorted_levels32, return_counts=True)
+        _, frontier_counts64 = torch.unique_consecutive(
+            sorted_levels32, return_counts=True
+        )
         level_ptr32 = torch.cat(
             [
                 torch.zeros(1, dtype=torch.int32, device=device),
@@ -1226,7 +1251,9 @@ def _spsv_nnz_balance_preprocess_kernel(
     tl.store(indegree_ptr + row, tl.sum(degree, axis=0))
 
 
-def _build_spsv_nnz_balance_metadata(indices64, indptr64, n_rows, *, lower, unit_diagonal):
+def _build_spsv_nnz_balance_metadata(
+    indices64, indptr64, n_rows, *, lower, unit_diagonal
+):
     n_rows = int(n_rows)
     device = indices64.device
     base_stats = _build_spsv_cw_matrix_stats(indptr64, n_rows)
@@ -1261,8 +1288,12 @@ def _build_spsv_nnz_balance_metadata(indices64, indptr64, n_rows, *, lower, unit
                     break
                 indegree_init[row] = degree
             return {
-                "indegree_init32": torch.tensor(indegree_init, dtype=torch.int32, device=device),
-                "csr_row_idx32": torch.tensor(row_idx, dtype=torch.int32, device=device),
+                "indegree_init32": torch.tensor(
+                    indegree_init, dtype=torch.int32, device=device
+                ),
+                "csr_row_idx32": torch.tensor(
+                    row_idx, dtype=torch.int32, device=device
+                ),
                 "launch_order32": _build_spsv_nnz_balance_launch_order(
                     indptr64, n_rows, lower=lower
                 ),
@@ -1320,7 +1351,9 @@ def _build_spsv_nnz_balance_metadata(indices64, indptr64, n_rows, *, lower, unit
                 break
         indegree_init[row] = degree
     return {
-        "indegree_init32": torch.tensor(indegree_init, dtype=torch.int32, device=device),
+        "indegree_init32": torch.tensor(
+            indegree_init, dtype=torch.int32, device=device
+        ),
         "csr_row_idx32": torch.tensor(row_idx, dtype=torch.int32, device=device),
         "launch_order32": _build_spsv_nnz_balance_launch_order(
             indptr64, n_rows, lower=lower
@@ -1427,7 +1460,9 @@ def _build_spsv_level_schedule_metadata(
     ).contiguous()
     num_levels = len(frontier_sizes)
     max_frontier = max(frontier_sizes) if frontier_sizes else 0
-    avg_frontier = (float(sum(frontier_sizes)) / float(num_levels)) if frontier_sizes else 0.0
+    avg_frontier = (
+        (float(sum(frontier_sizes)) / float(num_levels)) if frontier_sizes else 0.0
+    )
     matrix_stats = {
         **base_stats,
         "num_levels": int(num_levels),
@@ -1446,7 +1481,9 @@ def _build_spsv_level_schedule_metadata(
     return {
         "row_map32": torch.tensor(row_map, dtype=torch.int32, device=device),
         "level_ptr32": torch.tensor(level_ptr, dtype=torch.int32, device=device),
-        "indegree_init32": torch.tensor(indegree_init, dtype=torch.int32, device=device),
+        "indegree_init32": torch.tensor(
+            indegree_init, dtype=torch.int32, device=device
+        ),
         "csr_row_idx32": csr_row_idx32,
         "matrix_stats": matrix_stats,
     }
@@ -1468,8 +1505,12 @@ def _prepare_spsv_csr_system(
         data, indices64, indptr64 = _maybe_sort_csr_rows(
             data, indices64, indptr64, n_rows, n_cols, lower=lower
         )
-        requested_route = _normalize_requested_spsv_route(requested_solve_kind, trans_mode)
-        _, avg_nnz_per_row, max_nnz_per_row = _spsv_csr_row_length_summary(indptr64, n_rows)
+        requested_route = _normalize_requested_spsv_route(
+            requested_solve_kind, trans_mode
+        )
+        _, avg_nnz_per_row, max_nnz_per_row = _spsv_csr_row_length_summary(
+            indptr64, n_rows
+        )
         base_stats = _build_spsv_cw_matrix_stats(
             indptr64,
             n_rows,
@@ -1524,7 +1565,9 @@ def _prepare_spsv_csr_system(
             supported_solve_kinds = ("csr_cw",)
         elif effective_route == "csr_roc":
             if bool(unit_diagonal):
-                raise ValueError("solve_kind='csr_roc' currently supports non-unit diagonal only")
+                raise ValueError(
+                    "solve_kind='csr_roc' currently supports non-unit diagonal only"
+                )
             if level_meta is None:
                 level_meta = _build_spsv_level_schedule_metadata(
                     indices64,
@@ -1534,7 +1577,10 @@ def _prepare_spsv_csr_system(
                     unit_diagonal=unit_diagonal,
                     minimal=True,
                 )
-            elif int(level_meta["level_ptr32"].numel()) > 1 or int(level_meta["indegree_init32"].numel()) > 0:
+            elif (
+                int(level_meta["level_ptr32"].numel()) > 1
+                or int(level_meta["indegree_init32"].numel()) > 0
+            ):
                 level_meta = _build_spsv_level_schedule_metadata(
                     indices64,
                     indptr64,
@@ -1548,7 +1594,9 @@ def _prepare_spsv_csr_system(
             supported_solve_kinds = ("csr_roc",)
         elif effective_route == "csr_smblk":
             if bool(unit_diagonal):
-                raise ValueError("solve_kind='csr_smblk' currently supports non-unit diagonal only")
+                raise ValueError(
+                    "solve_kind='csr_smblk' currently supports non-unit diagonal only"
+                )
             matrix_stats = auto_matrix_stats if requested_route is None else base_stats
             default_solve_kind = "csr_smblk"
             supported_solve_kinds = ("csr_smblk",)
@@ -1573,7 +1621,11 @@ def _prepare_spsv_csr_system(
                     lower=lower,
                     unit_diagonal=unit_diagonal,
                 )
-            matrix_stats = auto_matrix_stats if requested_route is None else nnz_meta["matrix_stats"]
+            matrix_stats = (
+                auto_matrix_stats
+                if requested_route is None
+                else nnz_meta["matrix_stats"]
+            )
             default_solve_kind = "csr_nnz_balance"
             supported_solve_kinds = ("csr_nnz_balance",)
         else:
@@ -1585,7 +1637,9 @@ def _prepare_spsv_csr_system(
                 supported_solve_kinds = ("csr_cw",)
             else:
                 matrix_stats = auto_matrix_stats
-                default_solve_kind = auto_route if auto_route is not None else "csr_smblk"
+                default_solve_kind = (
+                    auto_route if auto_route is not None else "csr_smblk"
+                )
                 supported_solve_kinds = (default_solve_kind,)
         route_name = nontrans_variant
         if default_solve_kind == "csr_roc":
@@ -1747,7 +1801,9 @@ def _select_spsv_runtime_plan(solve_plan, trans_mode, requested_solve_kind=None)
         requested_route = str(
             solve_plan.get("default_solve_kind", solve_plan.get("solve_kind", "csr_cw"))
         )
-    supported = tuple(solve_plan.get("supported_solve_kinds", (solve_plan.get("solve_kind"),)))
+    supported = tuple(
+        solve_plan.get("supported_solve_kinds", (solve_plan.get("solve_kind"),))
+    )
     if requested_route not in supported:
         raise ValueError(
             f"solve_kind={requested_route!r} is not available for this SpSV problem; "
@@ -1757,16 +1813,26 @@ def _select_spsv_runtime_plan(solve_plan, trans_mode, requested_solve_kind=None)
     if requested_route == "csr_cw":
         routed["route_name"] = str(solve_plan.get("nontrans_variant", requested_route))
     elif requested_route == "csr_roc":
-        routed["route_name"] = "csr_n_lo_roc" if bool(routed.get("lower_eff", True)) else "csr_n_up_roc"
+        routed["route_name"] = (
+            "csr_n_lo_roc" if bool(routed.get("lower_eff", True)) else "csr_n_up_roc"
+        )
     elif requested_route == "csr_smblk":
-        routed["route_name"] = "csr_n_lo_smblk" if bool(routed.get("lower_eff", True)) else "csr_n_up_smblk"
+        routed["route_name"] = (
+            "csr_n_lo_smblk"
+            if bool(routed.get("lower_eff", True))
+            else "csr_n_up_smblk"
+        )
     elif requested_route == "csr_cw_levelschd":
         routed["route_name"] = (
-            "csr_n_lo_cw_levelschd" if bool(routed.get("lower_eff", True)) else "csr_n_up_cw_levelschd"
+            "csr_n_lo_cw_levelschd"
+            if bool(routed.get("lower_eff", True))
+            else "csr_n_up_cw_levelschd"
         )
     elif requested_route == "csr_nnz_balance":
         routed["route_name"] = (
-            "csr_n_lo_nnz_balance" if bool(routed.get("lower_eff", True)) else "csr_n_up_nnz_balance"
+            "csr_n_lo_nnz_balance"
+            if bool(routed.get("lower_eff", True))
+            else "csr_n_up_nnz_balance"
         )
     else:
         routed["route_name"] = requested_route
@@ -1835,7 +1901,9 @@ def _propagate_complex(residual_ri_ptr, idx, delta_re, delta_im, mask):
 
 
 @triton.jit
-def _propagate_then_release_complex(residual_ri_ptr, indegree_ptr, idx, delta_re, delta_im, mask):
+def _propagate_then_release_complex(
+    residual_ri_ptr, indegree_ptr, idx, delta_re, delta_im, mask
+):
     """Complex propagation + dependency release for transpose-style solve."""
 
     _propagate_complex(residual_ri_ptr, idx, delta_re, delta_im, mask)
@@ -2343,10 +2411,14 @@ def _spsv_csr_roc_kernel(
             a = tl.load(data_ptr + ptr, mask=advance_mask, other=0.0)
             if USE_FP64_ACC:
                 a = a.to(tl.float64)
-                y_dep = tl.atomic_add(x_ptr + col, zero_vec, mask=advance_mask).to(tl.float64)
+                y_dep = tl.atomic_add(x_ptr + col, zero_vec, mask=advance_mask).to(
+                    tl.float64
+                )
             else:
                 a = a.to(tl.float32)
-                y_dep = tl.atomic_add(x_ptr + col, zero_vec, mask=advance_mask).to(tl.float32)
+                y_dep = tl.atomic_add(x_ptr + col, zero_vec, mask=advance_mask).to(
+                    tl.float32
+                )
             local_sum += tl.where(advance_mask, -a * y_dep, 0.0)
             ptr = ptr + tl.where(advance_mask, WARP_SIZE, 0)
 
@@ -2940,7 +3012,9 @@ def _spsv_csr_nnz_balance_kernel_complex(
                 done = 1
 
 
-def _auto_spsv_launch_config(indptr, block_nnz=None, max_segments=None, *, max_nnz_per_row=None):
+def _auto_spsv_launch_config(
+    indptr, block_nnz=None, max_segments=None, *, max_nnz_per_row=None
+):
     if max_nnz_per_row is None:
         if indptr.numel() <= 1:
             max_nnz_per_row = 0
@@ -2966,9 +3040,7 @@ def _auto_spsv_launch_config(indptr, block_nnz=None, max_segments=None, *, max_n
         if block_nnz_use <= 0:
             raise ValueError("block_nnz must be a positive integer")
 
-    required_segments = max(
-        (max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1
-    )
+    required_segments = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
     if max_segments is None:
         max_segments_use = required_segments
         if auto_block:
@@ -3005,7 +3077,11 @@ def _triton_spsv_csr_cw_vector(
     row_counter_in=None,
 ):
     x = torch.zeros_like(b_vec)
-    ready = ready_in if ready_in is not None else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    ready = (
+        ready_in
+        if ready_in is not None
+        else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    )
     row_counter = (
         row_counter_in
         if row_counter_in is not None
@@ -3055,7 +3131,11 @@ def _triton_spsv_csr_cw_vector_complex(
     row_counter_in=None,
 ):
     x = torch.zeros_like(b_vec)
-    ready = ready_in if ready_in is not None else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    ready = (
+        ready_in
+        if ready_in is not None
+        else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    )
     row_counter = (
         row_counter_in
         if row_counter_in is not None
@@ -3143,19 +3223,27 @@ def _triton_spsv_csr_n_up_cw_vector(*args, **kwargs):
 
 
 def _triton_spsv_csr_u_lo_cw_vector_complex(*args, **kwargs):
-    return _triton_spsv_csr_cw_vector_complex(*args, lower=True, unit_diagonal=True, **kwargs)
+    return _triton_spsv_csr_cw_vector_complex(
+        *args, lower=True, unit_diagonal=True, **kwargs
+    )
 
 
 def _triton_spsv_csr_n_lo_cw_vector_complex(*args, **kwargs):
-    return _triton_spsv_csr_cw_vector_complex(*args, lower=True, unit_diagonal=False, **kwargs)
+    return _triton_spsv_csr_cw_vector_complex(
+        *args, lower=True, unit_diagonal=False, **kwargs
+    )
 
 
 def _triton_spsv_csr_u_up_cw_vector_complex(*args, **kwargs):
-    return _triton_spsv_csr_cw_vector_complex(*args, lower=False, unit_diagonal=True, **kwargs)
+    return _triton_spsv_csr_cw_vector_complex(
+        *args, lower=False, unit_diagonal=True, **kwargs
+    )
 
 
 def _triton_spsv_csr_n_up_cw_vector_complex(*args, **kwargs):
-    return _triton_spsv_csr_cw_vector_complex(*args, lower=False, unit_diagonal=False, **kwargs)
+    return _triton_spsv_csr_cw_vector_complex(
+        *args, lower=False, unit_diagonal=False, **kwargs
+    )
 
 
 def _triton_spsv_csr_n_lo_roc_vector(
@@ -3171,8 +3259,10 @@ def _triton_spsv_csr_n_lo_roc_vector(
     ready_in=None,
 ):
     x = torch.zeros_like(b_vec)
-    ready = ready_in if ready_in is not None else torch.zeros(
-        n_rows, dtype=torch.int32, device=b_vec.device
+    ready = (
+        ready_in
+        if ready_in is not None
+        else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
     )
     ready.zero_()
     if n_rows == 0:
@@ -3210,8 +3300,10 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
     ready_in=None,
 ):
     x = torch.zeros_like(b_vec)
-    ready = ready_in if ready_in is not None else torch.zeros(
-        n_rows, dtype=torch.int32, device=b_vec.device
+    ready = (
+        ready_in
+        if ready_in is not None
+        else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
     )
     ready.zero_()
     if n_rows == 0:
@@ -3251,8 +3343,10 @@ def _triton_spsv_csr_n_lo_smblk_vector(
     ready_in=None,
 ):
     x = torch.zeros_like(b_vec)
-    ready = ready_in if ready_in is not None else torch.zeros(
-        n_rows, dtype=torch.int32, device=b_vec.device
+    ready = (
+        ready_in
+        if ready_in is not None
+        else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
     )
     ready.zero_()
     if n_rows == 0:
@@ -3289,8 +3383,10 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
     ready_in=None,
 ):
     x = torch.zeros_like(b_vec)
-    ready = ready_in if ready_in is not None else torch.zeros(
-        n_rows, dtype=torch.int32, device=b_vec.device
+    ready = (
+        ready_in
+        if ready_in is not None
+        else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
     )
     ready.zero_()
     if n_rows == 0:
@@ -3331,7 +3427,11 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
     ready_in=None,
 ):
     x = torch.zeros_like(b_vec)
-    ready = ready_in if ready_in is not None else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    ready = (
+        ready_in
+        if ready_in is not None
+        else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    )
     ready.zero_()
     if n_rows == 0:
         return x
@@ -3416,7 +3516,11 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
     if n_rows == 0:
         return x
     tmp_sum = tmp_sum_in if tmp_sum_in is not None else torch.zeros_like(b_vec)
-    ready = ready_in if ready_in is not None else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    ready = (
+        ready_in
+        if ready_in is not None
+        else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    )
     indegree = (
         indegree_in
         if indegree_in is not None
@@ -3674,7 +3778,9 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
 
 def _choose_transpose_family_launch_config(indptr, block_nnz=None, max_segments=None):
     if block_nnz is not None or max_segments is not None:
-        return _auto_spsv_launch_config(indptr, block_nnz=block_nnz, max_segments=max_segments)
+        return _auto_spsv_launch_config(
+            indptr, block_nnz=block_nnz, max_segments=max_segments
+        )
 
     if indptr.numel() <= 1:
         return 32, 1
@@ -3967,9 +4073,7 @@ def _analyze_spsv_csr(
         unit_diagonal,
         requested_solve_kind=solve_kind,
     )
-    _select_spsv_runtime_plan(
-        solve_plan, trans_mode, requested_solve_kind=solve_kind
-    )
+    _select_spsv_runtime_plan(solve_plan, trans_mode, requested_solve_kind=solve_kind)
     if return_time:
         torch.cuda.synchronize()
         return (time.perf_counter() - t0) * 1000.0
@@ -3993,8 +4097,8 @@ def flagsparse_spsv_analysis_coo(
     """Analyze a COO SpSV problem by canonicalizing COO into CSR first."""
 
     dummy_b = torch.empty(int(shape[0]), dtype=data.dtype, device=data.device)
-    data, _input_index_dtype, row64, col64, _b, n_rows, _n_cols = _prepare_spsv_coo_inputs(
-        data, row, col, dummy_b, shape
+    data, _input_index_dtype, row64, col64, _b, n_rows, _n_cols = (
+        _prepare_spsv_coo_inputs(data, row, col, dummy_b, shape)
     )
     trans_mode = _normalize_spsv_transpose_mode(transpose)
     if trans_mode == "N":
@@ -4182,65 +4286,130 @@ def _execute_spsv_csr_plan(
             workspace.prepared_solve_kind = "transpose_cw"
             workspace.prepared_signature = transpose_sig
     stream_ctx = (
-        torch.cuda.stream(solve_stream)
-        if solve_stream is not None
-        else nullcontext()
+        torch.cuda.stream(solve_stream) if solve_stream is not None else nullcontext()
     )
     with stream_ctx:
         if torch.is_complex(data_in):
             if vec_complex is None:
-                raise ValueError(f"solve_kind={solve_kind!r} currently supports real dtypes only")
+                raise ValueError(
+                    f"solve_kind={solve_kind!r} currently supports real dtypes only"
+                )
             if solve_kind == "transpose_cw":
                 x = vec_complex(
-                data_in,
-                kernel_indices,
-                kernel_indptr,
-                b_in,
-                n_rows,
-                lower=lower_eff,
-                unit_diagonal=unit_diagonal,
-                conjugate=(trans_mode == "C"),
-                block_nnz=block_nnz,
-                max_segments=max_segments,
-                diag_eps=diag_eps,
-                block_nnz_use=block_nnz_use,
-                max_segments_use=max_segments_use,
-                worker_count=worker_count_use,
-                matrix_stats=matrix_stats_use,
-                data_ri_in=complex_kernel_data_ri,
-                residual_in=residual_buf,
-                indegree_in=indegree_buf,
-                row_counter_in=row_counter_buf,
-                preprocessed=transpose_preprocessed,
+                    data_in,
+                    kernel_indices,
+                    kernel_indptr,
+                    b_in,
+                    n_rows,
+                    lower=lower_eff,
+                    unit_diagonal=unit_diagonal,
+                    conjugate=(trans_mode == "C"),
+                    block_nnz=block_nnz,
+                    max_segments=max_segments,
+                    diag_eps=diag_eps,
+                    block_nnz_use=block_nnz_use,
+                    max_segments_use=max_segments_use,
+                    worker_count=worker_count_use,
+                    matrix_stats=matrix_stats_use,
+                    data_ri_in=complex_kernel_data_ri,
+                    residual_in=residual_buf,
+                    indegree_in=indegree_buf,
+                    row_counter_in=row_counter_buf,
+                    preprocessed=transpose_preprocessed,
                 )
             else:
                 if solve_kind == "csr_roc":
                     x = vec_complex(
-                    data_in,
-                    kernel_indices,
-                    kernel_indptr,
-                    level_row_map32,
-                    b_in,
-                    n_rows,
-                    lower=lower_eff,
-                    diag_eps=diag_eps,
-                    data_ri_in=complex_kernel_data_ri,
-                    ready_in=ready_buf,
+                        data_in,
+                        kernel_indices,
+                        kernel_indptr,
+                        level_row_map32,
+                        b_in,
+                        n_rows,
+                        lower=lower_eff,
+                        diag_eps=diag_eps,
+                        data_ri_in=complex_kernel_data_ri,
+                        ready_in=ready_buf,
                     )
                 elif solve_kind == "csr_smblk":
                     x = vec_complex(
+                        data_in,
+                        kernel_indices,
+                        kernel_indptr,
+                        b_in,
+                        n_rows,
+                        lower=lower_eff,
+                        diag_eps=diag_eps,
+                        data_ri_in=complex_kernel_data_ri,
+                        ready_in=ready_buf,
+                    )
+                elif solve_kind == "csr_cw_levelschd":
+                    x = vec_complex(
+                        data_in,
+                        kernel_indices,
+                        kernel_indptr,
+                        level_row_map32,
+                        b_in,
+                        n_rows,
+                        lower=lower_eff,
+                        diag_eps=diag_eps,
+                        data_ri_in=complex_kernel_data_ri,
+                        ready_in=ready_buf,
+                    )
+                elif solve_kind == "csr_nnz_balance":
+                    x = vec_complex(
+                        data_in,
+                        kernel_indices,
+                        nnz_balance_launch_order32,
+                        nnz_balance_row_idx32,
+                        nnz_balance_indegree32,
+                        b_in,
+                        n_rows,
+                        lower=lower_eff,
+                        diag_eps=diag_eps,
+                        data_ri_in=complex_kernel_data_ri,
+                        tmp_sum_in=tmp_sum_buf,
+                        ready_in=ready_buf,
+                        indegree_in=indegree_buf,
+                    )
+                else:
+                    x = vec_complex(
+                        data_in,
+                        kernel_indices,
+                        kernel_indptr,
+                        b_in,
+                        n_rows,
+                        diag_eps=diag_eps,
+                        worker_count=worker_count_use,
+                        matrix_stats=matrix_stats_use,
+                        data_ri_in=complex_kernel_data_ri,
+                        ready_in=ready_buf,
+                        row_counter_in=row_counter_buf,
+                    )
+        else:
+            if solve_kind == "transpose_cw":
+                x = vec_real(
                     data_in,
                     kernel_indices,
                     kernel_indptr,
                     b_in,
                     n_rows,
                     lower=lower_eff,
+                    unit_diagonal=unit_diagonal,
+                    block_nnz=block_nnz,
+                    max_segments=max_segments,
                     diag_eps=diag_eps,
-                    data_ri_in=complex_kernel_data_ri,
-                    ready_in=ready_buf,
-                    )
-                elif solve_kind == "csr_cw_levelschd":
-                    x = vec_complex(
+                    block_nnz_use=block_nnz_use,
+                    max_segments_use=max_segments_use,
+                    worker_count=worker_count_use,
+                    matrix_stats=matrix_stats_use,
+                    residual_in=residual_buf,
+                    indegree_in=indegree_buf,
+                    row_counter_in=row_counter_buf,
+                    preprocessed=transpose_preprocessed,
+                )
+            elif solve_kind == "csr_roc":
+                x = vec_real(
                     data_in,
                     kernel_indices,
                     kernel_indptr,
@@ -4249,11 +4418,33 @@ def _execute_spsv_csr_plan(
                     n_rows,
                     lower=lower_eff,
                     diag_eps=diag_eps,
-                    data_ri_in=complex_kernel_data_ri,
                     ready_in=ready_buf,
-                    )
-                elif solve_kind == "csr_nnz_balance":
-                    x = vec_complex(
+                )
+            elif solve_kind == "csr_smblk":
+                x = vec_real(
+                    data_in,
+                    kernel_indices,
+                    kernel_indptr,
+                    b_in,
+                    n_rows,
+                    lower=lower_eff,
+                    diag_eps=diag_eps,
+                    ready_in=ready_buf,
+                )
+            elif solve_kind == "csr_cw_levelschd":
+                x = vec_real(
+                    data_in,
+                    kernel_indices,
+                    kernel_indptr,
+                    level_row_map32,
+                    b_in,
+                    n_rows,
+                    lower=lower_eff,
+                    diag_eps=diag_eps,
+                    ready_in=ready_buf,
+                )
+            elif solve_kind == "csr_nnz_balance":
+                x = vec_real(
                     data_in,
                     kernel_indices,
                     nnz_balance_launch_order32,
@@ -4263,13 +4454,12 @@ def _execute_spsv_csr_plan(
                     n_rows,
                     lower=lower_eff,
                     diag_eps=diag_eps,
-                    data_ri_in=complex_kernel_data_ri,
                     tmp_sum_in=tmp_sum_buf,
                     ready_in=ready_buf,
                     indegree_in=indegree_buf,
-                    )
-                else:
-                    x = vec_complex(
+                )
+            else:
+                x = vec_real(
                     data_in,
                     kernel_indices,
                     kernel_indptr,
@@ -4278,96 +4468,12 @@ def _execute_spsv_csr_plan(
                     diag_eps=diag_eps,
                     worker_count=worker_count_use,
                     matrix_stats=matrix_stats_use,
-                    data_ri_in=complex_kernel_data_ri,
                     ready_in=ready_buf,
                     row_counter_in=row_counter_buf,
-                    )
-        else:
-            if solve_kind == "transpose_cw":
-                x = vec_real(
-                data_in,
-                kernel_indices,
-                kernel_indptr,
-                b_in,
-                n_rows,
-                lower=lower_eff,
-                unit_diagonal=unit_diagonal,
-                block_nnz=block_nnz,
-                max_segments=max_segments,
-                diag_eps=diag_eps,
-                block_nnz_use=block_nnz_use,
-                max_segments_use=max_segments_use,
-                worker_count=worker_count_use,
-                matrix_stats=matrix_stats_use,
-                residual_in=residual_buf,
-                indegree_in=indegree_buf,
-                row_counter_in=row_counter_buf,
-                preprocessed=transpose_preprocessed,
                 )
-            elif solve_kind == "csr_roc":
-                x = vec_real(
-                data_in,
-                kernel_indices,
-                kernel_indptr,
-                level_row_map32,
-                b_in,
-                n_rows,
-                lower=lower_eff,
-                diag_eps=diag_eps,
-                ready_in=ready_buf,
-                )
-            elif solve_kind == "csr_smblk":
-                x = vec_real(
-                data_in,
-                kernel_indices,
-                kernel_indptr,
-                b_in,
-                n_rows,
-                lower=lower_eff,
-                diag_eps=diag_eps,
-                ready_in=ready_buf,
-                )
-            elif solve_kind == "csr_cw_levelschd":
-                x = vec_real(
-                data_in,
-                kernel_indices,
-                kernel_indptr,
-                level_row_map32,
-                b_in,
-                n_rows,
-                lower=lower_eff,
-                diag_eps=diag_eps,
-                ready_in=ready_buf,
-                )
-            elif solve_kind == "csr_nnz_balance":
-                x = vec_real(
-                data_in,
-                kernel_indices,
-                nnz_balance_launch_order32,
-                nnz_balance_row_idx32,
-                nnz_balance_indegree32,
-                b_in,
-                n_rows,
-                lower=lower_eff,
-                diag_eps=diag_eps,
-                tmp_sum_in=tmp_sum_buf,
-                ready_in=ready_buf,
-                indegree_in=indegree_buf,
-                )
-            else:
-                x = vec_real(
-                data_in,
-                kernel_indices,
-                kernel_indptr,
-                b_in,
-                n_rows,
-                diag_eps=diag_eps,
-                worker_count=worker_count_use,
-                matrix_stats=matrix_stats_use,
-                ready_in=ready_buf,
-                row_counter_in=row_counter_buf,
-                )
-    target_dtype = original_output_dtype if original_output_dtype is not None else data.dtype
+    target_dtype = (
+        original_output_dtype if original_output_dtype is not None else data.dtype
+    )
     if x.dtype != target_dtype:
         x = x.to(target_dtype)
     if return_time:
@@ -4428,7 +4534,9 @@ def flagsparse_spsv_solve_csr(
         return_time=return_time,
         workspace=workspace,
         original_output_dtype=descr.value_dtype,
-        compute_dtype=compute_dtype if compute_dtype is not None else descr.compute_dtype,
+        compute_dtype=(
+            compute_dtype if compute_dtype is not None else descr.compute_dtype
+        ),
         handle=handle,
         stream=stream,
     )
@@ -4708,10 +4816,8 @@ def flagsparse_spsv_sell(
 ):
     """Solve a real non-unit lower triangle in column-major SELL format."""
 
-    values, cols, offsets, b, n_rows, slice_size = (
-        _prepare_spsv_sell_inputs(
-            values, col_indices, slice_offsets, b, shape, slice_size
-        )
+    values, cols, offsets, b, n_rows, slice_size = _prepare_spsv_sell_inputs(
+        values, col_indices, slice_offsets, b, shape, slice_size
     )
     return _launch_spsv_sell(
         values,
@@ -4811,6 +4917,7 @@ def flagsparse_spsv_csr(
         handle=handle,
         stream=stream,
     )
+
 
 def flagsparse_spsv_coo(
     data,

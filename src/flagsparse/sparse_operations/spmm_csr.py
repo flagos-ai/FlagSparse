@@ -140,6 +140,7 @@ def _spmm_validation_metrics(candidate, reference):
     )
     return metrics
 
+
 @triton.jit
 def _spmm_csr_real_kernel(
     data_ptr,
@@ -249,8 +250,16 @@ def _spmm_csr_complex_kernel(
                 mask=mask_n & valid,
                 other=0.0,
             )
-            acc_re = acc_re + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE) - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
-            acc_im = acc_im + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE) + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+            acc_re = (
+                acc_re
+                + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+                - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+            )
+            acc_im = (
+                acc_im
+                + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+                + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+            )
 
     tl.store(c_ri_ptr + row * stride_cm + offs_n * stride_cn, acc_re, mask=mask_n)
     tl.store(
@@ -311,8 +320,16 @@ def _spmm_csr_selected_rows_complex_kernel(
                 mask=mask_n & valid,
                 other=0.0,
             )
-            acc_re = acc_re + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE) - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
-            acc_im = acc_im + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE) + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+            acc_re = (
+                acc_re
+                + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+                - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+            )
+            acc_im = (
+                acc_im
+                + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+                + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+            )
 
     tl.store(c_ri_ptr + row * stride_cm + offs_n * stride_cn, acc_re, mask=mask_n)
     tl.store(
@@ -320,6 +337,7 @@ def _spmm_csr_selected_rows_complex_kernel(
         acc_im,
         mask=mask_n,
     )
+
 
 def _prepare_spmm_csr_matrix(data, indices, indptr, shape):
     if len(shape) != 2:
@@ -354,7 +372,9 @@ def _prepare_spmm_csr_matrix(data, indices, indptr, shape):
     if indptr.numel() > 0 and int(indptr[0].item()) != 0:
         raise ValueError("indptr[0] must be 0")
     if indptr.numel() > 0 and int(indptr[-1].item()) != nnz:
-        raise ValueError(f"indptr[-1] must equal nnz={nnz}, got {int(indptr[-1].item())}")
+        raise ValueError(
+            f"indptr[-1] must equal nnz={nnz}, got {int(indptr[-1].item())}"
+        )
     if indptr.numel() > 1 and bool(torch.any(indptr[1:] < indptr[:-1]).item()):
         raise ValueError("indptr must be nondecreasing")
     if nnz > 0:
@@ -371,7 +391,9 @@ def _prepare_spmm_csr_matrix(data, indices, indptr, shape):
     indices = indices.contiguous()
     indptr = indptr.contiguous()
 
-    kernel_indices = indices.to(torch.int32) if indices.dtype == torch.int64 else indices
+    kernel_indices = (
+        indices.to(torch.int32) if indices.dtype == torch.int64 else indices
+    )
     kernel_indptr = indptr.to(torch.int64)
     row_lengths = (
         kernel_indptr[1:] - kernel_indptr[:-1]
@@ -666,7 +688,11 @@ def _normalize_spmm_csr_alg(alg):
         return "spmm_csr_alg2"
     if token in ("alg2_accuracy", "csr_alg2_accuracy", "spmm_csr_alg2_accuracy"):
         return "spmm_csr_alg2_accuracy"
-    if token in ("alg2_accuracy_hp", "csr_alg2_accuracy_hp", "spmm_csr_alg2_accuracy_hp"):
+    if token in (
+        "alg2_accuracy_hp",
+        "csr_alg2_accuracy_hp",
+        "spmm_csr_alg2_accuracy_hp",
+    ):
         return "spmm_csr_alg2_accuracy_hp"
     if token == "auto":
         return "auto"
@@ -679,7 +705,16 @@ def _normalize_dense_layout(layout):
         return "row"
     if token in ("row", "row_major", "row-major", "c", "c_order"):
         return "row"
-    if token in ("col", "column", "col_major", "column_major", "col-major", "column-major", "f", "fortran"):
+    if token in (
+        "col",
+        "column",
+        "col_major",
+        "column_major",
+        "col-major",
+        "column-major",
+        "f",
+        "fortran",
+    ):
         return "col"
     raise ValueError("dense_layout must be one of: auto, row, col")
 
@@ -707,7 +742,9 @@ def _empty_dense_layout(shape, dtype, device, layout):
     layout = _normalize_dense_layout(layout)
     rows, cols = int(shape[0]), int(shape[1])
     if layout == "col":
-        return torch.empty_strided((rows, cols), (1, max(1, rows)), dtype=dtype, device=device)
+        return torch.empty_strided(
+            (rows, cols), (1, max(1, rows)), dtype=dtype, device=device
+        )
     return torch.empty((rows, cols), dtype=dtype, device=device)
 
 
@@ -744,7 +781,9 @@ def _validate_spmm_route_runtime_inputs(prepared, B):
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
     if B.shape[0] != prepared.n_cols:
-        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
+        raise ValueError(
+            f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}"
+        )
     return B
 
 
@@ -756,7 +795,9 @@ def _spmm_csr_route_from_materialized(prepared, data, indices, indptr, shape, op
         else kernel_indptr.new_empty((0,))
     )
     max_row_nnz = int(row_lengths.max().item()) if int(shape[0]) > 0 else 0
-    kernel_indices = indices.to(torch.int32) if indices.dtype == torch.int64 else indices
+    kernel_indices = (
+        indices.to(torch.int32) if indices.dtype == torch.int64 else indices
+    )
     return PreparedCsrSpmmRoute(
         data=data.contiguous(),
         kernel_indices=kernel_indices.contiguous(),
@@ -801,10 +842,17 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
     return runtime_prepared, None
 
 
-def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
+def _run_spmm_csr_base_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     return _run_spmm_csr_base_route_impl(
-        prepared, B, timing=timing, diagnostics=diagnostics,
-        dense_layout=dense_layout, accuracy=False, route_name="csr_base",
+        prepared,
+        B,
+        timing=timing,
+        diagnostics=diagnostics,
+        dense_layout=dense_layout,
+        accuracy=False,
+        route_name="csr_base",
     )
 
 
@@ -812,14 +860,25 @@ def _run_spmm_csr_base_accuracy_route(
     prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
 ):
     return _run_spmm_csr_base_route_impl(
-        prepared, B, timing=timing, diagnostics=diagnostics,
-        dense_layout=dense_layout, accuracy=True, route_name="csr_base_accuracy",
+        prepared,
+        B,
+        timing=timing,
+        diagnostics=diagnostics,
+        dense_layout=dense_layout,
+        accuracy=True,
+        route_name="csr_base_accuracy",
     )
 
 
 def _run_spmm_csr_base_route_impl(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row",
-    accuracy=False, route_name="csr_base",
+    prepared,
+    B,
+    *,
+    timing=False,
+    diagnostics=False,
+    dense_layout="row",
+    accuracy=False,
+    route_name="csr_base",
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
@@ -935,6 +994,7 @@ def _run_alpha_spmm_alg1_tle_route(
         dense_layout,
     )
     from . import alpha_spmm_alg1 as alpha_mod
+
     availability_fn = getattr(alpha_mod, availability_fn_name)
     unavailable_reason_fn = getattr(alpha_mod, unavailable_reason_fn_name)
     if not availability_fn():
@@ -1099,7 +1159,9 @@ def _spmm_csr_alg1_process_count_kernel(
     bucket = tl.where(
         lens <= 32,
         0,
-        tl.where(lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))),
+        tl.where(
+            lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))
+        ),
     )
     for bid in tl.static_range(0, 5):
         hits = mask & (bucket == bid)
@@ -1123,7 +1185,9 @@ def _spmm_csr_alg1_process_compact_kernel(
     bucket = tl.where(
         lens <= 32,
         0,
-        tl.where(lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))),
+        tl.where(
+            lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))
+        ),
     )
     for bid in tl.static_range(0, 5):
         hits = mask & (bucket == bid)
@@ -1153,7 +1217,9 @@ def _spmm_csr_alg1_build_bucket_descriptors(rows_flat, counts, offsets):
     buckets = []
     long_rows = torch.empty((0,), dtype=row_index_dtype, device=device)
     lower = 0
-    for spec, count, offset in zip(_SPMM_CSR_ALG1_BUCKET_SPECS, counts_cpu, offsets_cpu):
+    for spec, count, offset in zip(
+        _SPMM_CSR_ALG1_BUCKET_SPECS, counts_cpu, offsets_cpu
+    ):
         upper = spec["max_row_nnz"]
         count = int(count)
         if count == 0:
@@ -1192,7 +1258,12 @@ def _spmm_csr_alg1_build_bucket_descriptors(rows_flat, counts, offsets):
 
 
 def _spmm_csr_alg1_build_process_plan(prepared, *, timing=False):
-    if prepared.data.dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+    if prepared.data.dtype not in (
+        torch.float32,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    ):
         raise TypeError(
             "spmm_csr_alg1 only supports float32, float64, complex64, and complex128"
         )
@@ -1276,7 +1347,9 @@ def _spmm_csr_alg1_build_process_plan(prepared, *, timing=False):
     if split_end is not None:
         split_end.record()
         torch.cuda.synchronize()
-        process_gpu_ms = float(process_gpu_ms or 0.0) + split_start.elapsed_time(split_end)
+        process_gpu_ms = float(process_gpu_ms or 0.0) + split_start.elapsed_time(
+            split_end
+        )
 
     return PreparedSpmmCsrAlg1Plan(
         data=prepared.data,
@@ -1461,11 +1534,15 @@ def _spmm_csr_alg1_compute(plan, B, *, out=None, dense_layout="row"):
     B = _materialize_dense_layout(B, dense_layout)
     block_n = _select_spmm_opt_block_n(int(B.shape[1]))
     if _is_complex_dtype(B.dtype):
-        C_out = out if out is not None else _empty_dense_layout(
-            (plan.n_rows, int(B.shape[1])),
-            B.dtype,
-            B.device,
-            dense_layout,
+        C_out = (
+            out
+            if out is not None
+            else _empty_dense_layout(
+                (plan.n_rows, int(B.shape[1])),
+                B.dtype,
+                B.device,
+                dense_layout,
+            )
         )
         C_out.zero_()
         for bucket in plan.row_buckets:
@@ -1483,11 +1560,15 @@ def _spmm_csr_alg1_compute(plan, B, *, out=None, dense_layout="row"):
                 num_stages=3,
             )
         return C_out
-    C_out = out if out is not None else _empty_dense_layout(
-        (plan.n_rows, int(B.shape[1])),
-        B.dtype,
-        B.device,
-        dense_layout,
+    C_out = (
+        out
+        if out is not None
+        else _empty_dense_layout(
+            (plan.n_rows, int(B.shape[1])),
+            B.dtype,
+            B.device,
+            dense_layout,
+        )
     )
     C_out.zero_()
     device_props = _normalize_spmm_opt_device_props(plan.data.device)
@@ -1499,7 +1580,9 @@ def _spmm_csr_alg1_compute(plan, B, *, out=None, dense_layout="row"):
     return C_out
 
 
-def _run_spmm_csr_alg1_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
+def _run_spmm_csr_alg1_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
     B = _materialize_dense_layout(B, dense_layout)
@@ -1665,7 +1748,9 @@ def _normalize_spmm_csr_alg2_device_props(device):
     props = torch.cuda.get_device_properties(device)
     warp_size = int(getattr(props, "warp_size", 32) or 32)
     sm_count = int(getattr(props, "multi_processor_count", 0) or 0)
-    max_threads_per_mp = int(getattr(props, "max_threads_per_multi_processor", 2048) or 2048)
+    max_threads_per_mp = int(
+        getattr(props, "max_threads_per_multi_processor", 2048) or 2048
+    )
     max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
     shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     return {
@@ -1699,7 +1784,9 @@ def _select_spmm_csr_alg2_block_n(n_dense_cols, block_n_cap):
 def _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype):
     warp_size = max(1, int(device_props["warp_size"]))
     max_threads_per_block = max(32, int(device_props["max_threads_per_block"]))
-    max_threads_per_mp = max(max_threads_per_block, int(device_props["max_threads_per_mp"]))
+    max_threads_per_mp = max(
+        max_threads_per_block, int(device_props["max_threads_per_mp"])
+    )
     lane_need = max(1, math.ceil(int(block_n) / warp_size))
     kind = bucket["kind"]
     block_k = int(bucket["block_k"])
@@ -1717,7 +1804,9 @@ def _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype):
         if segments >= 4:
             desired = max(desired, 8 if block_k >= 64 else 4)
         if segments >= 8:
-            desired = max(desired, 16 if dtype == torch.float32 and block_n >= 64 else 8)
+            desired = max(
+                desired, 16 if dtype == torch.float32 and block_n >= 64 else 8
+            )
 
     if dtype == torch.float64 and desired > 8:
         desired = 8
@@ -1884,7 +1973,9 @@ def _spmm_csr_alg2_build_bucket_descriptors(rows_flat, counts, offsets, dtype):
     offsets_cpu = offsets.cpu().tolist()
     buckets = []
     long_row_count = 0
-    for spec, count, offset in zip(_spmm_csr_alg2_bucket_specs(dtype), counts_cpu, offsets_cpu):
+    for spec, count, offset in zip(
+        _spmm_csr_alg2_bucket_specs(dtype), counts_cpu, offsets_cpu
+    ):
         count = int(count)
         if count == 0:
             continue
@@ -1907,7 +1998,12 @@ def _spmm_csr_alg2_build_bucket_descriptors(rows_flat, counts, offsets, dtype):
 
 
 def _spmm_csr_alg2_build_process_plan(prepared, *, timing=False):
-    if prepared.data.dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+    if prepared.data.dtype not in (
+        torch.float32,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    ):
         raise TypeError(
             "spmm_csr_alg2 only supports float32, float64, complex64, and complex128"
         )
@@ -1960,11 +2056,13 @@ def _spmm_csr_alg2_build_process_plan(prepared, *, timing=False):
         torch.cuda.synchronize()
         process_gpu_ms = None
 
-    row_buckets, long_row_count, process_cpu_ms = _spmm_csr_alg2_build_bucket_descriptors(
-        rows_flat,
-        counts,
-        offsets,
-        prepared.data.dtype,
+    row_buckets, long_row_count, process_cpu_ms = (
+        _spmm_csr_alg2_build_bucket_descriptors(
+            rows_flat,
+            counts,
+            offsets,
+            prepared.data.dtype,
+        )
     )
     return PreparedSpmmCsrAlg2Plan(
         data=prepared.data,
@@ -1997,7 +2095,15 @@ def _spmm_csr_alg2_acc_dtype(dtype):
 
 
 def _spmm_csr_alg2_run_bucket(
-    plan, bucket, B, C_out, device_props, kernels, *, accuracy=False, high_precision=False
+    plan,
+    bucket,
+    B,
+    C_out,
+    device_props,
+    kernels,
+    *,
+    accuracy=False,
+    high_precision=False,
 ):
     launch = _resolve_spmm_csr_alg2_launch(
         bucket,
@@ -2010,7 +2116,9 @@ def _spmm_csr_alg2_run_bucket(
         return launch
 
     batched_kernel, row_kernel, segmented_kernel = kernels
-    acc_dtype = tl.float64 if high_precision else _spmm_csr_alg2_acc_dtype(plan.data.dtype)
+    acc_dtype = (
+        tl.float64 if high_precision else _spmm_csr_alg2_acc_dtype(plan.data.dtype)
+    )
     out_dtype = tl.float64 if plan.data.dtype == torch.float64 else tl.float32
     accuracy_kernel = bool(accuracy and plan.data.dtype == torch.float32)
     common_kwargs = {
@@ -2112,11 +2220,15 @@ def _spmm_csr_alg2_compute(
     dense_layout = _normalize_dense_layout(dense_layout)
     B = _materialize_dense_layout(B, dense_layout)
     if _is_complex_dtype(B.dtype):
-        C_out = out if out is not None else _empty_dense_layout(
-            (plan.n_rows, int(B.shape[1])),
-            B.dtype,
-            B.device,
-            dense_layout,
+        C_out = (
+            out
+            if out is not None
+            else _empty_dense_layout(
+                (plan.n_rows, int(B.shape[1])),
+                B.dtype,
+                B.device,
+                dense_layout,
+            )
         )
         C_out.zero_()
         device_props = _normalize_spmm_csr_alg2_device_props(plan.data.device)
@@ -2146,11 +2258,15 @@ def _spmm_csr_alg2_compute(
             launch["grid_n"] = int(triton.cdiv(B.shape[1], launch["block_n"]))
             plan.launch_configs.append(launch)
         return C_out
-    C_out = out if out is not None else _empty_dense_layout(
-        (plan.n_rows, int(B.shape[1])),
-        B.dtype,
-        B.device,
-        dense_layout,
+    C_out = (
+        out
+        if out is not None
+        else _empty_dense_layout(
+            (plan.n_rows, int(B.shape[1])),
+            B.dtype,
+            B.device,
+            dense_layout,
+        )
     )
     C_out.zero_()
     device_props = _normalize_spmm_csr_alg2_device_props(plan.data.device)
@@ -2158,14 +2274,22 @@ def _spmm_csr_alg2_compute(
     plan.launch_configs.clear()
     for bucket in plan.row_buckets:
         launch = _spmm_csr_alg2_run_bucket(
-            plan, bucket, B, C_out, device_props, kernels,
-            accuracy=accuracy, high_precision=high_precision,
+            plan,
+            bucket,
+            B,
+            C_out,
+            device_props,
+            kernels,
+            accuracy=accuracy,
+            high_precision=high_precision,
         )
         plan.launch_configs.append(launch)
     return C_out
 
 
-def _run_spmm_csr_alg2_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
+def _run_spmm_csr_alg2_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
     B = _materialize_dense_layout(B, dense_layout)
@@ -2225,8 +2349,13 @@ def _run_spmm_csr_alg2_accuracy_route(
     prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
 ):
     return _run_spmm_csr_alg2_accuracy_impl(
-        prepared, B, timing=timing, diagnostics=diagnostics,
-        dense_layout=dense_layout, high_precision=False, route_name="spmm_csr_alg2_accuracy",
+        prepared,
+        B,
+        timing=timing,
+        diagnostics=diagnostics,
+        dense_layout=dense_layout,
+        high_precision=False,
+        route_name="spmm_csr_alg2_accuracy",
     )
 
 
@@ -2234,14 +2363,25 @@ def _run_spmm_csr_alg2_accuracy_hp_route(
     prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
 ):
     return _run_spmm_csr_alg2_accuracy_impl(
-        prepared, B, timing=timing, diagnostics=diagnostics,
-        dense_layout=dense_layout, high_precision=True, route_name="spmm_csr_alg2_accuracy_hp",
+        prepared,
+        B,
+        timing=timing,
+        diagnostics=diagnostics,
+        dense_layout=dense_layout,
+        high_precision=True,
+        route_name="spmm_csr_alg2_accuracy_hp",
     )
 
 
 def _run_spmm_csr_alg2_accuracy_impl(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row",
-    high_precision=False, route_name="spmm_csr_alg2_accuracy",
+    prepared,
+    B,
+    *,
+    timing=False,
+    diagnostics=False,
+    dense_layout="row",
+    high_precision=False,
+    route_name="spmm_csr_alg2_accuracy",
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
@@ -2292,7 +2432,8 @@ def _run_spmm_csr_alg2_accuracy_impl(
             "long_part_count": 0,
             "launch_version": (
                 "spmm_csr_alg2_accuracy_hp_v1"
-                if high_precision else "spmm_csr_alg2_accuracy_v1"
+                if high_precision
+                else "spmm_csr_alg2_accuracy_v1"
             ),
             "block_n": first_launch.get("block_n"),
             "block_nnz": first_launch.get("block_k"),
@@ -2320,49 +2461,84 @@ SPMM_CSR_ALGORITHMS = {
         name="csr_base_accuracy",
         display_name="BaseAccuracy",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=(
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ),
         run=_run_spmm_csr_base_accuracy_route,
     ),
     "alpha_alg1_tle_opt": SpmmCsrAlgorithm(
         name="alpha_alg1_tle_opt",
         display_name="TLEOpt",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=(
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ),
         run=_run_alpha_spmm_alg1_tle_opt_route,
     ),
     "alpha_alg1_tle_opt2": SpmmCsrAlgorithm(
         name="alpha_alg1_tle_opt2",
         display_name="TLEOpt2",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=(
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ),
         run=_run_alpha_spmm_alg1_tle_opt2_route,
     ),
     "spmm_csr_alg1": SpmmCsrAlgorithm(
         name="spmm_csr_alg1",
         display_name="Alg1",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=(
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ),
         run=_run_spmm_csr_alg1_route,
     ),
     "spmm_csr_alg2": SpmmCsrAlgorithm(
         name="spmm_csr_alg2",
         display_name="Alg2",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=(
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ),
         run=_run_spmm_csr_alg2_route,
     ),
     "spmm_csr_alg2_accuracy": SpmmCsrAlgorithm(
         name="spmm_csr_alg2_accuracy",
         display_name="Alg2Accuracy",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=(
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ),
         run=_run_spmm_csr_alg2_accuracy_route,
     ),
     "spmm_csr_alg2_accuracy_hp": SpmmCsrAlgorithm(
         name="spmm_csr_alg2_accuracy_hp",
         display_name="Alg2AccuracyHP",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=(
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ),
         run=_run_spmm_csr_alg2_accuracy_hp_route,
     ),
 }
@@ -2374,7 +2550,9 @@ def resolve_spmm_csr_algorithm(alg, op, dtype):
         token = "csr_base"
     if token not in SPMM_CSR_ALGORITHMS:
         supported = ", ".join(sorted(SPMM_CSR_ALGORITHMS))
-        raise ValueError(f"unsupported CSR SpMM algorithm {alg!r}; supported: auto, {supported}")
+        raise ValueError(
+            f"unsupported CSR SpMM algorithm {alg!r}; supported: auto, {supported}"
+        )
     algorithm = SPMM_CSR_ALGORITHMS[token]
     op_name = _spmm_op_to_name(op)
     if op_name not in algorithm.supported_ops:
@@ -2476,7 +2654,9 @@ def flagsparse_spmm_csr_run(
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
 
-    start = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+    start = (
+        torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+    )
     end = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
     if start is not None:
         torch.cuda.synchronize()
@@ -2503,7 +2683,9 @@ def flagsparse_spmm_csr_run(
     process_cpu_ms = float(route_meta.get("process_cpu_ms", 0.0) or 0.0)
     route_process_gpu_ms = route_meta.get("process_gpu_ms")
     if timing:
-        process_gpu_ms = float(op_process_gpu_ms or 0.0) + float(route_process_gpu_ms or 0.0)
+        process_gpu_ms = float(op_process_gpu_ms or 0.0) + float(
+            route_process_gpu_ms or 0.0
+        )
     else:
         process_gpu_ms = None
     operator_ms = (process_cpu_ms + float(gpu_ms)) if gpu_ms is not None else None
@@ -2600,16 +2782,37 @@ _SPMM_OPT_BUCKET_SPECS = (
     {"max_row_nnz": 32, "kind": "batched", "batch_rows": 8, "block_nnz": 32},
     {"max_row_nnz": 128, "kind": "batched", "batch_rows": 4, "block_nnz": 64},
     {"max_row_nnz": 512, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
-    {"max_row_nnz": _SPMM_OPT_LONG_ROW_THRESHOLD, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
-    {"max_row_nnz": None, "kind": "split", "batch_rows": 1, "block_nnz": _SPMM_OPT_SPLIT_BLOCK_NNZ},
+    {
+        "max_row_nnz": _SPMM_OPT_LONG_ROW_THRESHOLD,
+        "kind": "vector",
+        "batch_rows": 1,
+        "block_nnz": 128,
+    },
+    {
+        "max_row_nnz": None,
+        "kind": "split",
+        "batch_rows": 1,
+        "block_nnz": _SPMM_OPT_SPLIT_BLOCK_NNZ,
+    },
 )
 _SPMM_CSR_ALG1_BUCKET_SPECS = (
     {"max_row_nnz": 32, "kind": "batched", "batch_rows": 8, "block_nnz": 32},
     {"max_row_nnz": 128, "kind": "batched", "batch_rows": 4, "block_nnz": 64},
     {"max_row_nnz": 512, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
-    {"max_row_nnz": _SPMM_OPT_LONG_ROW_THRESHOLD, "kind": "vector", "batch_rows": 1, "block_nnz": 128},
-    {"max_row_nnz": None, "kind": "split", "batch_rows": 1, "block_nnz": _SPMM_OPT_SPLIT_BLOCK_NNZ},
+    {
+        "max_row_nnz": _SPMM_OPT_LONG_ROW_THRESHOLD,
+        "kind": "vector",
+        "batch_rows": 1,
+        "block_nnz": 128,
+    },
+    {
+        "max_row_nnz": None,
+        "kind": "split",
+        "batch_rows": 1,
+        "block_nnz": _SPMM_OPT_SPLIT_BLOCK_NNZ,
+    },
 )
+
 
 def _spmm_opt_make_bucket(
     label,
@@ -2743,7 +2946,9 @@ def _build_spmm_opt_split_metadata(kernel_indptr, long_rows, part_block_nnz):
     row_ends = kernel_indptr[long_rows_i64 + 1].to(torch.int64)
     row_lengths = row_ends - row_starts
     part_counts = torch.div(row_lengths + block - 1, block, rounding_mode="floor")
-    row_part_ptr = torch.empty((long_rows.numel() + 1,), dtype=torch.int64, device=device)
+    row_part_ptr = torch.empty(
+        (long_rows.numel() + 1,), dtype=torch.int64, device=device
+    )
     row_part_ptr[0] = 0
     row_part_ptr[1:] = torch.cumsum(part_counts, dim=0)
 
@@ -2828,7 +3033,9 @@ def _spmm_opt_alg1_symbolic_count_kernel(
     bucket = tl.where(
         lens <= 32,
         0,
-        tl.where(lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))),
+        tl.where(
+            lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))
+        ),
     )
     for bid in tl.static_range(0, 5):
         hits = mask & (bucket == bid)
@@ -2852,7 +3059,9 @@ def _spmm_opt_alg1_symbolic_compact_kernel(
     bucket = tl.where(
         lens <= 32,
         0,
-        tl.where(lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))),
+        tl.where(
+            lens <= 128, 1, tl.where(lens <= 512, 2, tl.where(lens <= 2048, 3, 4))
+        ),
     )
     for bid in tl.static_range(0, 5):
         hits = mask & (bucket == bid)
@@ -2994,7 +3203,9 @@ def _build_spmm_csr_opt_runtime_symbolic_with_builder(prepared, bucket_builder):
         prepared.data.dtype,
         nnz=prepared.data.numel(),
     )
-    long_part_rows = torch.empty((0,), dtype=long_rows.dtype, device=prepared.data.device)
+    long_part_rows = torch.empty(
+        (0,), dtype=long_rows.dtype, device=prepared.data.device
+    )
     long_part_starts = torch.empty((0,), dtype=torch.int64, device=prepared.data.device)
     long_part_ends = torch.empty((0,), dtype=torch.int64, device=prepared.data.device)
     long_row_part_ptr = torch.zeros(1, dtype=torch.int64, device=prepared.data.device)
@@ -3075,15 +3286,21 @@ def _triton_spmm_csr_complex_impl(
 
     data_ri = torch.view_as_real(data).contiguous().reshape(-1)
     B_ri = torch.view_as_real(B)
-    C_complex = out if out is not None else _empty_dense_layout(
-        (n_rows, n_dense_cols),
-        dtype,
-        device,
-        dense_layout,
+    C_complex = (
+        out
+        if out is not None
+        else _empty_dense_layout(
+            (n_rows, n_dense_cols),
+            dtype,
+            device,
+            dense_layout,
+        )
     )
     C_ri = torch.view_as_real(C_complex)
     grid = (n_rows, triton.cdiv(n_dense_cols, block_n))
-    acc_dtype = tl.float64 if (B_ri.dtype == torch.float64 or high_precision) else tl.float32
+    acc_dtype = (
+        tl.float64 if (B_ri.dtype == torch.float64 or high_precision) else tl.float32
+    )
     _spmm_csr_complex_kernel[grid](
         data_ri,
         indices,
@@ -3126,7 +3343,9 @@ def _spmm_csr_run_selected_rows_complex(
     data_ri = torch.view_as_real(data).contiguous().reshape(-1)
     B_ri = torch.view_as_real(B)
     C_ri = torch.view_as_real(C_out)
-    acc_dtype = tl.float64 if (B_ri.dtype == torch.float64 or high_precision) else tl.float32
+    acc_dtype = (
+        tl.float64 if (B_ri.dtype == torch.float64 or high_precision) else tl.float32
+    )
     grid = (rows.numel(), triton.cdiv(int(B.shape[1]), block_n))
     _spmm_csr_selected_rows_complex_kernel[grid](
         data_ri,
@@ -3192,7 +3411,9 @@ def _triton_spmm_csr_impl(
         C_compute = (
             out
             if out is not None and compute_dtype == dtype
-            else _empty_dense_layout((n_rows, n_dense_cols), compute_dtype, device, dense_layout)
+            else _empty_dense_layout(
+                (n_rows, n_dense_cols), compute_dtype, device, dense_layout
+            )
         )
         grid = (n_rows, triton.cdiv(n_dense_cols, block_n))
         acc_dtype = tl.float64 if compute_dtype == torch.float64 else tl.float32
@@ -3221,7 +3442,9 @@ def _triton_spmm_csr_impl(
                 out.copy_(C_cast)
                 return out
             if dense_layout == "col":
-                C_out = _empty_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
+                C_out = _empty_dense_layout(
+                    (n_rows, n_dense_cols), dtype, device, dense_layout
+                )
                 C_out.copy_(C_cast)
                 return C_out
             return C_cast
@@ -3285,7 +3508,9 @@ def _spmm_csr_batched_rows_f32_kernel(
                     other=0.0,
                 )
                 acc = acc + a_val * b_vals
-        tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n & active)
+        tl.store(
+            c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n & active
+        )
 
 
 @triton.jit
@@ -3330,7 +3555,9 @@ def _spmm_csr_batched_rows_f64_kernel(
                     other=0.0,
                 )
                 acc = acc + a_val * b_vals
-        tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n & active)
+        tl.store(
+            c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n & active
+        )
 
 
 @triton.jit
@@ -3453,7 +3680,9 @@ def _spmm_csr_split_part_f32_kernel(
             other=0.0,
         )
         acc = acc + a_val * b_vals
-    tl.store(workspace_ptr + pid_part * stride_wm + offs_n * stride_wn, acc, mask=mask_n)
+    tl.store(
+        workspace_ptr + pid_part * stride_wm + offs_n * stride_wn, acc, mask=mask_n
+    )
 
 
 @triton.jit
@@ -3490,7 +3719,9 @@ def _spmm_csr_split_part_f64_kernel(
             other=0.0,
         )
         acc = acc + a_val * b_vals
-    tl.store(workspace_ptr + pid_part * stride_wm + offs_n * stride_wn, acc, mask=mask_n)
+    tl.store(
+        workspace_ptr + pid_part * stride_wm + offs_n * stride_wn, acc, mask=mask_n
+    )
 
 
 @triton.jit
@@ -3725,12 +3956,16 @@ def _triton_spmm_csr_impl_opt_prepared(prepared, B):
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
     if B.shape[0] != prepared.n_cols:
-        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
+        raise ValueError(
+            f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}"
+        )
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
     B = B.contiguous()
     block_n = _select_spmm_opt_block_n(int(B.shape[1]))
-    C_out = torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
+    C_out = torch.zeros(
+        (prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device
+    )
     long_row_fallback_used = False
     device_props = _normalize_spmm_opt_device_props(prepared.data.device)
     for bucket in prepared.row_buckets:
@@ -3941,8 +4176,13 @@ def _flagsparse_spmm_csr_opt_alg1_impl(
         if not out.is_cuda:
             raise ValueError("out must be a CUDA tensor")
         if out.device != prepared.data.device:
-            raise ValueError("out must be on the same CUDA device as sparse matrix data")
-        if out.shape != (prepared.n_rows, int(B.shape[1])) or out.dtype != prepared.data.dtype:
+            raise ValueError(
+                "out must be on the same CUDA device as sparse matrix data"
+            )
+        if (
+            out.shape != (prepared.n_rows, int(B.shape[1]))
+            or out.dtype != prepared.data.dtype
+        ):
             raise ValueError("out shape/dtype must match result")
     do_timing = bool(return_time or return_meta)
     symbolic_ms = None
@@ -4150,7 +4390,9 @@ def benchmark_spmm_opt_case(
             indptr_cp = _cupy_from_torch(indptr)
             B_cp = _cupy_from_torch(B)
             A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-            _, cu_ms = _benchmark_cuda_op(lambda: A_csr @ B_cp, warmup=warmup, iters=iters)
+            _, cu_ms = _benchmark_cuda_op(
+                lambda: A_csr @ B_cp, warmup=warmup, iters=iters
+            )
         except Exception:
             cu_ms = None
 
@@ -4275,7 +4517,9 @@ def benchmark_spmm_case(
     pytorch_ms = None
     pytorch_format = "CSR"
     try:
-        csr_pt = torch.sparse_csr_tensor(indptr64, indices64, data, size=shape, device=device)
+        csr_pt = torch.sparse_csr_tensor(
+            indptr64, indices64, data, size=shape, device=device
+        )
         if op_code == SPMM_OP_NON:
             pytorch_op = lambda: torch.sparse.mm(csr_pt, B)
         elif op_code == SPMM_OP_TRANS:
@@ -4283,38 +4527,54 @@ def benchmark_spmm_case(
         else:
             pytorch_op = lambda: torch.sparse.mm(csr_pt.conj().transpose(0, 1), B)
         if value_dtype in (torch.float16, torch.bfloat16):
-            csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float32), size=shape, device=device)
+            csr_ref = torch.sparse_csr_tensor(
+                indptr64, indices64, data.to(torch.float32), size=shape, device=device
+            )
             expected = (
                 torch.sparse.mm(csr_ref, B.to(torch.float32))
                 if op_code == SPMM_OP_NON
                 else torch.sparse.mm(
-                    csr_ref.transpose(0, 1)
-                    if op_code == SPMM_OP_TRANS
-                    else csr_ref.conj().transpose(0, 1),
+                    (
+                        csr_ref.transpose(0, 1)
+                        if op_code == SPMM_OP_TRANS
+                        else csr_ref.conj().transpose(0, 1)
+                    ),
                     B.to(torch.float32),
                 )
             ).to(value_dtype)
         elif value_dtype == torch.float32:
-            csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float64), size=shape, device=device)
+            csr_ref = torch.sparse_csr_tensor(
+                indptr64, indices64, data.to(torch.float64), size=shape, device=device
+            )
             expected = (
                 torch.sparse.mm(csr_ref, B.to(torch.float64))
                 if op_code == SPMM_OP_NON
                 else torch.sparse.mm(
-                    csr_ref.transpose(0, 1)
-                    if op_code == SPMM_OP_TRANS
-                    else csr_ref.conj().transpose(0, 1),
+                    (
+                        csr_ref.transpose(0, 1)
+                        if op_code == SPMM_OP_TRANS
+                        else csr_ref.conj().transpose(0, 1)
+                    ),
                     B.to(torch.float64),
                 )
             ).to(value_dtype)
         elif value_dtype == torch.complex64:
-            csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.complex128), size=shape, device=device)
+            csr_ref = torch.sparse_csr_tensor(
+                indptr64,
+                indices64,
+                data.to(torch.complex128),
+                size=shape,
+                device=device,
+            )
             expected = (
                 torch.sparse.mm(csr_ref, B.to(torch.complex128))
                 if op_code == SPMM_OP_NON
                 else torch.sparse.mm(
-                    csr_ref.transpose(0, 1)
-                    if op_code == SPMM_OP_TRANS
-                    else csr_ref.conj().transpose(0, 1),
+                    (
+                        csr_ref.transpose(0, 1)
+                        if op_code == SPMM_OP_TRANS
+                        else csr_ref.conj().transpose(0, 1)
+                    ),
                     B.to(torch.complex128),
                 )
             ).to(value_dtype)
@@ -4341,9 +4601,11 @@ def benchmark_spmm_case(
                 torch.sparse.mm(coo_ref, B.to(torch.float32))
                 if op_code == SPMM_OP_NON
                 else torch.sparse.mm(
-                    coo_ref.transpose(0, 1)
-                    if op_code == SPMM_OP_TRANS
-                    else coo_ref.conj().transpose(0, 1),
+                    (
+                        coo_ref.transpose(0, 1)
+                        if op_code == SPMM_OP_TRANS
+                        else coo_ref.conj().transpose(0, 1)
+                    ),
                     B.to(torch.float32),
                 )
             ).to(value_dtype)
@@ -4353,9 +4615,11 @@ def benchmark_spmm_case(
                 torch.sparse.mm(coo_ref, B.to(torch.float64))
                 if op_code == SPMM_OP_NON
                 else torch.sparse.mm(
-                    coo_ref.transpose(0, 1)
-                    if op_code == SPMM_OP_TRANS
-                    else coo_ref.conj().transpose(0, 1),
+                    (
+                        coo_ref.transpose(0, 1)
+                        if op_code == SPMM_OP_TRANS
+                        else coo_ref.conj().transpose(0, 1)
+                    ),
                     B.to(torch.float64),
                 )
             ).to(value_dtype)
@@ -4365,9 +4629,11 @@ def benchmark_spmm_case(
                 torch.sparse.mm(coo_ref, B.to(torch.complex128))
                 if op_code == SPMM_OP_NON
                 else torch.sparse.mm(
-                    coo_ref.transpose(0, 1)
-                    if op_code == SPMM_OP_TRANS
-                    else coo_ref.conj().transpose(0, 1),
+                    (
+                        coo_ref.transpose(0, 1)
+                        if op_code == SPMM_OP_TRANS
+                        else coo_ref.conj().transpose(0, 1)
+                    ),
                     B.to(torch.complex128),
                 )
             ).to(value_dtype)
@@ -4380,7 +4646,9 @@ def benchmark_spmm_case(
             pytorch_op, warmup=warmup, iters=iters
         )
     except Exception as exc:
-        pytorch_reason = str(exc) if pytorch_reason is None else f"{pytorch_reason}; timing: {exc}"
+        pytorch_reason = (
+            str(exc) if pytorch_reason is None else f"{pytorch_reason}; timing: {exc}"
+        )
 
     triton_metrics = _spmm_validation_metrics(triton_C, expected)
     triton_match = triton_metrics["strict_allclose_match"]
@@ -4479,12 +4747,36 @@ def benchmark_spmm_case(
             "pytorch_relative_threshold": threshold,
             "cusparse_match_reference": cusparse_match,
             "cusparse_match_pytorch": cusparse_match,
-            "cusparse_max_error": (cusparse_metrics["max_abs_error"] if cusparse_metrics is not None else None),
-            "cusparse_max_abs_error": (cusparse_metrics["max_abs_error"] if cusparse_metrics is not None else None),
-            "cusparse_max_relative_error": (cusparse_metrics["max_relative_error"] if cusparse_metrics is not None else None),
-            "cusparse_sum_relative_error": (cusparse_metrics["sum_relative_error"] if cusparse_metrics is not None else None),
-            "cusparse_relative_threshold": (cusparse_metrics["relative_threshold"] if cusparse_metrics is not None else threshold),
-            "cusparse_strict_allclose_match": (cusparse_metrics["strict_allclose_match"] if cusparse_metrics is not None else None),
+            "cusparse_max_error": (
+                cusparse_metrics["max_abs_error"]
+                if cusparse_metrics is not None
+                else None
+            ),
+            "cusparse_max_abs_error": (
+                cusparse_metrics["max_abs_error"]
+                if cusparse_metrics is not None
+                else None
+            ),
+            "cusparse_max_relative_error": (
+                cusparse_metrics["max_relative_error"]
+                if cusparse_metrics is not None
+                else None
+            ),
+            "cusparse_sum_relative_error": (
+                cusparse_metrics["sum_relative_error"]
+                if cusparse_metrics is not None
+                else None
+            ),
+            "cusparse_relative_threshold": (
+                cusparse_metrics["relative_threshold"]
+                if cusparse_metrics is not None
+                else threshold
+            ),
+            "cusparse_strict_allclose_match": (
+                cusparse_metrics["strict_allclose_match"]
+                if cusparse_metrics is not None
+                else None
+            ),
         },
         "backend_status": {
             "pytorch_unavailable_reason": pytorch_reason,
@@ -4499,6 +4791,8 @@ def benchmark_spmm_case(
             "cusparse": cusparse_values,
         },
     }
+
+
 def comprehensive_spmm_test(
     n_rows=4096,
     n_cols=4096,

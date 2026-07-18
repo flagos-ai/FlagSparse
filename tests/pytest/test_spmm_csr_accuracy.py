@@ -30,7 +30,6 @@ from tests.pytest.param_shapes import (
 )
 from tests.pytest.accuracy_utils import close_tolerances
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 _SYNTHETIC_VALUE_SCALE = 0.125

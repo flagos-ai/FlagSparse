@@ -48,7 +48,6 @@ from .spgemm_csr import benchmark_spgemm_case
 from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
 
-
 _GATHER_GRAPH_BATCH = 100
 
 
@@ -109,9 +108,7 @@ def benchmark_gather_case(
 
     pytorch_out = torch.empty_like(expected)
     triton_out = torch.empty_like(expected)
-    pytorch_op = lambda: torch.index_select(
-        dense_vector, 0, indices, out=pytorch_out
-    )
+    pytorch_op = lambda: torch.index_select(dense_vector, 0, indices, out=pytorch_out)
     triton_op = lambda: _triton_gather_impl(
         dense_vector, kernel_indices, out=triton_out, block_size=block_size
     )
@@ -140,9 +137,7 @@ def benchmark_gather_case(
     atol, rtol = _tolerance_for_dtype(value_dtype)
     triton_match = torch.allclose(triton_values, expected, atol=atol, rtol=rtol)
     triton_max_error = (
-        float(torch.max(torch.abs(triton_values - expected)).item())
-        if nnz > 0
-        else 0.0
+        float(torch.max(torch.abs(triton_values - expected)).item()) if nnz > 0 else 0.0
     )
 
     cusparse_ms = None
@@ -194,9 +189,7 @@ def benchmark_gather_case(
         pytorch_ms / triton_ms if triton_ms > 0 else float("inf")
     )
     triton_speedup_vs_cusparse = (
-        cusparse_ms / triton_ms
-        if (cusparse_ms is not None and triton_ms > 0)
-        else None
+        cusparse_ms / triton_ms if (cusparse_ms is not None and triton_ms > 0) else None
     )
 
     return {
@@ -249,19 +242,26 @@ def benchmark_scatter_case(
 ):
     """Benchmark Triton scatter vs PyTorch index_copy vs cuSPARSE-backed COO SpMV."""
     device = torch.device("cuda")
-    requested_value_dtype, requested_effective_dtype, fallback_applied, fallback_reason = (
-        _resolve_scatter_benchmark_dtype(value_dtype, dtype_policy)
-    )
+    (
+        requested_value_dtype,
+        requested_effective_dtype,
+        fallback_applied,
+        fallback_reason,
+    ) = _resolve_scatter_benchmark_dtype(value_dtype, dtype_policy)
     sparse_values = _build_random_dense(nnz, requested_effective_dtype, device)
-    indices = _build_indices(nnz, dense_size, index_dtype, device, unique=unique_indices)
+    indices = _build_indices(
+        nnz, dense_size, index_dtype, device, unique=unique_indices
+    )
 
-    sparse_values, indices, kernel_indices, dense_size, prep_meta = _prepare_scatter_inputs(
-        sparse_values,
-        indices,
-        dense_size=dense_size,
-        out=None,
-        dtype_policy=dtype_policy,
-        return_metadata=True,
+    sparse_values, indices, kernel_indices, dense_size, prep_meta = (
+        _prepare_scatter_inputs(
+            sparse_values,
+            indices,
+            dense_size=dense_size,
+            out=None,
+            dtype_policy=dtype_policy,
+            return_metadata=True,
+        )
     )
     effective_value_dtype = prep_meta["effective_value_dtype"]
     fallback_applied = fallback_applied or prep_meta["fallback_applied"]
@@ -289,7 +289,10 @@ def benchmark_scatter_case(
         return_metadata=True,
     )
     effective_kernel_indices = kernel_indices
-    if triton_index_meta["index_fallback_applied"] and kernel_indices.dtype == torch.int64:
+    if (
+        triton_index_meta["index_fallback_applied"]
+        and kernel_indices.dtype == torch.int64
+    ):
         effective_kernel_indices = kernel_indices.to(torch.int32)
     triton_out = base_out.clone()
 
@@ -310,7 +313,9 @@ def benchmark_scatter_case(
         index_fallback_policy="strict",
     )
 
-    pytorch_values, pytorch_ms = _benchmark_cuda_op(pytorch_op, warmup=warmup, iters=iters)
+    pytorch_values, pytorch_ms = _benchmark_cuda_op(
+        pytorch_op, warmup=warmup, iters=iters
+    )
     triton_values, triton_ms = _benchmark_cuda_op(triton_op, warmup=warmup, iters=iters)
 
     atol, rtol = _tolerance_for_dtype(effective_value_dtype)
@@ -327,7 +332,9 @@ def benchmark_scatter_case(
     cusparse_reason = None
     if run_cusparse:
         if not reset_output:
-            skip_reason = "cuSPARSE scatter baseline only matches reset_output=True semantics"
+            skip_reason = (
+                "cuSPARSE scatter baseline only matches reset_output=True semantics"
+            )
         else:
             skip_reason = _cusparse_baseline_skip_reason(sparse_values.dtype)
         if skip_reason:
@@ -356,9 +363,7 @@ def benchmark_scatter_case(
         pytorch_ms / triton_ms if triton_ms > 0 else float("inf")
     )
     triton_speedup_vs_cusparse = (
-        cusparse_ms / triton_ms
-        if (cusparse_ms is not None and triton_ms > 0)
-        else None
+        cusparse_ms / triton_ms if (cusparse_ms is not None and triton_ms > 0) else None
     )
 
     return {
@@ -463,9 +468,7 @@ def benchmark_spmv_case(
         indices_cp = _cupy_from_torch(indices.to(torch.int64))
         indptr_cp = _cupy_from_torch(indptr)
         x_cp = _cupy_from_torch(x)
-        A_csr = cpx_sparse.csr_matrix(
-            (data_cp, indices_cp, indptr_cp), shape=shape
-        )
+        A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
         ref_y = _apply_cupy_spmv_op(A_csr, x_cp, op_code)
         expected = _torch_from_cupy(ref_y)
     else:
@@ -484,17 +487,15 @@ def benchmark_spmv_case(
         if value_dtype in (torch.float16, torch.bfloat16):
             coo_f32 = coo.to(torch.float32)
             x_2d_f32 = x_2d.to(torch.float32)
-            expected = _apply_torch_sparse_spmv_op(
-                coo_f32, x_2d_f32, op_code
-            ).to(value_dtype)
+            expected = _apply_torch_sparse_spmv_op(coo_f32, x_2d_f32, op_code).to(
+                value_dtype
+            )
         else:
             expected = _apply_torch_sparse_spmv_op(coo, x_2d, op_code)
     atol, rtol = _tolerance_for_dtype(value_dtype)
     triton_match = torch.allclose(triton_y, expected, atol=atol, rtol=rtol)
     triton_max_error = (
-        float(torch.max(torch.abs(triton_y - expected)).item())
-        if y_size > 0
-        else 0.0
+        float(torch.max(torch.abs(triton_y - expected)).item()) if y_size > 0 else 0.0
     )
     cusparse_ms = None
     cusparse_match = None
@@ -512,9 +513,7 @@ def benchmark_spmv_case(
         else:
             try:
                 A_op = _cupy_spmv_op_matrix(A_csr, op_code)
-                cusparse_op = lambda: _torch_from_cupy(
-                    A_op @ _cupy_from_torch(x)
-                )
+                cusparse_op = lambda: _torch_from_cupy(A_op @ _cupy_from_torch(x))
                 cusparse_values, cusparse_ms = _benchmark_cuda_op(
                     cusparse_op, warmup=warmup, iters=iters
                 )
@@ -529,13 +528,9 @@ def benchmark_spmv_case(
             except Exception as exc:
                 cusparse_reason = str(exc)
     elif run_cusparse and value_dtype not in _cupy_supported_dtypes:
-        cusparse_reason = (
-            "float16/bfloat16 not supported by CuPy sparse; skipped"
-        )
+        cusparse_reason = "float16/bfloat16 not supported by CuPy sparse; skipped"
     triton_speedup_vs_cusparse = (
-        cusparse_ms / triton_ms
-        if (cusparse_ms is not None and triton_ms > 0)
-        else None
+        cusparse_ms / triton_ms if (cusparse_ms is not None and triton_ms > 0) else None
     )
     return {
         "parameters": {

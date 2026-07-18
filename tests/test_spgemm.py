@@ -162,7 +162,7 @@ def _slice_csr_rows(data, indices, indptr, shape, row_start, row_end):
     ptr_end = int(indptr[row_end].item())
     sub_data = data[ptr_start:ptr_end]
     sub_indices = indices[ptr_start:ptr_end]
-    sub_indptr = (indptr[row_start:row_end + 1] - ptr_start).to(torch.int64)
+    sub_indptr = (indptr[row_start : row_end + 1] - ptr_start).to(torch.int64)
     sub_shape = (int(row_end - row_start), int(shape[1]))
     return sub_data, sub_indices, sub_indptr, sub_shape
 
@@ -190,9 +190,19 @@ def _concat_csr_row_blocks(blocks, n_rows, n_cols, device, data_dtype=torch.floa
             indptr_parts.append(indptr_b[1:].to(torch.int64) + nnz_acc)
         nnz_acc += int(data_b.numel())
     if row_acc != int(n_rows):
-        raise RuntimeError(f"blocked CSR concat row mismatch: got {row_acc}, expected {n_rows}")
-    data = torch.cat(data_parts) if data_parts else torch.empty(0, dtype=data_dtype, device=device)
-    indices = torch.cat(idx_parts) if idx_parts else torch.empty(0, dtype=torch.int32, device=device)
+        raise RuntimeError(
+            f"blocked CSR concat row mismatch: got {row_acc}, expected {n_rows}"
+        )
+    data = (
+        torch.cat(data_parts)
+        if data_parts
+        else torch.empty(0, dtype=data_dtype, device=device)
+    )
+    indices = (
+        torch.cat(idx_parts)
+        if idx_parts
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
     indptr = torch.cat(indptr_parts)
     return data, indices, indptr, (int(n_rows), int(n_cols))
 
@@ -213,7 +223,7 @@ def _csr_sorted_pairs_block(data, indices, indptr, n_cols, row_start, row_end):
             torch.empty(0, dtype=torch.int64, device=data.device),
             torch.empty(0, dtype=data.dtype, device=data.device),
         )
-    ptr = indptr[row_start:row_end + 1].to(torch.int64)
+    ptr = indptr[row_start : row_end + 1].to(torch.int64)
     start = int(ptr[0].item())
     end = int(ptr[-1].item())
     if end <= start:
@@ -301,7 +311,9 @@ def _spgemm_compare_metrics(candidate, reference, value_dtype):
                 "reason": f"sparsity pattern mismatch in rows [{row}, {row + chunk_rows})",
             }
         if c_vals.numel() > 0:
-            err_ratio = max(err_ratio, _allclose_error_ratio(c_vals, r_vals, atol, rtol))
+            err_ratio = max(
+                err_ratio, _allclose_error_ratio(c_vals, r_vals, atol, rtol)
+            )
             abs_diff = torch.abs(c_vals - r_vals)
             max_abs = max(max_abs, float(torch.max(abs_diff).item()))
             ref_max = max(ref_max, float(torch.max(torch.abs(r_vals)).item()))
@@ -359,7 +371,10 @@ def _normalize_csv_path(csv_path):
 
 def _log_stage(path, stage, start_time):
     elapsed = time.perf_counter() - start_time
-    print(f"[SpGEMM][{os.path.basename(path)}] {stage} (elapsed={elapsed:.2f}s)", flush=True)
+    print(
+        f"[SpGEMM][{os.path.basename(path)}] {stage} (elapsed={elapsed:.2f}s)",
+        flush=True,
+    )
 
 
 def _resolve_input_mode(requested_mode, shape):
@@ -423,7 +438,9 @@ def _build_torch_spgemm_reference(
         op = lambda: torch.sparse.mm(a_coo, b_coo)
         ref_sparse = op()
     if ref_sparse.layout not in (torch.sparse_coo, torch.sparse_csr):
-        raise RuntimeError(f"Unexpected torch sparse.mm result layout: {ref_sparse.layout}")
+        raise RuntimeError(
+            f"Unexpected torch sparse.mm result layout: {ref_sparse.layout}"
+        )
     return ast_ops._torch_sparse_to_csr(ref_sparse), ref_format, op
 
 
@@ -445,10 +462,18 @@ def _build_torch_spgemm_reference_blocked(
         formats = set()
         for row_start in range(0, n_rows, block_rows):
             row_end = min(row_start + block_rows, n_rows)
-            a_blk = _slice_csr_rows(a_data, a_indices, a_indptr, a_shape, row_start, row_end)
+            a_blk = _slice_csr_rows(
+                a_data, a_indices, a_indptr, a_shape, row_start, row_end
+            )
             ref_blk, fmt_blk, _ = _build_torch_spgemm_reference(
-                a_blk[0], a_blk[1], a_blk[2], a_blk[3],
-                b_data, b_indices, b_indptr, b_shape,
+                a_blk[0],
+                a_blk[1],
+                a_blk[2],
+                a_blk[3],
+                b_data,
+                b_indices,
+                b_indptr,
+                b_shape,
             )
             blocks.append(ref_blk)
             formats.add(fmt_blk)
@@ -507,7 +532,10 @@ def _build_cupy_spgemm_reference(
         cols = ast_ops._torch_from_cupy(c_coo.col).to(torch.int64)
         vals = ast_ops._torch_from_cupy(c_coo.data).to(a_data.dtype)
         c_t = torch.sparse_coo_tensor(
-            torch.stack([rows, cols]), vals, (a_shape[0], b_shape[1]), device=a_data.device
+            torch.stack([rows, cols]),
+            vals,
+            (a_shape[0], b_shape[1]),
+            device=a_data.device,
         ).coalesce()
         return ast_ops._torch_sparse_to_csr(c_t)
 
@@ -531,10 +559,18 @@ def _build_cupy_spgemm_reference_blocked(
         blocks = []
         for row_start in range(0, n_rows, block_rows):
             row_end = min(row_start + block_rows, n_rows)
-            a_blk = _slice_csr_rows(a_data, a_indices, a_indptr, a_shape, row_start, row_end)
+            a_blk = _slice_csr_rows(
+                a_data, a_indices, a_indptr, a_shape, row_start, row_end
+            )
             ref_blk, _, _ = _build_cupy_spgemm_reference(
-                a_blk[0], a_blk[1], a_blk[2], a_blk[3],
-                b_data, b_indices, b_indptr, b_shape,
+                a_blk[0],
+                a_blk[1],
+                a_blk[2],
+                a_blk[3],
+                b_data,
+                b_indices,
+                b_indptr,
+                b_shape,
             )
             blocks.append(ref_blk)
         return _concat_csr_row_blocks(
@@ -614,7 +650,9 @@ def _run_reference_worker_subprocess(
     if isinstance(payload, dict):
         reason = payload.get("reason")
     if not reason:
-        reason = stderr or stdout or f"isolated worker failed with code {proc.returncode}"
+        reason = (
+            stderr or stdout or f"isolated worker failed with code {proc.returncode}"
+        )
     return {
         "success": False,
         "reason": reason,
@@ -644,8 +682,16 @@ def _run_reference_with_retries(
     input_mode,
     result_device="gpu",
 ):
-    run_direct = _build_torch_spgemm_reference if backend == "torch" else _build_cupy_spgemm_reference
-    run_blocked = _build_torch_spgemm_reference_blocked if backend == "torch" else _build_cupy_spgemm_reference_blocked
+    run_direct = (
+        _build_torch_spgemm_reference
+        if backend == "torch"
+        else _build_cupy_spgemm_reference
+    )
+    run_blocked = (
+        _build_torch_spgemm_reference_blocked
+        if backend == "torch"
+        else _build_cupy_spgemm_reference_blocked
+    )
     attempted_modes = ["direct"]
 
     def _mark_mode(mode):
@@ -680,7 +726,9 @@ def _run_reference_with_retries(
             b_shape,
         )
         _, ref_ms = ast_ops._benchmark_cuda_op(ref_op, warmup=warmup, iters=iters)
-        compare_result = _convert_result_for_compare(ref_result, result_device, a_data.device)
+        compare_result = _convert_result_for_compare(
+            ref_result, result_device, a_data.device
+        )
         ref_result = None
         if result_device == "cpu" and ref_cleanup:
             _cleanup_reference_pools()
@@ -717,8 +765,12 @@ def _run_reference_with_retries(
                     b_shape,
                     block_rows=int(br),
                 )
-                _, ref_ms = ast_ops._benchmark_cuda_op(ref_op, warmup=warmup, iters=iters)
-                compare_result = _convert_result_for_compare(ref_result, result_device, a_data.device)
+                _, ref_ms = ast_ops._benchmark_cuda_op(
+                    ref_op, warmup=warmup, iters=iters
+                )
+                compare_result = _convert_result_for_compare(
+                    ref_result, result_device, a_data.device
+                )
                 ref_result = None
                 if result_device == "cpu" and ref_cleanup:
                     _cleanup_reference_pools()
@@ -790,7 +842,9 @@ def _run_reference_with_retries(
     return _finalize()
 
 
-def _pick_effective_benchmark_loops(warmup, iters, first_call_ms, target_window_seconds):
+def _pick_effective_benchmark_loops(
+    warmup, iters, first_call_ms, target_window_seconds
+):
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
     per_call_s = max(float(first_call_ms) / 1000.0, 1e-4)
@@ -821,8 +875,14 @@ def _benchmark_flagsparse_spgemm(
     torch.cuda.synchronize()
     t_prepare0 = time.perf_counter()
     prepared = ast.prepare_spgemm_csr(
-        a_data, a_indices, a_indptr, a_shape,
-        b_data, b_indices, b_indptr, b_shape,
+        a_data,
+        a_indices,
+        a_indptr,
+        a_shape,
+        b_data,
+        b_indices,
+        b_indptr,
+        b_shape,
     )
     torch.cuda.synchronize()
     prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
@@ -830,7 +890,9 @@ def _benchmark_flagsparse_spgemm(
     _log_stage(mtx_path, "first-call", start_time)
     torch.cuda.synchronize()
     t_first0 = time.perf_counter()
-    first_result, first_meta = ast.flagsparse_spgemm_csr(prepared=prepared, return_meta=True)
+    first_result, first_meta = ast.flagsparse_spgemm_csr(
+        prepared=prepared, return_meta=True
+    )
     torch.cuda.synchronize()
     first_call_ms = (time.perf_counter() - t_first0) * 1000.0
     first_meta = dict(first_meta)
@@ -960,8 +1022,12 @@ def run_one_mtx(
     cu_ref_success = False
     pt_ref_result = None
     cu_ref_result = None
-    ref_warmup = result["effective_warmup"] if result["effective_warmup"] is not None else warmup
-    ref_iters = result["effective_iters"] if result["effective_iters"] is not None else iters
+    ref_warmup = (
+        result["effective_warmup"] if result["effective_warmup"] is not None else warmup
+    )
+    ref_iters = (
+        result["effective_iters"] if result["effective_iters"] is not None else iters
+    )
     ref_warmup = max(0, int(ref_warmup))
     ref_iters = max(1, int(ref_iters))
 
@@ -999,7 +1065,9 @@ def run_one_mtx(
     else:
         result["pytorch_reason"] = pt_ref.get("reason")
         result["ref_fail_stage"] = pt_ref.get("fail_stage")
-        result["error"] = _append_error(result["error"], f"pt_ref: {pt_ref.get('reason')}")
+        result["error"] = _append_error(
+            result["error"], f"pt_ref: {pt_ref.get('reason')}"
+        )
     if ref_cleanup:
         _cleanup_reference_pools()
 
@@ -1030,7 +1098,11 @@ def run_one_mtx(
         result["cu_retry_count"] = int(cu_ref.get("retry_count", 0))
         if cu_ref.get("peak_block_rows") is not None:
             cur_peak = result.get("ref_peak_block_rows")
-            result["ref_peak_block_rows"] = int(cu_ref["peak_block_rows"]) if cur_peak is None else max(int(cur_peak), int(cu_ref["peak_block_rows"]))
+            result["ref_peak_block_rows"] = (
+                int(cu_ref["peak_block_rows"])
+                if cur_peak is None
+                else max(int(cur_peak), int(cu_ref["peak_block_rows"]))
+            )
         if cu_ref.get("success"):
             cu_ref_success = True
             result["cusparse_ms"] = cu_ref.get("ms")
@@ -1039,7 +1111,9 @@ def run_one_mtx(
             result["cusparse_reason"] = cu_ref.get("reason")
             if result.get("ref_fail_stage") is None:
                 result["ref_fail_stage"] = cu_ref.get("fail_stage")
-            result["error"] = _append_error(result["error"], f"cu_ref: {cu_ref.get('reason')}")
+            result["error"] = _append_error(
+                result["error"], f"cu_ref: {cu_ref.get('reason')}"
+            )
     else:
         result["cusparse_reason"] = "CuPy/cuSPARSE reference is disabled"
         result["cu_exec_mode"] = "disabled"
@@ -1080,7 +1154,9 @@ def run_one_mtx(
         result["long_row_sliced_count"] = meta.get("long_row_sliced_count")
         result["effective_warmup"] = meta.get("effective_warmup")
         result["effective_iters"] = meta.get("effective_iters")
-        result["nnz_c"] = int(triton_result[0].numel()) if triton_result is not None else None
+        result["nnz_c"] = (
+            int(triton_result[0].numel()) if triton_result is not None else None
+        )
         triton_compare_result = _convert_result_for_compare(
             triton_result,
             compare_device,
@@ -1095,14 +1171,20 @@ def run_one_mtx(
     _log_stage(mtx_path, "compare", case_start)
     if triton_compare_result is not None and pt_ref_result is not None:
         try:
-            compare_fn = _compare_spgemm_cpu if compare_device == "cpu" else _spgemm_compare_metrics
+            compare_fn = (
+                _compare_spgemm_cpu
+                if compare_device == "cpu"
+                else _spgemm_compare_metrics
+            )
             pt_metrics = compare_fn(triton_compare_result, pt_ref_result, value_dtype)
             result["triton_ok_pt"] = pt_metrics["pass"]
             result["err_pt"] = pt_metrics["err_ratio"]
             result["max_abs_err_pt"] = pt_metrics["max_abs_error"]
             result["max_rel_err_pt"] = pt_metrics["max_relative_error"]
             if not pt_metrics["pattern_ok"]:
-                result["error"] = _append_error(result["error"], f"pt_ref: {pt_metrics['reason']}")
+                result["error"] = _append_error(
+                    result["error"], f"pt_ref: {pt_metrics['reason']}"
+                )
             pt_compared = True
         except Exception as cmp_exc:
             cmp_msg = str(cmp_exc)
@@ -1118,14 +1200,20 @@ def run_one_mtx(
                     _cleanup_reference_pools()
     if triton_compare_result is not None and cu_ref_result is not None:
         try:
-            compare_fn = _compare_spgemm_cpu if compare_device == "cpu" else _spgemm_compare_metrics
+            compare_fn = (
+                _compare_spgemm_cpu
+                if compare_device == "cpu"
+                else _spgemm_compare_metrics
+            )
             cu_metrics = compare_fn(triton_compare_result, cu_ref_result, value_dtype)
             result["triton_ok_cu"] = cu_metrics["pass"]
             result["err_cu"] = cu_metrics["err_ratio"]
             result["max_abs_err_cu"] = cu_metrics["max_abs_error"]
             result["max_rel_err_cu"] = cu_metrics["max_relative_error"]
             if not cu_metrics["pattern_ok"]:
-                result["error"] = _append_error(result["error"], f"cu_ref: {cu_metrics['reason']}")
+                result["error"] = _append_error(
+                    result["error"], f"cu_ref: {cu_metrics['reason']}"
+                )
             cu_compared = True
         except Exception as cmp_exc:
             cmp_msg = str(cmp_exc)
@@ -1152,7 +1240,9 @@ def run_one_mtx(
         return result
 
     if pt_compared or cu_compared:
-        result["status"] = "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
+        result["status"] = (
+            "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
+        )
     else:
         had_ref_success = pt_ref_success or cu_ref_success
         if had_ref_success and result.get("compare_status") != "OK":
@@ -1214,7 +1304,9 @@ def run_mtx_batch(
 
 
 def _print_spgemm_mtx_header(value_dtype, index_dtype):
-    print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
+    print(
+        f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
+    )
     print("Formats: FlagSparse=CSR SpGEMM(A@B), cuSPARSE=CSR@CSR, PyTorch=sparse.mm.")
     print("Err(PT/CU)=max(|diff|/(atol+rtol*|ref|)); MaxRel=max(|diff|)/max(|ref|).")
     print("-" * 320)
@@ -1280,7 +1372,9 @@ def _print_spgemm_mtx_row(entry):
         entry.get("bucket_ms_medium"),
         entry.get("bucket_ms_long"),
     )
-    if any(v is not None for v in (*b_rows, *b_ms, (entry.get("long_row_sliced_count")))):
+    if any(
+        v is not None for v in (*b_rows, *b_ms, (entry.get("long_row_sliced_count")))
+    ):
         print(
             "  PERF: "
             f"bucket_nrows(s/m/l)={b_rows[0] if b_rows[0] is not None else 'N/A'}/"
@@ -1402,29 +1496,68 @@ def run_all_dtypes_export_csv(
                     }
                 )
     fieldnames = [
-        "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
-        "triton_ms", "cusparse_ms", "pytorch_ms",
-        "triton_speedup_vs_cusparse", "triton_speedup_vs_pytorch",
-        "pt_status", "cu_status", "status", "ref_reason_code", "err_pt", "err_cu",
-        "max_abs_err_pt", "max_rel_err_pt", "max_abs_err_cu", "max_rel_err_cu",
-        "pytorch_reason", "cusparse_reason", "error",
-        "pt_exec_mode", "cu_exec_mode", "attempted_modes_pt", "attempted_modes_cu",
-        "compare_status", "pt_retry_count", "cu_retry_count",
-        "ref_peak_block_rows", "ref_fail_stage",
-        "nnz_a", "nnz_b", "nnz_c", "input_mode", "shape_a", "shape_b",
-        "prepare_ms", "count_ms", "fill_ms",
-        "bucket_nrows_short", "bucket_nrows_medium", "bucket_nrows_long",
-        "bucket_ms_short", "bucket_ms_medium", "bucket_ms_long",
+        "matrix",
+        "value_dtype",
+        "index_dtype",
+        "n_rows",
+        "n_cols",
+        "nnz",
+        "triton_ms",
+        "cusparse_ms",
+        "pytorch_ms",
+        "triton_speedup_vs_cusparse",
+        "triton_speedup_vs_pytorch",
+        "pt_status",
+        "cu_status",
+        "status",
+        "ref_reason_code",
+        "err_pt",
+        "err_cu",
+        "max_abs_err_pt",
+        "max_rel_err_pt",
+        "max_abs_err_cu",
+        "max_rel_err_cu",
+        "pytorch_reason",
+        "cusparse_reason",
+        "error",
+        "pt_exec_mode",
+        "cu_exec_mode",
+        "attempted_modes_pt",
+        "attempted_modes_cu",
+        "compare_status",
+        "pt_retry_count",
+        "cu_retry_count",
+        "ref_peak_block_rows",
+        "ref_fail_stage",
+        "nnz_a",
+        "nnz_b",
+        "nnz_c",
+        "input_mode",
+        "shape_a",
+        "shape_b",
+        "prepare_ms",
+        "count_ms",
+        "fill_ms",
+        "bucket_nrows_short",
+        "bucket_nrows_medium",
+        "bucket_nrows_long",
+        "bucket_ms_short",
+        "bucket_ms_medium",
+        "bucket_ms_long",
         "long_row_sliced_count",
-        "triton_started", "ref_started",
-        "effective_warmup", "effective_iters",
+        "triton_started",
+        "ref_started",
+        "effective_warmup",
+        "effective_iters",
         "compare_device",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+            writer.writerow(
+                {key: ("" if value is None else value) for key, value in row.items()}
+            )
     print(f"Wrote {len(rows)} rows to {csv_path}")
 
 
@@ -1438,39 +1571,69 @@ def run_api_validation_checks():
     a_indptr = torch.tensor([0, 2, 3], dtype=torch.int64, device=device)
     shape = (2, 2)
     c_data, c_indices, c_indptr, _ = ast.flagsparse_spgemm_csr(
-        a_data, a_indices, a_indptr, shape,
-        a_data, a_indices, a_indptr, shape,
+        a_data,
+        a_indices,
+        a_indptr,
+        shape,
+        a_data,
+        a_indices,
+        a_indptr,
+        shape,
     )
     negative_cases = [
         (
             "shape mismatch",
             lambda: ast.flagsparse_spgemm_csr(
-                a_data, a_indices, a_indptr, (2, 3),
-                a_data, a_indices, a_indptr, shape,
+                a_data,
+                a_indices,
+                a_indptr,
+                (2, 3),
+                a_data,
+                a_indices,
+                a_indptr,
+                shape,
             ),
             ValueError,
         ),
         (
             "dtype mismatch",
             lambda: ast.flagsparse_spgemm_csr(
-                a_data, a_indices, a_indptr, shape,
-                a_data.to(torch.float64), a_indices, a_indptr, shape,
+                a_data,
+                a_indices,
+                a_indptr,
+                shape,
+                a_data.to(torch.float64),
+                a_indices,
+                a_indptr,
+                shape,
             ),
             TypeError,
         ),
         (
             "indices dtype must int32",
             lambda: ast.flagsparse_spgemm_csr(
-                a_data, a_indices.to(torch.int64), a_indptr, shape,
-                a_data, a_indices, a_indptr, shape,
+                a_data,
+                a_indices.to(torch.int64),
+                a_indptr,
+                shape,
+                a_data,
+                a_indices,
+                a_indptr,
+                shape,
             ),
             TypeError,
         ),
         (
             "out data must be CUDA",
             lambda: ast.flagsparse_spgemm_csr(
-                a_data, a_indices, a_indptr, shape,
-                a_data, a_indices, a_indptr, shape,
+                a_data,
+                a_indices,
+                a_indptr,
+                shape,
+                a_data,
+                a_indices,
+                a_indptr,
+                shape,
                 out=(
                     torch.empty(c_data.shape, dtype=c_data.dtype),
                     torch.empty(c_indices.shape, dtype=c_indices.dtype, device=device),
@@ -1497,8 +1660,14 @@ def run_api_validation_checks():
 
     try:
         out = ast.flagsparse_spgemm_csr(
-            a_data, a_indices, a_indptr, shape,
-            a_data, a_indices, a_indptr, shape,
+            a_data,
+            a_indices,
+            a_indptr,
+            shape,
+            a_data,
+            a_indices,
+            a_indptr,
+            shape,
         )
         if len(out) != 4:
             raise AssertionError("unexpected result tuple length")
@@ -1558,7 +1727,9 @@ def _convert_result_for_compare(csr_tuple, compare_device, device=None):
         if csr_tuple[0].device.type == "cuda":
             return csr_tuple
         if device is None:
-            raise ValueError("device is required when converting CPU CSR payload back to CUDA")
+            raise ValueError(
+                "device is required when converting CPU CSR payload back to CUDA"
+            )
         return _csr_to_device_payload(csr_tuple, device)
     raise ValueError(f"unsupported compare_device: {compare_device}")
 
@@ -1625,7 +1796,9 @@ def _run_reference_worker(args):
 def main():
     parser = argparse.ArgumentParser(description="FlagSparse SpGEMM CSR tests")
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
-    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float64"])
+    parser.add_argument(
+        "--dtype", type=str, default="float32", choices=["float32", "float64"]
+    )
     parser.add_argument("--index-dtype", type=str, default="int32", choices=["int32"])
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
@@ -1692,7 +1865,9 @@ def main():
         action="store_true",
         help="run API validation checks before matrix benchmark (disabled by default)",
     )
-    parser.add_argument("--skip-api-checks", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--skip-api-checks", action="store_true", help=argparse.SUPPRESS
+    )
     parser.add_argument(
         "--input-mode",
         type=str,
@@ -1707,13 +1882,33 @@ def main():
         choices=["cpu", "gpu"],
         help="where to compare Triton/reference results; cpu mode offloads each result before compare",
     )
-    parser.add_argument("--_ref-worker", type=str, choices=["torch", "cupy"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--_ref-worker",
+        type=str,
+        choices=["torch", "cupy"],
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--_worker-mtx", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-output", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-block-rows", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-input-mode", type=str, default=DEFAULT_INPUT_MODE, choices=["auto", "a_equals_b", "a_at"], help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-no-blocked", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--_worker-no-cleanup", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--_worker-output", type=str, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--_worker-block-rows", type=int, default=0, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--_worker-input-mode",
+        type=str,
+        default=DEFAULT_INPUT_MODE,
+        choices=["auto", "a_equals_b", "a_at"],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_worker-no-blocked", action="store_true", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--_worker-no-cleanup", action="store_true", help=argparse.SUPPRESS
+    )
     args = parser.parse_args()
 
     if args._ref_worker is not None:
@@ -1735,8 +1930,12 @@ def main():
     ref_block_rows = _parse_ref_block_rows(args.ref_block_rows)
     paths = _expand_mtx_paths(args.mtx)
     if not paths and not args.csv:
-        print("No .mtx files given. Use: python test_spgemm.py <file.mtx> [file2.mtx ...] or <dir/>")
-        print("Or run all dtypes and export CSV: python test_spgemm.py <dir/> --csv results.csv")
+        print(
+            "No .mtx files given. Use: python test_spgemm.py <file.mtx> [file2.mtx ...] or <dir/>"
+        )
+        print(
+            "Or run all dtypes and export CSV: python test_spgemm.py <dir/> --csv results.csv"
+        )
         return
 
     if args.csv is not None:

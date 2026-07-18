@@ -23,6 +23,5 @@ if str(root) not in sys.path:
 
 from tests.test_spsv import main
 
-
 if __name__ == "__main__":
     main()

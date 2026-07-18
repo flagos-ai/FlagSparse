@@ -21,7 +21,6 @@ These tests are intentionally opt-in. Run them on a GPU machine with, for exampl
 
 import pytest
 
-
 pytestmark = pytest.mark.performance
 
 

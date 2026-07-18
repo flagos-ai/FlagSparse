@@ -21,7 +21,6 @@ from flagsparse import flagsparse_spmv_csr
 from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import SPMV_MN_SHAPES
 
-
 spmv_mod = importlib.import_module("flagsparse.sparse_operations.spmv_csr")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

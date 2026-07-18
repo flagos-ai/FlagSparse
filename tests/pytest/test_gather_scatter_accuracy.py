@@ -24,7 +24,6 @@ from tests.pytest.param_shapes import (
     GATHER_SCATTER_SHAPES,
 )
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 INDEX_DTYPES = [torch.int32, torch.int64]
 INDEX_DTYPE_IDS = ["int32", "int64"]

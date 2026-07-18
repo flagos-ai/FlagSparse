@@ -293,9 +293,11 @@ _FORMAT_EXPORTS = {
 def __getattr__(name):
     if name in _OPS_EXPORTS:
         from . import sparse_operations as _ops
+
         return getattr(_ops, name)
     if name in _FORMAT_EXPORTS:
         from . import sparse_formats as _formats
+
         return getattr(_formats, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

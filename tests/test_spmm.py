@@ -22,6 +22,7 @@ a Triton-native CSR path for CSR + dense with non/trans/conj operation modes.
 It borrows part of the AlphaSparse CSR ALG1 dense-N heuristic, but the dedicated
 experimental structural port lives in alpha_spmm_alg1.py.
 """
+
 import argparse
 import csv
 import glob
@@ -39,8 +40,6 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as ast
 import flagsparse.sparse_operations.spmm_csr as ast_ops
-
-
 
 VALUE_DTYPES = [
     torch.float16,
@@ -76,8 +75,6 @@ DEFAULT_MAX_SEGMENTS = None
 LONG_ROW_NNZ = 1536
 LONG_ROW_SHAPE = (2, 2048)
 LONG_ROW_DENSE_COLS = 48
-
-
 
 
 def _dtype_name(dtype):
@@ -133,10 +130,12 @@ def _fmt_check(value):
         return "N/A"
     return "PASS" if value else "FAIL"
 
+
 def _status_label(value):
     if value is None:
         return "N/A"
     return "PASS" if value else "FAIL"
+
 
 def _normalize_csv_path(csv_path):
     csv_path = str(csv_path)
@@ -146,6 +145,7 @@ def _normalize_csv_path(csv_path):
     if parent:
         os.makedirs(parent, exist_ok=True)
     return csv_path
+
 
 def _fmt_launch_value(value):
     return "auto" if value is None else str(value)
@@ -201,6 +201,7 @@ def _scaled_allclose_error(candidate, reference, value_dtype=None):
     diff = torch.abs(candidate - reference)
     denom = atol + rtol * torch.abs(reference)
     return float(torch.max(diff / denom).item())
+
 
 def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
     """Load SuiteSparse / Matrix Market .mtx file into CSR as torch tensors."""
@@ -273,11 +274,15 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
             value = 1.0
         elif is_complex:
             if len(parts) < 4:
-                raise ValueError(f"Complex Matrix Market entry is missing an imaginary part: {line}")
+                raise ValueError(
+                    f"Complex Matrix Market entry is missing an imaginary part: {line}"
+                )
             value = complex(float(parts[2]), float(parts[3]))
         else:
             if len(parts) < 3:
-                raise ValueError(f"Matrix Market entry is missing a numeric value: {line}")
+                raise ValueError(
+                    f"Matrix Market entry is missing a numeric value: {line}"
+                )
             value = float(parts[2])
 
         _accumulate(row_idx, col_idx, value)
@@ -309,6 +314,7 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
     indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
     return data, indices, indptr, (n_rows, n_cols)
 
+
 def _apply_torch_sparse_op(sparse_matrix, B, op):
     if op == "non":
         return torch.sparse.mm(sparse_matrix, B)
@@ -332,17 +338,35 @@ def _build_pytorch_reference(data, indices, indptr, shape, B, op="non"):
     )
 
     try:
-        csr_pt = torch.sparse_csr_tensor(indptr64, indices64, data, size=shape, device=device)
+        csr_pt = torch.sparse_csr_tensor(
+            indptr64, indices64, data, size=shape, device=device
+        )
         timing_op = lambda: _apply_torch_sparse_op(csr_pt, B, op)
         if data.dtype in (torch.float16, torch.bfloat16):
-            csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float32), size=shape, device=device)
-            ref = _apply_torch_sparse_op(csr_ref, B.to(torch.float32), op).to(data.dtype)
+            csr_ref = torch.sparse_csr_tensor(
+                indptr64, indices64, data.to(torch.float32), size=shape, device=device
+            )
+            ref = _apply_torch_sparse_op(csr_ref, B.to(torch.float32), op).to(
+                data.dtype
+            )
         elif data.dtype == torch.float32:
-            csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float64), size=shape, device=device)
-            ref = _apply_torch_sparse_op(csr_ref, B.to(torch.float64), op).to(data.dtype)
+            csr_ref = torch.sparse_csr_tensor(
+                indptr64, indices64, data.to(torch.float64), size=shape, device=device
+            )
+            ref = _apply_torch_sparse_op(csr_ref, B.to(torch.float64), op).to(
+                data.dtype
+            )
         elif data.dtype == torch.complex64:
-            csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.complex128), size=shape, device=device)
-            ref = _apply_torch_sparse_op(csr_ref, B.to(torch.complex128), op).to(data.dtype)
+            csr_ref = torch.sparse_csr_tensor(
+                indptr64,
+                indices64,
+                data.to(torch.complex128),
+                size=shape,
+                device=device,
+            )
+            ref = _apply_torch_sparse_op(csr_ref, B.to(torch.complex128), op).to(
+                data.dtype
+            )
         else:
             ref = _apply_torch_sparse_op(csr_pt, B, op)
         return ref, timing_op, "CSR"
@@ -355,14 +379,22 @@ def _build_pytorch_reference(data, indices, indptr, shape, B, op="non"):
         ).coalesce()
         timing_op = lambda: _apply_torch_sparse_op(coo, B, op)
         if data.dtype in (torch.float16, torch.bfloat16):
-            ref = _apply_torch_sparse_op(coo.to(torch.float32), B.to(torch.float32), op).to(data.dtype)
+            ref = _apply_torch_sparse_op(
+                coo.to(torch.float32), B.to(torch.float32), op
+            ).to(data.dtype)
         elif data.dtype == torch.float32:
-            ref = _apply_torch_sparse_op(coo.to(torch.float64), B.to(torch.float64), op).to(data.dtype)
+            ref = _apply_torch_sparse_op(
+                coo.to(torch.float64), B.to(torch.float64), op
+            ).to(data.dtype)
         elif data.dtype == torch.complex64:
-            ref = _apply_torch_sparse_op(coo.to(torch.complex128), B.to(torch.complex128), op).to(data.dtype)
+            ref = _apply_torch_sparse_op(
+                coo.to(torch.complex128), B.to(torch.complex128), op
+            ).to(data.dtype)
         else:
             ref = _apply_torch_sparse_op(coo, B, op)
         return ref, timing_op, "COO"
+
+
 def _benchmark_triton_spmm(
     data,
     indices,
@@ -399,6 +431,7 @@ def _benchmark_triton_spmm(
         iters=iters,
     )
     return result, steady_ms, first_call_ms
+
 
 def _assert_spmm_matches_reference(
     data,
@@ -438,9 +471,15 @@ def _assert_spmm_matches_reference(
             f"rtol={rtol:.3e}"
         )
     if out is not None and result.data_ptr() != out.data_ptr():
-        raise AssertionError("flagsparse_spmm_csr did not return the provided out tensor")
+        raise AssertionError(
+            "flagsparse_spmm_csr did not return the provided out tensor"
+        )
     return result, ref_C
-def _build_long_row_case(value_dtype, index_dtype, device, n_dense_cols=LONG_ROW_DENSE_COLS):
+
+
+def _build_long_row_case(
+    value_dtype, index_dtype, device, n_dense_cols=LONG_ROW_DENSE_COLS
+):
     n_rows, n_cols = LONG_ROW_SHAPE
     row0_cols = torch.arange(LONG_ROW_NNZ, dtype=torch.int64, device=device)
     row1_cols = torch.tensor([7, 129, 511, 1024], dtype=torch.int64, device=device)
@@ -453,6 +492,7 @@ def _build_long_row_case(value_dtype, index_dtype, device, n_dense_cols=LONG_ROW
     )
     B = _build_dense_matrix(n_cols, n_dense_cols, value_dtype, device)
     return data, indices, indptr, B, (n_rows, n_cols)
+
 
 def run_one_mtx(
     mtx_path,
@@ -470,7 +510,9 @@ def run_one_mtx(
     """Run SpMM on one .mtx and compare against PyTorch/CuPy baselines."""
     op = ast_ops._spmm_op_to_name(op)
     device = torch.device("cuda")
-    data, indices, indptr, shape = load_mtx_to_csr_torch(mtx_path, dtype=value_dtype, device=device)
+    data, indices, indptr, shape = load_mtx_to_csr_torch(
+        mtx_path, dtype=value_dtype, device=device
+    )
     indices = indices.to(index_dtype)
     n_rows, n_cols = shape
     nnz = data.numel()
@@ -561,14 +603,18 @@ def run_one_mtx(
     )
     if run_cusparse:
         if value_dtype not in _cupy_supported_dtypes:
-            result["cusparse_reason"] = "float16/bfloat16 not supported by CuPy sparse; skipped"
+            result["cusparse_reason"] = (
+                "float16/bfloat16 not supported by CuPy sparse; skipped"
+            )
         else:
             try:
                 import cupy as cp
                 import cupyx.scipy.sparse as cpx
 
                 data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-                ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
+                ind_cp = cp.from_dlpack(
+                    torch.utils.dlpack.to_dlpack(indices.to(torch.int64))
+                )
                 ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
                 B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
                 A_csr = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
@@ -595,10 +641,16 @@ def run_one_mtx(
                 cs_C_t = torch.utils.dlpack.from_dlpack(cs_C.toDlpack())
                 cusparse_metrics = ast_ops._spmm_validation_metrics(cs_C_t, ref_C)
                 result["cusparse_abs_err"] = cusparse_metrics["max_abs_error"]
-                result["cusparse_relative_error_diag"] = cusparse_metrics["max_relative_error"]
+                result["cusparse_relative_error_diag"] = cusparse_metrics[
+                    "max_relative_error"
+                ]
                 if triton_C is not None:
-                    result["err_cu"] = _scaled_allclose_error(triton_C, cs_C_t, value_dtype)
-                    result["triton_ok_cu"] = torch.allclose(triton_C, cs_C_t, atol=atol, rtol=rtol)
+                    result["err_cu"] = _scaled_allclose_error(
+                        triton_C, cs_C_t, value_dtype
+                    )
+                    result["triton_ok_cu"] = torch.allclose(
+                        triton_C, cs_C_t, atol=atol, rtol=rtol
+                    )
             except Exception as exc:
                 result["cusparse_ms"] = None
                 result["err_cu"] = None
@@ -607,8 +659,12 @@ def run_one_mtx(
                 result["triton_ok_cu"] = None
                 result["cusparse_reason"] = str(exc)
 
-    result["status"] = "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
+    result["status"] = (
+        "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
+    )
     return result
+
+
 def run_mtx_batch(
     mtx_paths,
     value_dtype=torch.float32,
@@ -648,10 +704,18 @@ def _print_spmm_csr_mtx_header(value_dtype, index_dtype, op="non"):
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  op: {op}"
     )
-    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm, PyTorch=CSR or COO.")
-    print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
-    print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
-    print("For float32, PT checks the float64-based correctness reference while CU checks consistency with native cuSPARSE float32, so PT and CU may differ.")
+    print(
+        "Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm, PyTorch=CSR or COO."
+    )
+    print(
+        "Timing stays in native dtype. For float32, correctness references use float64 compute then cast."
+    )
+    print(
+        "PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|))."
+    )
+    print(
+        "For float32, PT checks the float64-based correctness reference while CU checks consistency with native cuSPARSE float32, so PT and CU may differ."
+    )
     print("-" * 186)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
@@ -688,7 +752,6 @@ def print_mtx_results(results, value_dtype, index_dtype):
     for entry in results:
         _print_spmm_csr_mtx_row(entry)
     print("-" * 186)
-
 
 
 def run_all_dtypes_export_csv(
@@ -732,46 +795,68 @@ def run_all_dtypes_export_csv(
                 print("-" * 186)
                 for entry in results:
                     n_rows, n_cols = entry["shape"]
-                    rows.append({
-                        "matrix": os.path.basename(entry["path"]),
-                        "value_dtype": _dtype_name(value_dtype),
-                        "index_dtype": _dtype_name(index_dtype),
-                        "op": op,
-                        "n_rows": n_rows,
-                        "n_cols": n_cols,
-                        "nnz": entry["nnz"],
-                        "triton_ms": entry.get("triton_ms"),
-                        "cusparse_ms": entry.get("cusparse_ms"),
-                        "pytorch_ms": entry.get("pytorch_ms"),
-                        "triton_speedup_vs_cusparse": _speedup_ratio(
-                            entry.get("cusparse_ms"), entry.get("triton_ms")
-                        ),
-                        "triton_speedup_vs_pytorch": _speedup_ratio(
-                            entry.get("pytorch_ms"), entry.get("triton_ms")
-                        ),
-                        "pt_status": _status_label(entry.get("triton_ok_pt")),
-                        "cu_status": _status_label(entry.get("triton_ok_cu")),
-                        "status": (
-                            "PASS"
-                            if (entry.get("triton_ok_pt") or entry.get("triton_ok_cu"))
-                            else "FAIL"
-                        ),
-                        "err_pt": entry.get("err_pt"),
-                        "err_cu": entry.get("err_cu"),
-                        "error": entry.get("error"),
-                    })
+                    rows.append(
+                        {
+                            "matrix": os.path.basename(entry["path"]),
+                            "value_dtype": _dtype_name(value_dtype),
+                            "index_dtype": _dtype_name(index_dtype),
+                            "op": op,
+                            "n_rows": n_rows,
+                            "n_cols": n_cols,
+                            "nnz": entry["nnz"],
+                            "triton_ms": entry.get("triton_ms"),
+                            "cusparse_ms": entry.get("cusparse_ms"),
+                            "pytorch_ms": entry.get("pytorch_ms"),
+                            "triton_speedup_vs_cusparse": _speedup_ratio(
+                                entry.get("cusparse_ms"), entry.get("triton_ms")
+                            ),
+                            "triton_speedup_vs_pytorch": _speedup_ratio(
+                                entry.get("pytorch_ms"), entry.get("triton_ms")
+                            ),
+                            "pt_status": _status_label(entry.get("triton_ok_pt")),
+                            "cu_status": _status_label(entry.get("triton_ok_cu")),
+                            "status": (
+                                "PASS"
+                                if (
+                                    entry.get("triton_ok_pt")
+                                    or entry.get("triton_ok_cu")
+                                )
+                                else "FAIL"
+                            ),
+                            "err_pt": entry.get("err_pt"),
+                            "err_cu": entry.get("err_cu"),
+                            "error": entry.get("error"),
+                        }
+                    )
     fieldnames = [
-        "matrix", "value_dtype", "index_dtype", "op", "n_rows", "n_cols", "nnz",
-        "triton_ms", "cusparse_ms", "pytorch_ms",
-        "triton_speedup_vs_cusparse", "triton_speedup_vs_pytorch",
-        "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
+        "matrix",
+        "value_dtype",
+        "index_dtype",
+        "op",
+        "n_rows",
+        "n_cols",
+        "nnz",
+        "triton_ms",
+        "cusparse_ms",
+        "pytorch_ms",
+        "triton_speedup_vs_cusparse",
+        "triton_speedup_vs_pytorch",
+        "pt_status",
+        "cu_status",
+        "status",
+        "err_pt",
+        "err_cu",
+        "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+            writer.writerow(
+                {key: ("" if value is None else value) for key, value in row.items()}
+            )
     print(f"Wrote {len(rows)} rows to {csv_path}")
+
 
 def run_api_validation_checks():
     if not torch.cuda.is_available():
@@ -788,27 +873,176 @@ def run_api_validation_checks():
     )
 
     negative_cases = [
-        ("shape must be 2D", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2,)), ValueError),
-        ("B must be 2D", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B[0], (2, 2)), ValueError),
-        ("dtype mismatch", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B.to(torch.float64), (2, 2)), TypeError),
-        ("shape mismatch", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, torch.randn((3, 4), dtype=torch.float32, device=device), (2, 2)), ValueError),
-        ("indptr length mismatch", lambda: ast.flagsparse_spmm_csr(data, indices, indptr[:-1], B, (2, 2)), ValueError),
-        ("indptr must start at 0", lambda: ast.flagsparse_spmm_csr(data, indices, torch.tensor([1, 2, 3], dtype=torch.int64, device=device), B, (2, 2)), ValueError),
-        ("indptr last must equal nnz", lambda: ast.flagsparse_spmm_csr(data, indices, torch.tensor([0, 2, 2], dtype=torch.int64, device=device), B, (2, 2)), ValueError),
-        ("indptr monotonic", lambda: ast.flagsparse_spmm_csr(data, indices, torch.tensor([0, 3, 2], dtype=torch.int64, device=device), B, (2, 2)), ValueError),
-        ("indices out of range", lambda: ast.flagsparse_spmm_csr(data, torch.tensor([0, 3, 1], dtype=torch.int32, device=device), indptr, B, (2, 2)), IndexError),
-        ("block_n positive", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2, 2), block_n=0), ValueError),
-        ("block_nnz positive", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2, 2), block_nnz=0), ValueError),
-        ("max_segments positive", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2, 2), max_segments=0), ValueError),
-        ("out shape mismatch", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2, 2), out=torch.empty((3, 4), dtype=torch.float32, device=device)), ValueError),
-        ("out device mismatch", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2, 2), out=torch.empty((2, 4), dtype=torch.float32)), ValueError),
-        ("bad op", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2, 2), op="bad"), ValueError),
-        ("op transpose conflict", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2, 2), op="non", transpose=True), ValueError),
-        ("transpose B mismatch", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, torch.randn((3, 4), dtype=torch.float32, device=device), (2, 2), op="trans"), ValueError),
-        ("transpose out shape mismatch", lambda: ast.flagsparse_spmm_csr(data, indices, indptr, torch.randn((2, 4), dtype=torch.float32, device=device), (2, 2), op="trans", out=torch.empty((2, 3), dtype=torch.float32, device=device)), ValueError),
+        (
+            "shape must be 2D",
+            lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2,)),
+            ValueError,
+        ),
+        (
+            "B must be 2D",
+            lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B[0], (2, 2)),
+            ValueError,
+        ),
+        (
+            "dtype mismatch",
+            lambda: ast.flagsparse_spmm_csr(
+                data, indices, indptr, B.to(torch.float64), (2, 2)
+            ),
+            TypeError,
+        ),
+        (
+            "shape mismatch",
+            lambda: ast.flagsparse_spmm_csr(
+                data,
+                indices,
+                indptr,
+                torch.randn((3, 4), dtype=torch.float32, device=device),
+                (2, 2),
+            ),
+            ValueError,
+        ),
+        (
+            "indptr length mismatch",
+            lambda: ast.flagsparse_spmm_csr(data, indices, indptr[:-1], B, (2, 2)),
+            ValueError,
+        ),
+        (
+            "indptr must start at 0",
+            lambda: ast.flagsparse_spmm_csr(
+                data,
+                indices,
+                torch.tensor([1, 2, 3], dtype=torch.int64, device=device),
+                B,
+                (2, 2),
+            ),
+            ValueError,
+        ),
+        (
+            "indptr last must equal nnz",
+            lambda: ast.flagsparse_spmm_csr(
+                data,
+                indices,
+                torch.tensor([0, 2, 2], dtype=torch.int64, device=device),
+                B,
+                (2, 2),
+            ),
+            ValueError,
+        ),
+        (
+            "indptr monotonic",
+            lambda: ast.flagsparse_spmm_csr(
+                data,
+                indices,
+                torch.tensor([0, 3, 2], dtype=torch.int64, device=device),
+                B,
+                (2, 2),
+            ),
+            ValueError,
+        ),
+        (
+            "indices out of range",
+            lambda: ast.flagsparse_spmm_csr(
+                data,
+                torch.tensor([0, 3, 1], dtype=torch.int32, device=device),
+                indptr,
+                B,
+                (2, 2),
+            ),
+            IndexError,
+        ),
+        (
+            "block_n positive",
+            lambda: ast.flagsparse_spmm_csr(
+                data, indices, indptr, B, (2, 2), block_n=0
+            ),
+            ValueError,
+        ),
+        (
+            "block_nnz positive",
+            lambda: ast.flagsparse_spmm_csr(
+                data, indices, indptr, B, (2, 2), block_nnz=0
+            ),
+            ValueError,
+        ),
+        (
+            "max_segments positive",
+            lambda: ast.flagsparse_spmm_csr(
+                data, indices, indptr, B, (2, 2), max_segments=0
+            ),
+            ValueError,
+        ),
+        (
+            "out shape mismatch",
+            lambda: ast.flagsparse_spmm_csr(
+                data,
+                indices,
+                indptr,
+                B,
+                (2, 2),
+                out=torch.empty((3, 4), dtype=torch.float32, device=device),
+            ),
+            ValueError,
+        ),
+        (
+            "out device mismatch",
+            lambda: ast.flagsparse_spmm_csr(
+                data,
+                indices,
+                indptr,
+                B,
+                (2, 2),
+                out=torch.empty((2, 4), dtype=torch.float32),
+            ),
+            ValueError,
+        ),
+        (
+            "bad op",
+            lambda: ast.flagsparse_spmm_csr(data, indices, indptr, B, (2, 2), op="bad"),
+            ValueError,
+        ),
+        (
+            "op transpose conflict",
+            lambda: ast.flagsparse_spmm_csr(
+                data, indices, indptr, B, (2, 2), op="non", transpose=True
+            ),
+            ValueError,
+        ),
+        (
+            "transpose B mismatch",
+            lambda: ast.flagsparse_spmm_csr(
+                data,
+                indices,
+                indptr,
+                torch.randn((3, 4), dtype=torch.float32, device=device),
+                (2, 2),
+                op="trans",
+            ),
+            ValueError,
+        ),
+        (
+            "transpose out shape mismatch",
+            lambda: ast.flagsparse_spmm_csr(
+                data,
+                indices,
+                indptr,
+                torch.randn((2, 4), dtype=torch.float32, device=device),
+                (2, 2),
+                op="trans",
+                out=torch.empty((2, 3), dtype=torch.float32, device=device),
+            ),
+            ValueError,
+        ),
         (
             "segment overflow override",
-            lambda: ast.flagsparse_spmm_csr(long_data, long_indices, long_indptr, long_B, long_shape, block_nnz=128, max_segments=4),
+            lambda: ast.flagsparse_spmm_csr(
+                long_data,
+                long_indices,
+                long_indptr,
+                long_B,
+                long_shape,
+                block_nnz=128,
+                max_segments=4,
+            ),
             ValueError,
         ),
     ]
@@ -832,13 +1066,17 @@ def run_api_validation_checks():
 
     def _positive_out_path():
         out = torch.empty((2, 4), dtype=torch.float32, device=device)
-        _assert_spmm_matches_reference(data, indices, indptr, B, (2, 2), torch.float32, out=out)
+        _assert_spmm_matches_reference(
+            data, indices, indptr, B, (2, 2), torch.float32, out=out
+        )
 
     positive_checks.append(("out path success", _positive_out_path))
 
     def _positive_transpose_path():
         dense = torch.randn((2, 4), dtype=torch.float32, device=device)
-        _assert_spmm_matches_reference(data, indices, indptr, dense, (2, 2), torch.float32, op="trans")
+        _assert_spmm_matches_reference(
+            data, indices, indptr, dense, (2, 2), torch.float32, op="trans"
+        )
 
     positive_checks.append(("transpose path success", _positive_transpose_path))
 
@@ -856,7 +1094,9 @@ def run_api_validation_checks():
             torch.float32,
         )
         if result.shape != (2, 4):
-            raise AssertionError(f"unexpected empty-matrix result shape: {tuple(result.shape)}")
+            raise AssertionError(
+                f"unexpected empty-matrix result shape: {tuple(result.shape)}"
+            )
 
     positive_checks.append(("empty matrix success", _positive_empty_matrix))
 
@@ -871,7 +1111,9 @@ def run_api_validation_checks():
             torch.float32,
         )
         if result.shape != (2, 0):
-            raise AssertionError(f"unexpected empty-dense result shape: {tuple(result.shape)}")
+            raise AssertionError(
+                f"unexpected empty-dense result shape: {tuple(result.shape)}"
+            )
 
     positive_checks.append(("empty dense cols success", _positive_empty_dense_cols))
 
@@ -879,7 +1121,9 @@ def run_api_validation_checks():
         dense = _build_dense_matrix(4, 2, torch.float32, device).transpose(0, 1)
         if dense.is_contiguous():
             raise AssertionError("expected non-contiguous test matrix")
-        _assert_spmm_matches_reference(data, indices, indptr, dense, (2, 2), torch.float32)
+        _assert_spmm_matches_reference(
+            data, indices, indptr, dense, (2, 2), torch.float32
+        )
 
     positive_checks.append(("noncontiguous B success", _positive_noncontiguous_b))
 
@@ -894,7 +1138,6 @@ def run_api_validation_checks():
         )
 
     positive_checks.append(("long-row default success", _positive_long_row_default))
-
 
     for name, fn in positive_checks:
         try:
@@ -941,14 +1184,22 @@ def run_alg1_tile_branch_coverage(warmup=WARMUP, iters=ITERS, run_cusparse=True)
         verify = result["verification"]
         backend = result["backend_status"]
         samples = result["samples"]
-        triton_ok = verify.get("triton_strict_allclose_match", verify.get("triton_match_reference"))
-        cusparse_ok = verify.get("cusparse_strict_allclose_match", verify.get("cusparse_match_reference"))
-        status = "PASS" if triton_ok and (cusparse_ok is None or cusparse_ok) else "FAIL"
+        triton_ok = verify.get(
+            "triton_strict_allclose_match", verify.get("triton_match_reference")
+        )
+        cusparse_ok = verify.get(
+            "cusparse_strict_allclose_match", verify.get("cusparse_match_reference")
+        )
+        status = (
+            "PASS" if triton_ok and (cusparse_ok is None or cusparse_ok) else "FAIL"
+        )
         if status != "PASS":
             failed += 1
         if backend.get("cusparse_unavailable_reason"):
             note = backend["cusparse_unavailable_reason"]
-        triton_err = _scaled_allclose_error(samples["triton"], samples["reference"], torch.float32)
+        triton_err = _scaled_allclose_error(
+            samples["triton"], samples["reference"], torch.float32
+        )
         print(
             f"{n_dense_cols:>8} {params['block_n']:>8} {params['block_nnz']:>8} {params['required_segments']:>7} "
             f"{params['alg1_warp_size']:>6} {params['alg1_factor']:>7} "
@@ -960,6 +1211,7 @@ def run_alg1_tile_branch_coverage(warmup=WARMUP, iters=ITERS, run_cusparse=True)
         print(f"cuSPARSE note: {note}")
     print()
     return failed
+
 
 def run_comprehensive_synthetic(
     warmup=WARMUP,
@@ -984,8 +1236,12 @@ def run_comprehensive_synthetic(
         f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  "
         f"MAX_SEGMENTS: {_fmt_launch_value(max_segments)}"
     )
-    print("Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm (when supported), PyTorch=CSR or COO.")
-    print("For float32, PT checks the float64-based correctness reference while CU reflects native cuSPARSE float32 consistency.")
+    print(
+        "Formats: FlagSparse=CSR base (ALG1-inspired heuristic), cuSPARSE=CSR dense-mm (when supported), PyTorch=CSR or COO."
+    )
+    print(
+        "For float32, PT checks the float64-based correctness reference while CU reflects native cuSPARSE float32 consistency."
+    )
     print()
 
     total = 0
@@ -1027,17 +1283,31 @@ def run_comprehensive_synthetic(
                     verify = result["verification"]
                     backend = result["backend_status"]
                     samples = result["samples"]
-                    triton_ok = verify.get("triton_strict_allclose_match", verify.get("triton_match_reference"))
-                    cusparse_ok = verify.get("cusparse_strict_allclose_match", verify.get("cusparse_match_reference"))
-                    status = "PASS" if triton_ok and (cusparse_ok is None or cusparse_ok) else "FAIL"
+                    triton_ok = verify.get(
+                        "triton_strict_allclose_match",
+                        verify.get("triton_match_reference"),
+                    )
+                    cusparse_ok = verify.get(
+                        "cusparse_strict_allclose_match",
+                        verify.get("cusparse_match_reference"),
+                    )
+                    status = (
+                        "PASS"
+                        if triton_ok and (cusparse_ok is None or cusparse_ok)
+                        else "FAIL"
+                    )
                     if status != "PASS":
                         failed += 1
                     if backend.get("cusparse_unavailable_reason"):
                         combo_reason = backend["cusparse_unavailable_reason"]
-                    triton_err = _scaled_allclose_error(samples["triton"], samples["reference"], value_dtype)
+                    triton_err = _scaled_allclose_error(
+                        samples["triton"], samples["reference"], value_dtype
+                    )
                     cusparse_err = None
                     if samples.get("cusparse") is not None:
-                        cusparse_err = _scaled_allclose_error(samples["triton"], samples["cusparse"], value_dtype)
+                        cusparse_err = _scaled_allclose_error(
+                            samples["triton"], samples["cusparse"], value_dtype
+                        )
                     print(
                         f"{n_rows:>7} {n_cols:>7} {nnz:>10} {n_dense_cols:>8} {params['block_n']:>4} {params['block_nnz']:>6} {params['required_segments']:>4} "
                         f"{_fmt_ms(perf.get('pytorch_ms')):>12} {_fmt_ms(perf.get('triton_ms')):>14} {_fmt_ms(perf.get('cusparse_ms')):>12} "
@@ -1049,7 +1319,13 @@ def run_comprehensive_synthetic(
                     print(f"  cuSPARSE: {combo_reason}")
                 print()
 
-    alg1_failed = run_alg1_tile_branch_coverage(warmup=warmup, iters=iters, run_cusparse=run_cusparse) if run_alg1_coverage else 0
+    alg1_failed = (
+        run_alg1_tile_branch_coverage(
+            warmup=warmup, iters=iters, run_cusparse=run_cusparse
+        )
+        if run_alg1_coverage
+        else 0
+    )
     api_failed = run_api_validation_checks() if run_api_checks else 0
     print("=" * 144)
     print(
@@ -1057,6 +1333,7 @@ def run_comprehensive_synthetic(
         f"Failed ALG1 branch cases: {alg1_failed}  Failed API checks: {api_failed}"
     )
     print("=" * 144)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1075,7 +1352,14 @@ def main():
     parser.add_argument(
         "--dtype",
         default="float32",
-        choices=["float16", "bfloat16", "float32", "float64", "complex64", "complex128"],
+        choices=[
+            "float16",
+            "bfloat16",
+            "float32",
+            "float64",
+            "complex64",
+            "complex128",
+        ],
         help="Value dtype (default: float32)",
     )
     parser.add_argument(
@@ -1099,7 +1383,9 @@ def main():
         default="non,trans,conj",
         help="Comma-separated SpMM ops to run: non,trans,conj",
     )
-    parser.add_argument("--dense-cols", type=int, default=32, help="Dense RHS column count")
+    parser.add_argument(
+        "--dense-cols", type=int, default=32, help="Dense RHS column count"
+    )
     parser.add_argument(
         "--block-n",
         type=int,
@@ -1120,9 +1406,19 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs")
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
-    parser.add_argument("--no-cusparse", action="store_true", help="Skip cuSPARSE baseline")
-    parser.add_argument("--skip-api-checks", action="store_true", help="Skip API validation checks in synthetic mode")
-    parser.add_argument("--skip-alg1-coverage", action="store_true", help="Skip dense-column ALG1 heuristic coverage in synthetic mode")
+    parser.add_argument(
+        "--no-cusparse", action="store_true", help="Skip cuSPARSE baseline"
+    )
+    parser.add_argument(
+        "--skip-api-checks",
+        action="store_true",
+        help="Skip API validation checks in synthetic mode",
+    )
+    parser.add_argument(
+        "--skip-alg1-coverage",
+        action="store_true",
+        help="Skip dense-column ALG1 heuristic coverage in synthetic mode",
+    )
     parser.add_argument(
         "--csv",
         type=str,
@@ -1174,9 +1470,13 @@ def main():
             paths.extend(sorted(glob.glob(os.path.join(path, "*.mtx"))))
 
     if not paths and not args.csv:
-        print("No .mtx files given. Use: python test_spmm.py <file.mtx> [file2.mtx ...] or <dir/>")
+        print(
+            "No .mtx files given. Use: python test_spmm.py <file.mtx> [file2.mtx ...] or <dir/>"
+        )
         print("Or run synthetic: python test_spmm.py --synthetic")
-        print("Or run all dtypes and export CSV: python test_spmm.py <dir/> --csv results.csv")
+        print(
+            "Or run all dtypes and export CSV: python test_spmm.py <dir/> --csv results.csv"
+        )
         return
 
     if args.csv is not None:
@@ -1191,13 +1491,17 @@ def main():
         print("=" * 100)
         try:
             csv_value_dtypes = _parse_csv_tokens(args.dtypes, dtype_map, "--dtypes")
-            csv_index_dtypes = _parse_csv_tokens(args.index_dtypes, index_map, "--index-dtypes")
+            csv_index_dtypes = _parse_csv_tokens(
+                args.index_dtypes, index_map, "--index-dtypes"
+            )
         except ValueError as exc:
             parser.error(str(exc))
         print(
             f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  DenseN: {args.dense_cols}  |  CSV: {csv_path}"
         )
-        print(f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}  |  ops: {args.ops}")
+        print(
+            f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}  |  ops: {args.ops}"
+        )
         run_all_dtypes_export_csv(
             paths,
             csv_path,
@@ -1239,7 +1543,6 @@ def main():
             op=op,
         )
         print_mtx_results(results, value_dtype, index_dtype)
-
 
 
 if __name__ == "__main__":

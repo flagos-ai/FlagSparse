@@ -28,7 +28,6 @@ from .spmm_csr import (
     prepare_spmm_csr_opt,
 )
 
-
 SUPPORTED_SPMM_OPT_ALG2_DTYPES = (
     torch.float32,
     torch.float64,
@@ -196,7 +195,9 @@ def _normalize_spmm_opt_alg2_device_props(device):
     props = torch.cuda.get_device_properties(device)
     warp_size = int(getattr(props, "warp_size", 32) or 32)
     sm_count = int(getattr(props, "multi_processor_count", 0) or 0)
-    max_threads_per_mp = int(getattr(props, "max_threads_per_multi_processor", 2048) or 2048)
+    max_threads_per_mp = int(
+        getattr(props, "max_threads_per_multi_processor", 2048) or 2048
+    )
     max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
     shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     name = str(getattr(props, "name", "cuda"))
@@ -232,7 +233,9 @@ def _select_spmm_opt_alg2_block_n(n_dense_cols, block_n_cap):
 def _select_spmm_opt_alg2_num_warps(bucket, block_n, device_props, dtype):
     warp_size = max(1, int(device_props["warp_size"]))
     max_threads_per_block = max(32, int(device_props["max_threads_per_block"]))
-    max_threads_per_mp = max(max_threads_per_block, int(device_props["max_threads_per_mp"]))
+    max_threads_per_mp = max(
+        max_threads_per_block, int(device_props["max_threads_per_mp"])
+    )
     lane_need = max(1, math.ceil(int(block_n) / warp_size))
     kind = bucket["kind"]
     block_k = int(bucket["block_k"])
@@ -250,7 +253,9 @@ def _select_spmm_opt_alg2_num_warps(bucket, block_n, device_props, dtype):
         if segments >= 4:
             desired = max(desired, 8 if block_k >= 64 else 4)
         if segments >= 8:
-            desired = max(desired, 16 if dtype == torch.float32 and block_n >= 64 else 8)
+            desired = max(
+                desired, 16 if dtype == torch.float32 and block_n >= 64 else 8
+            )
 
     if dtype == torch.float64 and desired > 8:
         desired = 8
@@ -366,7 +371,11 @@ def _spmm_opt_alg2_symbolic_count_kernel(
     offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     mask = offs < n_rows
     lens = tl.load(row_lengths_ptr + offs, mask=mask, other=0)
-    bucket = tl.where(lens <= 16, 0, tl.where(lens <= 64, 1, tl.where(lens <= 256, 2, tl.where(lens <= 1024, 3, 4))))
+    bucket = tl.where(
+        lens <= 16,
+        0,
+        tl.where(lens <= 64, 1, tl.where(lens <= 256, 2, tl.where(lens <= 1024, 3, 4))),
+    )
     for bid in tl.static_range(0, 5):
         hits = mask & (bucket == bid)
         count = tl.sum(tl.where(hits, 1, 0), axis=0)
@@ -386,7 +395,11 @@ def _spmm_opt_alg2_symbolic_compact_kernel(
     offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     mask = offs < n_rows
     lens = tl.load(row_lengths_ptr + offs, mask=mask, other=0)
-    bucket = tl.where(lens <= 16, 0, tl.where(lens <= 64, 1, tl.where(lens <= 256, 2, tl.where(lens <= 1024, 3, 4))))
+    bucket = tl.where(
+        lens <= 16,
+        0,
+        tl.where(lens <= 64, 1, tl.where(lens <= 256, 2, tl.where(lens <= 1024, 3, 4))),
+    )
     for bid in tl.static_range(0, 5):
         hits = mask & (bucket == bid)
         ranks = tl.cumsum(tl.where(hits, 1, 0), axis=0) - 1
@@ -438,7 +451,9 @@ def _build_spmm_opt_alg2_buckets_triton_symbolic(row_lengths, dtype):
     counts_cpu = counts.to("cpu").tolist()
     offsets_cpu = offsets.to("cpu").tolist()
     buckets = []
-    for spec, count, offset in zip(_spmm_opt_alg2_bucket_specs(dtype), counts_cpu, offsets_cpu):
+    for spec, count, offset in zip(
+        _spmm_opt_alg2_bucket_specs(dtype), counts_cpu, offsets_cpu
+    ):
         count = int(count)
         if count == 0:
             continue
@@ -581,7 +596,9 @@ def _spmm_csr_alg2_row_rows_kernel(
                     other=0.0,
                 )
                 acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
-    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n)
+    tl.store(
+        c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n
+    )
 
 
 @triton.jit
@@ -891,7 +908,9 @@ def _spmm_csr_alg2_segmented_rows_kernel(
         acc = (acc0 + acc1) + (acc2 + acc3)
     else:
         acc = ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))
-    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n)
+    tl.store(
+        c_ptr + row * stride_cm + offs_n * stride_cn, acc.to(OUT_DTYPE), mask=mask_n
+    )
 
 
 def prepare_spmm_csr_opt_alg2(data, indices, indptr, shape):
@@ -938,13 +957,20 @@ def _validate_spmm_opt_alg2_runtime_inputs(prepared, B, out):
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
     if B.shape[0] != prepared.n_cols:
-        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
+        raise ValueError(
+            f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}"
+        )
     if out is not None:
         if not out.is_cuda:
             raise ValueError("out must be a CUDA tensor")
         if out.device != prepared.data.device:
-            raise ValueError("out must be on the same CUDA device as sparse matrix data")
-        if out.shape != (prepared.n_rows, int(B.shape[1])) or out.dtype != prepared.data.dtype:
+            raise ValueError(
+                "out must be on the same CUDA device as sparse matrix data"
+            )
+        if (
+            out.shape != (prepared.n_rows, int(B.shape[1]))
+            or out.dtype != prepared.data.dtype
+        ):
             raise ValueError("out shape/dtype must match result")
 
 
@@ -953,7 +979,9 @@ def _spmm_opt_alg2_acc_dtype(dtype):
 
 
 def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
-    launch = _resolve_spmm_opt_alg2_launch(bucket, int(B.shape[1]), prepared.data.dtype, device_props)
+    launch = _resolve_spmm_opt_alg2_launch(
+        bucket, int(B.shape[1]), prepared.data.dtype, device_props
+    )
     rows = bucket["rows"]
     if rows.numel() == 0:
         return launch
@@ -1042,7 +1070,9 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
     return launch
 
 
-def _triton_spmm_csr_impl_opt_alg2_prepared(prepared, B, opt_buckets=None, return_meta=False):
+def _triton_spmm_csr_impl_opt_alg2_prepared(
+    prepared, B, opt_buckets=None, return_meta=False
+):
     device_props = _normalize_spmm_opt_alg2_device_props(prepared.data.device)
     if B.dtype in (torch.complex64, torch.complex128):
         C_out = _triton_spmm_csr_complex_impl(
@@ -1071,7 +1101,9 @@ def _triton_spmm_csr_impl_opt_alg2_prepared(prepared, B, opt_buckets=None, retur
                 "complex_kernel": "csr_base_complex",
             }
         return C_out, meta
-    C_out = torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
+    C_out = torch.zeros(
+        (prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device
+    )
     launch_configs = []
     bucket_hits = []
     if opt_buckets is None:
@@ -1208,8 +1240,6 @@ def flagsparse_spmm_csr_opt_alg2_preprocess(
     )
 
 
-
-
 def _spmm_opt_alg2_reference_error(candidate, reference, value_dtype):
     atol, rtol = _spmm_coo_reference_tolerance(value_dtype)
     if candidate.numel() == 0:
@@ -1233,7 +1263,9 @@ def benchmark_spmm_opt_alg2_case(
     """Benchmark CSR SpMM base, opt, and opt-alg2 against torch / sparse backend references."""
 
     if value_dtype not in SUPPORTED_SPMM_OPT_ALG2_DTYPES:
-        raise TypeError("benchmark_spmm_opt_alg2_case only supports float32 and float64")
+        raise TypeError(
+            "benchmark_spmm_opt_alg2_case only supports float32 and float64"
+        )
 
     device = torch.device("cuda")
     data, indices, indptr = _build_random_csr(
@@ -1275,8 +1307,12 @@ def benchmark_spmm_opt_alg2_case(
 
     torch_ms = None
     try:
-        pt_sparse = torch.sparse_csr_tensor(indptr64, indices64, data, size=shape, device=device)
-        _, torch_ms = _benchmark_cuda_op(lambda: torch.sparse.mm(pt_sparse, B), warmup=warmup, iters=iters)
+        pt_sparse = torch.sparse_csr_tensor(
+            indptr64, indices64, data, size=shape, device=device
+        )
+        _, torch_ms = _benchmark_cuda_op(
+            lambda: torch.sparse.mm(pt_sparse, B), warmup=warmup, iters=iters
+        )
     except Exception:
         torch_ms = None
 
@@ -1292,8 +1328,12 @@ def benchmark_spmm_opt_alg2_case(
                 indices_cp = _cupy_from_torch(indices.to(torch.int64))
                 indptr_cp = _cupy_from_torch(indptr)
                 B_cp = _cupy_from_torch(B)
-                A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-                sparse_backend, sparse_ms = _benchmark_cuda_op(lambda: A_csr @ B_cp, warmup=warmup, iters=iters)
+                A_csr = cpx_sparse.csr_matrix(
+                    (data_cp, indices_cp, indptr_cp), shape=shape
+                )
+                sparse_backend, sparse_ms = _benchmark_cuda_op(
+                    lambda: A_csr @ B_cp, warmup=warmup, iters=iters
+                )
                 sparse_backend = _torch_from_cupy(sparse_backend)
             except Exception as exc:
                 sparse_reason = str(exc)
@@ -1315,9 +1355,15 @@ def benchmark_spmm_opt_alg2_case(
             "cusparse_ms": sparse_ms,
         },
         "verification": {
-            "base_vs_torch_err": _spmm_opt_alg2_reference_error(base_values, torch_ref, value_dtype),
-            "opt_vs_torch_err": _spmm_opt_alg2_reference_error(opt_values, torch_ref, value_dtype),
-            "opt_alg2_vs_torch_err": _spmm_opt_alg2_reference_error(alg2_values, torch_ref, value_dtype),
+            "base_vs_torch_err": _spmm_opt_alg2_reference_error(
+                base_values, torch_ref, value_dtype
+            ),
+            "opt_vs_torch_err": _spmm_opt_alg2_reference_error(
+                opt_values, torch_ref, value_dtype
+            ),
+            "opt_alg2_vs_torch_err": _spmm_opt_alg2_reference_error(
+                alg2_values, torch_ref, value_dtype
+            ),
             "base_vs_cusparse_err": (
                 _spmm_opt_alg2_reference_error(base_values, sparse_backend, value_dtype)
                 if sparse_backend is not None

@@ -230,9 +230,13 @@ def _validate_sddmm_dense_inputs(data, prepared, x, y):
     if data is not None and data.dtype != x.dtype:
         raise TypeError("data dtype must match x/y dtype")
     if x.shape[0] != prepared.n_rows:
-        raise ValueError(f"x.shape[0] must be n_rows={prepared.n_rows}, got {x.shape[0]}")
+        raise ValueError(
+            f"x.shape[0] must be n_rows={prepared.n_rows}, got {x.shape[0]}"
+        )
     if y.shape[0] != prepared.n_cols:
-        raise ValueError(f"y.shape[0] must be n_cols={prepared.n_cols}, got {y.shape[0]}")
+        raise ValueError(
+            f"y.shape[0] must be n_cols={prepared.n_cols}, got {y.shape[0]}"
+        )
     if x.shape[1] != y.shape[1]:
         raise ValueError("x and y must have the same K dimension")
     if data is not None and data.numel() != prepared.nnz:
@@ -260,7 +264,9 @@ def _normalize_sddmm_diagnostic_variant(variant):
     variant = str(variant).strip().lower()
     if variant not in SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS:
         supported = ", ".join(SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS)
-        raise ValueError(f"Unsupported SDDMM diagnostic variant {variant!r}; expected one of: {supported}")
+        raise ValueError(
+            f"Unsupported SDDMM diagnostic variant {variant!r}; expected one of: {supported}"
+        )
     return variant
 
 
@@ -282,10 +288,25 @@ def _resolve_sddmm_diagnostic_out_dtype(variant, value_dtype):
     return value_dtype
 
 
-def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=False, variant="baseline", out_dtype=None):
+def _run_sddmm_prepared(
+    prepared,
+    x,
+    y,
+    data,
+    alpha,
+    beta,
+    out,
+    allow_fallback=False,
+    variant="baseline",
+    out_dtype=None,
+):
     nnz = prepared.nnz
     variant = _normalize_sddmm_diagnostic_variant(variant)
-    target_out_dtype = _resolve_sddmm_diagnostic_out_dtype(variant, x.dtype) if out_dtype is None else out_dtype
+    target_out_dtype = (
+        _resolve_sddmm_diagnostic_out_dtype(variant, x.dtype)
+        if out_dtype is None
+        else out_dtype
+    )
     out = _prepare_validated_sddmm_out(prepared, x, out, out_dtype=target_out_dtype)
     if nnz == 0:
         return out, {
@@ -327,7 +348,11 @@ def _run_sddmm_prepared(prepared, x, y, data, alpha, beta, out, allow_fallback=F
                 num_warps=num_warps,
             )
         except Exception:
-            out.copy_(_sddmm_reference(prepared.indices, prepared.indptr, x, y, data, alpha, beta).to(out.dtype))
+            out.copy_(
+                _sddmm_reference(
+                    prepared.indices, prepared.indptr, x, y, data, alpha, beta
+                ).to(out.dtype)
+            )
             fallback_used = True
     else:
         kernel[grid](
@@ -380,7 +405,9 @@ def flagsparse_sddmm_csr(
     prepare_ms = 0.0
     if prepared is None:
         if any(v is None for v in (indices, indptr, shape)):
-            raise ValueError("indices, indptr, and shape are required when prepared is not provided")
+            raise ValueError(
+                "indices, indptr, and shape are required when prepared is not provided"
+            )
         torch.cuda.synchronize()
         t_prepare0 = time.perf_counter()
         k_hint = int(x.shape[1]) if (x is not None and x.ndim == 2) else 64
@@ -401,7 +428,12 @@ def flagsparse_sddmm_csr(
             out.zero_()
         else:
             out.copy_(data * beta)
-        meta = {"prepare_ms": prepare_ms, "block_k": prepared.block_k, "num_warps": prepared.num_warps, "fallback_used": False}
+        meta = {
+            "prepare_ms": prepare_ms,
+            "block_k": prepared.block_k,
+            "num_warps": prepared.num_warps,
+            "fallback_used": False,
+        }
         if return_time and return_meta:
             return out, 0.0, meta
         if return_time:
@@ -451,7 +483,9 @@ def _sddmm_reference(indices, indptr, x, y, data, alpha, beta):
     return vals
 
 
-def _cupy_sampled_dot_reference(indices, indptr, x, y, data, alpha, beta, chunk_nnz=262144):
+def _cupy_sampled_dot_reference(
+    indices, indptr, x, y, data, alpha, beta, chunk_nnz=262144
+):
     _require_cupy()
     n_rows = int(indptr.numel()) - 1
     row_ids = torch.repeat_interleave(
@@ -516,7 +550,9 @@ def benchmark_sddmm_case(
         return_time=False,
     )
     triton_values, triton_ms = _benchmark_cuda_op(op, warmup=warmup, iters=iters)
-    ref_op = lambda: _sddmm_reference(indices, indptr.to(torch.int64), x, y, data, alpha, beta)
+    ref_op = lambda: _sddmm_reference(
+        indices, indptr.to(torch.int64), x, y, data, alpha, beta
+    )
     ref_values, pytorch_ms = _benchmark_cuda_op(ref_op, warmup=warmup, iters=iters)
 
     atol, rtol = _tolerance_for_dtype(value_dtype)
@@ -548,7 +584,9 @@ def benchmark_sddmm_case(
                     warmup=warmup,
                     iters=iters,
                 )
-                cusparse_match = bool(torch.allclose(triton_values, ref_cu, atol=atol, rtol=rtol))
+                cusparse_match = bool(
+                    torch.allclose(triton_values, ref_cu, atol=atol, rtol=rtol)
+                )
             except Exception as exc:
                 cusparse_reason = str(exc)
 
@@ -568,8 +606,12 @@ def benchmark_sddmm_case(
             "triton_ms": triton_ms,
             "pytorch_ms": pytorch_ms,
             "cusparse_ms": cusparse_ms,
-            "triton_speedup_vs_pytorch": (pytorch_ms / triton_ms if triton_ms > 0 else None),
-            "triton_speedup_vs_cusparse": (cusparse_ms / triton_ms if (cusparse_ms and triton_ms > 0) else None),
+            "triton_speedup_vs_pytorch": (
+                pytorch_ms / triton_ms if triton_ms > 0 else None
+            ),
+            "triton_speedup_vs_cusparse": (
+                cusparse_ms / triton_ms if (cusparse_ms and triton_ms > 0) else None
+            ),
         },
         "verification": {
             "triton_match_pytorch": match,

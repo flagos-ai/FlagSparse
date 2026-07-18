@@ -32,10 +32,7 @@ def _scatter_dtype_error_message():
     supported = ", ".join(
         str(dtype).replace("torch.", "") for dtype in SUPPORTED_SCATTER_VALUE_DTYPES
     )
-    return (
-        "Scatter benchmark supports value dtypes: "
-        f"{supported}."
-    )
+    return "Scatter benchmark supports value dtypes: " f"{supported}."
 
 
 @triton.jit
@@ -121,7 +118,9 @@ def _scatter_complex_kernel(
     sparse_offsets = offsets * 2
 
     values_real = tl.load(sparse_values_ri_ptr + sparse_offsets, mask=mask, other=0.0)
-    values_imag = tl.load(sparse_values_ri_ptr + sparse_offsets + 1, mask=mask, other=0.0)
+    values_imag = tl.load(
+        sparse_values_ri_ptr + sparse_offsets + 1, mask=mask, other=0.0
+    )
 
     tl.store(dense_values_ri_ptr + dense_offsets, values_real, mask=mask)
     tl.store(dense_values_ri_ptr + dense_offsets + 1, values_imag, mask=mask)
@@ -170,7 +169,9 @@ def _triton_gather_impl(
 
     sparse_values = out
     if sparse_values is None:
-        sparse_values = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
+        sparse_values = torch.empty(
+            nnz, dtype=dense_vector.dtype, device=dense_vector.device
+        )
     else:
         if sparse_values.shape != (nnz,):
             raise ValueError("out shape must match gather output shape")
@@ -188,6 +189,7 @@ def _triton_gather_impl(
         num_warps=DEFAULT_GATHER_NUM_WARPS,
     )
     return sparse_values
+
 
 def _triton_scatter_impl(
     sparse_values,
@@ -411,7 +413,9 @@ def _check_cusparse_status(status, op_name):
 def _set_cusparse_stream(lib, handle, *, strict=False):
     if not hasattr(lib, "cusparseSetStream"):
         if strict:
-            raise RuntimeError("Loaded cuSPARSE library does not export cusparseSetStream")
+            raise RuntimeError(
+                "Loaded cuSPARSE library does not export cusparseSetStream"
+            )
         return
     try:
         stream = torch.cuda.current_stream()
@@ -539,7 +543,11 @@ def _cusparse_native_gather(dense_vector, indices, out=None):
 
 
 def _cusparse_spmv(selector_matrix, dense_vector):
-    if cp is not None and cpx_sparse is not None and isinstance(selector_matrix, cpx_sparse.spmatrix):
+    if (
+        cp is not None
+        and cpx_sparse is not None
+        and isinstance(selector_matrix, cpx_sparse.spmatrix)
+    ):
         if torch.is_tensor(dense_vector):
             out_dtype = dense_vector.dtype
             dense_for_compute = (
@@ -562,14 +570,18 @@ def _cusparse_spmv(selector_matrix, dense_vector):
     # Fallback path: torch sparse SpMV (still CUDA-backed).
     if torch.is_tensor(selector_matrix) and selector_matrix.is_sparse:
         if not torch.is_tensor(dense_vector):
-            raise TypeError("dense_vector must be torch.Tensor for torch sparse fallback")
+            raise TypeError(
+                "dense_vector must be torch.Tensor for torch sparse fallback"
+            )
         out_dtype = dense_vector.dtype
         dense_for_compute = (
             dense_vector.to(torch.float32)
             if dense_vector.dtype == torch.bfloat16
             else dense_vector
         )
-        out = torch.sparse.mm(selector_matrix, dense_for_compute.unsqueeze(1)).squeeze(1)
+        out = torch.sparse.mm(selector_matrix, dense_for_compute.unsqueeze(1)).squeeze(
+            1
+        )
         if out_dtype == torch.bfloat16:
             out = out.to(torch.bfloat16)
         return out
@@ -621,7 +633,9 @@ def _make_scatter_selector_matrix(indices, dense_size, value_dtype):
     ).coalesce()
 
 
-def _pytorch_scatter_impl(sparse_values, indices, dense_size, out=None, reset_output=True):
+def _pytorch_scatter_impl(
+    sparse_values, indices, dense_size, out=None, reset_output=True
+):
     if out is None:
         dense_values = torch.zeros(
             dense_size, dtype=sparse_values.dtype, device=sparse_values.device
@@ -648,7 +662,9 @@ def flagsparse_gather(
 
     dense_vector, dense_backend = _to_torch_tensor(a, "a")
     indices_tensor, _ = _to_torch_tensor(indices, "indices")
-    dense_vector, indices_tensor, kernel_indices = _prepare_inputs(dense_vector, indices_tensor)
+    dense_vector, indices_tensor, kernel_indices = _prepare_inputs(
+        dense_vector, indices_tensor
+    )
     _validate_gather_value_dtype(dense_vector, "flagsparse_gather")
     out_tensor = None
     if out is not None:
@@ -730,9 +746,7 @@ def flagsparse_scatter(
 
 
 # Backward compatibility wrappers.
-def triton_cusparse_gather(
-    dense_vector, indices, block_size=DEFAULT_GATHER_BLOCK_SIZE
-):
+def triton_cusparse_gather(dense_vector, indices, block_size=DEFAULT_GATHER_BLOCK_SIZE):
     return flagsparse_gather(
         dense_vector, indices, block_size=block_size, return_time=True
     )
@@ -783,7 +797,12 @@ def pytorch_index_gather(dense_vector, indices):
 
 
 def pytorch_index_scatter(
-    sparse_values, indices, dense_size=None, out=None, reset_output=True, dtype_policy="auto"
+    sparse_values,
+    indices,
+    dense_size=None,
+    out=None,
+    reset_output=True,
+    dtype_policy="auto",
 ):
     """Baseline scatter using PyTorch index_copy_."""
     sparse_values, indices, _, dense_size, _ = _prepare_scatter_inputs(
@@ -865,7 +884,9 @@ def cusparse_spmv_scatter(
         raise RuntimeError(skip_reason)
 
     if selector_matrix is None:
-        selector_matrix = _make_scatter_selector_matrix(indices, dense_size, sparse_values.dtype)
+        selector_matrix = _make_scatter_selector_matrix(
+            indices, dense_size, sparse_values.dtype
+        )
 
     try:
         torch.cuda.synchronize()

@@ -18,7 +18,6 @@ import torch
 
 from tests.pytest.conftest import QUICK_MODE
 
-
 if QUICK_MODE:
     SPMV_MN_SHAPES = [
         (1, 32),

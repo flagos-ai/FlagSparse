@@ -20,6 +20,7 @@ Usage:
     python tests/test_spmv_opt.py <dir/>                # batch run, default float32
     python tests/test_spmv_opt.py <dir/> --csv opt.csv  # selected dtype, export CSV
 """
+
 import argparse
 import csv
 import glob
@@ -39,6 +40,7 @@ ITERS = 50
 
 def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
     import math as _math
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with open(file_path, "r", encoding="utf-8") as f:
@@ -74,9 +76,9 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
         indices = torch.tensor([], dtype=torch.int64, device=device)
         indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
         return data, indices, indptr, (n_rows, n_cols)
-    is_pattern = (mm_field == "pattern")
+    is_pattern = mm_field == "pattern"
     is_symmetric = mm_symmetry in ("symmetric", "hermitian")
-    is_skew = (mm_symmetry == "skew-symmetric")
+    is_skew = mm_symmetry == "skew-symmetric"
     row_maps = [dict() for _ in range(n_rows)]
     for line in data_lines[:nnz]:
         parts = line.split()
@@ -125,7 +127,9 @@ def _cuda_event_benchmark(op, warmup, iters):
 def _timed_spmv(prepared, x, warmup, iters, use_opt, timing=False):
     if not use_opt:
         out, gpu_ms = _cuda_event_benchmark(
-            lambda: spmv_csr_mod._run_spmv_prepared_with_fallback(prepared, x, use_opt=False),
+            lambda: spmv_csr_mod._run_spmv_prepared_with_fallback(
+                prepared, x, use_opt=False
+            ),
             warmup,
             iters,
         )
@@ -180,8 +184,11 @@ def _timed_pytorch(data, indices, indptr, x, shape, warmup, iters):
     n_rows = int(shape[0])
     try:
         A = torch.sparse_csr_tensor(
-            indptr.to(torch.int64), indices.to(torch.int64), data,
-            size=shape, device=device,
+            indptr.to(torch.int64),
+            indices.to(torch.int64),
+            data,
+            size=shape,
+            device=device,
         )
         y = torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
         op = lambda: torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
@@ -192,7 +199,9 @@ def _timed_pytorch(data, indices, indptr, x, shape, warmup, iters):
         )
         A = torch.sparse_coo_tensor(
             torch.stack([row_ind, indices.to(torch.int64)]),
-            data, shape, device=device,
+            data,
+            shape,
+            device=device,
         ).coalesce()
         y = torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
         op = lambda: torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
@@ -213,6 +222,7 @@ def _timed_pytorch(data, indices, indptr, x, shape, warmup, iters):
 def _timed_cusparse(data, indices, indptr, x, shape, warmup, iters):
     import cupy as cp
     import cupyx.scipy.sparse as cpx
+
     data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
     ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
     ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
@@ -278,7 +288,9 @@ def _reference_tolerance(dtype):
 
 def run_one_mtx(path, dtype, index_dtype, warmup, iters, timing=False):
     device = torch.device("cuda")
-    data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
+    data, indices, indptr, shape = load_mtx_to_csr_torch(
+        path, dtype=dtype, device=device
+    )
     indices = indices.to(index_dtype)
     n_rows, n_cols = shape
     nnz = data.numel()
@@ -294,8 +306,11 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters, timing=False):
         x_ref = x.to(ref_dtype)
         try:
             A_ref = torch.sparse_csr_tensor(
-                indptr.to(torch.int64), indices.to(torch.int64), data_ref,
-                size=shape, device=device,
+                indptr.to(torch.int64),
+                indices.to(torch.int64),
+                data_ref,
+                size=shape,
+                device=device,
             )
             y_ref = torch.sparse.mm(A_ref, x_ref.unsqueeze(1)).squeeze(1).to(dtype)
         except Exception:
@@ -305,7 +320,9 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters, timing=False):
             )
             A_ref = torch.sparse_coo_tensor(
                 torch.stack([row_ind, indices.to(torch.int64)]),
-                data_ref, shape, device=device,
+                data_ref,
+                shape,
+                device=device,
             ).coalesce()
             y_ref = torch.sparse.mm(A_ref, x_ref.unsqueeze(1)).squeeze(1).to(dtype)
     except Exception:
@@ -339,7 +356,7 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters, timing=False):
     if y_ref is not None and n_rows > 0:
         diff_b = torch.abs(y_base - y_ref).to(torch.float64)
         diff_o = torch.abs(y_opt - y_ref).to(torch.float64)
-        tol = (atol + rtol * torch.abs(y_ref).to(torch.float64))
+        tol = atol + rtol * torch.abs(y_ref).to(torch.float64)
         err_base = float(torch.max(diff_b / tol).item())
         err_opt = float(torch.max(diff_o / tol).item())
 
@@ -348,8 +365,11 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters, timing=False):
     status = "PASS" if opt_ok else "FAIL"
 
     return {
-        "path": path, "shape": shape, "nnz": nnz,
-        "base_ms": base["ms"], "opt_ms": opt["ms"],
+        "path": path,
+        "shape": shape,
+        "nnz": nnz,
+        "base_ms": base["ms"],
+        "opt_ms": opt["ms"],
         "base_gpu_ms": base["gpu_ms"],
         "opt_gpu_ms": opt["gpu_ms"],
         "base_process_cpu_ms": base["process_cpu_ms"],
@@ -362,9 +382,12 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters, timing=False):
         "symbolic_ms": opt["symbolic_ms"],
         "compute_ms": opt["compute_ms"],
         "op_total_ms": opt["ms"],
-        "pt_ms": pt_ms, "cu_ms": cu_ms,
-        "err_base": err_base, "err_opt": err_opt,
-        "base_ok": base_ok, "opt_ok": opt_ok,
+        "pt_ms": pt_ms,
+        "cu_ms": cu_ms,
+        "err_base": err_base,
+        "err_opt": err_opt,
+        "base_ok": base_ok,
+        "opt_ok": opt_ok,
         "status": status,
     }
 
@@ -374,7 +397,8 @@ def print_row(r, timing=False):
     n_rows, n_cols = r["shape"]
     split = (
         f"{_fmt(r.get('opt_process_gpu_ms')):>9} {_fmt(r.get('opt_compute_ms')):>9} "
-        if timing else ""
+        if timing
+        else ""
     )
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {r['nnz']:>10}  "
@@ -423,41 +447,85 @@ def run_all_csv(paths, csv_path, warmup, iters, dtype_filter=None, timing=False)
             print(_sep(timing))
             for r in results:
                 n_rows, n_cols = r["shape"]
-                all_rows.append({
-                    "matrix": os.path.basename(r["path"]),
-                    "value_dtype": dname,
-                    "index_dtype": iname,
-                    "n_rows": n_rows, "n_cols": n_cols, "nnz": r["nnz"],
-                    "base_ms": r["base_ms"], "opt_ms": r["opt_ms"],
-                    "base_gpu_ms": r["base_gpu_ms"],
-                    "opt_gpu_ms": r["opt_gpu_ms"],
-                    "base_process_cpu_ms": r["base_process_cpu_ms"],
-                    "opt_process_cpu_ms": r["opt_process_cpu_ms"],
-                    "base_process_gpu_ms": r["base_process_gpu_ms"],
-                    "opt_process_gpu_ms": r["opt_process_gpu_ms"],
-                    "base_compute_ms": r["base_compute_ms"],
-                    "opt_compute_ms": r["opt_compute_ms"],
-                    "symbolic_ms": r["symbolic_ms"],
-                    "compute_ms": r["compute_ms"],
-                    "op_total_ms": r["op_total_ms"],
-                    "pt_ms": r["pt_ms"], "cu_ms": r["cu_ms"],
-                    "opt_vs_base": r["base_ms"] / r["op_total_ms"] if r["op_total_ms"] and r["op_total_ms"] > 0 else None,
-                    "opt_vs_pt": r["pt_ms"] / r["op_total_ms"] if r["pt_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
-                    "opt_vs_cu": r["cu_ms"] / r["op_total_ms"] if r["cu_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
-                    "triton_speedup_vs_pytorch": r["pt_ms"] / r["op_total_ms"] if r["pt_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
-                    "triton_speedup_vs_cusparse": r["cu_ms"] / r["op_total_ms"] if r["cu_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0 else None,
-                    "err_base": r["err_base"], "err_opt": r["err_opt"],
-                    "status": r["status"],
-                })
+                all_rows.append(
+                    {
+                        "matrix": os.path.basename(r["path"]),
+                        "value_dtype": dname,
+                        "index_dtype": iname,
+                        "n_rows": n_rows,
+                        "n_cols": n_cols,
+                        "nnz": r["nnz"],
+                        "base_ms": r["base_ms"],
+                        "opt_ms": r["opt_ms"],
+                        "base_gpu_ms": r["base_gpu_ms"],
+                        "opt_gpu_ms": r["opt_gpu_ms"],
+                        "base_process_cpu_ms": r["base_process_cpu_ms"],
+                        "opt_process_cpu_ms": r["opt_process_cpu_ms"],
+                        "base_process_gpu_ms": r["base_process_gpu_ms"],
+                        "opt_process_gpu_ms": r["opt_process_gpu_ms"],
+                        "base_compute_ms": r["base_compute_ms"],
+                        "opt_compute_ms": r["opt_compute_ms"],
+                        "symbolic_ms": r["symbolic_ms"],
+                        "compute_ms": r["compute_ms"],
+                        "op_total_ms": r["op_total_ms"],
+                        "pt_ms": r["pt_ms"],
+                        "cu_ms": r["cu_ms"],
+                        "opt_vs_base": (
+                            r["base_ms"] / r["op_total_ms"]
+                            if r["op_total_ms"] and r["op_total_ms"] > 0
+                            else None
+                        ),
+                        "opt_vs_pt": (
+                            r["pt_ms"] / r["op_total_ms"]
+                            if r["pt_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0
+                            else None
+                        ),
+                        "opt_vs_cu": (
+                            r["cu_ms"] / r["op_total_ms"]
+                            if r["cu_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0
+                            else None
+                        ),
+                        "triton_speedup_vs_pytorch": (
+                            r["pt_ms"] / r["op_total_ms"]
+                            if r["pt_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0
+                            else None
+                        ),
+                        "triton_speedup_vs_cusparse": (
+                            r["cu_ms"] / r["op_total_ms"]
+                            if r["cu_ms"] and r["op_total_ms"] and r["op_total_ms"] > 0
+                            else None
+                        ),
+                        "err_base": r["err_base"],
+                        "err_opt": r["err_opt"],
+                        "status": r["status"],
+                    }
+                )
     fields = [
-        "matrix", "value_dtype", "index_dtype",
-        "n_rows", "n_cols", "nnz",
-        "base_ms", "base_gpu_ms", "base_process_cpu_ms",
-        "opt_ms", "opt_gpu_ms", "opt_process_cpu_ms",
-        "symbolic_ms", "compute_ms", "op_total_ms", "pt_ms", "cu_ms",
-        "opt_vs_base", "opt_vs_pt", "opt_vs_cu",
-        "triton_speedup_vs_pytorch", "triton_speedup_vs_cusparse",
-        "err_base", "err_opt", "status",
+        "matrix",
+        "value_dtype",
+        "index_dtype",
+        "n_rows",
+        "n_cols",
+        "nnz",
+        "base_ms",
+        "base_gpu_ms",
+        "base_process_cpu_ms",
+        "opt_ms",
+        "opt_gpu_ms",
+        "opt_process_cpu_ms",
+        "symbolic_ms",
+        "compute_ms",
+        "op_total_ms",
+        "pt_ms",
+        "cu_ms",
+        "opt_vs_base",
+        "opt_vs_pt",
+        "opt_vs_cu",
+        "triton_speedup_vs_pytorch",
+        "triton_speedup_vs_cusparse",
+        "err_base",
+        "err_opt",
+        "status",
     ]
     if timing:
         insert_at = fields.index("symbolic_ms")
@@ -480,13 +548,21 @@ def main():
         description="SpMV opt A/B: baseline vs optimised, with PyTorch/cuSPARSE."
     )
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
-    parser.add_argument("--csv", type=str, default=None, metavar="FILE",
-                        help="Export selected dtype(s) to CSV")
-    parser.add_argument("--dtype", default="all",
-                        choices=["float32", "float64", "all"])
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Export selected dtype(s) to CSV",
+    )
+    parser.add_argument("--dtype", default="all", choices=["float32", "float64", "all"])
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
-    parser.add_argument("--timing", action="store_true", help="Add process_gpu_ms/compute_ms split timing columns")
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help="Add process_gpu_ms/compute_ms split timing columns",
+    )
     args = parser.parse_args()
 
     paths = []
@@ -503,10 +579,14 @@ def main():
         print("=" * 80)
         print("FLAGSPARSE SpMV Optimisation A/B Test - export CSV")
         print("=" * 80)
-        print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {args.csv}")
+        print(
+            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {args.csv}"
+        )
         dtype_map = {"float32": torch.float32, "float64": torch.float64}
         dtype_filter = None if args.dtype == "all" else dtype_map[args.dtype]
-        run_all_csv(paths, args.csv, args.warmup, args.iters, dtype_filter, timing=args.timing)
+        run_all_csv(
+            paths, args.csv, args.warmup, args.iters, dtype_filter, timing=args.timing
+        )
         return
 
     dtype_map = {"float32": torch.float32, "float64": torch.float64}
@@ -515,7 +595,9 @@ def main():
         dname = str(dtype).replace("torch.", "")
         print("=" * (210 if args.timing else 190))
         print(f"FLAGSPARSE SpMV Optimisation A/B Test")
-        print(f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {dname}  |  Files: {len(paths)}")
+        print(
+            f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {dname}  |  Files: {len(paths)}"
+        )
         print(
             "Base = prepared baseline kernel. "
             "Opt = CSR-Vector with bucket execution-plan data. "
@@ -525,7 +607,9 @@ def main():
         print(_sep(args.timing))
         print(_header(args.timing))
         print(_sep(args.timing))
-        results = run_batch(paths, dtype, torch.int32, args.warmup, args.iters, timing=args.timing)
+        results = run_batch(
+            paths, dtype, torch.int32, args.warmup, args.iters, timing=args.timing
+        )
         print(_sep(args.timing))
         passed = sum(1 for r in results if r["status"] == "PASS")
         print(f"Passed: {passed} / {len(results)}")

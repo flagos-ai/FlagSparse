@@ -20,7 +20,6 @@ from flagsparse import flagsparse_spsm_coo, flagsparse_spsm_csr
 from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import SPSM_N_RHS
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 

@@ -19,7 +19,6 @@ from ._common import *
 import triton
 import triton.language as tl
 
-
 SUPPORTED_SPMV_CSC_VALUE_DTYPES = (
     torch.float32,
     torch.float64,
@@ -35,9 +34,7 @@ SPMV_CSC_OP_NAMES = {
     SPMV_CSC_OP_TRANS: "trans",
     SPMV_CSC_OP_CONJ_TRANS: "conj",
 }
-_SPMV_CSC_OP_NAME_TO_CODE = {
-    name: code for code, name in SPMV_CSC_OP_NAMES.items()
-}
+_SPMV_CSC_OP_NAME_TO_CODE = {name: code for code, name in SPMV_CSC_OP_NAMES.items()}
 
 
 def _spmv_csc_dtype_error_message():
