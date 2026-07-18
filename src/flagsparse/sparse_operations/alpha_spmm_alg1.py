@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Experimental Triton port of AlphaSparse CUDA CSR ALG1 for SpMM."""
 
 import importlib
@@ -25,7 +39,9 @@ def _load_tle_language():
         if hasattr(module, "gpu"):
             return module, None
         errors.append(f"{module_name}: imported, but has no gpu namespace")
-    return None, RuntimeError("No FlagTree TLE module with a gpu namespace was found: " + "; ".join(errors))
+    return None, RuntimeError(
+        "No FlagTree TLE module with a gpu namespace was found: " + "; ".join(errors)
+    )
 
 
 tle, _TLE_IMPORT_ERROR = _load_tle_language()
@@ -147,13 +163,20 @@ def _validate_alpha_spmm_alg1_runtime_inputs(prepared, B, out):
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
     if B.shape[0] != prepared.n_cols:
-        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
+        raise ValueError(
+            f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}"
+        )
     if out is not None:
         if not out.is_cuda:
             raise ValueError("out must be a CUDA tensor")
         if out.device != prepared.data.device:
-            raise ValueError("out must be on the same CUDA device as sparse matrix data")
-        if out.shape != (prepared.n_rows, int(B.shape[1])) or out.dtype != prepared.data.dtype:
+            raise ValueError(
+                "out must be on the same CUDA device as sparse matrix data"
+            )
+        if (
+            out.shape != (prepared.n_rows, int(B.shape[1]))
+            or out.dtype != prepared.data.dtype
+        ):
             raise ValueError("out shape/dtype must match result")
     return B.contiguous()
 
@@ -186,7 +209,9 @@ def _build_alpha_spmm_alg1_runtime_meta(prepared, B):
     return meta
 
 
-def _resolve_alpha_spmm_alg1_tle_opt_launch_v0(dtype, n_dense_cols, max_row_nnz, block_cols):
+def _resolve_alpha_spmm_alg1_tle_opt_launch_v0(
+    dtype, n_dense_cols, max_row_nnz, block_cols
+):
     """Rollback baseline used by the first TLEOpt route before P1a tuning."""
     n_dense_cols = int(n_dense_cols)
     max_row_nnz = int(max_row_nnz)
@@ -205,11 +230,15 @@ def _resolve_alpha_spmm_alg1_tle_opt_launch_v0(dtype, n_dense_cols, max_row_nnz,
         num_warps = min(num_warps, 8)
     else:
         num_warps = min(num_warps, 8)
-    num_stages = 1 if (n_dense_cols > 64 or block_cols >= 128 or max_row_nnz >= 512) else 2
+    num_stages = (
+        1 if (n_dense_cols > 64 or block_cols >= 128 or max_row_nnz >= 512) else 2
+    )
     return int(num_warps), int(num_stages)
 
 
-def _resolve_alpha_spmm_alg1_tle_opt_launch_v1(dtype, n_dense_cols, max_row_nnz, block_cols):
+def _resolve_alpha_spmm_alg1_tle_opt_launch_v1(
+    dtype, n_dense_cols, max_row_nnz, block_cols
+):
     n_dense_cols = int(n_dense_cols)
     max_row_nnz = int(max_row_nnz)
     block_cols = int(block_cols)
@@ -431,12 +460,22 @@ def _run_alpha_spmm_alg1(prepared, B, meta, out=None):
         if out is not None:
             out.zero_()
             return out
-        return torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+        return torch.zeros(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
     if prepared.data.is_complex():
         return _run_alpha_spmm_alg1_complex_kernel(prepared, B, out)
 
-    C_out = out if out is not None else torch.empty(
-        (prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device
+    C_out = (
+        out
+        if out is not None
+        else torch.empty(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
     )
     grid = (meta["grid_m"], meta["grid_n"])
     _alpha_spmm_alg1_rowmajor_kernel[grid](
@@ -531,17 +570,37 @@ def _alpha_spmm_alg1_tle_rowmajor_kernel(
 
     for chunk_offset in tl.range(0, MAX_ROW_NNZ, WARP_SIZE):
         elem_offsets = row_start[:, None] + chunk_offset + lane_ids_2d
-        valid_offsets = row_valid[:, None] & ((chunk_offset + lane_ids_2d) < row_nnz[:, None])
+        valid_offsets = row_valid[:, None] & (
+            (chunk_offset + lane_ids_2d) < row_nnz[:, None]
+        )
         staged_cols = tl.load(indices_ptr + elem_offsets, mask=valid_offsets, other=0)
-        staged_vals = tl.load(data_ptr + elem_offsets, mask=valid_offsets, other=0.0).to(ACC_DTYPE)
-        tl.store(tle.gpu.local_ptr(s_col, indices=(row_ids_2d, lane_ids_2d)), staged_cols, mask=valid_offsets)
-        tl.store(tle.gpu.local_ptr(s_val, indices=(row_ids_2d, lane_ids_2d)), staged_vals, mask=valid_offsets)
+        staged_vals = tl.load(
+            data_ptr + elem_offsets, mask=valid_offsets, other=0.0
+        ).to(ACC_DTYPE)
+        tl.store(
+            tle.gpu.local_ptr(s_col, indices=(row_ids_2d, lane_ids_2d)),
+            staged_cols,
+            mask=valid_offsets,
+        )
+        tl.store(
+            tle.gpu.local_ptr(s_val, indices=(row_ids_2d, lane_ids_2d)),
+            staged_vals,
+            mask=valid_offsets,
+        )
 
         for jj in tl.static_range(0, WARP_SIZE):
             valid = row_valid & ((chunk_offset + jj) < row_nnz)
             local_jj = tl.full((BLOCK_ROWS,), jj, dtype=tl.int32)
-            a_col = tl.load(tle.gpu.local_ptr(s_col, indices=(local_row_offsets, local_jj)), mask=valid, other=0)
-            a_val = tl.load(tle.gpu.local_ptr(s_val, indices=(local_row_offsets, local_jj)), mask=valid, other=0.0).to(ACC_DTYPE)
+            a_col = tl.load(
+                tle.gpu.local_ptr(s_col, indices=(local_row_offsets, local_jj)),
+                mask=valid,
+                other=0,
+            )
+            a_val = tl.load(
+                tle.gpu.local_ptr(s_val, indices=(local_row_offsets, local_jj)),
+                mask=valid,
+                other=0.0,
+            ).to(ACC_DTYPE)
             if FACTOR > 0:
                 b0 = tl.load(
                     b_ptr + a_col[:, None] * stride_bk + offs0[None, :] * stride_bn,
@@ -668,17 +727,37 @@ def _alpha_spmm_alg1_tle_opt_rowmajor_kernel(
     # the current row block instead of the matrix-wide max row nnz.
     for chunk_offset in tl.range(0, block_row_nnz, WARP_SIZE):
         elem_offsets = row_start[:, None] + chunk_offset + lane_ids_2d
-        valid_offsets = row_valid[:, None] & ((chunk_offset + lane_ids_2d) < row_nnz[:, None])
+        valid_offsets = row_valid[:, None] & (
+            (chunk_offset + lane_ids_2d) < row_nnz[:, None]
+        )
         staged_cols = tl.load(indices_ptr + elem_offsets, mask=valid_offsets, other=0)
-        staged_vals = tl.load(data_ptr + elem_offsets, mask=valid_offsets, other=0.0).to(ACC_DTYPE)
-        tl.store(tle.gpu.local_ptr(s_col, indices=(row_ids_2d, lane_ids_2d)), staged_cols, mask=valid_offsets)
-        tl.store(tle.gpu.local_ptr(s_val, indices=(row_ids_2d, lane_ids_2d)), staged_vals, mask=valid_offsets)
+        staged_vals = tl.load(
+            data_ptr + elem_offsets, mask=valid_offsets, other=0.0
+        ).to(ACC_DTYPE)
+        tl.store(
+            tle.gpu.local_ptr(s_col, indices=(row_ids_2d, lane_ids_2d)),
+            staged_cols,
+            mask=valid_offsets,
+        )
+        tl.store(
+            tle.gpu.local_ptr(s_val, indices=(row_ids_2d, lane_ids_2d)),
+            staged_vals,
+            mask=valid_offsets,
+        )
 
         for jj in tl.static_range(0, WARP_SIZE):
             valid = row_valid & ((chunk_offset + jj) < row_nnz)
             local_jj = tl.full((BLOCK_ROWS,), jj, dtype=tl.int32)
-            a_col = tl.load(tle.gpu.local_ptr(s_col, indices=(local_row_offsets, local_jj)), mask=valid, other=0)
-            a_val = tl.load(tle.gpu.local_ptr(s_val, indices=(local_row_offsets, local_jj)), mask=valid, other=0.0).to(ACC_DTYPE)
+            a_col = tl.load(
+                tle.gpu.local_ptr(s_col, indices=(local_row_offsets, local_jj)),
+                mask=valid,
+                other=0,
+            )
+            a_val = tl.load(
+                tle.gpu.local_ptr(s_val, indices=(local_row_offsets, local_jj)),
+                mask=valid,
+                other=0.0,
+            ).to(ACC_DTYPE)
             if FACTOR > 0:
                 b0 = tl.load(
                     b_ptr + a_col[:, None] * stride_bk + offs0[None, :] * stride_bn,
@@ -805,17 +884,37 @@ def _alpha_spmm_alg1_tle_opt2_rowmajor_kernel(
     # launch heuristic is independently bucketed by matrix shape.
     for chunk_offset in tl.range(0, block_row_nnz, WARP_SIZE):
         elem_offsets = row_start[:, None] + chunk_offset + lane_ids_2d
-        valid_offsets = row_valid[:, None] & ((chunk_offset + lane_ids_2d) < row_nnz[:, None])
+        valid_offsets = row_valid[:, None] & (
+            (chunk_offset + lane_ids_2d) < row_nnz[:, None]
+        )
         staged_cols = tl.load(indices_ptr + elem_offsets, mask=valid_offsets, other=0)
-        staged_vals = tl.load(data_ptr + elem_offsets, mask=valid_offsets, other=0.0).to(ACC_DTYPE)
-        tl.store(tle.gpu.local_ptr(s_col, indices=(row_ids_2d, lane_ids_2d)), staged_cols, mask=valid_offsets)
-        tl.store(tle.gpu.local_ptr(s_val, indices=(row_ids_2d, lane_ids_2d)), staged_vals, mask=valid_offsets)
+        staged_vals = tl.load(
+            data_ptr + elem_offsets, mask=valid_offsets, other=0.0
+        ).to(ACC_DTYPE)
+        tl.store(
+            tle.gpu.local_ptr(s_col, indices=(row_ids_2d, lane_ids_2d)),
+            staged_cols,
+            mask=valid_offsets,
+        )
+        tl.store(
+            tle.gpu.local_ptr(s_val, indices=(row_ids_2d, lane_ids_2d)),
+            staged_vals,
+            mask=valid_offsets,
+        )
 
         for jj in tl.static_range(0, WARP_SIZE):
             valid = row_valid & ((chunk_offset + jj) < row_nnz)
             local_jj = tl.full((BLOCK_ROWS,), jj, dtype=tl.int32)
-            a_col = tl.load(tle.gpu.local_ptr(s_col, indices=(local_row_offsets, local_jj)), mask=valid, other=0)
-            a_val = tl.load(tle.gpu.local_ptr(s_val, indices=(local_row_offsets, local_jj)), mask=valid, other=0.0).to(ACC_DTYPE)
+            a_col = tl.load(
+                tle.gpu.local_ptr(s_col, indices=(local_row_offsets, local_jj)),
+                mask=valid,
+                other=0,
+            )
+            a_val = tl.load(
+                tle.gpu.local_ptr(s_val, indices=(local_row_offsets, local_jj)),
+                mask=valid,
+                other=0.0,
+            ).to(ACC_DTYPE)
             if FACTOR > 0:
                 b0 = tl.load(
                     b_ptr + a_col[:, None] * stride_bk + offs0[None, :] * stride_bn,
@@ -961,8 +1060,16 @@ def _alpha_spmm_alg1_complex_rowmajor_kernel(
                 mask=mask_n & valid,
                 other=0.0,
             )
-            acc_re = acc_re + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE) - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
-            acc_im = acc_im + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE) + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+            acc_re = (
+                acc_re
+                + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+                - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+            )
+            acc_im = (
+                acc_im
+                + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+                + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+            )
 
     tl.store(c_ri_ptr + row * stride_cm + offs_n * stride_cn, acc_re, mask=mask_n)
     tl.store(
@@ -974,7 +1081,11 @@ def _alpha_spmm_alg1_complex_rowmajor_kernel(
 
 def _run_alpha_spmm_alg1_complex_kernel(prepared, B, out):
     if out is None:
-        C_out = torch.empty((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+        C_out = torch.empty(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
     else:
         C_out = out
     data_ri = torch.view_as_real(prepared.data).contiguous().reshape(-1)
@@ -1017,12 +1128,22 @@ def _run_alpha_spmm_alg1_tle(prepared, B, meta, out=None):
         if out is not None:
             out.zero_()
             return out
-        return torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+        return torch.zeros(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
     if prepared.data.is_complex():
         return _run_alpha_spmm_alg1_complex_kernel(prepared, B, out)
 
-    C_out = out if out is not None else torch.empty(
-        (prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device
+    C_out = (
+        out
+        if out is not None
+        else torch.empty(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
     )
     grid = (meta["grid_m"], meta["grid_n"])
     _alpha_spmm_alg1_tle_rowmajor_kernel[grid](
@@ -1059,12 +1180,22 @@ def _run_alpha_spmm_alg1_tle_opt(prepared, B, meta, out=None):
         if out is not None:
             out.zero_()
             return out
-        return torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+        return torch.zeros(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
     if prepared.data.is_complex():
         return _run_alpha_spmm_alg1_complex_kernel(prepared, B, out)
 
-    C_out = out if out is not None else torch.empty(
-        (prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device
+    C_out = (
+        out
+        if out is not None
+        else torch.empty(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
     )
     grid = (meta["grid_m"], meta["grid_n"])
     _alpha_spmm_alg1_tle_opt_rowmajor_kernel[grid](
@@ -1101,12 +1232,22 @@ def _run_alpha_spmm_alg1_tle_opt2(prepared, B, meta, out=None):
         if out is not None:
             out.zero_()
             return out
-        return torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device)
+        return torch.zeros(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
     if prepared.data.is_complex():
         return _run_alpha_spmm_alg1_complex_kernel(prepared, B, out)
 
-    C_out = out if out is not None else torch.empty(
-        (prepared.n_rows, int(B.shape[1])), dtype=prepared.data.dtype, device=prepared.data.device
+    C_out = (
+        out
+        if out is not None
+        else torch.empty(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
     )
     grid = (meta["grid_m"], meta["grid_n"])
     _alpha_spmm_alg1_tle_opt2_rowmajor_kernel[grid](

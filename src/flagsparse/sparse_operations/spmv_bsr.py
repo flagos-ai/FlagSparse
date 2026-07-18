@@ -1,10 +1,23 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Native BSR SpMV kernels and public helpers."""
 
 from ._common import *
 
 import triton
 import triton.language as tl
-
 
 SUPPORTED_SPMV_BSR_VALUE_DTYPES = (
     torch.float32,
@@ -22,9 +35,7 @@ SPMV_BSR_OP_NAMES = {
     SPMV_BSR_OP_CONJ_TRANS: "conj",
 }
 SPMV_BSR_SUPPORTED_OP_NAMES = ("non", "trans", "conj")
-_SPMV_BSR_OP_NAME_TO_CODE = {
-    name: code for code, name in SPMV_BSR_OP_NAMES.items()
-}
+_SPMV_BSR_OP_NAME_TO_CODE = {name: code for code, name in SPMV_BSR_OP_NAMES.items()}
 
 
 def _spmv_bsr_dtype_error_message():
@@ -167,11 +178,14 @@ def _spmv_bsr_non_real_kernel(
     offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
     mask = offs < end
     bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
-    acc = tl.load(
-        data_ptr + start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM,
-        mask=start < end,
-        other=0.0,
-    ) * 0
+    acc = (
+        tl.load(
+            data_ptr + start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM,
+            mask=start < end,
+            other=0.0,
+        )
+        * 0
+    )
     for inner_col in tl.static_range(0, BLOCK_DIM):
         col = bcols * BLOCK_DIM + inner_col
         valid = mask
@@ -209,16 +223,24 @@ def _spmv_bsr_non_complex_kernel(
     offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
     mask = offs < end
     bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
-    acc_re = tl.load(
-        data_ri_ptr + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2,
-        mask=start < end,
-        other=0.0,
-    ) * 0
-    acc_im = tl.load(
-        data_ri_ptr + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2 + 1,
-        mask=start < end,
-        other=0.0,
-    ) * 0
+    acc_re = (
+        tl.load(
+            data_ri_ptr + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2,
+            mask=start < end,
+            other=0.0,
+        )
+        * 0
+    )
+    acc_im = (
+        tl.load(
+            data_ri_ptr
+            + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2
+            + 1,
+            mask=start < end,
+            other=0.0,
+        )
+        * 0
+    )
     for inner_col in tl.static_range(0, BLOCK_DIM):
         col = bcols * BLOCK_DIM + inner_col
         valid = mask
@@ -354,9 +376,7 @@ def _prepare_spmv_bsr_matrix(data, indices, indptr, shape, block_dim):
         if min_index < 0 or max_index >= n_block_cols:
             raise IndexError("indices out of range for n_block_cols")
     block_row_lengths = indptr[1:] - indptr[:-1]
-    max_block_row_nnz = (
-        int(block_row_lengths.max().item()) if n_block_rows > 0 else 0
-    )
+    max_block_row_nnz = int(block_row_lengths.max().item()) if n_block_rows > 0 else 0
     return (
         data,
         indices,
@@ -402,7 +422,9 @@ def prepare_spmv_bsr(
     if block_nnz_use <= 0:
         raise ValueError("block_nnz must be positive")
     if max_segments is None:
-        max_segments_use = max((max_block_row_nnz + block_nnz_use - 1) // block_nnz_use, 1)
+        max_segments_use = max(
+            (max_block_row_nnz + block_nnz_use - 1) // block_nnz_use, 1
+        )
         while max_segments_use > 2048 and block_nnz_use < 65536:
             block_nnz_use *= 2
             max_segments_use = max(
@@ -437,7 +459,9 @@ def _validate_spmv_bsr_x(x, prepared, op_code):
         raise ValueError("x must be a CUDA tensor")
     if x.dtype != prepared.data.dtype:
         raise TypeError("x dtype must match sparse matrix dtype")
-    logical_expected = prepared.n_rows if _spmv_bsr_op_transposes(op_code) else prepared.n_cols
+    logical_expected = (
+        prepared.n_rows if _spmv_bsr_op_transposes(op_code) else prepared.n_cols
+    )
     padded_expected = (
         prepared.padded_n_rows
         if _spmv_bsr_op_transposes(op_code)

@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Sparse matrix formats aligned with CuPy/cupyx."""
 
 try:
@@ -108,6 +122,7 @@ class CSRMatrix:
 
 class CSCMatrix:
     """Compressed Sparse Column matrix (CuPy-style)."""
+
     def __init__(self, values, indices=None, indptr=None, shape=None, dtype=None):
         if isinstance(values, cpx_sparse.csc_matrix):
             self.matrix = values
@@ -152,7 +167,10 @@ class CSCMatrix:
 
 class BSRMatrix:
     """Block Sparse Row matrix (CuPy/SciPy-style). blocksize=(R,C)."""
-    def __init__(self, data, indices=None, indptr=None, shape=None, blocksize=None, dtype=None):
+
+    def __init__(
+        self, data, indices=None, indptr=None, shape=None, blocksize=None, dtype=None
+    ):
         if isinstance(data, cpx_sparse.bsr_matrix):
             self.matrix = data
         else:
@@ -214,6 +232,7 @@ class SELLMatrix:
     for the high-level conversion helpers; the physical stride is always
     ``slice_size``, including the final partial slice.
     """
+
     def __init__(
         self,
         values,
@@ -282,6 +301,7 @@ class BLOCKEDELLMatrix:
     Blocked ELL format. data shape (n_block_rows, max_blocks_per_row, r, c),
     indices shape (n_block_rows, max_blocks_per_row). CuPy arrays.
     """
+
     def __init__(self, data, indices, block_shape, shape, dtype=None):
         self._data = _to_cupy_array(data, dtype=_resolve_dtype(dtype))
         self._indices = _to_cupy_array(indices, dtype=cp.int64)
@@ -319,7 +339,9 @@ class BLOCKEDELLMatrix:
 
 
 class COOMatrix:
-    def __init__(self, row_indices, col_indices=None, values=None, shape=None, dtype=None):
+    def __init__(
+        self, row_indices, col_indices=None, values=None, shape=None, dtype=None
+    ):
         if isinstance(row_indices, cpx_sparse.coo_matrix):
             self.matrix = row_indices
         else:
@@ -562,9 +584,7 @@ def _coo_to_blocked_ell_impl(rows, cols, data, shape, block_shape):
         for t, j in enumerate(cols_in_row):
             data_out[i, t] = blocks[(i, j)]
             indices_out[i, t] = j
-    return BLOCKEDELLMatrix(
-        data_out, indices_out, block_shape, shape, dtype=data.dtype
-    )
+    return BLOCKEDELLMatrix(data_out, indices_out, block_shape, shape, dtype=data.dtype)
 
 
 def create_csr_matrix(values, indices, indptr, shape, dtype=None):
@@ -612,9 +632,7 @@ def coo_to_blocked_ell(coo_matrix, block_shape):
     rows = coo_matrix.row_indices
     cols = coo_matrix.col_indices
     data = coo_matrix.values
-    return _coo_to_blocked_ell_impl(
-        rows, cols, data, coo_matrix.shape, block_shape
-    )
+    return _coo_to_blocked_ell_impl(rows, cols, data, coo_matrix.shape, block_shape)
 
 
 def create_csc_matrix(values, indices, indptr, shape, dtype=None):

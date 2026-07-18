@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """CSR SpMV: Triton baseline kernels + optimised CSR-Vector buckets."""
 
 from ._common import *
@@ -162,7 +176,6 @@ _SPMV_OPT_BUCKET_CONFIGS_FP64 = (
 _SPMV_OPT_ACC_MODES = ("fast", "mixed", "accurate")
 
 
-
 @triton.jit
 def _spmv_csr_real_kernel(
     data_ptr,
@@ -230,6 +243,7 @@ def _spmv_csr_complex_kernel(
 # ── Optimised SpMV (CSR-Vector, perf-oriented, no CuPy) ─────────────
 # fp32 / fp64 native lane accum.  Batched kernel for many short rows per program.
 
+
 @triton.jit
 def _spmv_csr_batched_short_f32(
     data_ptr,
@@ -260,6 +274,7 @@ def _spmv_csr_batched_short_f32(
             xv = tl.load(x_ptr + col, mask=mask, other=0.0)
             acc += tl.where(mask, a * xv, 0.0)
         tl.store(y_ptr + row, tl.sum(acc), mask=active)
+
 
 @triton.jit
 def _spmv_csr_batched_short_f64(
@@ -292,6 +307,7 @@ def _spmv_csr_batched_short_f64(
             acc += tl.where(mask, a * xv, 0.0)
         tl.store(y_ptr + row, tl.sum(acc), mask=active)
 
+
 @triton.jit
 def _spmv_csr_vector_rows_f32(
     data_ptr,
@@ -321,6 +337,7 @@ def _spmv_csr_vector_rows_f32(
         acc = tl.where(mask, acc + a * xv, acc)
     tl.store(y_ptr + row, tl.sum(acc))
 
+
 @triton.jit
 def _spmv_csr_vector_rows_f64(
     data_ptr,
@@ -349,6 +366,7 @@ def _spmv_csr_vector_rows_f64(
         xv = tl.load(x_ptr + col, mask=mask, other=0.0)
         acc = tl.where(mask, acc + a * xv, acc)
     tl.store(y_ptr + row, tl.sum(acc))
+
 
 def _build_spmv_opt_buckets(
     row_lengths,
@@ -400,7 +418,9 @@ def _build_spmv_opt_buckets(
 
 
 def _build_spmv_opt_runtime_buckets(prepared):
-    row_index_dtype = torch.int32 if prepared.n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+    row_index_dtype = (
+        torch.int32 if prepared.n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+    )
     return _build_spmv_opt_buckets(
         prepared.row_lengths,
         max_row_nnz=prepared.max_row_nnz,
@@ -408,6 +428,7 @@ def _build_spmv_opt_runtime_buckets(prepared):
         max_segments=prepared.opt_max_segments,
         fp64=prepared.data.dtype == torch.float64,
     )
+
 
 def _triton_spmv_csr_impl_opt_prepared(prepared, x, opt_buckets=None):
     # First bucket includes nnz==0 rows; every row gets exactly one store.
@@ -515,7 +536,9 @@ def _transpose_csr_for_spmv(data, indices, indptr, shape):
     )
 
 
-def _prepare_spmv_csr_matrix(data, indices, indptr, shape, index_fallback_policy="auto"):
+def _prepare_spmv_csr_matrix(
+    data, indices, indptr, shape, index_fallback_policy="auto"
+):
     _normalize_spmv_index_fallback_policy(index_fallback_policy)
     if not all(torch.is_tensor(t) for t in (data, indices, indptr)):
         raise TypeError("data, indices, indptr must all be torch.Tensor")
@@ -731,7 +754,10 @@ def _spmv_uses_int64_indices(prepared):
 
 
 def _spmv_int32_fallback_blocker(prepared):
-    if prepared.kernel_indices.dtype == torch.int64 and prepared.kernel_indices.numel() > 0:
+    if (
+        prepared.kernel_indices.dtype == torch.int64
+        and prepared.kernel_indices.numel() > 0
+    ):
         min_index = int(prepared.kernel_indices.min().item())
         max_index = int(prepared.kernel_indices.max().item())
         if min_index < 0 or max_index > _INDEX_LIMIT_INT32:
@@ -739,12 +765,13 @@ def _spmv_int32_fallback_blocker(prepared):
                 f"column index range [{min_index}, {max_index}] cannot fit int32 "
                 f"for shape={prepared.shape}"
             )
-    if prepared.kernel_indptr.dtype == torch.int64 and prepared.kernel_indptr.numel() > 0:
+    if (
+        prepared.kernel_indptr.dtype == torch.int64
+        and prepared.kernel_indptr.numel() > 0
+    ):
         max_offset = int(prepared.kernel_indptr[-1].item())
         if max_offset > _INDEX_LIMIT_INT32:
-            return (
-                f"CSR nnz offset {max_offset} cannot fit int32 for shape={prepared.shape}"
-            )
+            return f"CSR nnz offset {max_offset} cannot fit int32 for shape={prepared.shape}"
     if prepared.n_rows > _INDEX_LIMIT_INT32:
         return f"row count {prepared.n_rows} cannot fit int32 row metadata"
     return None
@@ -789,13 +816,10 @@ def _run_spmv_prepared(prepared, x, use_opt=False, opt_buckets=None):
 
 def _run_spmv_prepared_with_fallback(prepared, x, use_opt=False, opt_buckets=None):
     try:
-        return _run_spmv_prepared(
-            prepared, x, use_opt=use_opt, opt_buckets=opt_buckets
-        )
+        return _run_spmv_prepared(prepared, x, use_opt=use_opt, opt_buckets=opt_buckets)
     except Exception as exc:
-        if (
-            prepared.index_fallback_policy != "auto"
-            or not _spmv_uses_int64_indices(prepared)
+        if prepared.index_fallback_policy != "auto" or not _spmv_uses_int64_indices(
+            prepared
         ):
             raise
         fallback_prepared = _spmv_prepared_with_int32_indices(prepared, exc)
@@ -840,7 +864,11 @@ def flagsparse_spmv_csr(
         op,
         transpose=False if transpose is None else bool(transpose),
     )
-    if op_explicit and transpose is not None and bool(transpose) != _spmv_op_transposes(op_code):
+    if (
+        op_explicit
+        and transpose is not None
+        and bool(transpose) != _spmv_op_transposes(op_code)
+    ):
         raise ValueError("transpose conflicts with op")
     if prepared is None:
         if any(arg is None for arg in (data, indices, indptr, shape)):
@@ -862,7 +890,11 @@ def flagsparse_spmv_csr(
             raise ValueError(
                 f"op={_spmv_op_to_name(op_code)} does not match prepared.op={_spmv_op_to_name(prepared.op)}"
             )
-        if not op_explicit and transpose is not None and bool(transpose) != prepared.transpose:
+        if (
+            not op_explicit
+            and transpose is not None
+            and bool(transpose) != prepared.transpose
+        ):
             raise ValueError(
                 f"transpose={bool(transpose)} does not match prepared.transpose={prepared.transpose}"
             )
@@ -1014,7 +1046,9 @@ def flagsparse_spmv_coo_tocsr(
             shape = prepared.shape
         sh = (int(shape[0]), int(shape[1]))
         if sh != prepared.shape:
-            raise ValueError(f"shape {sh} does not match prepared.shape {prepared.shape}")
+            raise ValueError(
+                f"shape {sh} does not match prepared.shape {prepared.shape}"
+            )
         return flagsparse_spmv_csr(
             x=x,
             shape=shape,

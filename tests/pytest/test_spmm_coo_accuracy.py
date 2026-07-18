@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
@@ -5,7 +19,6 @@ from flagsparse import flagsparse_spmm_coo
 
 from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import MNK_SHAPES
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -79,9 +92,7 @@ def _reference(Asp, B, op):
     "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
 )
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
-def test_spmm_coo_matches_dense_reference(
-    M, N, K, dtype_name, dtype, index_dtype, op
-):
+def test_spmm_coo_matches_dense_reference(M, N, K, dtype_name, dtype, index_dtype, op):
     device = torch.device("cuda")
     Asp = _random_coo_mk(M, K, dtype, device)
     indices = Asp.indices()
@@ -131,9 +142,7 @@ def test_spmm_coo_non_meta_has_zero_symbolic_time():
     row = torch.tensor([0, 1], dtype=torch.int32, device=device)
     col = torch.tensor([0, 1], dtype=torch.int32, device=device)
     B = torch.randn(2, 3, dtype=torch.float32, device=device)
-    out, meta = flagsparse_spmm_coo(
-        data, row, col, B, (2, 2), return_meta=True
-    )
+    out, meta = flagsparse_spmm_coo(data, row, col, B, (2, 2), return_meta=True)
     assert out.shape == (2, 3)
     assert meta["op"] == "non"
     assert meta["symbolic_ms"] == 0.0
@@ -151,9 +160,7 @@ def test_spmm_coo_rejects_invalid_ops_and_shapes():
     with pytest.raises(ValueError):
         flagsparse_spmm_coo(data, row, col, B_non, (2, 4), op="bad")
     with pytest.raises(ValueError):
-        flagsparse_spmm_coo(
-            data, row, col, B_non, (2, 4), op="non", transpose=True
-        )
+        flagsparse_spmm_coo(data, row, col, B_non, (2, 4), op="non", transpose=True)
     with pytest.raises(ValueError):
         flagsparse_spmm_coo(
             data, row, col, B_bad_trans, (2, 4), op="trans", transpose=False

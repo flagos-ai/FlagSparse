@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
@@ -15,7 +29,6 @@ from tests.pytest.param_shapes import (
     SPMV_COO_DTYPE_IDS,
     SPMV_MN_SHAPES,
 )
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -85,13 +98,17 @@ def _apply_dense_op(dense, op):
 def _assert_close(actual, expected, dtype):
     rtol, atol = _tol(dtype)
     ref_dtype = _reference_dtype(dtype)
-    assert torch.allclose(actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(
+        actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol
+    )
 
 
 @pytest.mark.spmv_coo
 @pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
 @pytest.mark.parametrize("dtype", SPMV_COO_DTYPES, ids=SPMV_COO_DTYPE_IDS)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op):
     device = torch.device("cuda")

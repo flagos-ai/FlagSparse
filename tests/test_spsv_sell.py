@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """SELL SpSV correctness and fair Triton/cuSPARSE timing checks."""
 
 import argparse
@@ -33,7 +47,6 @@ from tests.test_spsv import (
     _load_mtx_to_csr_torch,
     _random_rhs_for_spsv,
 )
-
 
 if __name__ != "__main__":
     pytestmark = pytest.mark.spsv_sell
@@ -152,9 +165,7 @@ def _csr_to_sell(values, cols, row_ptr, n_rows, slice_size):
             )
         )
 
-    offsets = torch.zeros(
-        n_slices + 1, dtype=row_ptr.dtype, device=row_ptr.device
-    )
+    offsets = torch.zeros(n_slices + 1, dtype=row_ptr.dtype, device=row_ptr.device)
     if widths:
         increments = torch.tensor(
             [width * slice_size for width in widths],
@@ -164,12 +175,8 @@ def _csr_to_sell(values, cols, row_ptr, n_rows, slice_size):
         offsets[1:] = torch.cumsum(increments, dim=0)
 
     padded_size = int(offsets[-1].item())
-    sell_values = torch.zeros(
-        padded_size, dtype=values.dtype, device=values.device
-    )
-    sell_cols = torch.full(
-        (padded_size,), -1, dtype=cols.dtype, device=cols.device
-    )
+    sell_values = torch.zeros(padded_size, dtype=values.dtype, device=values.device)
+    sell_cols = torch.full((padded_size,), -1, dtype=cols.dtype, device=cols.device)
     for slice_id in range(n_slices):
         row0 = slice_id * slice_size
         row1 = min(row0 + slice_size, n_rows)
@@ -523,9 +530,7 @@ def test_spsv_sell_matches_cusparse(value_dtype, index_dtype, slice_size):
     expected = _random_rhs_for_spsv(
         shape, value_dtype, values.device, op_mode="NON", seed=1234
     )
-    b = _apply_csr_op(
-        values, cols, row_ptr, expected, shape, "NON", lower=True
-    )
+    b = _apply_csr_op(values, cols, row_ptr, expected, shape, "NON", lower=True)
     atol = 2e-5 if value_dtype == torch.float32 else 1e-11
     rtol = 2e-5 if value_dtype == torch.float32 else 1e-11
     try:
@@ -641,7 +646,10 @@ def main():
         writer.writeheader()
         for record in records:
             writer.writerow(
-                {key: "" if record.get(key) is None else record.get(key) for key in CSV_FIELDS}
+                {
+                    key: "" if record.get(key) is None else record.get(key)
+                    for key in CSV_FIELDS
+                }
             )
     print("-" * 144)
     print(f"Wrote {len(records)} rows to {args.csv}")

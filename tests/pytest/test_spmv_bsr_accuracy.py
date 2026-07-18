@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib
 
 import pytest
@@ -5,7 +19,6 @@ import torch
 
 from flagsparse import flagsparse_spmv_bsr, prepare_spmv_bsr
 from tests.pytest.accuracy_utils import close_tolerances
-
 
 spmv_bsr_mod = importlib.import_module("flagsparse.sparse_operations.spmv_bsr")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -76,7 +89,9 @@ def _dense_to_bsr(dense, index_dtype, block_dim):
     if data:
         data_tensor = torch.stack(data).contiguous()
     else:
-        data_tensor = torch.empty((0, block_dim, block_dim), dtype=dense.dtype, device=device)
+        data_tensor = torch.empty(
+            (0, block_dim, block_dim), dtype=dense.dtype, device=device
+        )
     return (
         data_tensor,
         torch.tensor(indices, dtype=index_dtype, device=device),
@@ -135,11 +150,15 @@ def _logical_out_len(M, N, op):
 
 
 def _padded_out_len(M, N, block_dim, op):
-    return _padded_cols(N, block_dim) if _op_transposes(op) else _padded_rows(M, block_dim)
+    return (
+        _padded_cols(N, block_dim) if _op_transposes(op) else _padded_rows(M, block_dim)
+    )
 
 
 def _padded_x_len(M, N, block_dim, op):
-    return _padded_rows(M, block_dim) if _op_transposes(op) else _padded_cols(N, block_dim)
+    return (
+        _padded_rows(M, block_dim) if _op_transposes(op) else _padded_cols(N, block_dim)
+    )
 
 
 def _assert_close(actual, expected, dtype):
@@ -160,7 +179,9 @@ def _assert_close(actual, expected, dtype):
 )
 @pytest.mark.parametrize("block_dim", [2, 4], ids=["block2", "block4"])
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
-def test_spmv_bsr_matches_dense_reference(M, N, name, dtype, index_dtype, block_dim, op):
+def test_spmv_bsr_matches_dense_reference(
+    M, N, name, dtype, index_dtype, block_dim, op
+):
     device = torch.device("cuda")
     data, indices, indptr, dense = _random_bsr_mn(
         M, N, dtype, index_dtype, block_dim, device
@@ -306,7 +327,9 @@ def test_spmv_bsr_accepts_logical_or_padded_x(op):
     )
     logical_x = _logical_x_len(M, N, op)
     x = torch.randn(logical_x, dtype=torch.float32, device=device)
-    x_padded = torch.zeros(_padded_x_len(M, N, block_dim, op), dtype=torch.float32, device=device)
+    x_padded = torch.zeros(
+        _padded_x_len(M, N, block_dim, op), dtype=torch.float32, device=device
+    )
     x_padded[:logical_x].copy_(x)
     ref = _make_ref(dense, x, op, torch.float32)
     prepared = prepare_spmv_bsr(data, indices, indptr, (M, N), block_dim, op=op)

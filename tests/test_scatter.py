@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import csv
 import math
@@ -249,8 +263,12 @@ def run_cli(args):
                             "case_id": case_id,
                             "gpu": torch.cuda.get_device_name(0),
                             "value_dtype_req": params.get("value_dtype"),
-                            "value_dtype_compute": str(params.get("effective_value_dtype")),
-                            "index_dtype": str(params.get("index_dtype")).replace("torch.", ""),
+                            "value_dtype_compute": str(
+                                params.get("effective_value_dtype")
+                            ),
+                            "index_dtype": str(params.get("index_dtype")).replace(
+                                "torch.", ""
+                            ),
                             "dense_size": int(params.get("dense_size")),
                             "nnz": int(params.get("nnz")),
                             "unique_indices": bool(params.get("unique_indices")),
@@ -263,15 +281,25 @@ def run_cli(args):
                             "triton_ms": perf.get("triton_ms"),
                             "pytorch_ms": perf.get("pytorch_ms"),
                             "cusparse_ms": perf.get("cusparse_ms"),
-                            "triton_speedup_vs_pytorch": perf.get("triton_speedup_vs_pytorch"),
-                            "triton_speedup_vs_cusparse": perf.get("triton_speedup_vs_cusparse"),
+                            "triton_speedup_vs_pytorch": perf.get(
+                                "triton_speedup_vs_pytorch"
+                            ),
+                            "triton_speedup_vs_cusparse": perf.get(
+                                "triton_speedup_vs_cusparse"
+                            ),
                             "triton_match_pytorch": verify.get("triton_match_pytorch"),
-                            "cusparse_match_pytorch": verify.get("cusparse_match_pytorch"),
+                            "cusparse_match_pytorch": verify.get(
+                                "cusparse_match_pytorch"
+                            ),
                             "triton_max_error": verify.get("triton_max_error"),
                             "cusparse_max_error": verify.get("cusparse_max_error"),
-                            "cusparse_unavailable_reason": backend.get("cusparse_unavailable_reason"),
+                            "cusparse_unavailable_reason": backend.get(
+                                "cusparse_unavailable_reason"
+                            ),
                             "fallback_reason": backend.get("fallback_reason"),
-                            "index_fallback_reason": backend.get("index_fallback_reason"),
+                            "index_fallback_reason": backend.get(
+                                "index_fallback_reason"
+                            ),
                             "status": status,
                         }
                         summary_rows.append(row)
@@ -383,9 +411,13 @@ def build_parser():
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--no-cusparse", action="store_true")
     parser.add_argument("--unique-indices", default="true")
-    parser.add_argument("--reset-output", choices=["true", "false", "both"], default="true")
+    parser.add_argument(
+        "--reset-output", choices=["true", "false", "both"], default="true"
+    )
     parser.add_argument("--dtype-policy", choices=["auto", "strict"], default="auto")
-    parser.add_argument("--index-fallback-policy", choices=["auto", "strict"], default="auto")
+    parser.add_argument(
+        "--index-fallback-policy", choices=["auto", "strict"], default="auto"
+    )
     parser.add_argument("--csv-summary", default=None)
     parser.add_argument("--csv-samples", default=None)
     parser.add_argument("--sample-limit", type=int, default=32)

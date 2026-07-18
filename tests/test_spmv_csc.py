@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Native CSC SpMV benchmark and correctness script."""
 
 import argparse
@@ -118,14 +132,18 @@ def _dense_to_csc(dense, index_dtype):
     if rows.numel() == 0:
         data = dense.new_empty((0,))
         indices = torch.empty(0, dtype=index_dtype, device=dense.device)
-        indptr = torch.zeros(int(dense.shape[1]) + 1, dtype=index_dtype, device=dense.device)
+        indptr = torch.zeros(
+            int(dense.shape[1]) + 1, dtype=index_dtype, device=dense.device
+        )
         return data, indices, indptr
     order = torch.argsort(cols * max(1, int(dense.shape[0])) + rows)
     rows = rows[order]
     cols = cols[order]
     data = dense[rows, cols].contiguous()
     col_counts = torch.bincount(cols, minlength=int(dense.shape[1]))
-    indptr = torch.zeros(int(dense.shape[1]) + 1, dtype=torch.int64, device=dense.device)
+    indptr = torch.zeros(
+        int(dense.shape[1]) + 1, dtype=torch.int64, device=dense.device
+    )
     indptr[1:] = torch.cumsum(col_counts, dim=0)
     return data, rows.to(index_dtype).contiguous(), indptr.to(index_dtype)
 
@@ -194,7 +212,9 @@ def _cuda_event_benchmark(op, warmup, iters):
     return out, start.elapsed_time(end) / count
 
 
-def _time_flagsparse_csc(data, indices, indptr, x, shape, op, warmup, iters, timing=False):
+def _time_flagsparse_csc(
+    data, indices, indptr, x, shape, op, warmup, iters, timing=False
+):
     prepared = fs.prepare_spmv_csc(data, indices, indptr, shape, op=op)
     out, gpu_ms = _cuda_event_benchmark(
         lambda: fs.flagsparse_spmv_csc(x=x, prepared=prepared),
@@ -228,7 +248,12 @@ def _time_pytorch(data, indices, indptr, x, shape, op, warmup, iters):
 def _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters):
     if cp is None or cpx_sparse is None:
         return None
-    if data.dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+    if data.dtype not in (
+        torch.float32,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    ):
         return None
     data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
     ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
@@ -418,7 +443,11 @@ def load_mtx_to_csc_torch(path, dtype=torch.float32, device=None):
             continue
         if header is None and stripped:
             parts = stripped.split()
-            header = (int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
+            header = (
+                int(parts[0]),
+                int(parts[1]),
+                int(parts[2]) if len(parts) > 2 else 0,
+            )
             continue
         if stripped:
             data_lines.append(stripped)
@@ -457,7 +486,9 @@ def load_mtx_to_csc_torch(path, dtype=torch.float32, device=None):
             elif is_skew and 0 <= c < n_rows and 0 <= r < n_cols:
                 add_entry(c, r, -value)
             elif is_hermitian and 0 <= c < n_rows and 0 <= r < n_cols:
-                add_entry(c, r, value.conjugate() if isinstance(value, complex) else value)
+                add_entry(
+                    c, r, value.conjugate() if isinstance(value, complex) else value
+                )
     sorted_entries = sorted(entries.items(), key=lambda item: (item[0][1], item[0][0]))
     rows = [key[0] for key, _ in sorted_entries]
     cols = [key[1] for key, _ in sorted_entries]
@@ -465,13 +496,25 @@ def load_mtx_to_csc_torch(path, dtype=torch.float32, device=None):
     data = torch.tensor(vals, dtype=dtype, device=device)
     indices = torch.tensor(rows, dtype=torch.int64, device=device)
     col_tensor = torch.tensor(cols, dtype=torch.int64, device=device)
-    col_counts = torch.bincount(col_tensor, minlength=n_cols) if col_tensor.numel() else torch.zeros(n_cols, dtype=torch.int64, device=device)
+    col_counts = (
+        torch.bincount(col_tensor, minlength=n_cols)
+        if col_tensor.numel()
+        else torch.zeros(n_cols, dtype=torch.int64, device=device)
+    )
     indptr = torch.zeros(n_cols + 1, dtype=torch.int64, device=device)
     indptr[1:] = torch.cumsum(col_counts, dim=0)
     return data, indices, indptr, (n_rows, n_cols)
 
 
-def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True):
+def run_synthetic(
+    value_dtypes=None,
+    index_dtypes=None,
+    ops=None,
+    warmup=WARMUP,
+    iters=ITERS,
+    timing=False,
+    run_cusparse=True,
+):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
         return
@@ -482,12 +525,16 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None, warmup=WARMUP,
     print("=" * 140)
     print("FLAGSPARSE SpMV CSC BENCHMARK (native CSC Triton)")
     print("=" * 140)
-    print("Timing policy: csc_ms = process_cpu_ms + csc_gpu_ms; CSC v1 has no process phase.")
+    print(
+        "Timing policy: csc_ms = process_cpu_ms + csc_gpu_ms; CSC v1 has no process phase."
+    )
     for dtype in value_dtypes:
         for index_dtype in index_dtypes:
             for op in ops:
                 print(_sep(timing))
-                print(f"dtype: {_dtype_name(dtype)} | index_dtype: {_dtype_name(index_dtype)} | op: {op}")
+                print(
+                    f"dtype: {_dtype_name(dtype)} | index_dtype: {_dtype_name(index_dtype)} | op: {op}"
+                )
                 print(_sep(timing))
                 print(_header(timing))
                 print(_sep(timing))
@@ -538,13 +585,17 @@ def run_csv(
         for index_dtype in index_dtypes:
             for op in ops:
                 print(_sep(timing))
-                print(f"Value dtype: {_dtype_name(dtype)} | Index dtype: {_dtype_name(index_dtype)} | op: {op}")
+                print(
+                    f"Value dtype: {_dtype_name(dtype)} | Index dtype: {_dtype_name(index_dtype)} | op: {op}"
+                )
                 print(_sep(timing))
                 print(_header(timing))
                 print(_sep(timing))
                 for path in mtx_paths:
                     try:
-                        data, indices, indptr, shape = load_mtx_to_csc_torch(path, dtype=dtype, device=device)
+                        data, indices, indptr, shape = load_mtx_to_csc_torch(
+                            path, dtype=dtype, device=device
+                        )
                         row = _run_one_case(
                             data,
                             indices,
@@ -620,7 +671,9 @@ def run_csv(
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+            writer.writerow(
+                {key: ("" if value is None else value) for key, value in row.items()}
+            )
     print(f"Wrote {len(rows)} rows to {csv_path}")
 
 
@@ -640,7 +693,9 @@ def main():
     args = parser.parse_args()
     try:
         value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
-        index_dtypes = _parse_csv_tokens(args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes")
+        index_dtypes = _parse_csv_tokens(
+            args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes"
+        )
         ops = _parse_ops(args.ops)
     except ValueError as exc:
         parser.error(str(exc))

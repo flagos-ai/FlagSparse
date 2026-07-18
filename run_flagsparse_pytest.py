@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Run FlagSparse accuracy and performance suites per operator.
 
 The operator inventory comes from ``conf/operators.yaml`` by default.  Each
@@ -1788,9 +1803,11 @@ def _phase_rows(results: list[dict[str, object]]) -> list[dict[str, object]]:
                     "stderr_log_path": phase_result.get("stderr_log_path", ""),
                     "data_path": phase_result.get("data_path", ""),
                     "reason": phase_result.get("reason", ""),
-                    "command": shlex.join(phase_result.get("command", []))
-                    if phase_result.get("command")
-                    else "",
+                    "command": (
+                        shlex.join(phase_result.get("command", []))
+                        if phase_result.get("command")
+                        else ""
+                    ),
                 }
             )
     return rows

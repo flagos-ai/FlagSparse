@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Export the FlagSparse sparse-operator support matrix to CSV.
 
 The script is intentionally static: it does not import torch/triton/cupy or
@@ -16,7 +31,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-
 CSV_FIELDS = (
     "operator",
     "format",
@@ -27,7 +41,14 @@ CSV_FIELDS = (
     "status",
 )
 
-DEFAULT_VALUE_DTYPES = ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")
+DEFAULT_VALUE_DTYPES = (
+    "float16",
+    "bfloat16",
+    "float32",
+    "float64",
+    "complex64",
+    "complex128",
+)
 DEFAULT_INDEX_DTYPES = ("int32", "int64")
 NA = "N/A"
 VALUE_DTYPE_ORDER = {
@@ -72,7 +93,9 @@ class SourceModule:
     def _collect(self) -> None:
         for node in self.tree.body:
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
                 for target in targets:
                     if isinstance(target, ast.Name):
                         self.assignments[target.id] = node.value
@@ -92,10 +115,18 @@ class SourceModule:
         if isinstance(node, ast.Set):
             return tuple(self._flatten(el) for el in node.elts)
         if isinstance(node, ast.Dict):
-            return {self._eval(k): self._eval(v) for k, v in zip(node.keys, node.values) if k is not None}
+            return {
+                self._eval(k): self._eval(v)
+                for k, v in zip(node.keys, node.values)
+                if k is not None
+            }
         if isinstance(node, ast.Starred):
             return self._eval(node.value)
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "torch":
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "torch"
+        ):
             return node.attr
         if isinstance(node, ast.Name):
             if node.id in self.assignments:
@@ -174,7 +205,9 @@ def discover_modules(src_root: Path) -> dict[str, SourceModule]:
         common_values = DEFAULT_VALUE_DTYPES
     shared = {
         "SUPPORTED_VALUE_DTYPES": common_values,
-        "SUPPORTED_INDEX_DTYPES": normalize_dtype_values(common.get("SUPPORTED_INDEX_DTYPES")),
+        "SUPPORTED_INDEX_DTYPES": normalize_dtype_values(
+            common.get("SUPPORTED_INDEX_DTYPES")
+        ),
     }
     modules = {"_common": common}
     for path in sorted(src_root.glob("*.py")):
@@ -272,26 +305,193 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             value_const="SUPPORTED_SCATTER_VALUE_DTYPES",
             index_const="SUPPORTED_INDEX_DTYPES",
         ),
-        ApiSpec("spmv", "flagsparse_spmv_csr", "spmv_csr", "CSR", "triton", value_const="SUPPORTED_SPMV_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_ops, notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent"),
-        ApiSpec("spmv", "flagsparse_spmv_coo", "spmv_coo", "COO", "triton", value_const="SUPPORTED_SPMV_COO_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_coo_ops, notes="COO path stores canonical row/col tensors and supports non/trans/conj"),
-        ApiSpec("spmv", "flagsparse_spmv_csc", "spmv_csc", "CSC", "triton", value_const="SUPPORTED_SPMV_CSC_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_csc_ops, notes="native CSC path supports non/trans/conj without CSR/COO conversion"),
-        ApiSpec("spmv", "flagsparse_spmv_bsr", "spmv_bsr", "BSR", "triton", value_const="SUPPORTED_SPMV_BSR_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_bsr_ops, notes="native BSR path supports non/trans/conj with padded block-grid output; trans/conj directly read BSR arrays without CSR/COO/CSC conversion"),
-        ApiSpec("spmv", "flagsparse_spmv_coo_tocsr", "spmv_csr", "COO->CSR", "triton", value_const="SUPPORTED_SPMV_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",), notes="COO input is converted to CSR before compute"),
-        ApiSpec("spmm", "flagsparse_spmm_csr", "spmm_csr", "CSR", "triton", value_const="SUPPORTED_SPMM_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmm_ops, notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent"),
-        ApiSpec("spmm", "flagsparse_spmm_csr_opt", "spmm_csr", "CSR", "triton_opt", values=("float32", "float64"), index_const="SUPPORTED_INDEX_DTYPES", ops=("non",), notes="bucketed opt path only supports float32/float64"),
-        ApiSpec("spmm", "flagsparse_spmm_csr_opt_alg2", "spmm_csr_opt_alg2", "CSR", "triton_opt_alg2", value_const="SUPPORTED_SPMM_OPT_ALG2_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",), notes="hardware-aware alg2 opt path only supports float32/float64"),
-        ApiSpec("spmm", "flagsparse_spmm_coo", "spmm_coo", "COO", "triton", values=spmm_values, index_const="SUPPORTED_INDEX_DTYPES", ops=spmm_coo_ops, notes="COO SpMM reuses CSR SpMM dtype declaration; op supports non/trans/conj"),
-        ApiSpec("spgemm", "flagsparse_spgemm_csr", "spgemm_csr", "CSR", "triton", value_const="SUPPORTED_SPGEMM_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",)),
-        ApiSpec("sddmm", "flagsparse_sddmm_csr", "sddmm_csr", "CSR", "triton", value_const="SUPPORTED_SDDMM_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",)),
-        ApiSpec("spsv", "flagsparse_spsv_csr", "spsv", "CSR", "triton", value_const="SUPPORTED_SPSV_VALUE_DTYPES", index_const="SUPPORTED_SPSV_INDEX_DTYPES", ops=("NON_TRANS", "TRANS"), notes="TRANS support is narrower than NON_TRANS; see combo constants"),
-        ApiSpec("spsv", "flagsparse_spsv_coo", "spsv", "COO", "triton", value_const="SUPPORTED_SPSV_VALUE_DTYPES", index_const="SUPPORTED_SPSV_INDEX_DTYPES", ops=("NON_TRANS", "TRANS"), notes="TRANS support is narrower than NON_TRANS; see combo constants"),
-        ApiSpec("spsv", "flagsparse_spsv_sell", "spsv", "SELL", "triton", values=("float32", "float64"), indices=("int32", "int64"), ops=("NON_TRANS",), notes="lower triangular; cuSPARSE-compatible column-major SELL storage; native Triton solve"),
-        ApiSpec("spsm", "flagsparse_spsm_csr", "spsm", "CSR", "triton", value_const="SUPPORTED_SPSM_VALUE_DTYPES", index_const="SUPPORTED_SPSM_INDEX_DTYPES", values=("float32", "float64", "complex64", "complex128"), indices=("int32",), ops=("NON_TRANS",), notes="opA/opB must both be NON_TRANS; row-major dense layout only"),
-        ApiSpec("spsm", "flagsparse_spsm_coo", "spsm", "COO", "triton", value_const="SUPPORTED_SPSM_VALUE_DTYPES", index_const="SUPPORTED_SPSM_INDEX_DTYPES", values=("float32", "float64", "complex64", "complex128"), indices=("int32",), ops=("NON_TRANS",), notes="opA/opB must both be NON_TRANS; row-major dense layout only"),
+        ApiSpec(
+            "spmv",
+            "flagsparse_spmv_csr",
+            "spmv_csr",
+            "CSR",
+            "triton",
+            value_const="SUPPORTED_SPMV_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=spmv_ops,
+            notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent",
+        ),
+        ApiSpec(
+            "spmv",
+            "flagsparse_spmv_coo",
+            "spmv_coo",
+            "COO",
+            "triton",
+            value_const="SUPPORTED_SPMV_COO_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=spmv_coo_ops,
+            notes="COO path stores canonical row/col tensors and supports non/trans/conj",
+        ),
+        ApiSpec(
+            "spmv",
+            "flagsparse_spmv_csc",
+            "spmv_csc",
+            "CSC",
+            "triton",
+            value_const="SUPPORTED_SPMV_CSC_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=spmv_csc_ops,
+            notes="native CSC path supports non/trans/conj without CSR/COO conversion",
+        ),
+        ApiSpec(
+            "spmv",
+            "flagsparse_spmv_bsr",
+            "spmv_bsr",
+            "BSR",
+            "triton",
+            value_const="SUPPORTED_SPMV_BSR_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=spmv_bsr_ops,
+            notes="native BSR path supports non/trans/conj with padded block-grid output; trans/conj directly read BSR arrays without CSR/COO/CSC conversion",
+        ),
+        ApiSpec(
+            "spmv",
+            "flagsparse_spmv_coo_tocsr",
+            "spmv_csr",
+            "COO->CSR",
+            "triton",
+            value_const="SUPPORTED_SPMV_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=("non",),
+            notes="COO input is converted to CSR before compute",
+        ),
+        ApiSpec(
+            "spmm",
+            "flagsparse_spmm_csr",
+            "spmm_csr",
+            "CSR",
+            "triton",
+            value_const="SUPPORTED_SPMM_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=spmm_ops,
+            notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent",
+        ),
+        ApiSpec(
+            "spmm",
+            "flagsparse_spmm_csr_opt",
+            "spmm_csr",
+            "CSR",
+            "triton_opt",
+            values=("float32", "float64"),
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=("non",),
+            notes="bucketed opt path only supports float32/float64",
+        ),
+        ApiSpec(
+            "spmm",
+            "flagsparse_spmm_csr_opt_alg2",
+            "spmm_csr_opt_alg2",
+            "CSR",
+            "triton_opt_alg2",
+            value_const="SUPPORTED_SPMM_OPT_ALG2_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=("non",),
+            notes="hardware-aware alg2 opt path only supports float32/float64",
+        ),
+        ApiSpec(
+            "spmm",
+            "flagsparse_spmm_coo",
+            "spmm_coo",
+            "COO",
+            "triton",
+            values=spmm_values,
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=spmm_coo_ops,
+            notes="COO SpMM reuses CSR SpMM dtype declaration; op supports non/trans/conj",
+        ),
+        ApiSpec(
+            "spgemm",
+            "flagsparse_spgemm_csr",
+            "spgemm_csr",
+            "CSR",
+            "triton",
+            value_const="SUPPORTED_SPGEMM_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=("non",),
+        ),
+        ApiSpec(
+            "sddmm",
+            "flagsparse_sddmm_csr",
+            "sddmm_csr",
+            "CSR",
+            "triton",
+            value_const="SUPPORTED_SDDMM_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=("non",),
+        ),
+        ApiSpec(
+            "spsv",
+            "flagsparse_spsv_csr",
+            "spsv",
+            "CSR",
+            "triton",
+            value_const="SUPPORTED_SPSV_VALUE_DTYPES",
+            index_const="SUPPORTED_SPSV_INDEX_DTYPES",
+            ops=("NON_TRANS", "TRANS"),
+            notes="TRANS support is narrower than NON_TRANS; see combo constants",
+        ),
+        ApiSpec(
+            "spsv",
+            "flagsparse_spsv_coo",
+            "spsv",
+            "COO",
+            "triton",
+            value_const="SUPPORTED_SPSV_VALUE_DTYPES",
+            index_const="SUPPORTED_SPSV_INDEX_DTYPES",
+            ops=("NON_TRANS", "TRANS"),
+            notes="TRANS support is narrower than NON_TRANS; see combo constants",
+        ),
+        ApiSpec(
+            "spsv",
+            "flagsparse_spsv_sell",
+            "spsv",
+            "SELL",
+            "triton",
+            values=("float32", "float64"),
+            indices=("int32", "int64"),
+            ops=("NON_TRANS",),
+            notes="lower triangular; cuSPARSE-compatible column-major SELL storage; native Triton solve",
+        ),
+        ApiSpec(
+            "spsm",
+            "flagsparse_spsm_csr",
+            "spsm",
+            "CSR",
+            "triton",
+            value_const="SUPPORTED_SPSM_VALUE_DTYPES",
+            index_const="SUPPORTED_SPSM_INDEX_DTYPES",
+            values=("float32", "float64", "complex64", "complex128"),
+            indices=("int32",),
+            ops=("NON_TRANS",),
+            notes="opA/opB must both be NON_TRANS; row-major dense layout only",
+        ),
+        ApiSpec(
+            "spsm",
+            "flagsparse_spsm_coo",
+            "spsm",
+            "COO",
+            "triton",
+            value_const="SUPPORTED_SPSM_VALUE_DTYPES",
+            index_const="SUPPORTED_SPSM_INDEX_DTYPES",
+            values=("float32", "float64", "complex64", "complex128"),
+            indices=("int32",),
+            ops=("NON_TRANS",),
+            notes="opA/opB must both be NON_TRANS; row-major dense layout only",
+        ),
     )
 
 
-def rows_for_spec(spec: ApiSpec, modules: dict[str, SourceModule], public_apis: set[str], src_root: Path) -> list[dict[str, str]]:
+def rows_for_spec(
+    spec: ApiSpec,
+    modules: dict[str, SourceModule],
+    public_apis: set[str],
+    src_root: Path,
+) -> list[dict[str, str]]:
     module = modules.get(spec.module)
     notes = [spec.notes] if spec.notes else []
     status = "SUPPORTED"
@@ -332,7 +532,9 @@ def rows_for_spec(spec: ApiSpec, modules: dict[str, SourceModule], public_apis: 
     ]
 
 
-def row(spec: ApiSpec, value_dtype: str, index_dtype: str, op: str, status: str) -> dict[str, str]:
+def row(
+    spec: ApiSpec, value_dtype: str, index_dtype: str, op: str, status: str
+) -> dict[str, str]:
     return {
         "operator": spec.operator,
         "format": spec.fmt,
@@ -344,7 +546,9 @@ def row(spec: ApiSpec, value_dtype: str, index_dtype: str, op: str, status: str)
     }
 
 
-def discovered_unmapped_rows(modules: dict[str, SourceModule], specs: Iterable[ApiSpec], src_root: Path) -> list[dict[str, str]]:
+def discovered_unmapped_rows(
+    modules: dict[str, SourceModule], specs: Iterable[ApiSpec], src_root: Path
+) -> list[dict[str, str]]:
     mapped = {(spec.module, spec.value_const) for spec in specs if spec.value_const}
     mapped |= {(spec.module, spec.index_const) for spec in specs if spec.index_const}
     out: list[dict[str, str]] = []
@@ -352,7 +556,9 @@ def discovered_unmapped_rows(modules: dict[str, SourceModule], specs: Iterable[A
         if module_name in {"_common", "__init__", "benchmarks"}:
             continue
         for const_name in sorted(module.assignments):
-            if not (const_name.startswith("SUPPORTED_") and const_name.endswith("_DTYPES")):
+            if not (
+                const_name.startswith("SUPPORTED_") and const_name.endswith("_DTYPES")
+            ):
                 continue
             if (module_name, const_name) in mapped:
                 continue
@@ -393,7 +599,9 @@ def _sort_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
 
 def build_rows(src_root: Path) -> list[dict[str, str]]:
     modules = discover_modules(src_root)
-    public_apis = collect_public_apis(src_root / "__init__.py", src_root.parent / "__init__.py")
+    public_apis = collect_public_apis(
+        src_root / "__init__.py", src_root.parent / "__init__.py"
+    )
     specs = registry(modules)
     rows: list[dict[str, str]] = []
     for spec in specs:

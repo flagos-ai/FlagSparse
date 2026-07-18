@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Native COO SpMM kernels, route helpers, and internal benchmark entry points."""
 
 from dataclasses import dataclass
@@ -261,8 +275,8 @@ def _prepare_spmm_coo_canonical_prepared(
 
 
 def _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape, dense_layout="row"):
-    data, kernel_row, kernel_col, B, n_rows, n_cols, n_dense_cols = _prepare_spmm_coo_inputs(
-        data, row, col, B, shape, dense_layout=dense_layout
+    data, kernel_row, kernel_col, B, n_rows, n_cols, n_dense_cols = (
+        _prepare_spmm_coo_inputs(data, row, col, B, shape, dense_layout=dense_layout)
     )
     return _prepare_spmm_coo_canonical_prepared(
         data,
@@ -274,6 +288,8 @@ def _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape, dense_layout="r
         n_dense_cols,
         dense_layout=dense_layout,
     )
+
+
 def _seg_starts_from_sorted_rows(row_i32, nnz, device):
     if nnz == 0:
         return None
@@ -325,7 +341,19 @@ class PreparedCooSpmmRoute:
         "alg",
     )
 
-    def __init__(self, data, row, col, shape, seg_starts, row_lengths, output_dtype, compute_dtype, op, alg):
+    def __init__(
+        self,
+        data,
+        row,
+        col,
+        shape,
+        seg_starts,
+        row_lengths,
+        output_dtype,
+        compute_dtype,
+        op,
+        alg,
+    ):
         self.data = data
         self.row = row
         self.col = col
@@ -442,8 +470,16 @@ def _spmm_coo_rowrun_complex_kernel(
                 mask=mask_n & valid,
                 other=0.0,
             )
-            acc_re = acc_re + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE) - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
-            acc_im = acc_im + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE) + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+            acc_re = (
+                acc_re
+                + a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+                - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+            )
+            acc_im = (
+                acc_im
+                + a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
+                + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+            )
 
     tl.store(c_ri_ptr + row_id * stride_cm + offs_n * stride_cn, acc_re, mask=mask_n)
     tl.store(
@@ -454,7 +490,9 @@ def _spmm_coo_rowrun_complex_kernel(
 
 
 @triton.jit
-def _spmm_coo_alg1_process_count_kernel(row_lengths_ptr, counts_ptr, n_segs, BLOCK_M: tl.constexpr):
+def _spmm_coo_alg1_process_count_kernel(
+    row_lengths_ptr, counts_ptr, n_segs, BLOCK_M: tl.constexpr
+):
     pid = tl.program_id(0)
     offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     mask = offs < n_segs
@@ -493,7 +531,9 @@ def _spmm_coo_alg1_process_compact_kernel(
         in_bucket = mask & (bucket == b)
         local = tl.cumsum(tl.where(in_bucket, 1, 0), 0) - 1
         n_bucket = tl.sum(tl.where(in_bucket, 1, 0))
-        base = tl.load(offsets_ptr + b) + tl.atomic_add(write_counts_ptr + b, n_bucket, sem="relaxed")
+        base = tl.load(offsets_ptr + b) + tl.atomic_add(
+            write_counts_ptr + b, n_bucket, sem="relaxed"
+        )
         tl.store(segs_flat_ptr + base + local, offs, mask=in_bucket)
 
 
@@ -575,6 +615,8 @@ def _spmm_coo_atomic_real_kernel(
         val_k.to(ACC_DTYPE) * b_val.to(ACC_DTYPE),
         sem="relaxed",
     )
+
+
 @triton.jit
 def _spmm_coo_atomic_complex_kernel(
     data_ri_ptr,
@@ -603,8 +645,12 @@ def _spmm_coo_atomic_complex_kernel(
     a_im = tl.load(data_ri_ptr + idx * 2 + 1)
     b_re = tl.load(b_ri_ptr + col_k * stride_bk + dense_col * stride_bn)
     b_im = tl.load(b_ri_ptr + col_k * stride_bk + dense_col * stride_bn + stride_br)
-    contrib_re = a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE) - a_im.to(ACC_DTYPE) * b_im.to(ACC_DTYPE)
-    contrib_im = a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE) + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
+    contrib_re = a_re.to(ACC_DTYPE) * b_re.to(ACC_DTYPE) - a_im.to(ACC_DTYPE) * b_im.to(
+        ACC_DTYPE
+    )
+    contrib_im = a_re.to(ACC_DTYPE) * b_im.to(ACC_DTYPE) + a_im.to(ACC_DTYPE) * b_re.to(
+        ACC_DTYPE
+    )
     tl.atomic_add(
         c_ri_ptr + row_k * stride_cm + dense_col * stride_cn,
         contrib_re,
@@ -615,6 +661,8 @@ def _spmm_coo_atomic_complex_kernel(
         contrib_im,
         sem="relaxed",
     )
+
+
 def _prepare_spmm_coo_inputs(data, row, col, B, shape, dense_layout="row"):
     dense_layout = _normalize_dense_layout(dense_layout)
     if len(shape) != 2:
@@ -649,7 +697,9 @@ def _prepare_spmm_coo_inputs(data, row, col, B, shape, dense_layout="row"):
 
     nnz = data.numel()
     if nnz > _INDEX_LIMIT_INT32:
-        raise ValueError("nnz exceeds the int32 range supported by the Triton COO kernel")
+        raise ValueError(
+            "nnz exceeds the int32 range supported by the Triton COO kernel"
+        )
     if nnz > 0:
         min_row = int(row.min().item())
         max_row = int(row.max().item())
@@ -724,7 +774,9 @@ def _triton_spmm_coo_rowrun_impl(
         if out is not None:
             out.zero_()
             return out
-        return _zeros_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+        return _zeros_dense_layout(
+            (n_rows, n_dense_cols), output_dtype, device, dense_layout
+        )
 
     if seg_starts is None:
         seg_starts = _seg_starts_from_sorted_rows(row, int(data.numel()), device)
@@ -733,14 +785,18 @@ def _triton_spmm_coo_rowrun_impl(
         if out is not None:
             out.zero_()
             return out
-        return _zeros_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+        return _zeros_dense_layout(
+            (n_rows, n_dense_cols), output_dtype, device, dense_layout
+        )
 
     grid = (n_segs, triton.cdiv(n_dense_cols, block_n))
     if not _is_complex_dtype(dtype):
         C_compute = (
             out
             if out is not None and dtype == output_dtype
-            else _zeros_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
+            else _zeros_dense_layout(
+                (n_rows, n_dense_cols), dtype, device, dense_layout
+            )
         )
         if C_compute is out:
             C_compute.zero_()
@@ -768,7 +824,9 @@ def _triton_spmm_coo_rowrun_impl(
                 out.copy_(C_cast)
                 return out
             if dense_layout == "col":
-                C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+                C_out = _empty_dense_layout(
+                    (n_rows, n_dense_cols), output_dtype, device, dense_layout
+                )
                 C_out.copy_(C_cast)
                 return C_out
             return C_cast
@@ -815,11 +873,14 @@ def _triton_spmm_coo_rowrun_impl(
             out.copy_(C_cast)
             return out
         if dense_layout == "col":
-            C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+            C_out = _empty_dense_layout(
+                (n_rows, n_dense_cols), output_dtype, device, dense_layout
+            )
             C_out.copy_(C_cast)
             return C_out
         return C_cast
     return C_compute
+
 
 def _triton_spmm_coo_atomic_impl(
     data,
@@ -846,20 +907,26 @@ def _triton_spmm_coo_atomic_impl(
         if out is not None:
             out.zero_()
             return out
-        return _zeros_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+        return _zeros_dense_layout(
+            (n_rows, n_dense_cols), output_dtype, device, dense_layout
+        )
 
     nnz = int(data.numel())
     if nnz == 0:
         if out is not None:
             out.zero_()
             return out
-        return _zeros_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+        return _zeros_dense_layout(
+            (n_rows, n_dense_cols), output_dtype, device, dense_layout
+        )
 
     if not _is_complex_dtype(dtype):
         C_compute = (
             out
             if out is not None and dtype == output_dtype
-            else _zeros_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
+            else _zeros_dense_layout(
+                (n_rows, n_dense_cols), dtype, device, dense_layout
+            )
         )
         if C_compute is out:
             C_compute.zero_()
@@ -884,7 +951,9 @@ def _triton_spmm_coo_atomic_impl(
                 out.copy_(C_cast)
                 return out
             if dense_layout == "col":
-                C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+                C_out = _empty_dense_layout(
+                    (n_rows, n_dense_cols), output_dtype, device, dense_layout
+                )
                 C_out.copy_(C_cast)
                 return C_out
             return C_cast
@@ -928,11 +997,14 @@ def _triton_spmm_coo_atomic_impl(
             out.copy_(C_cast)
             return out
         if dense_layout == "col":
-            C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+            C_out = _empty_dense_layout(
+                (n_rows, n_dense_cols), output_dtype, device, dense_layout
+            )
             C_out.copy_(C_cast)
             return C_out
         return C_cast
     return C_compute
+
 
 def _normalize_spmm_coo_route(route):
     route = "rowrun" if route is None else str(route).lower()
@@ -1027,7 +1099,9 @@ def _prepare_spmm_coo_matrix(data, row, col, shape):
         raise TypeError("col dtype must be torch.int32 or torch.int64")
     nnz = int(data.numel())
     if nnz > _INDEX_LIMIT_INT32:
-        raise ValueError("nnz exceeds the int32 range supported by the Triton COO kernel")
+        raise ValueError(
+            "nnz exceeds the int32 range supported by the Triton COO kernel"
+        )
     if nnz > 0:
         min_row = int(row.min().item())
         max_row = int(row.max().item())
@@ -1038,11 +1112,23 @@ def _prepare_spmm_coo_matrix(data, row, col, shape):
         if min_col < 0 or max_col >= n_cols:
             raise IndexError("col indices out of range for n_cols")
         if max_row > _INDEX_LIMIT_INT32:
-            raise ValueError("row indices exceed the int32 range supported by the Triton kernel")
+            raise ValueError(
+                "row indices exceed the int32 range supported by the Triton kernel"
+            )
         if max_col > _INDEX_LIMIT_INT32:
-            raise ValueError("column indices exceed the int32 range supported by the Triton kernel")
-    kernel_row = row.contiguous().to(torch.int32) if row.dtype == torch.int64 else row.contiguous()
-    kernel_col = col.contiguous().to(torch.int32) if col.dtype == torch.int64 else col.contiguous()
+            raise ValueError(
+                "column indices exceed the int32 range supported by the Triton kernel"
+            )
+    kernel_row = (
+        row.contiguous().to(torch.int32)
+        if row.dtype == torch.int64
+        else row.contiguous()
+    )
+    kernel_col = (
+        col.contiguous().to(torch.int32)
+        if col.dtype == torch.int64
+        else col.contiguous()
+    )
     return data.contiguous(), kernel_row, kernel_col, (n_rows, n_cols)
 
 
@@ -1058,12 +1144,20 @@ def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout):
     if B.dtype != prepared.output_dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
     if int(B.shape[0]) != prepared.n_cols:
-        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
-    B_compute = B if prepared.compute_dtype == prepared.output_dtype else B.to(prepared.compute_dtype)
+        raise ValueError(
+            f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}"
+        )
+    B_compute = (
+        B
+        if prepared.compute_dtype == prepared.output_dtype
+        else B.to(prepared.compute_dtype)
+    )
     return _materialize_dense_layout(B_compute, dense_layout)
 
 
-def _run_spmm_coo_rowrun_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
+def _run_spmm_coo_rowrun_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     dense_layout = _normalize_dense_layout(dense_layout)
     B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout)
     launch = _resolve_spmm_coo_launch_config(int(B.shape[1]), prepared.nnz)
@@ -1123,7 +1217,9 @@ def _run_spmm_coo_rowrun_route(prepared, B, *, timing=False, diagnostics=False, 
     return C, meta
 
 
-def _run_spmm_coo_atomic_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
+def _run_spmm_coo_atomic_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     dense_layout = _normalize_dense_layout(dense_layout)
     B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout)
     launch = _resolve_spmm_coo_launch_config(int(B.shape[1]), prepared.nnz)
@@ -1205,7 +1301,9 @@ def _spmm_coo_alg1_build_bucket_descriptors(segs_flat, counts, offsets):
     return buckets, process_cpu_ms
 
 
-def _run_spmm_coo_alg1_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
+def _run_spmm_coo_alg1_route(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+):
     if prepared.output_dtype not in (torch.float32, torch.float64):
         raise TypeError("spmm_coo_alg1 only supports float32 and float64")
     dense_layout = _normalize_dense_layout(dense_layout)
@@ -1253,9 +1351,13 @@ def _run_spmm_coo_alg1_route(prepared, B, *, timing=False, diagnostics=False, de
         process_gpu_ms = start.elapsed_time(end)
     else:
         torch.cuda.synchronize()
-    buckets, process_cpu_ms = _spmm_coo_alg1_build_bucket_descriptors(segs_flat, counts, offsets)
+    buckets, process_cpu_ms = _spmm_coo_alg1_build_bucket_descriptors(
+        segs_flat, counts, offsets
+    )
 
-    C_compute = _zeros_dense_layout((prepared.n_rows, n_dense_cols), prepared.compute_dtype, device, dense_layout)
+    C_compute = _zeros_dense_layout(
+        (prepared.n_rows, n_dense_cols), prepared.compute_dtype, device, dense_layout
+    )
     launch = _resolve_spmm_coo_launch_config(n_dense_cols, prepared.nnz)
     acc_dtype = tl.float64 if prepared.compute_dtype == torch.float64 else tl.float32
     compute_ms = None
@@ -1294,7 +1396,12 @@ def _run_spmm_coo_alg1_route(prepared, B, *, timing=False, diagnostics=False, de
     if prepared.compute_dtype != prepared.output_dtype:
         C = C_compute.to(prepared.output_dtype)
         if dense_layout == "col":
-            C_out = _empty_dense_layout((prepared.n_rows, n_dense_cols), prepared.output_dtype, device, dense_layout)
+            C_out = _empty_dense_layout(
+                (prepared.n_rows, n_dense_cols),
+                prepared.output_dtype,
+                device,
+                dense_layout,
+            )
             C_out.copy_(C)
             C = C_out
     else:
@@ -1366,7 +1473,9 @@ def resolve_spmm_coo_algorithm(alg, op, dtype):
         token = "coo_rowrun"
     if token not in SPMM_COO_ALGORITHMS:
         supported = ", ".join(sorted(SPMM_COO_ALGORITHMS))
-        raise ValueError(f"unsupported COO SpMM algorithm {alg!r}; supported: auto, {supported}")
+        raise ValueError(
+            f"unsupported COO SpMM algorithm {alg!r}; supported: auto, {supported}"
+        )
     algorithm = SPMM_COO_ALGORITHMS[token]
     op_name = _spmm_coo_op_to_name(op)
     if op_name not in algorithm.supported_ops:
@@ -1397,7 +1506,9 @@ def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto"):
     compute_dtype = _spmm_coo_compute_dtype(output_dtype)
     data, row, col, shape = _prepare_spmm_coo_matrix(data, row, col, shape)
     data_compute = data if compute_dtype == output_dtype else data.to(compute_dtype)
-    canonical_data, canonical_row, canonical_col = _coalesce_coo_entries(data_compute, row, col, shape)
+    canonical_data, canonical_row, canonical_col = _coalesce_coo_entries(
+        data_compute, row, col, shape
+    )
     canonical_data, canonical_row, canonical_col = _sort_coo_lex_inplace(
         canonical_data,
         canonical_row,
@@ -1406,7 +1517,9 @@ def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto"):
     )
     canonical_row = canonical_row.to(torch.int32)
     canonical_col = canonical_col.to(torch.int32)
-    seg_starts = _seg_starts_from_sorted_rows(canonical_row, int(canonical_data.numel()), canonical_data.device)
+    seg_starts = _seg_starts_from_sorted_rows(
+        canonical_row, int(canonical_data.numel()), canonical_data.device
+    )
     if seg_starts is None:
         row_lengths = torch.empty((0,), dtype=torch.int32, device=canonical_data.device)
     else:
@@ -1445,7 +1558,9 @@ def flagsparse_spmm_coo_run(
     alg_name = prepared.alg if alg is None else _normalize_spmm_coo_alg(alg)
     algorithm = resolve_spmm_coo_algorithm(alg_name, prepared.op, prepared.output_dtype)
     dense_layout = _normalize_dense_layout(dense_layout)
-    start = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+    start = (
+        torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+    )
     end = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
     if start is not None:
         torch.cuda.synchronize()
@@ -1547,6 +1662,7 @@ def _run_spmm_coo_canonical_route(
         return C, elapsed_ms
     return C
 
+
 def _run_spmm_coo_route(
     data,
     row,
@@ -1593,7 +1709,11 @@ def _run_spmm_coo_route(
     data, row, col, shape = _materialize_spmm_coo_op(data, row, col, shape, op_code)
     if do_timing:
         torch.cuda.synchronize()
-        symbolic_ms = (time.perf_counter() - t0) * 1000.0 if _spmm_coo_op_transposes(op_code) else 0.0
+        symbolic_ms = (
+            (time.perf_counter() - t0) * 1000.0
+            if _spmm_coo_op_transposes(op_code)
+            else 0.0
+        )
 
     (
         canonical_data,
@@ -1656,6 +1776,7 @@ def _run_spmm_coo_route(
         return C, meta
     return C
 
+
 def flagsparse_spmm_coo(
     data,
     row,
@@ -1712,12 +1833,11 @@ def _build_spmm_coo_pytorch_reference_from_canonical(
     return expected if expected.dtype == output_dtype else expected.to(output_dtype)
 
 
-
 def _build_spmm_coo_pytorch_reference(data, row, col, B, shape, op="non"):
     op_code = _normalize_spmm_coo_op(op)
     data, row, col, shape = _materialize_spmm_coo_op(data, row, col, shape, op_code)
-    native_data, native_row, native_col, native_B, n_rows, n_cols, n_dense_cols = _prepare_spmm_coo_inputs(
-        data, row, col, B, shape
+    native_data, native_row, native_col, native_B, n_rows, n_cols, n_dense_cols = (
+        _prepare_spmm_coo_inputs(data, row, col, B, shape)
     )
     (
         canonical_data,
@@ -1791,7 +1911,6 @@ def _benchmark_spmm_coo_canonical_route(
     return values, steady_ms, first_call_ms
 
 
-
 def _benchmark_spmm_coo_route(
     data,
     row,
@@ -1828,6 +1947,8 @@ def _benchmark_spmm_coo_route(
     first_call_ms = (time.perf_counter() - t0) * 1000.0
     values, steady_ms = _benchmark_cuda_op(run, warmup=warmup, iters=iters)
     return values, steady_ms, first_call_ms
+
+
 def _spmm_coo_pairwise_summary(candidate, reference, value_dtype):
     metrics = _spmm_validation_metrics(candidate, reference)
     atol, rtol = _spmm_coo_reference_tolerance(value_dtype)
@@ -1878,12 +1999,14 @@ def benchmark_spmm_coo_case(
         _build_random_dense((b_rows, n_dense_cols), value_dtype, device),
         dense_layout,
     )
-    effective_data, effective_row, effective_col, effective_shape = _materialize_spmm_coo_op(
-        data,
-        row,
-        col,
-        shape,
-        op_code,
+    effective_data, effective_row, effective_col, effective_shape = (
+        _materialize_spmm_coo_op(
+            data,
+            row,
+            col,
+            shape,
+            op_code,
+        )
     )
 
     native_data, native_row, native_col, native_B, _, _, _ = _prepare_spmm_coo_inputs(
@@ -1920,7 +2043,9 @@ def benchmark_spmm_coo_case(
         block_n=block_n,
         block_nnz=block_nnz,
     )
-    seg_starts = _seg_starts_from_sorted_rows(canonical_row, canonical_data.numel(), device)
+    seg_starts = _seg_starts_from_sorted_rows(
+        canonical_row, canonical_data.numel(), device
+    )
     n_row_runs = int(seg_starts.numel()) - 1 if seg_starts is not None else 0
     cusparse_data, cusparse_row, cusparse_col = _coalesce_coo_entries(
         native_data,
@@ -1943,7 +2068,9 @@ def benchmark_spmm_coo_case(
         effective_shape,
         output_dtype,
     )
-    pytorch_coo = _build_torch_sparse_coo(native_data, native_row, native_col, effective_shape)
+    pytorch_coo = _build_torch_sparse_coo(
+        native_data, native_row, native_col, effective_shape
+    )
     pytorch_op = lambda: torch.sparse.mm(pytorch_coo, native_B)
     pytorch_format = "COO"
     pytorch_reason = None
@@ -1972,7 +2099,9 @@ def benchmark_spmm_coo_case(
             pytorch_op, warmup=warmup, iters=iters
         )
     except Exception as exc:
-        pytorch_reason = str(exc) if pytorch_reason is None else f"{pytorch_reason}; timing: {exc}"
+        pytorch_reason = (
+            str(exc) if pytorch_reason is None else f"{pytorch_reason}; timing: {exc}"
+        )
 
     cusparse_ms = None
     cusparse_match = None
@@ -2003,7 +2132,9 @@ def benchmark_spmm_coo_case(
                     lambda: A_coo @ B_cp, warmup=warmup, iters=iters
                 )
                 cusparse_values = _torch_from_cupy(cusparse_values_cp)
-                cusparse_summary = _spmm_coo_pairwise_summary(cusparse_values, expected, value_dtype)
+                cusparse_summary = _spmm_coo_pairwise_summary(
+                    cusparse_values, expected, value_dtype
+                )
                 cusparse_match = cusparse_summary["match"]
             except Exception as exc:
                 cusparse_reason = str(exc)
@@ -2023,7 +2154,9 @@ def benchmark_spmm_coo_case(
                 "max_abs_error": triton_summary["max_abs_error"],
                 "max_relative_error": triton_summary["max_relative_error"],
                 "match_cusparse": (
-                    None if cusparse_values is None else torch.allclose(
+                    None
+                    if cusparse_values is None
+                    else torch.allclose(
                         triton_C,
                         cusparse_values,
                         atol=_spmm_coo_reference_tolerance(value_dtype)[0],
@@ -2052,7 +2185,9 @@ def benchmark_spmm_coo_case(
                     op=op_name,
                     dense_layout=dense_layout,
                 )
-                extra_summary = _spmm_coo_pairwise_summary(extra_values, expected, value_dtype)
+                extra_summary = _spmm_coo_pairwise_summary(
+                    extra_values, expected, value_dtype
+                )
                 route_outputs[extra_route] = extra_values
                 route_results[extra_route] = {
                     "route": extra_route,
@@ -2063,7 +2198,9 @@ def benchmark_spmm_coo_case(
                     "max_abs_error": extra_summary["max_abs_error"],
                     "max_relative_error": extra_summary["max_relative_error"],
                     "match_cusparse": (
-                        None if cusparse_values is None else torch.allclose(
+                        None
+                        if cusparse_values is None
+                        else torch.allclose(
                             extra_values,
                             cusparse_values,
                             atol=_spmm_coo_reference_tolerance(value_dtype)[0],
@@ -2087,7 +2224,9 @@ def benchmark_spmm_coo_case(
 
         def _safe_parity(lhs, rhs):
             if lhs in route_outputs and rhs in route_outputs:
-                return _spmm_coo_pairwise_summary(route_outputs[lhs], route_outputs[rhs], value_dtype)
+                return _spmm_coo_pairwise_summary(
+                    route_outputs[lhs], route_outputs[rhs], value_dtype
+                )
             return {
                 "match": None,
                 "error_ratio": None,
@@ -2159,10 +2298,26 @@ def benchmark_spmm_coo_case(
             "pytorch_relative_threshold": threshold,
             "cusparse_match_reference": cusparse_match,
             "cusparse_match_pytorch": cusparse_match,
-            "cusparse_max_error": (cusparse_summary["max_abs_error"] if cusparse_summary is not None else None),
-            "cusparse_max_abs_error": (cusparse_summary["max_abs_error"] if cusparse_summary is not None else None),
-            "cusparse_max_relative_error": (cusparse_summary["max_relative_error"] if cusparse_summary is not None else None),
-            "cusparse_sum_relative_error": (cusparse_summary["sum_relative_error"] if cusparse_summary is not None else None),
+            "cusparse_max_error": (
+                cusparse_summary["max_abs_error"]
+                if cusparse_summary is not None
+                else None
+            ),
+            "cusparse_max_abs_error": (
+                cusparse_summary["max_abs_error"]
+                if cusparse_summary is not None
+                else None
+            ),
+            "cusparse_max_relative_error": (
+                cusparse_summary["max_relative_error"]
+                if cusparse_summary is not None
+                else None
+            ),
+            "cusparse_sum_relative_error": (
+                cusparse_summary["sum_relative_error"]
+                if cusparse_summary is not None
+                else None
+            ),
             "cusparse_relative_threshold": threshold,
             "cusparse_strict_allclose_match": cusparse_match,
         },
@@ -2182,6 +2337,7 @@ def benchmark_spmm_coo_case(
         "parity": parity,
         "route_samples": route_samples,
     }
+
 
 def comprehensive_spmm_coo_test(
     n_rows=4096,

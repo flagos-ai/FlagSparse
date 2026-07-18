@@ -1,9 +1,22 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Sparse triangular matrix-matrix solve (SpSM) for CSR/COO."""
 
 from collections import OrderedDict
 
 from ._common import *
-
 
 SUPPORTED_SPSM_VALUE_DTYPES = (
     torch.float32,
@@ -25,6 +38,7 @@ SPSM_NON_TRANS_PRIMARY_COMBOS = (
 _SPSM_PREPROCESS_CACHE = OrderedDict()
 _SPSM_PREPROCESS_CACHE_SIZE = 8
 _SPSM_POLLING_RHS_TILE = 1024
+
 
 def _clear_spsm_preprocess_cache():
     _SPSM_PREPROCESS_CACHE.clear()
@@ -84,7 +98,14 @@ def _prepare_spsm_csr_inputs(data, indices, indptr, B, shape, opA, opB, major):
         raise TypeError("indices and indptr dtype must match for SpSM CSR")
     input_index_dtype = indices.dtype
     _validate_spsm_non_trans_combo("csr", data.dtype, input_index_dtype)
-    return data.contiguous(), indices.contiguous(), indptr.contiguous(), B.contiguous(), n_rows, n_cols
+    return (
+        data.contiguous(),
+        indices.contiguous(),
+        indptr.contiguous(),
+        B.contiguous(),
+        n_rows,
+        n_cols,
+    )
 
 
 def _prepare_spsm_coo_inputs(data, row, col, B, shape, opA, opB, major):
@@ -108,12 +129,22 @@ def _prepare_spsm_coo_inputs(data, row, col, B, shape, opA, opB, major):
         raise TypeError("data dtype must be float32, float64, complex64, or complex128")
     if B.dtype != data.dtype:
         raise TypeError("B dtype must match data dtype")
-    if row.dtype not in SUPPORTED_SPSM_INDEX_DTYPES or col.dtype not in SUPPORTED_SPSM_INDEX_DTYPES:
+    if (
+        row.dtype not in SUPPORTED_SPSM_INDEX_DTYPES
+        or col.dtype not in SUPPORTED_SPSM_INDEX_DTYPES
+    ):
         raise TypeError("row/col dtype must be torch.int32")
     if row.dtype != col.dtype:
         raise TypeError("row and col dtype must match for SpSM COO")
     _validate_spsm_non_trans_combo("coo", data.dtype, row.dtype)
-    return data.contiguous(), row.contiguous(), col.contiguous(), B.contiguous(), n_rows, n_cols
+    return (
+        data.contiguous(),
+        row.contiguous(),
+        col.contiguous(),
+        B.contiguous(),
+        n_rows,
+        n_cols,
+    )
 
 
 def _complex_interleaved_view(tensor):
@@ -173,6 +204,7 @@ def _prepare_spsm_kernel_row_ptr(indptr64):
     if int(indptr64[-1].item()) <= _INDEX_LIMIT_INT32:
         return indptr64.to(torch.int32)
     return indptr64
+
 
 def _alpha_is_one(alpha):
     if torch.is_tensor(alpha):
@@ -292,11 +324,19 @@ def _spsm_csr_polling_kernel_real(
     rhs_mask = rhs_offsets < n_rhs
 
     if USE_FP64_ACC:
-        rhs = tl.load(work_ptr + row_i64 * stride_work0 + rhs_offsets_i64, mask=rhs_mask, other=0.0).to(tl.float64)
+        rhs = tl.load(
+            work_ptr + row_i64 * stride_work0 + rhs_offsets_i64,
+            mask=rhs_mask,
+            other=0.0,
+        ).to(tl.float64)
         alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float64)
         local_sum = rhs * alpha_val
     else:
-        rhs = tl.load(work_ptr + row_i64 * stride_work0 + rhs_offsets_i64, mask=rhs_mask, other=0.0).to(tl.float32)
+        rhs = tl.load(
+            work_ptr + row_i64 * stride_work0 + rhs_offsets_i64,
+            mask=rhs_mask,
+            other=0.0,
+        ).to(tl.float32)
         alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float32)
         local_sum = rhs * alpha_val
 
@@ -619,7 +659,9 @@ def _prepare_spsm_coo_system(data, row32, col32, n_rows, n_cols, lower, unit_dia
     return plan
 
 
-def _resolve_spsm_csr_runtime(data, indices, indptr, B, shape, lower, unit_diagonal, opA, opB, major):
+def _resolve_spsm_csr_runtime(
+    data, indices, indptr, B, shape, lower, unit_diagonal, opA, opB, major
+):
     data, indices64, indptr64, B, n_rows, n_cols = _prepare_spsm_csr_inputs(
         data, indices, indptr, B, shape, opA, opB, major
     )
@@ -635,11 +677,15 @@ def _resolve_spsm_csr_runtime(data, indices, indptr, B, shape, lower, unit_diago
         solve_plan = _prepare_spsm_csr_system(
             data, indices64, indptr64, n_rows, lower, unit_diagonal
         )
-        _spsm_cache_put(_SPSM_PREPROCESS_CACHE, cache_key, solve_plan, _SPSM_PREPROCESS_CACHE_SIZE)
+        _spsm_cache_put(
+            _SPSM_PREPROCESS_CACHE, cache_key, solve_plan, _SPSM_PREPROCESS_CACHE_SIZE
+        )
     return data, B, n_rows, n_cols, solve_plan
 
 
-def _resolve_spsm_coo_runtime(data, row, col, B, shape, lower, unit_diagonal, opA, opB, major):
+def _resolve_spsm_coo_runtime(
+    data, row, col, B, shape, lower, unit_diagonal, opA, opB, major
+):
     data, row64, col64, B, n_rows, n_cols = _prepare_spsm_coo_inputs(
         data, row, col, B, shape, opA, opB, major
     )
@@ -655,7 +701,9 @@ def _resolve_spsm_coo_runtime(data, row, col, B, shape, lower, unit_diagonal, op
         solve_plan = _prepare_spsm_coo_system(
             data, row64, col64, n_rows, n_cols, lower, unit_diagonal
         )
-        _spsm_cache_put(_SPSM_PREPROCESS_CACHE, cache_key, solve_plan, _SPSM_PREPROCESS_CACHE_SIZE)
+        _spsm_cache_put(
+            _SPSM_PREPROCESS_CACHE, cache_key, solve_plan, _SPSM_PREPROCESS_CACHE_SIZE
+        )
     return data, B, n_rows, n_cols, solve_plan
 
 
@@ -876,7 +924,9 @@ def _analyze_spsm_csr(
     if return_time:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    _resolve_spsm_csr_runtime(data, indices, indptr, B, shape, lower, unit_diagonal, opA, opB, major)
+    _resolve_spsm_csr_runtime(
+        data, indices, indptr, B, shape, lower, unit_diagonal, opA, opB, major
+    )
     if return_time:
         torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -904,7 +954,9 @@ def _analyze_spsm_coo(
     if return_time:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    _resolve_spsm_coo_runtime(data, row, col, B, shape, lower, unit_diagonal, opA, opB, major)
+    _resolve_spsm_coo_runtime(
+        data, row, col, B, shape, lower, unit_diagonal, opA, opB, major
+    )
     if return_time:
         torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -939,7 +991,9 @@ def benchmark_spsm_case(
     data = data[tri_mask]
     row_ids = row_ids[tri_mask]
     col_ids = col_ids[tri_mask]
-    data, col_ids, indptr = _coo_to_csr_sorted_unique(data, row_ids, col_ids, n_rows, n_rows)
+    data, col_ids, indptr = _coo_to_csr_sorted_unique(
+        data, row_ids, col_ids, n_rows, n_rows
+    )
     row_ids = torch.repeat_interleave(
         torch.arange(n_rows, device=device, dtype=torch.int64),
         indptr[1:] - indptr[:-1],
@@ -948,13 +1002,17 @@ def benchmark_spsm_case(
     diag_present = torch.zeros(n_rows, dtype=torch.bool, device=device)
     if diag_mask.numel() > 0 and bool(torch.any(diag_mask).item()):
         diag_present[row_ids[diag_mask]] = True
-    missing_diag = torch.nonzero(~diag_present, as_tuple=False).reshape(-1).to(torch.int64)
+    missing_diag = (
+        torch.nonzero(~diag_present, as_tuple=False).reshape(-1).to(torch.int64)
+    )
     if missing_diag.numel() > 0:
         diag_values = torch.ones(missing_diag.numel(), dtype=value_dtype, device=device)
         data = torch.cat([data, diag_values], dim=0)
         row_ids = torch.cat([row_ids, missing_diag], dim=0)
         col_ids = torch.cat([col_ids, missing_diag], dim=0)
-        data, col_ids, indptr = _coo_to_csr_sorted_unique(data, row_ids, col_ids, n_rows, n_rows)
+        data, col_ids, indptr = _coo_to_csr_sorted_unique(
+            data, row_ids, col_ids, n_rows, n_rows
+        )
     B = torch.randn((n_rows, n_rhs), dtype=value_dtype, device=device).contiguous()
     shape = (n_rows, n_rows)
 
@@ -1029,7 +1087,9 @@ def benchmark_spsm_case(
             "triton_analysis_ms": analysis_ms,
             "triton_solve_ms": solve_ms,
             "triton_time_total_ms": (
-                analysis_ms + solve_ms if analysis_ms is not None and solve_ms is not None else None
+                analysis_ms + solve_ms
+                if analysis_ms is not None and solve_ms is not None
+                else None
             ),
         },
         "samples": {"flagsparse": C_fs},

@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 SpMM alg1 test: compare base vs optimised path with PyTorch and cuSPARSE timings.
 Alg1 timings report CPU-wall runtime preprocessing plus CUDA-event compute time.
@@ -138,9 +152,7 @@ def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
     preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
 
     def op():
-        out, _ = spmm_csr_mod._triton_spmm_csr_impl_opt_prepared(
-            runtime_prepared, B
-        )
+        out, _ = spmm_csr_mod._triton_spmm_csr_impl_opt_prepared(runtime_prepared, B)
         return out
 
     out = op()
@@ -296,7 +308,9 @@ def _seeded_dense_matrix(shape, dtype, device, seed):
 
 def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
     device = torch.device("cuda")
-    data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
+    data, indices, indptr, shape = load_mtx_to_csr_torch(
+        path, dtype=dtype, device=device
+    )
     indices = indices.to(index_dtype)
     n_rows, n_cols = shape
     nnz = data.numel()
@@ -367,7 +381,9 @@ def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
     results = []
     for path in paths:
         try:
-            row = run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=seed)
+            row = run_one_mtx(
+                path, dtype, index_dtype, dense_cols, warmup, iters, seed=seed
+            )
         except Exception as exc:
             print(f"  ERROR on {os.path.basename(path)}: {exc}")
             continue
@@ -376,7 +392,9 @@ def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
     return results
 
 
-def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dtypes=None):
+def run_all_csv(
+    paths, csv_path, dense_cols, warmup, iters, seed=None, value_dtypes=None
+):
     rows = []
     if value_dtypes is None:
         value_dtypes = VALUE_DTYPES
@@ -385,7 +403,9 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
             dname = str(dtype).replace("torch.", "")
             iname = str(index_dtype).replace("torch.", "")
             print("=" * 182)
-            print(f"Value dtype: {dname}  |  Index dtype: {iname}  |  Dense cols: {dense_cols}")
+            print(
+                f"Value dtype: {dname}  |  Index dtype: {iname}  |  Dense cols: {dense_cols}"
+            )
             print(
                 "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
                 "Alg1 = bucketed CSR SpMM native path with Triton runtime preprocessing. "
@@ -395,38 +415,66 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
             print(SEP)
             print(HEADER)
             print(SEP)
-            results = run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed=seed)
+            results = run_batch(
+                paths, dtype, index_dtype, dense_cols, warmup, iters, seed=seed
+            )
             print(SEP)
             for row in results:
                 n_rows, n_cols = row["shape"]
-                rows.append({
-                    "matrix": os.path.basename(row["path"]),
-                    "value_dtype": dname,
-                    "index_dtype": iname,
-                    "n_rows": n_rows,
-                    "n_cols": n_cols,
-                    "nnz": row["nnz"],
-                    "dense_cols": row["dense_cols"],
-                    "seed": row["seed"],
-                    "base_ms": row["base_ms"],
-                    "opt_ms": row["opt_ms"],
-                    "alg1_ms": row["alg1_ms"],
-                    "alg1_preprocess_ms": row["alg1_preprocess_ms"],
-                    "alg1_compute_ms": row["alg1_compute_ms"],
-                    "pt_ms": row["pt_ms"],
-                    "cu_ms": row["cu_ms"],
-                    "opt_vs_base": (row["base_ms"] / row["opt_ms"] if row["opt_ms"] and row["opt_ms"] > 0 else None),
-                    "opt_vs_pt": (row["pt_ms"] / row["opt_ms"] if row["pt_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
-                    "opt_vs_cu": (row["cu_ms"] / row["opt_ms"] if row["cu_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
-                    "base_vs_alg1_speedup": (row["base_ms"] / row["alg1_ms"] if row["alg1_ms"] and row["alg1_ms"] > 0 else None),
-                    "torch_vs_alg1_speedup": (row["pt_ms"] / row["alg1_ms"] if row["pt_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0 else None),
-                    "cusparse_vs_alg1_speedup": (row["cu_ms"] / row["alg1_ms"] if row["cu_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0 else None),
-                    "err_base": row["err_base"],
-                    "err_opt": row["err_opt"],
-                    "err_alg1": row["err_alg1"],
-                    "status_alg1": row["status_alg1"],
-                    "status": row["status"],
-                })
+                rows.append(
+                    {
+                        "matrix": os.path.basename(row["path"]),
+                        "value_dtype": dname,
+                        "index_dtype": iname,
+                        "n_rows": n_rows,
+                        "n_cols": n_cols,
+                        "nnz": row["nnz"],
+                        "dense_cols": row["dense_cols"],
+                        "seed": row["seed"],
+                        "base_ms": row["base_ms"],
+                        "opt_ms": row["opt_ms"],
+                        "alg1_ms": row["alg1_ms"],
+                        "alg1_preprocess_ms": row["alg1_preprocess_ms"],
+                        "alg1_compute_ms": row["alg1_compute_ms"],
+                        "pt_ms": row["pt_ms"],
+                        "cu_ms": row["cu_ms"],
+                        "opt_vs_base": (
+                            row["base_ms"] / row["opt_ms"]
+                            if row["opt_ms"] and row["opt_ms"] > 0
+                            else None
+                        ),
+                        "opt_vs_pt": (
+                            row["pt_ms"] / row["opt_ms"]
+                            if row["pt_ms"] and row["opt_ms"] and row["opt_ms"] > 0
+                            else None
+                        ),
+                        "opt_vs_cu": (
+                            row["cu_ms"] / row["opt_ms"]
+                            if row["cu_ms"] and row["opt_ms"] and row["opt_ms"] > 0
+                            else None
+                        ),
+                        "base_vs_alg1_speedup": (
+                            row["base_ms"] / row["alg1_ms"]
+                            if row["alg1_ms"] and row["alg1_ms"] > 0
+                            else None
+                        ),
+                        "torch_vs_alg1_speedup": (
+                            row["pt_ms"] / row["alg1_ms"]
+                            if row["pt_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0
+                            else None
+                        ),
+                        "cusparse_vs_alg1_speedup": (
+                            row["cu_ms"] / row["alg1_ms"]
+                            if row["cu_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0
+                            else None
+                        ),
+                        "err_base": row["err_base"],
+                        "err_opt": row["err_opt"],
+                        "err_alg1": row["err_alg1"],
+                        "status_alg1": row["status_alg1"],
+                        "status": row["status"],
+                    }
+                )
     fields = [
         "matrix",
         "value_dtype",
@@ -459,19 +507,34 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+            writer.writerow(
+                {key: ("" if value is None else value) for key, value in row.items()}
+            )
     print(f"\nWrote {len(rows)} rows to {csv_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SpMM alg1: baseline vs optimised, with PyTorch/cuSPARSE timings.")
+    parser = argparse.ArgumentParser(
+        description="SpMM alg1: baseline vs optimised, with PyTorch/cuSPARSE timings."
+    )
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
-    parser.add_argument("--csv", type=str, default=None, metavar="FILE", help="Export selected dtype to CSV")
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Export selected dtype to CSV",
+    )
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     parser.add_argument("--dense-cols", type=int, default=DEFAULT_DENSE_COLS)
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Optional fixed seed for reproducible dense RHS generation")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Optional fixed seed for reproducible dense RHS generation",
+    )
     args = parser.parse_args()
 
     paths = []
@@ -487,12 +550,22 @@ def main():
     dtype_map = {"float32": torch.float32, "float64": torch.float64}
     dtype = dtype_map[args.dtype]
     if args.csv:
-        run_all_csv(paths, args.csv, args.dense_cols, args.warmup, args.iters, seed=args.seed, value_dtypes=[dtype])
+        run_all_csv(
+            paths,
+            args.csv,
+            args.dense_cols,
+            args.warmup,
+            args.iters,
+            seed=args.seed,
+            value_dtypes=[dtype],
+        )
         return
 
     print("=" * 182)
     print("FLAGSPARSE SpMM Alg1 Test")
-    print(f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {args.dtype}  |  Dense cols: {args.dense_cols}  |  Files: {len(paths)}")
+    print(
+        f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {args.dtype}  |  Dense cols: {args.dense_cols}  |  Files: {len(paths)}"
+    )
     if args.seed is not None:
         print(f"Seed: {args.seed}")
     print(
@@ -504,7 +577,15 @@ def main():
     print(SEP)
     print(HEADER)
     print(SEP)
-    results = run_batch(paths, dtype, torch.int32, args.dense_cols, args.warmup, args.iters, seed=args.seed)
+    results = run_batch(
+        paths,
+        dtype,
+        torch.int32,
+        args.dense_cols,
+        args.warmup,
+        args.iters,
+        seed=args.seed,
+    )
     print(SEP)
     passed = sum(1 for row in results if row["status"] == "PASS")
     print(f"Passed: {passed} / {len(results)}")

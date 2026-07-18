@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """CSR SpGEMM (A@B) with two-phase structure/value build."""
 
 from ._common import *
@@ -143,7 +157,9 @@ def _validate_csr(data, indices, indptr, shape, tag):
         raise ValueError(f"{tag}_indptr[0] must be 0")
     if indptr_i64.numel() > 0 and int(indptr_i64[-1].item()) != nnz:
         raise ValueError(f"{tag}_indptr[-1] must equal nnz={nnz}")
-    if indptr_i64.numel() > 1 and bool(torch.any(indptr_i64[1:] < indptr_i64[:-1]).item()):
+    if indptr_i64.numel() > 1 and bool(
+        torch.any(indptr_i64[1:] < indptr_i64[:-1]).item()
+    ):
         raise ValueError(f"{tag}_indptr must be nondecreasing")
     if nnz > 0:
         min_col = int(indices.min().item())
@@ -163,8 +179,12 @@ def _prepare_spgemm_csr_inputs(
     b_indptr,
     b_shape,
 ):
-    a_rows, a_cols, a_indptr64 = _validate_csr(a_data, a_indices, a_indptr, a_shape, "a")
-    b_rows, b_cols, b_indptr64 = _validate_csr(b_data, b_indices, b_indptr, b_shape, "b")
+    a_rows, a_cols, a_indptr64 = _validate_csr(
+        a_data, a_indices, a_indptr, a_shape, "a"
+    )
+    b_rows, b_cols, b_indptr64 = _validate_csr(
+        b_data, b_indices, b_indptr, b_shape, "b"
+    )
     if a_cols != b_rows:
         raise ValueError(
             f"shape mismatch for A@B: A is {a_rows}x{a_cols}, B is {b_rows}x{b_cols}"
@@ -351,7 +371,9 @@ def prepare_spgemm_csr(
         row_work_ready = False
     long_row_slices_host = {}
     if row_work_ready:
-        long_rows = torch.nonzero(row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False).flatten()
+        long_rows = torch.nonzero(
+            row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False
+        ).flatten()
         long_row_slices_host = _build_long_row_slices_host(
             a_indptr,
             a_indices,
@@ -387,14 +409,20 @@ def _ensure_row_work(prepared):
     if prepared.row_work_ready:
         return
     if prepared.a_data.numel() == 0 or prepared.b_data.numel() == 0:
-        prepared.a_row_work = torch.zeros(prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device)
-        prepared.row_bucket = torch.zeros(prepared.n_rows, dtype=torch.int8, device=prepared.a_data.device)
+        prepared.a_row_work = torch.zeros(
+            prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device
+        )
+        prepared.row_bucket = torch.zeros(
+            prepared.n_rows, dtype=torch.int8, device=prepared.a_data.device
+        )
         prepared.hash_capacity_hint = 256
         prepared.row_work_ready = True
         prepared.long_row_slices_host = {}
         _clear_runtime_schedules(prepared)
         return
-    row_work = torch.empty(prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device)
+    row_work = torch.empty(
+        prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device
+    )
     _spgemm_row_work_kernel[(prepared.n_rows,)](
         prepared.a_indptr,
         prepared.a_indices,
@@ -405,7 +433,9 @@ def _ensure_row_work(prepared):
     )
     prepared.a_row_work = row_work
     prepared.row_bucket = _build_row_bucket(row_work)
-    long_rows = torch.nonzero(prepared.row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False).flatten()
+    long_rows = torch.nonzero(
+        prepared.row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False
+    ).flatten()
     prepared.long_row_slices_host = _build_long_row_slices_host(
         prepared.a_indptr,
         prepared.a_indices,
@@ -487,7 +517,9 @@ def _clear_fill_schedule(prepared):
 
 def _ensure_bucket_rows(prepared):
     if prepared.bucket_rows is None:
-        prepared.bucket_rows = _build_bucket_rows(prepared.row_bucket, prepared.a_data.device)
+        prepared.bucket_rows = _build_bucket_rows(
+            prepared.row_bucket, prepared.a_data.device
+        )
     return prepared.bucket_rows
 
 
@@ -542,7 +574,9 @@ def _expand_rows_contrib(prepared, row_ids, need_values):
         return empty_i64, None
 
     row_ids = row_ids.to(torch.int64)
-    row_nnz = (prepared.a_indptr[row_ids + 1] - prepared.a_indptr[row_ids]).to(torch.int64)
+    row_nnz = (prepared.a_indptr[row_ids + 1] - prepared.a_indptr[row_ids]).to(
+        torch.int64
+    )
     total_a = int(row_nnz.sum().item())
     if total_a == 0:
         empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
@@ -557,10 +591,9 @@ def _expand_rows_contrib(prepared, row_ids, need_values):
     )
     prefix = torch.cumsum(row_nnz, dim=0)
     base = prefix - row_nnz
-    intra = (
-        torch.arange(total_a, device=device, dtype=torch.int64)
-        - torch.repeat_interleave(base, row_nnz)
-    )
+    intra = torch.arange(
+        total_a, device=device, dtype=torch.int64
+    ) - torch.repeat_interleave(base, row_nnz)
     row_starts = prepared.a_indptr[row_ids]
     a_pos = row_starts[owner] + intra
     rows = row_ids[owner]
@@ -584,10 +617,9 @@ def _expand_rows_contrib(prepared, row_ids, need_values):
     prefix = torch.cumsum(b_counts, dim=0)
     base = prefix - b_counts
     starts_rep = torch.repeat_interleave(b_starts, b_counts)
-    intra = (
-        torch.arange(total, device=device, dtype=torch.int64)
-        - torch.repeat_interleave(base, b_counts)
-    )
+    intra = torch.arange(
+        total, device=device, dtype=torch.int64
+    ) - torch.repeat_interleave(base, b_counts)
     b_pos = starts_rep + intra
     cols = prepared.b_indices[b_pos].to(torch.int64)
     keys = rows_expanded * max(1, prepared.n_cols) + cols
@@ -599,7 +631,9 @@ def _expand_rows_contrib(prepared, row_ids, need_values):
     return keys, vals
 
 
-def _expand_single_row_slice_contrib(prepared, row, a_ptr_start, a_ptr_end, need_values):
+def _expand_single_row_slice_contrib(
+    prepared, row, a_ptr_start, a_ptr_end, need_values
+):
     device = prepared.a_data.device
     if a_ptr_end <= a_ptr_start:
         empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
@@ -628,10 +662,9 @@ def _expand_single_row_slice_contrib(prepared, row, a_ptr_start, a_ptr_end, need
     prefix = torch.cumsum(b_counts, dim=0)
     base = prefix - b_counts
     starts_rep = torch.repeat_interleave(b_starts, b_counts)
-    intra = (
-        torch.arange(total, device=device, dtype=torch.int64)
-        - torch.repeat_interleave(base, b_counts)
-    )
+    intra = torch.arange(
+        total, device=device, dtype=torch.int64
+    ) - torch.repeat_interleave(base, b_counts)
     b_pos = starts_rep + intra
     cols = prepared.b_indices[b_pos].to(torch.int64)
     keys = int(row) * max(1, prepared.n_cols) + cols
@@ -643,7 +676,11 @@ def _expand_single_row_slice_contrib(prepared, row, a_ptr_start, a_ptr_end, need
 
 
 def _iter_row_a_slices(prepared, row, max_expanded):
-    cached = prepared.long_row_slices_host.get(int(row)) if prepared.long_row_slices_host is not None else None
+    cached = (
+        prepared.long_row_slices_host.get(int(row))
+        if prepared.long_row_slices_host is not None
+        else None
+    )
     if cached is not None:
         return cached
     start = int(prepared.a_indptr[row].item())
@@ -653,7 +690,9 @@ def _iter_row_a_slices(prepared, row, max_expanded):
             prepared.long_row_slices_host[int(row)] = []
         return []
     a_cols = prepared.a_indices[start:end].to(torch.int64)
-    b_counts = (prepared.b_indptr[a_cols + 1] - prepared.b_indptr[a_cols]).to(torch.int64)
+    b_counts = (prepared.b_indptr[a_cols + 1] - prepared.b_indptr[a_cols]).to(
+        torch.int64
+    )
     counts_host = b_counts.cpu().tolist()
     slices = []
     idx = 0
@@ -758,7 +797,9 @@ def _spgemm_count_phase(prepared, profile=False):
                 torch.cuda.synchronize()
                 elapsed = (time.perf_counter() - t_bucket0) * 1000.0
                 bucket_ms[bucket_id] = (
-                    elapsed if bucket_ms[bucket_id] is None else bucket_ms[bucket_id] + elapsed
+                    elapsed
+                    if bucket_ms[bucket_id] is None
+                    else bucket_ms[bucket_id] + elapsed
                 )
     meta = {
         "bucket_count_ms_short": bucket_ms[_SPGEMM_BUCKET_SHORT],
@@ -769,7 +810,9 @@ def _spgemm_count_phase(prepared, profile=False):
     return row_nnz_c, meta
 
 
-def _spgemm_fill_phase(prepared, c_indptr, out_data=None, out_indices=None, profile=False):
+def _spgemm_fill_phase(
+    prepared, c_indptr, out_data=None, out_indices=None, profile=False
+):
     nnz_c = int(c_indptr[-1].item())
     device = prepared.a_data.device
     c_data = (
@@ -813,13 +856,18 @@ def _spgemm_fill_phase(prepared, c_indptr, out_data=None, out_indices=None, prof
                         max(1, prepared.n_cols),
                         rounding_mode="floor",
                     )
-                    uniq_cols = (uniq_keys - uniq_rows * max(1, prepared.n_cols)).to(torch.int32)
-                    _, row_counts = torch.unique_consecutive(uniq_rows, return_counts=True)
-                    row_offsets = torch.cumsum(row_counts.to(torch.int64), dim=0) - row_counts.to(torch.int64)
-                    local_pos = (
-                        torch.arange(uniq_keys.numel(), device=device, dtype=torch.int64)
-                        - torch.repeat_interleave(row_offsets, row_counts)
+                    uniq_cols = (uniq_keys - uniq_rows * max(1, prepared.n_cols)).to(
+                        torch.int32
                     )
+                    _, row_counts = torch.unique_consecutive(
+                        uniq_rows, return_counts=True
+                    )
+                    row_offsets = torch.cumsum(
+                        row_counts.to(torch.int64), dim=0
+                    ) - row_counts.to(torch.int64)
+                    local_pos = torch.arange(
+                        uniq_keys.numel(), device=device, dtype=torch.int64
+                    ) - torch.repeat_interleave(row_offsets, row_counts)
                     dst = c_indptr[uniq_rows] + local_pos
                     c_indices[dst] = uniq_cols
                     c_data[dst] = uniq_vals
@@ -858,7 +906,9 @@ def _spgemm_fill_phase(prepared, c_indptr, out_data=None, out_indices=None, prof
                     if row_nnz == 0:
                         continue
                     if not key_parts:
-                        raise RuntimeError(f"row {row} expected nnz={row_nnz} but got empty fill")
+                        raise RuntimeError(
+                            f"row {row} expected nnz={row_nnz} but got empty fill"
+                        )
                     row_keys = torch.cat(key_parts)
                     row_vals = torch.cat(val_parts)
                     row_keys, row_vals = _sort_reduce_pairs(
@@ -870,14 +920,18 @@ def _spgemm_fill_phase(prepared, c_indptr, out_data=None, out_indices=None, prof
                         raise RuntimeError(
                             f"row {row} fill nnz mismatch: expected {row_nnz}, got {row_keys.numel()}"
                         )
-                    row_cols = (row_keys - row * max(1, prepared.n_cols)).to(torch.int32)
+                    row_cols = (row_keys - row * max(1, prepared.n_cols)).to(
+                        torch.int32
+                    )
                     c_indices[row_start:row_end] = row_cols
                     c_data[row_start:row_end] = row_vals
             if profile:
                 torch.cuda.synchronize()
                 elapsed = (time.perf_counter() - t_bucket0) * 1000.0
                 bucket_ms[bucket_id] = (
-                    elapsed if bucket_ms[bucket_id] is None else bucket_ms[bucket_id] + elapsed
+                    elapsed
+                    if bucket_ms[bucket_id] is None
+                    else bucket_ms[bucket_id] + elapsed
                 )
 
     meta = {
@@ -897,9 +951,18 @@ def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False)
         out_data, out_indices, out_indptr = out
         if not out_data.is_cuda or not out_indices.is_cuda or not out_indptr.is_cuda:
             raise ValueError("out data/indices/indptr must be CUDA tensors")
-        if out_data.device != prepared.a_data.device or out_indices.device != prepared.a_data.device or out_indptr.device != prepared.a_data.device:
-            raise ValueError("out data/indices/indptr must be on the same CUDA device as computed C")
-        if out_indptr.shape != (prepared.n_rows + 1,) or out_indptr.dtype != torch.int64:
+        if (
+            out_data.device != prepared.a_data.device
+            or out_indices.device != prepared.a_data.device
+            or out_indptr.device != prepared.a_data.device
+        ):
+            raise ValueError(
+                "out data/indices/indptr must be on the same CUDA device as computed C"
+            )
+        if (
+            out_indptr.shape != (prepared.n_rows + 1,)
+            or out_indptr.dtype != torch.int64
+        ):
             raise ValueError("out indptr shape/dtype must match computed C indptr")
     else:
         out_data = out_indices = out_indptr = None
@@ -917,7 +980,9 @@ def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False)
 
     c_indptr = out_indptr
     if c_indptr is None:
-        c_indptr = torch.empty(prepared.n_rows + 1, dtype=torch.int64, device=prepared.a_data.device)
+        c_indptr = torch.empty(
+            prepared.n_rows + 1, dtype=torch.int64, device=prepared.a_data.device
+        )
     c_indptr[0] = 0
     if prepared.n_rows > 0:
         c_indptr[1:] = torch.cumsum(row_nnz_c, dim=0)
@@ -953,28 +1018,45 @@ def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False)
             return None
         return float(count_val + fill_val)
 
-    return c_data, c_indices, c_indptr, {
-        "count_ms": count_ms,
-        "fill_ms": fill_ms,
-        "bucket_ms_short": _sum_bucket_ms("bucket_count_ms_short", "bucket_fill_ms_short"),
-        "bucket_ms_medium": _sum_bucket_ms("bucket_count_ms_medium", "bucket_fill_ms_medium"),
-        "bucket_ms_long": _sum_bucket_ms("bucket_count_ms_long", "bucket_fill_ms_long"),
-        "bucket_count_ms_short": count_meta["bucket_count_ms_short"],
-        "bucket_count_ms_medium": count_meta["bucket_count_ms_medium"],
-        "bucket_count_ms_long": count_meta["bucket_count_ms_long"],
-        "bucket_fill_ms_short": fill_meta["bucket_fill_ms_short"],
-        "bucket_fill_ms_medium": fill_meta["bucket_fill_ms_medium"],
-        "bucket_fill_ms_long": fill_meta["bucket_fill_ms_long"],
-        "bucket_nrows_short": int(torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_SHORT).item()),
-        "bucket_nrows_medium": int(torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_MEDIUM).item()),
-        "bucket_nrows_long": int(torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_LONG).item()),
-        "long_row_sliced_count": int(
-            max(
-                count_meta["long_row_sliced_count_count"],
-                fill_meta["long_row_sliced_count_fill"],
-            )
-        ),
-    }
+    return (
+        c_data,
+        c_indices,
+        c_indptr,
+        {
+            "count_ms": count_ms,
+            "fill_ms": fill_ms,
+            "bucket_ms_short": _sum_bucket_ms(
+                "bucket_count_ms_short", "bucket_fill_ms_short"
+            ),
+            "bucket_ms_medium": _sum_bucket_ms(
+                "bucket_count_ms_medium", "bucket_fill_ms_medium"
+            ),
+            "bucket_ms_long": _sum_bucket_ms(
+                "bucket_count_ms_long", "bucket_fill_ms_long"
+            ),
+            "bucket_count_ms_short": count_meta["bucket_count_ms_short"],
+            "bucket_count_ms_medium": count_meta["bucket_count_ms_medium"],
+            "bucket_count_ms_long": count_meta["bucket_count_ms_long"],
+            "bucket_fill_ms_short": fill_meta["bucket_fill_ms_short"],
+            "bucket_fill_ms_medium": fill_meta["bucket_fill_ms_medium"],
+            "bucket_fill_ms_long": fill_meta["bucket_fill_ms_long"],
+            "bucket_nrows_short": int(
+                torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_SHORT).item()
+            ),
+            "bucket_nrows_medium": int(
+                torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_MEDIUM).item()
+            ),
+            "bucket_nrows_long": int(
+                torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_LONG).item()
+            ),
+            "long_row_sliced_count": int(
+                max(
+                    count_meta["long_row_sliced_count_count"],
+                    fill_meta["long_row_sliced_count_fill"],
+                )
+            ),
+        },
+    )
 
 
 def flagsparse_spgemm_csr(
@@ -1223,8 +1305,14 @@ def benchmark_spgemm_case(
     )
 
     prepared = prepare_spgemm_csr(
-        a_data, a_indices, a_indptr, (n_rows, n_inner),
-        b_data, b_indices, b_indptr, (n_inner, n_cols),
+        a_data,
+        a_indices,
+        a_indptr,
+        (n_rows, n_inner),
+        b_data,
+        b_indices,
+        b_indptr,
+        (n_inner, n_cols),
     )
     op = lambda: flagsparse_spgemm_csr(prepared=prepared, return_time=False)
     triton_result, triton_ms = _benchmark_cuda_op(op, warmup=warmup, iters=iters)
@@ -1237,17 +1325,23 @@ def benchmark_spgemm_case(
     pytorch_result = None
     try:
         torch_op = lambda: torch.sparse.mm(a_t, b_t)
-        pytorch_sparse, pytorch_ms = _benchmark_cuda_op(torch_op, warmup=warmup, iters=iters)
+        pytorch_sparse, pytorch_ms = _benchmark_cuda_op(
+            torch_op, warmup=warmup, iters=iters
+        )
         pytorch_result = _torch_sparse_to_csr(pytorch_sparse)
     except Exception as exc:
         pytorch_reason = str(exc)
         a_coo = a_t.to_sparse_coo().coalesce()
         b_coo = b_t.to_sparse_coo().coalesce()
         torch_op = lambda: torch.sparse.mm(a_coo, b_coo)
-        pytorch_sparse, pytorch_ms = _benchmark_cuda_op(torch_op, warmup=warmup, iters=iters)
+        pytorch_sparse, pytorch_ms = _benchmark_cuda_op(
+            torch_op, warmup=warmup, iters=iters
+        )
         pytorch_result = _torch_sparse_to_csr(pytorch_sparse)
 
-    triton_summary = _spgemm_pairwise_summary(triton_result, pytorch_result, value_dtype)
+    triton_summary = _spgemm_pairwise_summary(
+        triton_result, pytorch_result, value_dtype
+    )
 
     cusparse_ms = None
     cusparse_reason = None
@@ -1258,14 +1352,24 @@ def benchmark_spgemm_case(
         else:
             try:
                 a_cp = cpx_sparse.csr_matrix(
-                    (_cupy_from_torch(a_data), _cupy_from_torch(a_indices.to(torch.int64)), _cupy_from_torch(a_indptr.to(torch.int64))),
+                    (
+                        _cupy_from_torch(a_data),
+                        _cupy_from_torch(a_indices.to(torch.int64)),
+                        _cupy_from_torch(a_indptr.to(torch.int64)),
+                    ),
                     shape=(n_rows, n_inner),
                 )
                 b_cp = cpx_sparse.csr_matrix(
-                    (_cupy_from_torch(b_data), _cupy_from_torch(b_indices.to(torch.int64)), _cupy_from_torch(b_indptr.to(torch.int64))),
+                    (
+                        _cupy_from_torch(b_data),
+                        _cupy_from_torch(b_indices.to(torch.int64)),
+                        _cupy_from_torch(b_indptr.to(torch.int64)),
+                    ),
                     shape=(n_inner, n_cols),
                 )
-                c_cp, cusparse_ms = _benchmark_cuda_op(lambda: a_cp @ b_cp, warmup=warmup, iters=iters)
+                c_cp, cusparse_ms = _benchmark_cuda_op(
+                    lambda: a_cp @ b_cp, warmup=warmup, iters=iters
+                )
                 c_coo = c_cp.tocoo()
                 rows = _torch_from_cupy(c_coo.row).to(torch.int64)
                 cols = _torch_from_cupy(c_coo.col).to(torch.int64)
@@ -1274,7 +1378,9 @@ def benchmark_spgemm_case(
                     torch.stack([rows, cols]), vals, (n_rows, n_cols), device=device
                 ).coalesce()
                 c_ref = _torch_sparse_to_csr(c_t)
-                cusparse_match = _spgemm_pairwise_summary(triton_result, c_ref, value_dtype)["match"]
+                cusparse_match = _spgemm_pairwise_summary(
+                    triton_result, c_ref, value_dtype
+                )["match"]
             except Exception as exc:
                 cusparse_reason = str(exc)
 
@@ -1293,8 +1399,12 @@ def benchmark_spgemm_case(
             "triton_ms": triton_ms,
             "pytorch_ms": pytorch_ms,
             "cusparse_ms": cusparse_ms,
-            "triton_speedup_vs_pytorch": (pytorch_ms / triton_ms if (pytorch_ms and triton_ms > 0) else None),
-            "triton_speedup_vs_cusparse": (cusparse_ms / triton_ms if (cusparse_ms and triton_ms > 0) else None),
+            "triton_speedup_vs_pytorch": (
+                pytorch_ms / triton_ms if (pytorch_ms and triton_ms > 0) else None
+            ),
+            "triton_speedup_vs_cusparse": (
+                cusparse_ms / triton_ms if (cusparse_ms and triton_ms > 0) else None
+            ),
         },
         "verification": {
             "triton_match_pytorch": triton_summary["match"],

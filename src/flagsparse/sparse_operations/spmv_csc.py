@@ -1,10 +1,23 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Native CSC SpMV kernels and public helpers."""
 
 from ._common import *
 
 import triton
 import triton.language as tl
-
 
 SUPPORTED_SPMV_CSC_VALUE_DTYPES = (
     torch.float32,
@@ -21,9 +34,7 @@ SPMV_CSC_OP_NAMES = {
     SPMV_CSC_OP_TRANS: "trans",
     SPMV_CSC_OP_CONJ_TRANS: "conj",
 }
-_SPMV_CSC_OP_NAME_TO_CODE = {
-    name: code for code, name in SPMV_CSC_OP_NAMES.items()
-}
+_SPMV_CSC_OP_NAME_TO_CODE = {name: code for code, name in SPMV_CSC_OP_NAMES.items()}
 
 
 def _spmv_csc_dtype_error_message():
