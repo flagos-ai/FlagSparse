@@ -20,6 +20,7 @@ import torch
 from flagsparse import flagsparse_spmv_bsr, prepare_spmv_bsr
 from tests.pytest.accuracy_utils import close_tolerances
 
+
 spmv_bsr_mod = importlib.import_module("flagsparse.sparse_operations.spmv_bsr")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 BSR_MN_SHAPES = ((7, 8), (12, 9), (16, 32), (64, 96))
@@ -89,9 +90,7 @@ def _dense_to_bsr(dense, index_dtype, block_dim):
     if data:
         data_tensor = torch.stack(data).contiguous()
     else:
-        data_tensor = torch.empty(
-            (0, block_dim, block_dim), dtype=dense.dtype, device=device
-        )
+        data_tensor = torch.empty((0, block_dim, block_dim), dtype=dense.dtype, device=device)
     return (
         data_tensor,
         torch.tensor(indices, dtype=index_dtype, device=device),
@@ -150,15 +149,11 @@ def _logical_out_len(M, N, op):
 
 
 def _padded_out_len(M, N, block_dim, op):
-    return (
-        _padded_cols(N, block_dim) if _op_transposes(op) else _padded_rows(M, block_dim)
-    )
+    return _padded_cols(N, block_dim) if _op_transposes(op) else _padded_rows(M, block_dim)
 
 
 def _padded_x_len(M, N, block_dim, op):
-    return (
-        _padded_rows(M, block_dim) if _op_transposes(op) else _padded_cols(N, block_dim)
-    )
+    return _padded_rows(M, block_dim) if _op_transposes(op) else _padded_cols(N, block_dim)
 
 
 def _assert_close(actual, expected, dtype):
@@ -179,9 +174,7 @@ def _assert_close(actual, expected, dtype):
 )
 @pytest.mark.parametrize("block_dim", [2, 4], ids=["block2", "block4"])
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
-def test_spmv_bsr_matches_dense_reference(
-    M, N, name, dtype, index_dtype, block_dim, op
-):
+def test_spmv_bsr_matches_dense_reference(M, N, name, dtype, index_dtype, block_dim, op):
     device = torch.device("cuda")
     data, indices, indptr, dense = _random_bsr_mn(
         M, N, dtype, index_dtype, block_dim, device
@@ -204,6 +197,37 @@ def test_spmv_bsr_matches_dense_reference(
 
 
 @pytest.mark.spmv_bsr
+@pytest.mark.parametrize("M, N", BSR_MN_SHAPES)
+@pytest.mark.parametrize(
+    "name,dtype", _value_dtype_cases(), ids=[c[0] for c in _value_dtype_cases()]
+)
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
+@pytest.mark.parametrize("block_dim", [2, 4], ids=["block2", "block4"])
+def test_spmv_bsr_blockrow_reduce_matches_dense_reference(M, N, name, dtype, index_dtype, block_dim):
+    device = torch.device("cuda")
+    data, indices, indptr, dense = _random_bsr_mn(
+        M, N, dtype, index_dtype, block_dim, device
+    )
+    x = _make_x(N, dtype, device)
+    ref = _make_ref(dense, x, "non", dtype)
+    out = flagsparse_spmv_bsr(
+        data,
+        indices,
+        indptr,
+        x,
+        shape=(M, N),
+        block_dim=block_dim,
+        op="non",
+        use_opt="blockrow_reduce",
+        index_fallback_policy="auto",
+    )
+    assert out.numel() == _padded_out_len(M, N, block_dim, "non")
+    _assert_close(out[:M], ref, dtype)
+
+
+@pytest.mark.spmv_bsr
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmv_bsr_prepared_path_matches_dense_reference(op):
     device = torch.device("cuda")
@@ -220,6 +244,23 @@ def test_spmv_bsr_prepared_path_matches_dense_reference(op):
     logical_out = _logical_out_len(M, N, op)
     assert out.numel() == _padded_out_len(M, N, block_dim, op)
     _assert_close(out[:logical_out], ref, dtype)
+
+
+@pytest.mark.spmv_bsr
+def test_spmv_bsr_blockrow_reduce_prepared_path_matches_dense_reference():
+    device = torch.device("cuda")
+    M, N = 7, 8
+    dtype = torch.complex64
+    block_dim = 4
+    data, indices, indptr, dense = _random_bsr_mn(
+        M, N, dtype, torch.int32, block_dim, device
+    )
+    prepared = prepare_spmv_bsr(data, indices, indptr, (M, N), block_dim, op="non")
+    x = _make_x(N, dtype, device)
+    ref = _make_ref(dense, x, "non", dtype)
+    out = flagsparse_spmv_bsr(x=x, prepared=prepared, use_opt=True)
+    assert out.numel() == _padded_out_len(M, N, block_dim, "non")
+    _assert_close(out[:M], ref, dtype)
 
 
 @pytest.mark.spmv_bsr
@@ -275,6 +316,41 @@ def test_spmv_bsr_int64_auto_fallback_to_int32(monkeypatch, op):
 
 
 @pytest.mark.spmv_bsr
+def test_spmv_bsr_blockrow_reduce_int64_auto_fallback_to_int32(monkeypatch):
+    device = torch.device("cuda")
+    M, N = 12, 9
+    data, indices, indptr, dense = _random_bsr_mn(
+        M, N, torch.float32, torch.int64, 2, device
+    )
+    x = torch.randn(N, dtype=torch.float32, device=device)
+    ref = _make_ref(dense, x, "non", torch.float32)
+    state = {"forced_once": False}
+    original = spmv_bsr_mod._triton_spmv_bsr_blockrow_reduce_kernel
+
+    def fail_int64_once(prepared, x_in, buckets=None):
+        if prepared.kernel_indices.dtype == torch.int64 and not state["forced_once"]:
+            state["forced_once"] = True
+            raise RuntimeError("forced int64 launch failure")
+        return original(prepared, x_in, buckets=buckets)
+
+    monkeypatch.setattr(spmv_bsr_mod, "_triton_spmv_bsr_blockrow_reduce_kernel", fail_int64_once)
+    out = flagsparse_spmv_bsr(
+        data,
+        indices,
+        indptr,
+        x,
+        shape=(M, N),
+        block_dim=2,
+        op="non",
+        use_opt="blockrow_reduce",
+        index_fallback_policy="auto",
+    )
+    assert state["forced_once"]
+    assert out.numel() == _padded_out_len(M, N, 2, "non")
+    _assert_close(out[:M], ref.to(torch.float32), torch.float32)
+
+
+@pytest.mark.spmv_bsr
 def test_spmv_bsr_int64_strict_no_fallback(monkeypatch):
     device = torch.device("cuda")
     data, indices, indptr, _dense = _random_bsr_mn(
@@ -327,9 +403,7 @@ def test_spmv_bsr_accepts_logical_or_padded_x(op):
     )
     logical_x = _logical_x_len(M, N, op)
     x = torch.randn(logical_x, dtype=torch.float32, device=device)
-    x_padded = torch.zeros(
-        _padded_x_len(M, N, block_dim, op), dtype=torch.float32, device=device
-    )
+    x_padded = torch.zeros(_padded_x_len(M, N, block_dim, op), dtype=torch.float32, device=device)
     x_padded[:logical_x].copy_(x)
     ref = _make_ref(dense, x, op, torch.float32)
     prepared = prepare_spmv_bsr(data, indices, indptr, (M, N), block_dim, op=op)

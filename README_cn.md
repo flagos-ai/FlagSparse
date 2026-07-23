@@ -88,6 +88,15 @@ python tests/test_spmv_opt.py <目录或文件.mtx> [...]
 python tests/test_spmv_opt.py <目录/> --csv out.csv
 ```
 
+**test_spmv_bsr.py** - 原生 BSR SpMV，输出按 block-grid padding：
+
+```bash
+python tests/test_spmv_bsr.py --synthetic --ops non,trans,conj
+python tests/test_spmv_bsr.py <目录/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj --alg compare
+# correctness 使用 BSR 展开的 COO 作为精确 reference；PyTorch BSR 只作为 baseline。
+# --alg blockrow_reduce 运行仅支持 non 的 block-row tile reduction 路径；compare 对 trans/conj 保持 base。
+```
+
 **test_spmm.py** - CSR SpMM（`.mtx` 批量、合成或 `--csv`）：
 
 ```bash
@@ -135,7 +144,10 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 
 **test_spsv_sell.py** - 下三角、实数、原生列主序 SELL SpSV。CSV 和终端字段
 遵循 CSR SpSV 输出；`FlagSparse_ms` 和 `cuSPARSE_ms` 都覆盖每次调用的准备/
-分析加求解，静态 descriptor 与 SELL 转换不计时。
+分析加求解，静态 descriptor 与 SELL 转换不计时。直接
+`flagsparse_spsv_sell` API 默认使用 ALG1；使用 `--alg_num 2` 或显式
+`flagsparse_spsv_analysis_sell` + `flagsparse_spsv_solve_sell` 生命周期可启用
+slice-cooperative ALG2 路径。
 
 ```bash
 python tests/test_spsv.py --synthetic
@@ -143,6 +155,7 @@ python tests/test_spsv.py <目录/> --csv-csr spsv.csv
 python tests/test_spsv.py <目录/> --csv-coo out.csv     # 列与 CSR 相同
 pytest -q -s tests/test_spsv_sell.py
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell.csv --slice-size 32
+python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_alg2.csv --slice-size 32 --alg_num 2
 ```
 
 **test_spsm.py** - SpSM（三角矩阵-稠密矩阵求解；**仅方阵**）：

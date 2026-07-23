@@ -19,6 +19,7 @@ from ._common import *
 import triton
 import triton.language as tl
 
+
 SUPPORTED_SPMV_BSR_VALUE_DTYPES = (
     torch.float32,
     torch.float64,
@@ -35,7 +36,12 @@ SPMV_BSR_OP_NAMES = {
     SPMV_BSR_OP_CONJ_TRANS: "conj",
 }
 SPMV_BSR_SUPPORTED_OP_NAMES = ("non", "trans", "conj")
-_SPMV_BSR_OP_NAME_TO_CODE = {name: code for code, name in SPMV_BSR_OP_NAMES.items()}
+_SPMV_BSR_OP_NAME_TO_CODE = {
+    name: code for code, name in SPMV_BSR_OP_NAMES.items()
+}
+SPMV_BSR_ALG_BASE = "base"
+SPMV_BSR_ALG_BLOCKROW_REDUCE = "blockrow_reduce"
+SPMV_BSR_SUPPORTED_ALGORITHMS = (SPMV_BSR_ALG_BASE, SPMV_BSR_ALG_BLOCKROW_REDUCE)
 
 
 def _spmv_bsr_dtype_error_message():
@@ -72,6 +78,25 @@ def _spmv_bsr_op_transposes(op):
 
 def _ensure_spmv_bsr_supported_op(op_code):
     _normalize_spmv_bsr_op(op_code)
+
+
+def _normalize_spmv_bsr_algorithm(use_opt=False):
+    if isinstance(use_opt, str):
+        token = use_opt.strip().lower().replace("-", "_")
+        if token in ("false", "0", "no", "base", "spmv_bsr_base"):
+            return SPMV_BSR_ALG_BASE
+        if token in (
+            "true",
+            "1",
+            "yes",
+            "opt",
+            "auto",
+            "blockrow_reduce",
+            "spmv_bsr_blockrow_reduce",
+        ):
+            return SPMV_BSR_ALG_BLOCKROW_REDUCE
+        raise ValueError("use_opt must be False, True, 'base', 'auto', or 'blockrow_reduce'")
+    return SPMV_BSR_ALG_BLOCKROW_REDUCE if bool(use_opt) else SPMV_BSR_ALG_BASE
 
 
 def _normalize_spmv_bsr_index_fallback_policy(index_fallback_policy):
@@ -178,14 +203,11 @@ def _spmv_bsr_non_real_kernel(
     offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
     mask = offs < end
     bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
-    acc = (
-        tl.load(
-            data_ptr + start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM,
-            mask=start < end,
-            other=0.0,
-        )
-        * 0
-    )
+    acc = tl.load(
+        data_ptr + start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM,
+        mask=start < end,
+        other=0.0,
+    ) * 0
     for inner_col in tl.static_range(0, BLOCK_DIM):
         col = bcols * BLOCK_DIM + inner_col
         valid = mask
@@ -223,24 +245,16 @@ def _spmv_bsr_non_complex_kernel(
     offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
     mask = offs < end
     bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
-    acc_re = (
-        tl.load(
-            data_ri_ptr + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2,
-            mask=start < end,
-            other=0.0,
-        )
-        * 0
-    )
-    acc_im = (
-        tl.load(
-            data_ri_ptr
-            + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2
-            + 1,
-            mask=start < end,
-            other=0.0,
-        )
-        * 0
-    )
+    acc_re = tl.load(
+        data_ri_ptr + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2,
+        mask=start < end,
+        other=0.0,
+    ) * 0
+    acc_im = tl.load(
+        data_ri_ptr + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2 + 1,
+        mask=start < end,
+        other=0.0,
+    ) * 0
     for inner_col in tl.static_range(0, BLOCK_DIM):
         col = bcols * BLOCK_DIM + inner_col
         valid = mask
@@ -255,6 +269,107 @@ def _spmv_bsr_non_complex_kernel(
         acc_im += tl.sum(tl.where(valid, prod_im, 0.0))
     tl.atomic_add(y_ri_ptr + row * 2, acc_re)
     tl.atomic_add(y_ri_ptr + row * 2 + 1, acc_im)
+
+
+@triton.jit
+def _spmv_bsr_blockrow_reduce_real_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    rows_ptr,
+    x_ptr,
+    y_ptr,
+    n_bucket_rows,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    DIRECT_STORE: tl.constexpr,
+):
+    row_pos = tl.program_id(0)
+    seg = tl.program_id(1)
+    if row_pos >= n_bucket_rows:
+        return
+    brow = tl.load(rows_ptr + row_pos)
+    start = tl.load(indptr_ptr + brow)
+    end = tl.load(indptr_ptr + brow + 1)
+    seg_start = start + seg * BLOCK_NNZ
+    offs = seg_start + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
+    for inner_row in tl.static_range(0, BLOCK_DIM):
+        acc = tl.load(
+            data_ptr + start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM,
+            mask=start < end,
+            other=0.0,
+        ) * 0
+        for inner_col in tl.static_range(0, BLOCK_DIM):
+            col = bcols * BLOCK_DIM + inner_col
+            vals = tl.load(
+                data_ptr + offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col,
+                mask=mask,
+                other=0.0,
+            )
+            x_vals = tl.load(x_ptr + col, mask=mask, other=0.0)
+            acc += tl.sum(tl.where(mask, vals * x_vals, 0.0))
+        out_row = brow * BLOCK_DIM + inner_row
+        if DIRECT_STORE:
+            tl.store(y_ptr + out_row, acc)
+        else:
+            tl.atomic_add(y_ptr + out_row, acc)
+
+
+@triton.jit
+def _spmv_bsr_blockrow_reduce_complex_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    rows_ptr,
+    x_ri_ptr,
+    y_ri_ptr,
+    n_bucket_rows,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    DIRECT_STORE: tl.constexpr,
+):
+    row_pos = tl.program_id(0)
+    seg = tl.program_id(1)
+    if row_pos >= n_bucket_rows:
+        return
+    brow = tl.load(rows_ptr + row_pos)
+    start = tl.load(indptr_ptr + brow)
+    end = tl.load(indptr_ptr + brow + 1)
+    seg_start = start + seg * BLOCK_NNZ
+    offs = seg_start + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
+    for inner_row in tl.static_range(0, BLOCK_DIM):
+        acc_re = tl.load(
+            data_ri_ptr + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2,
+            mask=start < end,
+            other=0.0,
+        ) * 0
+        acc_im = tl.load(
+            data_ri_ptr + (start * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM) * 2 + 1,
+            mask=start < end,
+            other=0.0,
+        ) * 0
+        for inner_col in tl.static_range(0, BLOCK_DIM):
+            col = bcols * BLOCK_DIM + inner_col
+            elem = offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col
+            a_re = tl.load(data_ri_ptr + elem * 2, mask=mask, other=0.0)
+            a_im = tl.load(data_ri_ptr + elem * 2 + 1, mask=mask, other=0.0)
+            x_re = tl.load(x_ri_ptr + col * 2, mask=mask, other=0.0)
+            x_im = tl.load(x_ri_ptr + col * 2 + 1, mask=mask, other=0.0)
+            prod_re = a_re * x_re - a_im * x_im
+            prod_im = a_re * x_im + a_im * x_re
+            acc_re += tl.sum(tl.where(mask, prod_re, 0.0))
+            acc_im += tl.sum(tl.where(mask, prod_im, 0.0))
+        out_row = brow * BLOCK_DIM + inner_row
+        if DIRECT_STORE:
+            tl.store(y_ri_ptr + out_row * 2, acc_re)
+            tl.store(y_ri_ptr + out_row * 2 + 1, acc_im)
+        else:
+            tl.atomic_add(y_ri_ptr + out_row * 2, acc_re)
+            tl.atomic_add(y_ri_ptr + out_row * 2 + 1, acc_im)
 
 
 @triton.jit
@@ -376,7 +491,9 @@ def _prepare_spmv_bsr_matrix(data, indices, indptr, shape, block_dim):
         if min_index < 0 or max_index >= n_block_cols:
             raise IndexError("indices out of range for n_block_cols")
     block_row_lengths = indptr[1:] - indptr[:-1]
-    max_block_row_nnz = int(block_row_lengths.max().item()) if n_block_rows > 0 else 0
+    max_block_row_nnz = (
+        int(block_row_lengths.max().item()) if n_block_rows > 0 else 0
+    )
     return (
         data,
         indices,
@@ -400,6 +517,7 @@ def prepare_spmv_bsr(
     max_segments=None,
     transpose=False,
     op=None,
+    use_opt=False,
     index_fallback_policy="auto",
 ):
     index_fallback_policy = _normalize_spmv_bsr_index_fallback_policy(
@@ -407,6 +525,11 @@ def prepare_spmv_bsr(
     )
     op_code = _normalize_spmv_bsr_op(op, transpose=transpose)
     _ensure_spmv_bsr_supported_op(op_code)
+    algorithm = _normalize_spmv_bsr_algorithm(use_opt)
+    if algorithm == SPMV_BSR_ALG_BLOCKROW_REDUCE and op_code != SPMV_BSR_OP_NON:
+        raise ValueError("spmv_bsr_blockrow_reduce only supports op='non'")
+    if algorithm == SPMV_BSR_ALG_BLOCKROW_REDUCE and int(block_dim) not in (2, 4, 8, 16):
+        raise ValueError("spmv_bsr_blockrow_reduce supports block_dim values 2, 4, 8, and 16")
     (
         data,
         indices,
@@ -422,9 +545,7 @@ def prepare_spmv_bsr(
     if block_nnz_use <= 0:
         raise ValueError("block_nnz must be positive")
     if max_segments is None:
-        max_segments_use = max(
-            (max_block_row_nnz + block_nnz_use - 1) // block_nnz_use, 1
-        )
+        max_segments_use = max((max_block_row_nnz + block_nnz_use - 1) // block_nnz_use, 1)
         while max_segments_use > 2048 and block_nnz_use < 65536:
             block_nnz_use *= 2
             max_segments_use = max(
@@ -459,9 +580,7 @@ def _validate_spmv_bsr_x(x, prepared, op_code):
         raise ValueError("x must be a CUDA tensor")
     if x.dtype != prepared.data.dtype:
         raise TypeError("x dtype must match sparse matrix dtype")
-    logical_expected = (
-        prepared.n_rows if _spmv_bsr_op_transposes(op_code) else prepared.n_cols
-    )
+    logical_expected = prepared.n_rows if _spmv_bsr_op_transposes(op_code) else prepared.n_cols
     padded_expected = (
         prepared.padded_n_rows
         if _spmv_bsr_op_transposes(op_code)
@@ -552,6 +671,130 @@ def _triton_spmv_bsr_kernel(prepared, x, op_code):
     return y
 
 
+def _spmv_bsr_blockrow_reduce_bucket_specs():
+    return (
+        ("le1", 0, 1, 1, True),
+        ("le4", 2, 4, 4, True),
+        ("le16", 5, 16, 16, True),
+        ("le64", 17, 64, 64, True),
+        ("gt64", 65, None, 128, False),
+    )
+
+
+def _build_spmv_bsr_blockrow_reduce_buckets(row_lengths, max_block_row_nnz):
+    buckets = []
+    lengths = row_lengths.to(torch.int64)
+    for label, low, high, block_nnz, direct_store in _spmv_bsr_blockrow_reduce_bucket_specs():
+        mask = lengths >= int(low)
+        if high is not None:
+            mask = mask & (lengths <= int(high))
+        rows = torch.nonzero(mask, as_tuple=False).flatten().to(torch.int64).contiguous()
+        if rows.numel() == 0:
+            continue
+        segments = 1 if direct_store else max(1, (int(max_block_row_nnz) + block_nnz - 1) // block_nnz)
+        buckets.append(
+            {
+                "label": label,
+                "rows": rows,
+                "block_nnz": int(block_nnz),
+                "segments": int(segments),
+                "direct_store": bool(direct_store),
+            }
+        )
+    return buckets
+
+
+def _triton_spmv_bsr_blockrow_reduce_kernel(prepared, x, buckets=None):
+    if prepared.op != SPMV_BSR_OP_NON:
+        raise ValueError("spmv_bsr_blockrow_reduce only supports op='non'")
+    dtype = prepared.data.dtype
+    y = torch.zeros(prepared.padded_n_rows, dtype=dtype, device=prepared.data.device)
+    if prepared.nnzb == 0:
+        return y
+    if buckets is None:
+        buckets = _build_spmv_bsr_blockrow_reduce_buckets(
+            prepared.block_row_lengths, prepared.max_block_row_nnz
+        )
+    if _is_complex_dtype(dtype):
+        data_ri = torch.view_as_real(prepared.data).reshape(-1)
+        x_ri = torch.view_as_real(x).reshape(-1)
+        y_ri = torch.view_as_real(y).reshape(-1)
+        for bucket in buckets:
+            rows = bucket["rows"]
+            if rows.numel() == 0:
+                continue
+            grid = (rows.numel(), bucket["segments"])
+            _spmv_bsr_blockrow_reduce_complex_kernel[grid](
+                data_ri,
+                prepared.kernel_indices,
+                prepared.kernel_indptr,
+                rows,
+                x_ri,
+                y_ri,
+                rows.numel(),
+                BLOCK_DIM=prepared.block_dim,
+                BLOCK_NNZ=bucket["block_nnz"],
+                DIRECT_STORE=bucket["direct_store"],
+            )
+    else:
+        for bucket in buckets:
+            rows = bucket["rows"]
+            if rows.numel() == 0:
+                continue
+            grid = (rows.numel(), bucket["segments"])
+            _spmv_bsr_blockrow_reduce_real_kernel[grid](
+                prepared.data,
+                prepared.kernel_indices,
+                prepared.kernel_indptr,
+                rows,
+                x,
+                y,
+                rows.numel(),
+                BLOCK_DIM=prepared.block_dim,
+                BLOCK_NNZ=bucket["block_nnz"],
+                DIRECT_STORE=bucket["direct_store"],
+            )
+    return y
+
+
+def _run_spmv_bsr_blockrow_reduce_with_timing(prepared, x):
+    torch.cuda.synchronize()
+    process_start = torch.cuda.Event(enable_timing=True)
+    process_end = torch.cuda.Event(enable_timing=True)
+    process_start.record()
+    buckets = _build_spmv_bsr_blockrow_reduce_buckets(
+        prepared.block_row_lengths, prepared.max_block_row_nnz
+    )
+    process_end.record()
+    torch.cuda.synchronize()
+    process_gpu_ms = process_start.elapsed_time(process_end)
+    compute_start = torch.cuda.Event(enable_timing=True)
+    compute_end = torch.cuda.Event(enable_timing=True)
+    compute_start.record()
+    y = _triton_spmv_bsr_blockrow_reduce_kernel(prepared, x, buckets=buckets)
+    compute_end.record()
+    torch.cuda.synchronize()
+    compute_ms = compute_start.elapsed_time(compute_end)
+    return y, {
+        "process_cpu_ms": 0.0,
+        "process_gpu_ms": process_gpu_ms,
+        "compute_ms": compute_ms,
+        "bucket_counts": [
+            {"bucket": bucket["label"], "rows": int(bucket["rows"].numel())}
+            for bucket in buckets
+        ],
+        "launch_configs": [
+            {
+                "bucket": bucket["label"],
+                "block_nnz": bucket["block_nnz"],
+                "segments": bucket["segments"],
+                "direct_store": bucket["direct_store"],
+            }
+            for bucket in buckets
+        ],
+    }
+
+
 def _spmv_bsr_uses_int64_indices(prepared):
     return (
         prepared.kernel_indices.dtype == torch.int64
@@ -596,9 +839,47 @@ def _spmv_bsr_prepared_with_int32_indices(prepared, reason):
     )
 
 
-def _run_spmv_bsr_prepared_with_fallback(prepared, x, op_code):
+def _run_spmv_bsr_algorithm(prepared, x, op_code, algorithm, collect_timing=False):
+    if algorithm == SPMV_BSR_ALG_BLOCKROW_REDUCE:
+        if op_code != SPMV_BSR_OP_NON:
+            raise ValueError("spmv_bsr_blockrow_reduce only supports op='non'")
+        if collect_timing:
+            return _run_spmv_bsr_blockrow_reduce_with_timing(prepared, x)
+        return _triton_spmv_bsr_blockrow_reduce_kernel(prepared, x), {
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": None,
+            "compute_ms": None,
+            "bucket_counts": None,
+            "launch_configs": None,
+        }
+    if collect_timing:
+        torch.cuda.synchronize()
+        compute_start = torch.cuda.Event(enable_timing=True)
+        compute_end = torch.cuda.Event(enable_timing=True)
+        compute_start.record()
+        y = _triton_spmv_bsr_kernel(prepared, x, op_code)
+        compute_end.record()
+        torch.cuda.synchronize()
+        compute_ms = compute_start.elapsed_time(compute_end)
+        return y, {
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0,
+            "compute_ms": compute_ms,
+            "bucket_counts": None,
+            "launch_configs": None,
+        }
+    return _triton_spmv_bsr_kernel(prepared, x, op_code), {
+        "process_cpu_ms": 0.0,
+        "process_gpu_ms": None,
+        "compute_ms": None,
+        "bucket_counts": None,
+        "launch_configs": None,
+    }
+
+
+def _run_spmv_bsr_prepared_with_fallback(prepared, x, op_code, algorithm, collect_timing=False):
     try:
-        return _triton_spmv_bsr_kernel(prepared, x, op_code)
+        return _run_spmv_bsr_algorithm(prepared, x, op_code, algorithm, collect_timing=collect_timing)
     except RuntimeError as exc:
         if (
             prepared.index_fallback_policy != "auto"
@@ -606,7 +887,9 @@ def _run_spmv_bsr_prepared_with_fallback(prepared, x, op_code):
         ):
             raise
         fallback_prepared = _spmv_bsr_prepared_with_int32_indices(prepared, exc)
-        return _triton_spmv_bsr_kernel(fallback_prepared, x, op_code)
+        return _run_spmv_bsr_algorithm(
+            fallback_prepared, x, op_code, algorithm, collect_timing=collect_timing
+        )
 
 
 def flagsparse_spmv_bsr(
@@ -624,6 +907,7 @@ def flagsparse_spmv_bsr(
     prepared=None,
     transpose=None,
     op=None,
+    use_opt=False,
     index_fallback_policy="auto",
 ):
     """BSR SpMV using a native Triton BSR kernel."""
@@ -639,6 +923,9 @@ def flagsparse_spmv_bsr(
     ):
         raise ValueError("transpose conflicts with op")
     _ensure_spmv_bsr_supported_op(op_code)
+    algorithm = _normalize_spmv_bsr_algorithm(use_opt)
+    if algorithm == SPMV_BSR_ALG_BLOCKROW_REDUCE and op_code != SPMV_BSR_OP_NON:
+        raise ValueError("spmv_bsr_blockrow_reduce only supports op='non'")
     if prepared is None:
         if any(arg is None for arg in (data, indices, indptr, shape, block_dim)):
             raise ValueError(
@@ -653,6 +940,7 @@ def flagsparse_spmv_bsr(
             block_nnz=block_nnz,
             max_segments=max_segments,
             op=op_code,
+            use_opt=algorithm,
             index_fallback_policy=index_fallback_policy,
         )
     else:
@@ -670,18 +958,33 @@ def flagsparse_spmv_bsr(
             )
         if not op_explicit:
             op_code = prepared.op
+    if algorithm == SPMV_BSR_ALG_BLOCKROW_REDUCE and op_code != SPMV_BSR_OP_NON:
+        raise ValueError("spmv_bsr_blockrow_reduce only supports op='non'")
+    if algorithm == SPMV_BSR_ALG_BLOCKROW_REDUCE and prepared.block_dim not in (2, 4, 8, 16):
+        raise ValueError("spmv_bsr_blockrow_reduce supports block_dim values 2, 4, 8, and 16")
     x = _validate_spmv_bsr_x(x, prepared, op_code)
     do_timing = bool(return_time or return_meta)
     if do_timing:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    y = _run_spmv_bsr_prepared_with_fallback(prepared, x, op_code)
+    y, alg_timing = _run_spmv_bsr_prepared_with_fallback(
+        prepared, x, op_code, algorithm, collect_timing=do_timing
+    )
     if do_timing:
         torch.cuda.synchronize()
-        compute_ms = (time.perf_counter() - t0) * 1000.0
-        op_total_ms = compute_ms
+        wall_total_ms = (time.perf_counter() - t0) * 1000.0
+        compute_ms = alg_timing["compute_ms"]
+        process_cpu_ms = alg_timing["process_cpu_ms"]
+        process_gpu_ms = alg_timing["process_gpu_ms"]
+        op_total_ms = (
+            process_cpu_ms + process_gpu_ms + compute_ms
+            if process_gpu_ms is not None and compute_ms is not None
+            else wall_total_ms
+        )
     else:
         compute_ms = None
+        process_cpu_ms = None
+        process_gpu_ms = None
         op_total_ms = None
     if out is not None:
         if not out.is_cuda:
@@ -694,6 +997,7 @@ def flagsparse_spmv_bsr(
         y = out
     if return_meta:
         meta = {
+            "algorithm": algorithm,
             "op": _spmv_bsr_op_to_name(op_code),
             "block_dim": prepared.block_dim,
             "logical_shape": prepared.shape,
@@ -702,9 +1006,13 @@ def flagsparse_spmv_bsr(
             "n_block_cols": prepared.n_block_cols,
             "nnzb": prepared.nnzb,
             "stored_nnz": prepared.stored_nnz,
-            "symbolic_ms": 0.0 if do_timing else None,
+            "symbolic_ms": (process_cpu_ms or 0.0) + (process_gpu_ms or 0.0) if do_timing else None,
+            "process_cpu_ms": process_cpu_ms,
+            "process_gpu_ms": process_gpu_ms,
             "compute_ms": compute_ms,
             "op_total_ms": op_total_ms,
+            "bucket_counts": alg_timing["bucket_counts"],
+            "launch_configs": alg_timing["launch_configs"],
             "index_fallback_applied": prepared.index_fallback_applied,
             "index_fallback_reason": prepared.index_fallback_reason,
         }
