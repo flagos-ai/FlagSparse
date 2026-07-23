@@ -120,6 +120,7 @@ from .spsv import (
     flagsparse_create_spsv_handle,
     flagsparse_spsv_analysis_coo,
     flagsparse_spsv_analysis_csr,
+    flagsparse_spsv_analysis_sell,
     flagsparse_spsv_analysis_ex,
     flagsparse_spsv_buffer_size,
     flagsparse_spsv_buffer_size_ex,
@@ -132,6 +133,7 @@ from .spsv import (
     flagsparse_spsv_solve_ex,
     flagsparse_spsv_solve_coo,
     flagsparse_spsv_solve_csr,
+    flagsparse_spsv_solve_sell,
 )
 
 _BENCHMARK_EXPORTS = {
@@ -213,6 +215,7 @@ __all__ = [
     "flagsparse_create_spsv_handle",
     "flagsparse_spsv_analysis_coo",
     "flagsparse_spsv_analysis_csr",
+    "flagsparse_spsv_analysis_sell",
     "flagsparse_spsv_analysis_ex",
     "flagsparse_spsv_buffer_size",
     "flagsparse_spsv_buffer_size_ex",
@@ -225,6 +228,7 @@ __all__ = [
     "flagsparse_spsv_solve_ex",
     "flagsparse_spsv_solve_coo",
     "flagsparse_spsv_solve_csr",
+    "flagsparse_spsv_solve_sell",
     "list_spmm_csr_algorithms",
     "list_spmm_coo_algorithms",
     "prepare_sddmm_csr",

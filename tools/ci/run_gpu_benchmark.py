@@ -123,6 +123,8 @@ def _command_specs(
             "--synthetic",
             "--ops",
             "non,trans,conj",
+            "--alg",
+            "compare",
             "--warmup",
             str(args.warmup),
             "--iters",

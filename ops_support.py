@@ -351,6 +351,17 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
         ),
         ApiSpec(
             "spmv",
+            "flagsparse_spmv_bsr",
+            "spmv_bsr",
+            "BSR",
+            "triton_blockrow_reduce",
+            value_const="SUPPORTED_SPMV_BSR_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=("non",),
+            notes="spmv_bsr_blockrow_reduce uses GPU block-row buckets and tile reduction; supports non only",
+        ),
+        ApiSpec(
+            "spmv",
             "flagsparse_spmv_coo_tocsr",
             "spmv_csr",
             "COO->CSR",
@@ -455,7 +466,7 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             values=("float32", "float64"),
             indices=("int32", "int64"),
             ops=("NON_TRANS",),
-            notes="lower triangular; cuSPARSE-compatible column-major SELL storage; native Triton solve",
+            notes="direct API plus explicit flagsparse_spsv_analysis_sell + flagsparse_spsv_solve_sell lifecycle; lower triangular; cuSPARSE-compatible column-major SELL storage; ALG1 original persistent-row and ALG2 slice-cooperative Triton kernels",
         ),
         ApiSpec(
             "spsm",
