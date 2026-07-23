@@ -37,6 +37,39 @@ SPSV_TRANS_SUPPORTED_COMBOS = (
     (torch.complex64, torch.int64),
     (torch.complex128, torch.int64),
 )
+SPSV_SELL_ALG1 = 1
+SPSV_SELL_ALG2 = 2
+
+
+def _normalize_spsv_sell_alg_num(alg_num):
+    try:
+        alg_num = int(alg_num)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SELL SpSV alg_num must be 1 or 2") from exc
+    if alg_num not in (SPSV_SELL_ALG1, SPSV_SELL_ALG2):
+        raise ValueError("SELL SpSV alg_num must be 1 or 2")
+    return alg_num
+
+
+def _resolve_spsv_sell_alg2_worker_count(n_slices, requested=None):
+    n_slices = int(n_slices)
+    if n_slices <= 0:
+        return 1
+    if requested is not None:
+        requested = int(requested)
+        if requested <= 0:
+            raise ValueError("SELL SpSV ALG2 worker count must be positive")
+        return min(requested, n_slices)
+
+    # A SELL worker already exposes up to slice_size rows.  The full-matrix
+    # results show no consistent benefit from raising the grid to 128 workers,
+    # while deep dependency chains pay substantially more ready-flag polling
+    # contention.  Keep a conservative upper bound; callers can still override
+    # it explicitly for architecture-specific experiments.
+    target = 64
+    return _snap_cw_worker_count(min(target, n_slices), n_slices)
+
+
 def _spsv_env_flag(name, default="0"):
     return str(os.environ.get(name, default)).lower() in ("1", "true", "yes", "on")
 
@@ -320,23 +353,22 @@ def _prepare_spsv_inputs(data, indices, indptr, b, shape):
     )
 
 
-def _prepare_spsv_sell_inputs(
+def _prepare_spsv_sell_matrix_inputs(
     values,
     col_indices,
     slice_offsets,
-    b,
     shape,
     slice_size,
 ):
-    """Validate cuSPARSE-compatible column-major SELL inputs."""
+    """Validate the reusable sparse-matrix part of a SELL SpSV problem."""
 
-    tensors = (values, col_indices, slice_offsets, b)
+    tensors = (values, col_indices, slice_offsets)
     if not all(torch.is_tensor(t) for t in tensors):
-        raise TypeError("SELL SpSV inputs must be torch.Tensor")
+        raise TypeError("SELL SpSV matrix inputs must be torch.Tensor")
     if any(not t.is_cuda or t.ndim != 1 for t in tensors):
-        raise ValueError("SELL SpSV inputs must be 1D CUDA tensors")
+        raise ValueError("SELL SpSV matrix inputs must be 1D CUDA tensors")
     if len({t.device for t in tensors}) != 1:
-        raise ValueError("SELL SpSV inputs must use one CUDA device")
+        raise ValueError("SELL SpSV matrix inputs must use one CUDA device")
 
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if n_rows != n_cols:
@@ -347,8 +379,8 @@ def _prepare_spsv_sell_inputs(
     n_slices = (n_rows + slice_size - 1) // slice_size
     if slice_offsets.numel() != n_slices + 1:
         raise ValueError("invalid slice_offsets length")
-    if values.numel() != col_indices.numel() or b.numel() != n_rows:
-        raise ValueError("invalid SELL values, columns, or right-hand-side length")
+    if values.numel() != col_indices.numel():
+        raise ValueError("invalid SELL values or columns length")
     if values.dtype not in (torch.float32, torch.float64):
         raise TypeError("SELL values must be float32 or float64")
     if (
@@ -356,9 +388,6 @@ def _prepare_spsv_sell_inputs(
         or slice_offsets.dtype != col_indices.dtype
     ):
         raise TypeError("SELL columns and offsets must share int32 or int64 dtype")
-    if b.dtype != values.dtype:
-        raise TypeError("b dtype must match SELL values")
-
     offsets = slice_offsets.contiguous()
     cols = col_indices.contiguous()
     slice_lengths = offsets[1:] - offsets[:-1]
@@ -372,11 +401,38 @@ def _prepare_spsv_sell_inputs(
     if cols.numel() > 0:
         if bool(torch.any(cols < -1).item()):
             raise IndexError("SELL padding must use column index -1")
-        valid_cols = cols >= 0
-        if bool(torch.any(cols[valid_cols] >= n_cols).item()):
+        if bool(torch.any(cols >= n_cols).item()):
             raise IndexError("SELL column index is out of range")
 
-    return values.contiguous(), cols, offsets, b.contiguous(), n_rows, slice_size
+    return values.contiguous(), cols, offsets, n_rows, slice_size
+
+
+def _prepare_spsv_sell_inputs(
+    values,
+    col_indices,
+    slice_offsets,
+    b,
+    shape,
+    slice_size,
+):
+    """Validate a complete cuSPARSE-compatible SELL SpSV call."""
+
+    values, cols, offsets, n_rows, slice_size = (
+        _prepare_spsv_sell_matrix_inputs(
+            values, col_indices, slice_offsets, shape, slice_size
+        )
+    )
+    if not torch.is_tensor(b):
+        raise TypeError("SELL SpSV right-hand side must be a torch.Tensor")
+    if not b.is_cuda or b.ndim != 1:
+        raise ValueError("SELL SpSV right-hand side must be a 1D CUDA tensor")
+    if b.device != values.device:
+        raise ValueError("SELL SpSV inputs must use one CUDA device")
+    if b.numel() != n_rows:
+        raise ValueError("invalid SELL right-hand-side length")
+    if b.dtype != values.dtype:
+        raise TypeError("b dtype must match SELL values")
+    return values, cols, offsets, b.contiguous(), n_rows, slice_size
 
 
 def _spsv_diag_eps_for_dtype(value_dtype):
@@ -504,7 +560,7 @@ def _spsv_effective_compute_dtype(value_dtype, trans_mode, compute_dtype=None):
 
 def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
     n_rows = int(n_rows)
-    if solve_kind == "csr_cw":
+    if solve_kind in ("csr_cw", "sell_alg1", "sell_alg2"):
         return (
             _workspace_entry("ready", n_rows, torch.int32),
             _workspace_entry("row_counter", 1, torch.int32),
@@ -2048,7 +2104,7 @@ def _spsv_csr_cw_kernel_complex(
 
 
 @triton.jit
-def _spsv_sell_cw_kernel(
+def _spsv_sell_cw_kernel_alg1(
     values_ptr,
     col_indices_ptr,
     slice_offsets_ptr,
@@ -2060,7 +2116,7 @@ def _spsv_sell_cw_kernel(
     SLICE_SIZE: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
 ):
-    """Persistent dependency solve over cuSPARSE column-major SELL storage."""
+    """ALG1: original persistent scalar-row dependency solver."""
 
     logical_row = tl.atomic_add(row_counter_ptr, 1)
     while logical_row < n_rows:
@@ -2107,6 +2163,133 @@ def _spsv_sell_cw_kernel(
         tl.store(x_ptr + row, x_row)
         _publish_ready_flag_i32(ready_ptr, row)
         logical_row = tl.atomic_add(row_counter_ptr, 1)
+
+
+@triton.jit
+def _spsv_sell_slice_kernel_alg2(
+    values_ptr,
+    col_indices_ptr,
+    slice_offsets_ptr,
+    b_ptr,
+    x_ptr,
+    ready_ptr,
+    row_counter_ptr,
+    n_rows,
+    n_slices,
+    SLICE_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+):
+    """ALG2: persistent slice-cooperative SELL dependency solver.
+
+    Each lane owns one row in a SELL slice.  Advancing all rows through their
+    current SELL slot keeps column/index loads coalesced, while the per-lane
+    slot state lets independent rows continue instead of waiting for the most
+    serialized row in the slice.  Claiming slices from one ascending counter
+    keeps the active dependency window contiguous even when not every program
+    can reside concurrently.
+    """
+
+    lanes = tl.arange(0, BLOCK_ROWS)
+    zero_i32 = tl.zeros((BLOCK_ROWS,), dtype=tl.int32)
+    logical_slice = tl.atomic_add(row_counter_ptr, 1, sem="relaxed")
+    while logical_slice < n_slices:
+        slice_id = logical_slice
+        slice_start = tl.load(slice_offsets_ptr + slice_id)
+        slice_end = tl.load(slice_offsets_ptr + slice_id + 1)
+        width = (slice_end - slice_start) // SLICE_SIZE
+        row = slice_id * SLICE_SIZE + lanes
+        valid_row = (lanes < SLICE_SIZE) & (row < n_rows)
+        rhs = tl.load(b_ptr + row, mask=valid_row, other=0.0)
+        if USE_FP64_ACC:
+            rhs = rhs.to(tl.float64)
+            tmp_sum = tl.zeros((BLOCK_ROWS,), dtype=tl.float64)
+            diag = tl.zeros((BLOCK_ROWS,), dtype=tl.float64)
+        else:
+            rhs = rhs.to(tl.float32)
+            tmp_sum = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+            diag = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+
+        slot = zero_i32
+        has_diag = ~valid_row
+        done = ~valid_row
+        while tl.sum((~done).to(tl.int32), axis=0) != 0:
+            in_bounds = slot < width
+            active = (~done) & in_bounds
+            offset = slice_start + slot * SLICE_SIZE + lanes
+            col = tl.load(col_indices_ptr + offset, mask=active, other=-1)
+
+            dependency = active & (col >= 0) & (col < row)
+            # Poll with volatile non-caching loads first.  Deep dependency
+            # chains otherwise issue thousands of contending atomic RMWs for
+            # flags that are still zero.  One acquire atomic is retained after
+            # the hint turns nonzero to order the dependent x load.
+            ready_hint = tl.load(
+                ready_ptr + col,
+                mask=dependency,
+                other=0,
+                cache_modifier=".cv",
+                volatile=True,
+            )
+            acquire_mask = dependency & (ready_hint != 0)
+            dep_ready = tl.atomic_add(
+                ready_ptr + col,
+                zero_i32,
+                mask=acquire_mask,
+                sem="acquire",
+            )
+            consume = acquire_mask & (dep_ready != 0)
+            value = tl.load(values_ptr + offset, mask=consume, other=0.0)
+            # The ready atomic is the acquire point for the preceding x store;
+            # the dependent value itself does not need another floating-point
+            # atomic read.
+            x_dep = tl.load(
+                x_ptr + col,
+                mask=consume,
+                other=0.0,
+                cache_modifier=".cv",
+            )
+            if USE_FP64_ACC:
+                value = value.to(tl.float64)
+                x_dep = x_dep.to(tl.float64)
+            else:
+                value = value.to(tl.float32)
+                x_dep = x_dep.to(tl.float32)
+            tmp_sum += tl.where(consume, value * x_dep, 0.0)
+
+            diagonal = active & (col == row)
+            diag_value = tl.load(values_ptr + offset, mask=diagonal, other=0.0)
+            if USE_FP64_ACC:
+                diag_value = diag_value.to(tl.float64)
+            else:
+                diag_value = diag_value.to(tl.float32)
+            diag = tl.where(diagonal, diag_value, diag)
+            has_diag = has_diag | diagonal
+
+            # Padding marks the end of this row even when another row in the
+            # same slice is much longer.  Finish immediately instead of
+            # scanning all remaining padded slots up to the slice width.
+            padding = active & (col < 0)
+            skip = active & ((col < 0) | (col > row))
+            slot = slot + (consume | diagonal | skip).to(tl.int32)
+            finished = (~done) & (padding | (slot >= width))
+            diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
+            x_row = (rhs - tmp_sum) / diag_safe
+            x_row = tl.where(has_diag, x_row, 0.0)
+            x_row = tl.where(x_row == x_row, x_row, 0.0)
+            tl.store(
+                x_ptr + row,
+                x_row,
+                mask=finished,
+                cache_modifier=".wt",
+            )
+            # Release publication follows the x store; dependent lanes use an
+            # acquire atomic before reading x.
+            tl.atomic_add(ready_ptr + row, 1, mask=finished, sem="release")
+            done = done | finished
+
+        logical_slice = tl.atomic_add(row_counter_ptr, 1, sem="relaxed")
 
 
 @triton.jit
@@ -3091,13 +3274,39 @@ def _launch_spsv_sell(
     out,
     ready,
     row_counter,
+    alg_num=1,
+    alg2_worker_count=None,
 ):
+    alg_num = _normalize_spsv_sell_alg_num(alg_num)
     ready.zero_()
     row_counter.zero_()
     if n_rows == 0:
         return out
-    worker_count = _snap_cw_worker_count(min(n_rows, 32), n_rows)
-    _spsv_sell_cw_kernel[(int(worker_count),)](
+    if alg_num == SPSV_SELL_ALG1:
+        worker_count = _snap_cw_worker_count(min(n_rows, 32), n_rows)
+        _spsv_sell_cw_kernel_alg1[(int(worker_count),)](
+            values,
+            col_indices,
+            slice_offsets,
+            b_vec,
+            out,
+            ready,
+            row_counter,
+            n_rows,
+            SLICE_SIZE=int(slice_size),
+            USE_FP64_ACC=values.dtype == torch.float64,
+        )
+        return out
+
+    n_slices = (int(n_rows) + int(slice_size) - 1) // int(slice_size)
+    block_rows = 1 << (int(slice_size) - 1).bit_length()
+    # One warp/program advances SELL slices from a contiguous dynamic frontier.
+    # The worker cap limits ready polling contention; benchmarks may override
+    # it explicitly.
+    worker_count = _resolve_spsv_sell_alg2_worker_count(
+        n_slices, requested=alg2_worker_count
+    )
+    _spsv_sell_slice_kernel_alg2[(int(worker_count),)](
         values,
         col_indices,
         slice_offsets,
@@ -3106,8 +3315,12 @@ def _launch_spsv_sell(
         ready,
         row_counter,
         n_rows,
+        n_slices,
         SLICE_SIZE=int(slice_size),
+        BLOCK_ROWS=int(block_rows),
         USE_FP64_ACC=values.dtype == torch.float64,
+        DIAG_EPS=_spsv_diag_eps_for_dtype(values.dtype),
+        num_warps=1,
     )
     return out
 
@@ -4683,6 +4896,127 @@ def flagsparse_spsv_solve_ex(
     raise ValueError("matA.format must be 'csr' or 'coo'")
 
 
+def flagsparse_spsv_analysis_sell(
+    values,
+    col_indices,
+    slice_offsets,
+    shape,
+    *,
+    slice_size,
+    alg_num=1,
+    alg2_worker_count=None,
+    workspace=None,
+):
+    """Analyze a lower real SELL SpSV problem and return a reusable descriptor."""
+
+    values, cols, offsets, n_rows, slice_size = (
+        _prepare_spsv_sell_matrix_inputs(
+            values, col_indices, slice_offsets, shape, slice_size
+        )
+    )
+    alg_num = _normalize_spsv_sell_alg_num(alg_num)
+    n_slices = (n_rows + slice_size - 1) // slice_size
+    resolved_workers = (
+        None
+        if alg_num == SPSV_SELL_ALG1
+        else _resolve_spsv_sell_alg2_worker_count(
+            n_slices, requested=alg2_worker_count
+        )
+    )
+    solve_kind = f"sell_alg{alg_num}"
+    layout = _build_spsv_workspace_layout(
+        n_rows, solve_kind, value_dtype=values.dtype
+    )
+    if workspace is not None:
+        _resolve_spsv_workspace(workspace, layout, values.device)
+    solve_plan = {
+        "solve_kind": solve_kind,
+        "slice_size": int(slice_size),
+        "alg_num": int(alg_num),
+        "alg2_worker_count": resolved_workers,
+        "n_slices": int(n_slices),
+    }
+    return FlagSparseSpSVDescr(
+        format="sell",
+        canonical_format="sell",
+        shape=(n_rows, n_rows),
+        lower=True,
+        unit_diagonal=False,
+        fill_mode="lower",
+        diag_type="non_unit",
+        matrix_type="triangular",
+        index_base=0,
+        transpose_mode="N",
+        value_dtype=values.dtype,
+        compute_dtype=values.dtype,
+        index_dtype=cols.dtype,
+        solve_kind=solve_kind,
+        route_name=solve_kind,
+        storage_view="sell",
+        buffer_size=_workspace_size_bytes(layout),
+        workspace_layout=layout,
+        data=values,
+        indices=cols,
+        indptr=offsets,
+        solve_plan=solve_plan,
+    )
+
+
+def flagsparse_spsv_solve_sell(
+    descr,
+    b,
+    *,
+    out=None,
+    workspace=None,
+):
+    """Solve a previously analyzed lower real SELL SpSV problem."""
+
+    if not isinstance(descr, FlagSparseSpSVDescr):
+        raise TypeError("descr must be a FlagSparseSpSVDescr")
+    if descr.canonical_format != "sell":
+        raise ValueError("descr must reference a SELL SpSV analysis")
+    if not torch.is_tensor(b):
+        raise TypeError("b must be a torch.Tensor")
+    if not b.is_cuda or b.ndim != 1:
+        raise ValueError("b must be a 1D CUDA tensor")
+    if b.device != descr.data.device:
+        raise ValueError("b device must match the analyzed SELL matrix")
+    if b.dtype != descr.value_dtype:
+        raise TypeError("b dtype must match the analyzed SELL matrix")
+    n_rows = int(descr.shape[0])
+    if int(b.numel()) != n_rows:
+        raise ValueError(f"b length must equal n_rows={n_rows}")
+    if out is None:
+        out = torch.empty_like(b)
+    elif (
+        not torch.is_tensor(out)
+        or not out.is_cuda
+        or out.ndim != 1
+        or not out.is_contiguous()
+        or out.device != b.device
+        or out.dtype != b.dtype
+        or int(out.numel()) != n_rows
+    ):
+        raise ValueError("out must be a matching contiguous 1D CUDA tensor")
+    buffers = _resolve_spsv_workspace(
+        workspace, descr.workspace_layout, descr.data.device
+    )
+    plan = descr.solve_plan
+    return _launch_spsv_sell(
+        descr.data,
+        descr.indices,
+        descr.indptr,
+        b.contiguous(),
+        n_rows,
+        slice_size=int(plan["slice_size"]),
+        out=out,
+        ready=buffers["ready"],
+        row_counter=buffers["row_counter"],
+        alg_num=int(plan["alg_num"]),
+        alg2_worker_count=plan.get("alg2_worker_count"),
+    )
+
+
 def flagsparse_spsv_sell(
     values,
     col_indices,
@@ -4691,24 +5025,28 @@ def flagsparse_spsv_sell(
     shape,
     *,
     slice_size,
+    alg_num=1,
+    alg2_worker_count=None,
+    out=None,
+    workspace=None,
 ):
     """Solve a real non-unit lower triangle in column-major SELL format."""
 
-    values, cols, offsets, b, n_rows, slice_size = (
-        _prepare_spsv_sell_inputs(
-            values, col_indices, slice_offsets, b, shape, slice_size
-        )
-    )
-    return _launch_spsv_sell(
+    descr = flagsparse_spsv_analysis_sell(
         values,
-        cols,
-        offsets,
-        b,
-        n_rows,
+        col_indices,
+        slice_offsets,
+        shape,
         slice_size=slice_size,
-        out=torch.empty_like(b),
-        ready=torch.empty(n_rows, dtype=torch.int32, device=b.device),
-        row_counter=torch.empty(1, dtype=torch.int32, device=b.device),
+        alg_num=alg_num,
+        alg2_worker_count=alg2_worker_count,
+        workspace=workspace,
+    )
+    return flagsparse_spsv_solve_sell(
+        descr,
+        b,
+        out=out,
+        workspace=workspace,
     )
 
 

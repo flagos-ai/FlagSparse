@@ -40,8 +40,9 @@ if __name__ != "__main__":
 
 VALUE_DTYPES = (torch.float32, torch.float64)
 INDEX_DTYPES = (torch.int32, torch.int64)
-WARMUP = 1
-ITERS = 1
+SELL_ALG_NUMS = (1, 2)
+WARMUP = 3
+ITERS = 10
 
 CSV_FIELDS = [
     "matrix",
@@ -314,7 +315,7 @@ class _CusparseSellSpSV:
             else ctypes.c_void_p()
         )
 
-    def analysis_and_solve(self):
+    def analysis(self):
         _check(
             self.lib.cusparseSpSV_analysis(
                 self.handle,
@@ -330,6 +331,8 @@ class _CusparseSellSpSV:
             ),
             "cusparseSpSV_analysis",
         )
+
+    def solve(self):
         _check(
             self.lib.cusparseSpSV_solve(
                 self.handle,
@@ -346,6 +349,10 @@ class _CusparseSellSpSV:
         )
         return self.x
 
+    def analysis_and_solve(self):
+        self.analysis()
+        return self.solve()
+
     def close(self):
         if self.descr.value:
             self.lib.cusparseSpSV_destroyDescr(self.descr)
@@ -359,22 +366,44 @@ class _CusparseSellSpSV:
             self.lib.cusparseDestroy(self.handle)
 
 
-def _benchmark_triton(values, cols, offsets, b, n_rows, slice_size):
-    ready = torch.empty(n_rows, dtype=torch.int32, device=b.device)
-    row_counter = torch.empty(1, dtype=torch.int32, device=b.device)
+def _benchmark_triton(
+    values,
+    cols,
+    offsets,
+    b,
+    n_rows,
+    slice_size,
+    alg_num,
+    alg2_worker_count=None,
+):
+    seed_descr = fs.flagsparse_spsv_analysis_sell(
+        values,
+        cols,
+        offsets,
+        (n_rows, n_rows),
+        slice_size=slice_size,
+        alg_num=alg_num,
+        alg2_worker_count=alg2_worker_count,
+    )
+    workspace = fs.flagsparse_spsv_create_workspace(seed_descr)
     out = torch.empty_like(b)
 
     def analysis_and_solve():
-        return spsv_impl._launch_spsv_sell(
+        descr = fs.flagsparse_spsv_analysis_sell(
             values,
             cols,
             offsets,
-            b,
-            n_rows,
+            (n_rows, n_rows),
             slice_size=slice_size,
+            alg_num=alg_num,
+            alg2_worker_count=alg2_worker_count,
+            workspace=workspace,
+        )
+        return fs.flagsparse_spsv_solve_sell(
+            descr,
+            b,
             out=out,
-            ready=ready,
-            row_counter=row_counter,
+            workspace=workspace,
         )
 
     return _time_cuda(analysis_and_solve)
@@ -388,21 +417,37 @@ def _run_case(
     b,
     expected,
     slice_size,
+    alg_num,
+    alg2_worker_count=None,
 ):
     n_rows = int(row_ptr.numel() - 1)
     sell_values, sell_cols, offsets = _csr_to_sell(
         values, cols, row_ptr, n_rows, slice_size
     )
-    public_result = fs.flagsparse_spsv_sell(
+    public_descr = fs.flagsparse_spsv_analysis_sell(
+        sell_values,
+        sell_cols,
+        offsets,
+        (n_rows, n_rows),
+        slice_size=slice_size,
+        alg_num=alg_num,
+        alg2_worker_count=alg2_worker_count,
+    )
+    public_workspace = fs.flagsparse_spsv_create_workspace(public_descr)
+    public_result = fs.flagsparse_spsv_solve_sell(
+        public_descr,
+        b,
+        workspace=public_workspace,
+    )
+    triton_result, triton_ms = _benchmark_triton(
         sell_values,
         sell_cols,
         offsets,
         b,
-        (n_rows, n_rows),
-        slice_size=slice_size,
-    )
-    triton_result, triton_ms = _benchmark_triton(
-        sell_values, sell_cols, offsets, b, n_rows, slice_size
+        n_rows,
+        slice_size,
+        alg_num,
+        alg2_worker_count,
     )
     baseline = _CusparseSellSpSV(
         sell_values,
@@ -419,22 +464,16 @@ def _run_case(
         baseline.close()
 
     err_ref = float(torch.max(torch.abs(public_result - expected)).item())
-    err_res = float(
-        torch.max(
-            torch.abs(
-                _apply_csr_op(
-                    values,
-                    cols,
-                    row_ptr,
-                    triton_result,
-                    (n_rows, n_rows),
-                    "NON",
-                    lower=True,
-                )
-                - b
-            )
-        ).item()
+    reconstructed_b = _apply_csr_op(
+        values,
+        cols,
+        row_ptr,
+        triton_result,
+        (n_rows, n_rows),
+        "NON",
+        lower=True,
     )
+    err_res = float(torch.max(torch.abs(reconstructed_b - b)).item())
     err_cu = float(torch.max(torch.abs(triton_result - cusparse_result)).item())
     atol = 2e-5 if values.dtype == torch.float32 else 1e-11
     rtol = 2e-5 if values.dtype == torch.float32 else 1e-11
@@ -468,16 +507,19 @@ def _run_case(
     return record, triton_result, cusparse_result
 
 
-def _print_header(slice_size, value_dtype, index_dtype):
+def _print_header(
+    slice_size, value_dtype, index_dtype, alg_num, alg2_worker_count=None
+):
     print("=" * 144)
     print(
         f"Value dtype: {_dtype_name(value_dtype)} | "
         f"Index dtype: {_dtype_name(index_dtype)} | SELL | "
-        f"triA=LOWER | opA=NON | slice_size={slice_size}"
+        f"ALG{alg_num} | triA=LOWER | opA=NON | slice_size={slice_size} | "
+        f"workers={alg2_worker_count if alg_num == 2 and alg2_worker_count else 'auto'}"
     )
     print(
         f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}; "
-        "FS.ms and CU.ms both include every per-call analysis/preparation + solve."
+        "FS.ms and CU.ms both include per-call analysis + solve."
     )
     print("CU.spd = CU.ms / FS.ms; PT.spd = PT.ms / FS.ms.")
     print("-" * 144)
@@ -507,7 +549,7 @@ def _print_record(record):
     )
 
 
-def test_spsv_sell_matches_cusparse(value_dtype, index_dtype, slice_size):
+def test_spsv_sell_matches_cusparse(value_dtype, index_dtype, slice_size, alg_num):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
 
@@ -530,7 +572,7 @@ def test_spsv_sell_matches_cusparse(value_dtype, index_dtype, slice_size):
     rtol = 2e-5 if value_dtype == torch.float32 else 1e-11
     try:
         record, triton_result, cusparse_result = _run_case(
-            "synthetic-64", values, cols, row_ptr, b, expected, slice_size
+            "synthetic-64", values, cols, row_ptr, b, expected, slice_size, alg_num
         )
     except (AttributeError, OSError, RuntimeError) as exc:
         pytest.skip(f"native cuSPARSE SELL SpSV is unavailable: {exc}")
@@ -538,8 +580,21 @@ def test_spsv_sell_matches_cusparse(value_dtype, index_dtype, slice_size):
     assert record["status"] == "PASS"
     assert record["FlagSparse_ms"] > 0.0
     assert record["cuSPARSE_ms"] > 0.0
-    _print_header(slice_size, value_dtype, index_dtype)
+    _print_header(slice_size, value_dtype, index_dtype, alg_num)
     _print_record(record)
+
+
+def test_spsv_sell_alg_num_contract():
+    assert spsv_impl._normalize_spsv_sell_alg_num(1) == 1
+    assert spsv_impl._normalize_spsv_sell_alg_num(2) == 2
+    assert spsv_impl._resolve_spsv_sell_alg2_worker_count(3172) == 64
+    assert spsv_impl._resolve_spsv_sell_alg2_worker_count(7077) == 64
+    assert spsv_impl._resolve_spsv_sell_alg2_worker_count(21335) == 64
+    assert spsv_impl._resolve_spsv_sell_alg2_worker_count(100, requested=48) == 48
+    with pytest.raises(ValueError, match="alg_num must be 1 or 2"):
+        spsv_impl._normalize_spsv_sell_alg_num(3)
+    with pytest.raises(ValueError, match="worker count must be positive"):
+        spsv_impl._resolve_spsv_sell_alg2_worker_count(100, requested=0)
 
 
 if __name__ != "__main__":
@@ -548,7 +603,9 @@ if __name__ != "__main__":
     )(
         pytest.mark.parametrize("index_dtype", INDEX_DTYPES)(
             pytest.mark.parametrize("slice_size", (8, 32))(
-                test_spsv_sell_matches_cusparse
+                pytest.mark.parametrize("alg_num", SELL_ALG_NUMS)(
+                    test_spsv_sell_matches_cusparse
+                )
             )
         )
     )
@@ -572,6 +629,21 @@ def main():
     parser.add_argument("mtx", nargs="+", help=".mtx files or directories")
     parser.add_argument("--csv", required=True, help="output CSV path")
     parser.add_argument("--slice-size", type=int, default=32)
+    parser.add_argument(
+        "--alg_num",
+        "--alg-num",
+        dest="alg_num",
+        type=int,
+        choices=SELL_ALG_NUMS,
+        default=1,
+        help="SELL kernel: 1=original persistent row solver, 2=slice-cooperative solver",
+    )
+    parser.add_argument(
+        "--alg2-workers",
+        type=int,
+        default=None,
+        help="override the ALG2 persistent slice-worker count (default: auto)",
+    )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     args = parser.parse_args()
@@ -587,7 +659,13 @@ def main():
     records = []
     for value_dtype in VALUE_DTYPES:
         for index_dtype in INDEX_DTYPES:
-            _print_header(args.slice_size, value_dtype, index_dtype)
+            _print_header(
+                args.slice_size,
+                value_dtype,
+                index_dtype,
+                args.alg_num,
+                args.alg2_workers,
+            )
             for path in paths:
                 try:
                     values, cols, row_ptr, shape = _load_mtx_to_csr_torch(
@@ -620,6 +698,8 @@ def main():
                         b,
                         expected,
                         args.slice_size,
+                        args.alg_num,
+                        args.alg2_workers,
                     )
                     records.append(record)
                     _print_record(record)
