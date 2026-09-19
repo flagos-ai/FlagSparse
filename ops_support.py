@@ -433,6 +433,13 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             ops=spmm_ops,
             notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent",
         ),
+        *(
+            ApiSpec("spmm", "flagsparse_spmm_csr_run", "spmm_csr", "CSR", name,
+                    values=("float32", "float64", "complex64", "complex128"),
+                    indices=("int32", "int64"), ops=("non", "trans", "conj"),
+                    notes="Native component precision; per-run transpose; backend capability gated; unverified")
+            for name in ("csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce", "csr_adaptive_tile_split")
+        ),
         ApiSpec(
             "spmm",
             "flagsparse_spmm_csr_opt",
@@ -618,6 +625,10 @@ def rows_for_spec(
         status = "UNVERIFIED"
         notes.append("new CSR SpMV route requires backend-specific hardware validation")
 
+    if spec.module == "spmm_csr" and spec.route in (
+        "csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce", "csr_adaptive_tile_split"
+    ) and status == "SUPPORTED":
+        status = "UNVERIFIED"
     ops = spec.ops
     if ops is None:
         ops_tuple = ("non",)

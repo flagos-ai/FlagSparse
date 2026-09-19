@@ -142,6 +142,8 @@ ops:
       - flagsparse_spmm_csr
       - flagsparse_spmm_csr_run
       - prepare_spmm_csr_route
+      - list_spmm_csr_algorithms
+      - get_spmm_csr_algorithm_spec
     labels:
       - flagsparse
       - sparse

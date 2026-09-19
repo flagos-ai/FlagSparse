@@ -144,7 +144,10 @@ def _command_specs(
             *no_cusparse,
         ],
         "spmm": [
-            "tests/test_spmm.py",
+            "tests/test_spmm_csr.py",
+            "--alg", "compare", "--exclude-tle", "--dtypes", "all", "--ops", "all",
+            "--layout", "all", "--dense-cols", "1,32,128", "--timing",
+            "--csv-csr", str(results_dir / "spmm_csr.csv"),
             "--synthetic",
             "--warmup",
             str(args.warmup),

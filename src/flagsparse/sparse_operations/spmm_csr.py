@@ -21,6 +21,8 @@ from . import _common as _common_mod
 from ._common import *
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
+from functools import partial
+from . import _spmm_csr_config as _new_spmm_policy
 
 _ASCEND_ROW_IDS_CACHE = {}
 
@@ -484,10 +486,7 @@ def _transpose_csr_for_spmm(data, indices, indptr, shape):
         row_counts.to(torch.int64),
     )
     col_ids = indices.to(torch.int64)
-    try:
-        order = torch.argsort(col_ids, stable=True)
-    except TypeError:
-        order = torch.argsort(col_ids)
+    order = torch.argsort(col_ids, stable=True)
     sorted_cols = col_ids[order]
     sorted_rows = row_ids[order]
     transposed_data = _gather_values(data, order).contiguous()
@@ -759,6 +758,7 @@ class SpmmCsrAlgorithm:
     supported_ops: tuple
     supported_dtypes: tuple
     run: object
+    supported_layouts: tuple = ("row", "col")
 
 
 class SpmmCsrAlgorithmUnavailable(RuntimeError):
@@ -781,6 +781,10 @@ class PreparedCsrSpmmRoute:
         "avg_nnz_per_row",
         "op",
         "alg",
+        "config",
+        "config_alg",
+        "input_index_dtypes",
+        "input_storage_tensors",
         "materialized_op",
         "materialized_route",
     )
@@ -810,7 +814,11 @@ class PreparedCsrSpmmRoute:
         self.avg_nnz_per_row = float(self.nnz) / float(max(1, self.n_rows))
         self.op = str(op)
         self.alg = str(alg)
-        # Filled in by prepare_spmm_csr_route for trans/conj; see the note there.
+        self.config = {}
+        self.config_alg = str(alg)
+        self.input_index_dtypes = (str(kernel_indices.dtype), str(kernel_indptr.dtype))
+        self.input_storage_tensors = (data, kernel_indices, kernel_indptr)
+        # Compatibility fields only: no cross-call transpose cache.
         self.materialized_op = None
         self.materialized_route = None
 
@@ -934,6 +942,8 @@ def _spmm_csr_route_from_materialized(prepared, data, indices, indptr, shape, op
         else kernel_indptr.new_empty((0,))
     )
     max_row_nnz = int(row_lengths.max().item()) if int(shape[0]) > 0 else 0
+    if indices.numel() and (int(indices.min().item()) < 0 or int(indices.max().item()) > torch.iinfo(torch.int32).max):
+        raise ValueError("transposed CSR column indices exceed the int32 execution range")
     kernel_indices = (
         indices.to(torch.int32) if indices.dtype == torch.int64 else indices
     )
@@ -954,9 +964,6 @@ def _spmm_csr_route_from_materialized(prepared, data, indices, indptr, shape, op
 def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
     if op_name == "non":
         return prepared, 0.0 if timing else None
-    cached = prepared.materialized_route
-    if cached is not None and prepared.materialized_op == op_name:
-        return cached, 0.0 if timing else None
 
     start = _ACCEL.Event(enable_timing=True) if timing else None
     end = _ACCEL.Event(enable_timing=True) if timing else None
@@ -1024,6 +1031,10 @@ def _run_spmm_csr_base_route_impl(
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
+    if timing:
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
+        start.record()
     B = _materialize_dense_layout(B, dense_layout)
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
@@ -1041,10 +1052,6 @@ def _run_spmm_csr_base_route_impl(
     process_cpu_ms = 0.0
     process_gpu_ms = 0.0 if timing else None
     compute_ms = None
-    if timing:
-        start = _ACCEL.Event(enable_timing=True)
-        end = _ACCEL.Event(enable_timing=True)
-        start.record()
     C = _triton_spmm_csr_impl(
         prepared.data,
         prepared.kernel_indices,
@@ -1065,6 +1072,8 @@ def _run_spmm_csr_base_route_impl(
         _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
+        "config": dict(launch),
+        "config_source": "legacy_resolver",
         "alg": route_name,
         "display_name": "BaseAccuracy" if accuracy else "Base",
         "op": prepared.op,
@@ -1351,7 +1360,6 @@ def _spmm_csr_alg1_empty_split_metadata(device, row_index_dtype):
 
 def _spmm_csr_alg1_build_bucket_descriptors(rows_flat, counts, offsets):
     _ACCEL.synchronize()
-    t0 = time.perf_counter()
     counts_cpu = counts.cpu().tolist()
     offsets_cpu = offsets.cpu().tolist()
     row_index_dtype = rows_flat.dtype
@@ -1395,7 +1403,7 @@ def _spmm_csr_alg1_build_bucket_descriptors(rows_flat, counts, offsets):
             long_rows = rows
         if upper is not None:
             lower = upper
-    process_cpu_ms = (time.perf_counter() - t0) * 1000.0
+    process_cpu_ms = 0.0  # Readback and launch dictionaries are not CPU algorithm work.
     return buckets, long_rows, process_cpu_ms
 
 
@@ -1733,6 +1741,11 @@ def _run_spmm_csr_alg1_route(
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
+    plan = _spmm_csr_alg1_build_process_plan(prepared, timing=bool(timing))
+    if timing:
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
+        start.record()
     B = _materialize_dense_layout(B, dense_layout)
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
@@ -1740,12 +1753,7 @@ def _run_spmm_csr_alg1_route(
         prepared.data.device,
         dense_layout,
     )
-    plan = _spmm_csr_alg1_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
-    if timing:
-        start = _ACCEL.Event(enable_timing=True)
-        end = _ACCEL.Event(enable_timing=True)
-        start.record()
     C = _spmm_csr_alg1_compute(plan, B, out=C_out, dense_layout=dense_layout)
     if timing:
         end.record()
@@ -2125,7 +2133,6 @@ def _spmm_csr_alg2_process_compact_kernel(
 
 def _spmm_csr_alg2_build_bucket_descriptors(rows_flat, counts, offsets, dtype):
     _ACCEL.synchronize()
-    t0 = time.perf_counter()
     counts_cpu = counts.cpu().tolist()
     offsets_cpu = offsets.cpu().tolist()
     buckets = []
@@ -2150,7 +2157,7 @@ def _spmm_csr_alg2_build_bucket_descriptors(rows_flat, counts, offsets, dtype):
                 "segments": int(spec.get("segments", 1)),
             }
         )
-    process_cpu_ms = (time.perf_counter() - t0) * 1000.0
+    process_cpu_ms = 0.0  # Readback and launch dictionaries are not CPU algorithm work.
     return buckets, long_row_count, process_cpu_ms
 
 
@@ -2449,6 +2456,11 @@ def _run_spmm_csr_alg2_route(
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
+    plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
+    if timing:
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
+        start.record()
     B = _materialize_dense_layout(B, dense_layout)
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
@@ -2456,12 +2468,7 @@ def _run_spmm_csr_alg2_route(
         prepared.data.device,
         dense_layout,
     )
-    plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
-    if timing:
-        start = _ACCEL.Event(enable_timing=True)
-        end = _ACCEL.Event(enable_timing=True)
-        start.record()
     C = _spmm_csr_alg2_compute(plan, B, out=C_out, dense_layout=dense_layout)
     if timing:
         end.record()
@@ -2483,6 +2490,7 @@ def _run_spmm_csr_alg2_route(
         first_launch = plan.launch_configs[0] if plan.launch_configs else {}
         meta["diagnostics"] = {
             "launch_config_scope": "bucket",
+            "launch_configs": list(plan.launch_configs),
             "launch_config_count": len(plan.launch_configs),
             "bucket_count": plan.bucket_count,
             "long_row_count": plan.long_row_count,
@@ -2542,6 +2550,11 @@ def _run_spmm_csr_alg2_accuracy_impl(
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
+    plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
+    if timing:
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
+        start.record()
     B = _materialize_dense_layout(B, dense_layout)
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
@@ -2549,12 +2562,7 @@ def _run_spmm_csr_alg2_accuracy_impl(
         prepared.data.device,
         dense_layout,
     )
-    plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
-    if timing:
-        start = _ACCEL.Event(enable_timing=True)
-        end = _ACCEL.Event(enable_timing=True)
-        start.record()
     C = _spmm_csr_alg2_compute(
         plan,
         B,
@@ -2583,6 +2591,7 @@ def _run_spmm_csr_alg2_accuracy_impl(
         first_launch = plan.launch_configs[0] if plan.launch_configs else {}
         meta["diagnostics"] = {
             "launch_config_scope": "bucket",
+            "launch_configs": list(plan.launch_configs),
             "launch_config_count": len(plan.launch_configs),
             "bucket_count": plan.bucket_count,
             "long_row_count": plan.long_row_count,
@@ -2701,6 +2710,35 @@ SPMM_CSR_ALGORITHMS = {
 }
 
 
+
+def _run_new_spmm_route(prepared, B, *, algorithm, config, config_meta,
+                        timing=False, diagnostics=False, dense_layout="row"):
+    from ._spmm_csr_runtime import run
+    return run(prepared, B, algorithm=algorithm, config=config, config_meta=config_meta,
+               timing=timing, diagnostics=diagnostics, dense_layout=dense_layout)
+
+
+for _name in _new_spmm_policy.NEW_ALGORITHMS:
+    SPMM_CSR_ALGORITHMS[_name] = SpmmCsrAlgorithm(
+        _name, _name, tuple(SPMM_OP_NAMES.values()),
+        (torch.float32, torch.float64, torch.complex64, torch.complex128),
+        partial(_run_new_spmm_route, algorithm=_name))
+
+
+def get_spmm_csr_algorithm_spec(alg):
+    name = _normalize_spmm_csr_alg(alg)
+    if name == "auto":
+        name = "csr_base"
+    if name not in SPMM_CSR_ALGORITHMS:
+        raise ValueError(f"unknown CSR SpMM algorithm {alg!r}")
+    algorithm = SPMM_CSR_ALGORITHMS[name]
+    if name in _new_spmm_policy.NEW_ALGORITHMS:
+        return _new_spmm_policy.algorithm_spec(name)
+    return dict(name=name, ops=algorithm.supported_ops,
+                value_dtypes=tuple(str(v).removeprefix("torch.") for v in algorithm.supported_dtypes),
+                layouts=algorithm.supported_layouts, backends=_new_spmm_policy.BACKENDS,
+                transpose_strategy="per_run_csr_rebuild")
+
 def resolve_spmm_csr_algorithm(alg, op, dtype):
     token = _normalize_spmm_csr_alg(alg)
     if token == "auto":
@@ -2719,10 +2757,14 @@ def resolve_spmm_csr_algorithm(alg, op, dtype):
     return algorithm
 
 
-def list_spmm_csr_algorithms(op=None, dtype=None):
+def list_spmm_csr_algorithms(op=None, dtype=None, backend=None, layout=None):
     op_name = None if op is None else _spmm_op_to_name(op)
     names = []
+    if backend is not None and backend not in _new_spmm_policy.BACKENDS:
+        raise ValueError(f"unknown backend {backend!r}")
     for name, algorithm in SPMM_CSR_ALGORITHMS.items():
+        if layout is not None and _normalize_dense_layout(layout) not in algorithm.supported_layouts:
+            continue
         if op_name is not None and op_name not in algorithm.supported_ops:
             continue
         if dtype is not None and dtype not in algorithm.supported_dtypes:
@@ -2731,8 +2773,9 @@ def list_spmm_csr_algorithms(op=None, dtype=None):
     return tuple(names)
 
 
-def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"):
+def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto", config=None):
     """Prepare matrix-level CSR SpMM metadata for the route-based run API."""
+    input_storage_tensors = (data, indices, indptr)
     op_code = _normalize_spmm_op(op)
     op_name = _spmm_op_to_name(op_code)
     (
@@ -2759,32 +2802,61 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
         op=op_name,
         alg=resolved_alg,
     )
-    if op_name != "non" and _backend_name() == "cuda":
-        # Materialise A.T (A.conj().T for conj) here instead of on every run.  The
-        # transpose is a sort + bincount + cumsum over nnz, and it used to run inside
-        # flagsparse_spmm_csr_run -- i.e. once per timed iteration -- while the cuSPARSE
-        # baseline materialises ``A_csr.transpose().tocsr()`` once outside its timed
-        # window (see tests/test_spmm.py).  Caching it here makes the two sides
-        # symmetric; a run-time ``op=`` override still re-materialises below.
-        t_data, t_indices, t_indptr, t_shape = _materialize_spmm_csr_op(
-            data,
-            kernel_indices,
-            kernel_indptr,
-            shape,
-            op_code,
-        )
-        route.materialized_route = _spmm_csr_route_from_materialized(
-            route, t_data, t_indices, t_indptr, t_shape, op_name
-        )
-        route.materialized_op = op_name
+    if config and resolved_alg not in _new_spmm_policy.NEW_ALGORITHMS:
+        raise ValueError("config requires an explicit new CSR SpMM algorithm")
+    route.config = dict(config or {})
+    route.config_alg = resolved_alg
+    route.input_index_dtypes = (str(indices.dtype), str(indptr.dtype))
+    route.input_storage_tensors = input_storage_tensors
     return route
 
 
 def flagsparse_spmm_csr_run(
+    prepared, B, *, alg=None, config=None, out=None, op=None, dense_layout="auto",
+    return_time=False, return_meta=False, timing=False, diagnostics=False,
+):
+    """Complete-run timing is measured without phase events, even with timing=True.
+
+    Phase diagnostics execute separately with the same inputs/configuration.
+    Prepared routes fix op; callers may select a different algorithm per run.
+    """
+    if not isinstance(prepared, PreparedCsrSpmmRoute):
+        raise TypeError("prepared must be a PreparedCsrSpmmRoute instance")
+    kwargs = dict(alg=alg, config=config, out=out, op=op, dense_layout=dense_layout,
+                  diagnostics=diagnostics)
+    with _ACCEL.device(prepared.data.device):
+        if not (timing or return_time or return_meta):
+            return _flagsparse_spmm_csr_run_impl(
+                prepared, B, **kwargs)
+        # Match the benchmark's outer event boundary, including runtime routing
+        # and capability/configuration resolution. No phase events in this call.
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
+        start.record()
+        C, meta = _flagsparse_spmm_csr_run_impl(prepared, B, return_meta=True, **kwargs)
+        end.record()
+        end.synchronize()
+        meta["gpu_ms"] = start.elapsed_time(end)
+        meta["operator_ms"] = meta["process_cpu_ms"] + meta["gpu_ms"]
+        if timing:
+            _, phases = _flagsparse_spmm_csr_run_impl(
+                prepared, B, return_meta=True, timing=True, **kwargs)
+            for key in ("process_gpu_ms", "compute_ms"):
+                meta[key] = phases[key]
+    if return_time and return_meta:
+        return C, meta["operator_ms"], meta
+    if return_time:
+        return C, meta["operator_ms"]
+    return (C, meta) if return_meta else C
+
+
+def _flagsparse_spmm_csr_run_impl(
     prepared,
     B,
     *,
     alg=None,
+    config=None,
+    out=None,
     op=None,
     dense_layout="auto",
     return_time=False,
@@ -2802,23 +2874,13 @@ def flagsparse_spmm_csr_run(
     if not isinstance(prepared, PreparedCsrSpmmRoute):
         raise TypeError("prepared must be a PreparedCsrSpmmRoute instance")
     op_name = prepared.op if op is None else _spmm_op_to_name(op)
+    if op_name != prepared.op:
+        raise ValueError("op conflicts with prepared CSR SpMM route")
     alg_name = prepared.alg if alg is None else _normalize_spmm_csr_alg(alg)
     algorithm = resolve_spmm_csr_algorithm(alg_name, op_name, prepared.data.dtype)
     dense_layout = _normalize_dense_layout(dense_layout)
-    col_major_algorithms = {
-        "csr_base",
-        "csr_base_accuracy",
-        "alpha_alg1_tle_opt",
-        "alpha_alg1_tle_opt2",
-        "spmm_csr_alg1",
-        "spmm_csr_alg2",
-        "spmm_csr_alg2_accuracy",
-        "spmm_csr_alg2_accuracy_hp",
-    }
-    if dense_layout == "col" and algorithm.name not in col_major_algorithms:
-        raise SpmmCsrAlgorithmUnavailable(
-            "col-major layout is currently supported only by CSR SpMM main algorithms"
-        )
+    if dense_layout not in algorithm.supported_layouts:
+        raise SpmmCsrAlgorithmUnavailable(f"{algorithm.name} does not support {dense_layout}")
     if B is None or not torch.is_tensor(B):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
@@ -2830,13 +2892,35 @@ def flagsparse_spmm_csr_run(
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
 
-    start = (
-        _ACCEL.Event(enable_timing=True) if (return_time or return_meta) else None
-    )
-    end = _ACCEL.Event(enable_timing=True) if (return_time or return_meta) else None
-    if start is not None:
-        _ACCEL.synchronize()
-        start.record()
+    expected = prepared.n_cols if op_name == "non" else prepared.n_rows
+    output_rows = prepared.n_rows if op_name == "non" else prepared.n_cols
+    if B.shape[0] != expected:
+        raise ValueError(f"B.shape[0] must be {expected}, got {B.shape[0]}")
+    if out is not None:
+        if out.shape != (output_rows, B.shape[1]) or out.dtype != B.dtype or out.device != B.device:
+            raise ValueError("out must match output shape, dtype and device")
+        if out.is_conj() or out.is_neg() or not (out.is_contiguous() or _is_col_major_2d(out)):
+            raise ValueError("out must be nonoverlapping row/column-major without lazy views")
+        if any(torch._C._overlaps(out, x) for x in (
+            B, prepared.data, prepared.kernel_indices, prepared.kernel_indptr,
+            *prepared.input_storage_tensors,
+        )):
+            raise ValueError("out must not overlap inputs")
+    route_kwargs = {}
+    if algorithm.name in _new_spmm_policy.NEW_ALGORITHMS:
+        from ._spmm_csr_runtime import backend_caps
+        inherited = prepared.config if prepared.config_alg == algorithm.name else {}
+        explicit = inherited if config is None else config
+        actual_layout = _dense_layout_name(B)
+        try:
+            resolved_config, config_meta = _new_spmm_policy.resolve_config(
+                algorithm.name, str(B.dtype).removeprefix("torch."), B.shape[1], actual_layout,
+                backend_caps(B.device), explicit, op=op_name)
+        except NotImplementedError as exc:
+            raise SpmmCsrAlgorithmUnavailable(str(exc)) from exc
+        route_kwargs = dict(config=resolved_config, config_meta=config_meta)
+    elif config:
+        raise ValueError("config is supported only by the new CSR SpMM algorithms")
     runtime_prepared, op_process_gpu_ms = _materialize_spmm_csr_route_op(
         prepared,
         op_name,
@@ -2848,13 +2932,24 @@ def flagsparse_spmm_csr_run(
         timing=bool(timing),
         diagnostics=bool(diagnostics),
         dense_layout=dense_layout,
+        **route_kwargs,
     )
-    if end is not None:
-        end.record()
-        _ACCEL.synchronize()
-        gpu_ms = start.elapsed_time(end)
-    else:
-        gpu_ms = None
+    if out is not None:
+        copy_start = _ACCEL.Event(enable_timing=True) if timing else None
+        copy_end = _ACCEL.Event(enable_timing=True) if timing else None
+        if copy_start is not None:
+            copy_start.record()
+        out.copy_(C)
+        C = out
+        route_meta["c_stride"] = tuple(C.stride())
+        route_meta["output_layout"] = _dense_layout_name(C)
+        if copy_end is not None:
+            copy_end.record()
+            copy_end.synchronize()
+            route_meta["compute_ms"] = float(route_meta.get("compute_ms") or 0) + copy_start.elapsed_time(copy_end)
+    # The public wrapper measures the complete call. This helper also executes
+    # phase diagnostics without inserting an additional full-run event pair.
+    gpu_ms = None
 
     process_cpu_ms = float(route_meta.get("process_cpu_ms", 0.0) or 0.0)
     route_process_gpu_ms = route_meta.get("process_gpu_ms")
@@ -2868,6 +2963,18 @@ def flagsparse_spmm_csr_run(
     meta = None
     if return_meta:
         meta = {
+            **route_meta,
+            "alg_requested": alg_name,
+            "alg_resolved": algorithm.name,
+            "route_contract_version": 2,
+            "backend": _backend_name(),
+            "input_index_dtypes": prepared.input_index_dtypes,
+            "execution_index_dtypes": (str(runtime_prepared.kernel_indices.dtype), str(runtime_prepared.kernel_indptr.dtype)),
+            "index_conversion_reason": (
+                "validated int64 columns converted to the existing int32 kernel ABI"
+                if prepared.input_index_dtypes[0] == "torch.int64" else None
+            ),
+            "transpose_strategy": "none" if op_name == "non" else "per_run_csr_rebuild",
             "alg": algorithm.name,
             "display_name": algorithm.display_name,
             "op": op_name,
@@ -4253,6 +4360,7 @@ def flagsparse_spmm_csr(
     transpose=None,
     op=None,
     return_meta=False,
+    *, alg=None, config=None, prepared=None, timing=False, dense_layout="auto",
 ):
     """CSR SpMM using Triton.
 
@@ -4270,6 +4378,24 @@ def flagsparse_spmm_csr(
         and bool(transpose) != _spmm_op_transposes(op_code)
     ):
         raise ValueError("transpose conflicts with op")
+
+    if alg is not None or prepared is not None or config is not None:
+        if any(value is not None for value in (block_n, block_nnz, max_segments)):
+            raise ValueError("legacy block parameters conflict with registered route; use config")
+        if prepared is None:
+            prepared = prepare_spmm_csr_route(data, indices, indptr, shape, op=op_code,
+                                              alg="auto" if alg is None else alg, config=config)
+        else:
+            if op is None and transpose is None:
+                op_code = _normalize_spmm_op(prepared.op)
+            for supplied, original in zip((data, indices, indptr), prepared.input_storage_tensors):
+                if supplied is not None and supplied is not original:
+                    raise ValueError("sparse inputs must be omitted when using prepared")
+            if shape is not None and tuple(shape) != prepared.shape:
+                raise ValueError("shape conflicts with prepared")
+        return flagsparse_spmm_csr_run(prepared, B, alg=alg, config=config, op=op_code,
+                                       out=out, dense_layout=dense_layout, timing=timing,
+                                       return_time=return_time, return_meta=return_meta)
 
     # Ascend 910B does not lower the Triton CSR kernels reliably (and its SparseCSR addmm
     # dispatcher is unavailable).  Same CSR reduction via torch_npu index_add, Ascend only.

@@ -435,3 +435,5 @@ python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 1024
 ## 授权许可
 
 本项目采用 [Apache (Version 2.0) license](./LICENSE) 许可证授权。
+
+CSR SpMM 新算法、接口、计时与计算节点验收见 [说明](docs/SPMM_CSR.md)。统一算法比较入口为 `tests/test_spmm_csr.py --synthetic --alg compare --exclude-tle --dtypes all --ops all --timing`；四个新算法目前均未实机验证，默认路由不变。

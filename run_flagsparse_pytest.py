@@ -322,14 +322,9 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{iters}",
     ),
     "spmm_csr": (
-        "tests/test_spmm.py",
-        "{input}",
-        "--csv",
-        "{csv}",
-        "--warmup",
-        "{warmup}",
-        "--iters",
-        "{iters}",
+        "tests/test_spmm_csr.py", "{input}", "--csv-csr", "{csv}",
+        "--alg", "compare", "--exclude-tle", "--dtypes", "all",
+        "--ops", "all", "--timing", "--warmup", "{warmup}", "--iters", "{iters}",
     ),
     "spmm_coo": (
         "tests/test_spmm_coo.py",

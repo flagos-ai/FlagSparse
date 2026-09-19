@@ -22,6 +22,10 @@ and ranked without changing the CSV schema.
 import argparse
 import csv
 import glob
+import json
+import itertools
+import platform
+import subprocess
 import os
 import sys
 from pathlib import Path
@@ -64,16 +68,7 @@ DEFAULT_INDEX_DTYPE_NAMES = ("int32", "int64")
 DEFAULT_OP_NAMES = tuple(spmm_ops.SPMM_OP_NAMES.values())
 CUSPARSE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 TLE_CSR_SPMM_ALGORITHMS = {"alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"}
-MAIN_CSR_SPMM_ALGORITHMS = {
-    "csr_base",
-    "csr_base_accuracy",
-    "alpha_alg1_tle_opt",
-    "alpha_alg1_tle_opt2",
-    "spmm_csr_alg1",
-    "spmm_csr_alg2",
-    "spmm_csr_alg2_accuracy",
-    "spmm_csr_alg2_accuracy_hp",
-}
+
 
 PERF_FIELDS = [
     "matrix",
@@ -101,6 +96,10 @@ PERF_FIELDS = [
     "reason",
     "cusparse_reason",
 ]
+
+PERF_FIELDS += ["indptr_dtype", "vendor_ms", "vendor_backend", "vendor_alg",
+                "speedup_vs_vendor", "vendor_reason", "vendor_status", "vendor_error",
+                "max_abs_error", "metadata", "correctness_ref"]
 
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
 
@@ -133,6 +132,9 @@ DIAG_FIELDS = [
     "output_layout",
 ]
 
+DIAG_FIELDS += ["indptr_dtype", "dense_cols", "config", "launch_configs", "segment_count",
+                "reduction_levels", "workspace_peak_bytes", "descriptor_peak_bytes_estimate"]
+
 BEST_FIELDS = [
     "matrix",
     "dtype",
@@ -145,6 +147,8 @@ BEST_FIELDS = [
     "best_torch_speedup",
     "best_cusparse_speedup",
 ]
+
+BEST_FIELDS += ["indptr_dtype", "dense_cols"]
 
 LAYOUT_NAMES = ("row", "col")
 
@@ -227,14 +231,32 @@ def _reference_tolerance(dtype):
 def _error_profile(candidate, reference, dtype):
     if candidate is None or reference is None:
         return {"global_err": None, "status": "SKIP"}
+    if candidate.shape != reference.shape or candidate.dtype != dtype:
+        return {"global_err": float("inf"), "max_abs_error": float("inf"), "status": "FAIL"}
     atol, rtol = _reference_tolerance(dtype)
     if candidate.numel() == 0:
-        return {"global_err": 0.0, "status": "PASS"}
+        return {"global_err": 0.0, "max_abs_error": 0.0, "status": "PASS"}
+    component_type = torch.complex128 if dtype.is_complex else torch.float64
+    candidate = candidate.detach().cpu().to(component_type)
+    reference = reference.detach().cpu().to(component_type)
     diff = torch.abs(candidate - reference).to(torch.float64)
     denom = (atol + rtol * torch.abs(reference)).to(torch.float64)
     ratio = diff / denom
     global_err = float(torch.max(ratio).item()) if ratio.numel() > 0 else 0.0
-    return {"global_err": global_err, "status": "PASS" if global_err <= 1.0 else "FAIL"}
+    return {"global_err": global_err, "max_abs_error": float(diff.max().item()), "status": "PASS" if global_err <= 1.0 else "FAIL"}
+
+
+def _correctness_reference(data, indices, indptr, shape, B, op):
+    # Do not first invoke unsupported device sparse/FP64 operations on platforms
+    # whose established correctness policy is CPU SciPy.
+    if fs_common._use_scipy_accuracy_reference():
+        import reference_utils
+        dtype = reference_utils.reference_dtype(data.dtype)
+        matrix = reference_utils.scipy_csr(data.cpu(), indices.cpu(), indptr.cpu(), shape, dtype)
+        product = reference_utils.spmm(matrix, B.cpu(), dtype, op=op)
+        return reference_utils.as_torch(product, dtype, "cpu"), "SciPy/CSR CPU"
+    ref, _, fmt = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
+    return ref, f"PyTorch/{fmt}"
 
 
 def _resolve_input_paths(input_paths):
@@ -265,8 +287,8 @@ def _parse_csv_names(value, all_names, option_name, explicit_names=None):
 
 def _parse_algs(value):
     value = str(value).strip().lower()
-    if value in ("auto", "all"):
-        return [value]
+    if value in ("auto", "all", "compare"):
+        return ["all" if value == "compare" else value]
     allowed = set(fs.SPMM_CSR_ALGORITHMS)
     names = [token.strip().lower() for token in value.split(",") if token.strip()]
     if not names:
@@ -300,7 +322,7 @@ def _expand_algs(alg_names, op, dtype, exclude_tle=False):
     for alg in expanded:
         if alg not in deduped:
             deduped.append(alg)
-    return deduped
+    return [a for a in deduped if a != "auto" or "csr_base" not in deduped]
 
 
 def _selected_tle_algs(alg_names):
@@ -341,7 +363,7 @@ def _print_tle_availability(alg_names):
 
 
 def _cuda_event_benchmark(op, warmup, iters):
-    out = None
+    out = op()  # Mandatory cold/JIT call stays outside events, even with warmup=0.
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
@@ -358,7 +380,7 @@ def _cuda_event_benchmark(op, warmup, iters):
 def _cupy_event_benchmark(op, warmup, iters):
     import cupy as cp
 
-    out = None
+    out = op()
     for _ in range(max(0, int(warmup))):
         out = op()
     cp.cuda.runtime.deviceSynchronize()
@@ -390,6 +412,10 @@ def _time_route(
         diagnostics=bool(diagnose),
     )
     process_cpu_ms = float(meta.get("process_cpu_ms", 0.0) or 0.0)
+    # The CSV represents the benchmark mean, not the extra metadata call.
+    meta["gpu_ms"] = gpu_ms
+    meta["operator_ms"] = process_cpu_ms + gpu_ms
+    meta["measurement"] = "mean_complete_run_without_phase_events"
     row = {
         "alg": meta.get("alg", alg),
         "ms": process_cpu_ms + gpu_ms,
@@ -403,6 +429,7 @@ def _time_route(
         "output_layout": meta.get("output_layout"),
         "diagnostics": meta.get("diagnostics", {}),
         "out": out,
+        "metadata": json.dumps(meta, default=str, sort_keys=True),
     }
     if timing:
         row["process_gpu_ms"] = meta.get("process_gpu_ms")
@@ -550,13 +577,15 @@ def run_one_case(
     timing,
     diagnose,
     exclude_tle=False,
+    indptr_dtype_name=None,
+    emit=None,
 ):
     device = accelerator_device()
-    data, indices, indptr, shape = load_mtx_to_csr_torch(
-        path, dtype=dtype, device=device
-    )
+    data, indices, indptr, shape = (_synthetic_case(path, dtype, device)
+        if path.startswith("synthetic:") else load_mtx_to_csr_torch(path, dtype=dtype, device=device))
     indices = indices.to(index_dtype)
-    indptr = indptr.to(index_dtype)
+    indptr_dtype_name = indptr_dtype_name or index_dtype_name
+    indptr = indptr.to(INDEX_DTYPE_MAP[indptr_dtype_name])
     n_rows, n_cols = shape
     b_rows = n_rows if op in ("trans", "conj") else n_cols
     B = _materialize_dense_layout_for_test(
@@ -564,47 +593,55 @@ def run_one_case(
         layout,
     )
     b_stride = _stride_string(B)
-    ref, torch_op, _torch_format = _build_pytorch_reference(
+    ref, reference_name = _correctness_reference(
         data, indices, indptr, shape, B, op=op
     )
-    _torch_out, torch_ms = _cuda_event_benchmark(torch_op, warmup, iters)
+    # Timing a correctness-only fallback format is not a CSR performance baseline.
+    torch_ms = None
     cusparse_out = None
     cusparse_ms = None
-    cusparse_reason = ""
+    cusparse_reason = "disabled by --no-vendor" if not run_cusparse else ""
     if run_cusparse:
         cusparse_out, cusparse_ms, cusparse_reason = _time_vendor_sparse_ref(
             data, indices, indptr, shape, B, op, warmup, iters, layout=layout
         )
 
-    rows = []
+    vendor_profile = _error_profile(cusparse_out, ref, dtype)
+    if cusparse_out is not None and vendor_profile["status"] != "PASS":
+        cusparse_reason = f"vendor correctness failed: {vendor_profile}"
+        cusparse_ms = None
+    def record(row):
+        row["indptr_dtype"] = indptr_dtype_name
+        row["correctness_ref"] = f"{reference_name} (correctness only)"
+        row["vendor_ms"] = cusparse_ms
+        row["vendor_backend"] = fs_common._expected_vendor_sparse_backend()
+        row["vendor_alg"] = "default" if cusparse_out is not None else None
+        row["vendor_reason"] = cusparse_reason or ""
+        row["vendor_status"] = vendor_profile["status"]
+        row["vendor_error"] = vendor_profile["global_err"]
+        row["speedup_vs_vendor"] = row.get("cusparse_vs_alg_speedup") if row["status"] == "PASS" else None
+        if emit:
+            emit(row)
+    rows = _StreamingRows(record)
     diag_rows = []
     prepared = fs.prepare_spmm_csr_route(
         data, indices, indptr, shape, op=op, alg="auto"
     )
-    for alg in _expand_algs(alg_names, op, dtype, exclude_tle=exclude_tle):
+    selected = _expand_algs(alg_names, op, dtype, exclude_tle=exclude_tle)
+    print(f"Algorithms dtype={dtype} op={op} layout={layout} N={dense_cols}: {', '.join(selected)}", flush=True)
+    if "all" in alg_names:
+        for name, spec in fs.SPMM_CSR_ALGORITHMS.items():
+            if name not in selected:
+                reason = "excluded TLE" if exclude_tle and name in TLE_CSR_SPMM_ALGORITHMS else "unsupported dtype/op"
+                print(f"  excluded {name}: {reason}", flush=True)
+    for alg in selected:
         try:
-            resolved = fs.resolve_spmm_csr_algorithm(alg, op, dtype)
-            if layout == "col" and resolved.name not in MAIN_CSR_SPMM_ALGORITHMS:
-                rows.append(
-                    _skip_row(
-                        path,
-                        dtype,
-                        index_dtype_name,
-                        op,
-                        layout,
-                        alg,
-                        shape,
-                        data.numel(),
-                        dense_cols,
-                        b_stride,
-                        torch_ms,
-                        cusparse_ms,
-                        "col-major layout is currently supported only by CSR SpMM main algorithms",
-                        timing,
-                        cusparse_reason=cusparse_reason,
-                    )
-                )
-                continue
+            try:
+                resolved = fs.resolve_spmm_csr_algorithm(alg, op, dtype)
+            except (ValueError, TypeError) as exc:
+                raise fs.SpmmCsrAlgorithmUnavailable(str(exc)) from exc
+            if layout not in resolved.supported_layouts:
+                raise fs.SpmmCsrAlgorithmUnavailable(f"unsupported layout {layout}")
             result = _time_route(
                 prepared,
                 B,
@@ -615,9 +652,13 @@ def run_one_case(
                 diagnose=diagnose,
                 layout=layout,
             )
-        except (fs.SpmmCsrAlgorithmUnavailable, ValueError, TypeError, RuntimeError) as exc:
-            rows.append(
-                _skip_row(
+            out = result.pop("out")
+            diagnostics = result.pop("diagnostics")
+            torch_profile = _error_profile(out, ref, dtype)
+            cusparse_profile = _error_profile(out, cusparse_out, dtype)
+        except Exception as exc:
+            failed = not isinstance(exc, (fs.SpmmCsrAlgorithmUnavailable, NotImplementedError))
+            failure = _skip_row(
                     path,
                     dtype,
                     index_dtype_name,
@@ -634,12 +675,9 @@ def run_one_case(
                     timing,
                     cusparse_reason=cusparse_reason,
                 )
-            )
+            failure["status"] = "FAIL" if failed else "SKIP"
+            rows.append(failure)
             continue
-        out = result.pop("out")
-        diagnostics = result.pop("diagnostics")
-        torch_profile = _error_profile(out, ref, dtype)
-        cusparse_profile = _error_profile(out, cusparse_out, dtype)
         row = {
             "matrix": os.path.basename(path),
             "dtype": _dtype_name(dtype),
@@ -658,12 +696,14 @@ def run_one_case(
             "process_cpu_ms": result["process_cpu_ms"],
             "torch_ms": torch_ms,
             "cusparse_ms": cusparse_ms,
-            "torch_vs_alg_speedup": _ratio(torch_ms, result["ms"]),
-            "cusparse_vs_alg_speedup": _ratio(cusparse_ms, result["ms"]),
+            "torch_vs_alg_speedup": _ratio(torch_ms, result["ms"]) if torch_profile["status"] == "PASS" else None,
+            "cusparse_vs_alg_speedup": _ratio(cusparse_ms, result["ms"]) if torch_profile["status"] == "PASS" else None,
             "err_vs_torch": torch_profile["global_err"],
             "err_vs_cusparse": cusparse_profile["global_err"],
             "status": torch_profile["status"],
-            "reason": "",
+            "reason": "" if torch_profile["status"] == "PASS" else "correctness check failed",
+            "max_abs_error": torch_profile["max_abs_error"],
+            "metadata": result["metadata"],
             "cusparse_reason": cusparse_reason or "",
         }
         if timing:
@@ -679,9 +719,11 @@ def run_one_case(
                 "layout": layout,
                 "alg": result["alg"],
             }
+            diag.update(indptr_dtype=indptr_dtype_name, dense_cols=dense_cols)
             for field in DIAG_FIELDS:
                 if field not in diag:
-                    diag[field] = diagnostics.get(field)
+                    value = diagnostics.get(field)
+                    diag[field] = json.dumps(value, default=str, sort_keys=True) if isinstance(value, (dict, list)) else value
             diag_rows.append(diag)
     return rows, diag_rows
 
@@ -697,10 +739,11 @@ def _best_rows(rows):
             row["index_dtype"],
             row["op"],
             row["layout"],
+            row.get("indptr_dtype"), row["dense_cols"],
         )
         groups.setdefault(key, []).append(row)
     best = []
-    for (matrix, dtype, index_dtype, op, layout), group in sorted(groups.items()):
+    for (matrix, dtype, index_dtype, op, layout, indptr_dtype, dense_cols), group in sorted(groups.items()):
         selected = min(group, key=lambda item: item["ms"])
         best.append(
             {
@@ -709,6 +752,7 @@ def _best_rows(rows):
                 "index_dtype": index_dtype,
                 "op": op,
                 "layout": layout,
+                "indptr_dtype": indptr_dtype, "dense_cols": dense_cols,
                 "best_alg": selected["alg"],
                 "best_ms": selected["ms"],
                 "best_gpu_ms": selected["gpu_ms"],
@@ -732,163 +776,142 @@ def _print_row(row):
         f"{_fmt(row['ms']):>9} {_fmt(row['gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9} "
         f"{_fmt(row['torch_ms']):>9} {_fmt(row['cusparse_ms']):>9} "
         f"{_fmt(row['torch_vs_alg_speedup'], 2):>9} {_fmt(row['cusparse_vs_alg_speedup'], 2):>9} "
-        f"{_fmt(row['err_vs_torch'], 2):>10} {row['status']:>6}"
+        f"{_fmt(row['err_vs_torch'], 2):>10} {row['status']:>6} "
+        f"ptr={row.get('indptr_dtype')} N={row['dense_cols']} max_abs={row.get('max_abs_error')}"
     )
+
+
+
+class _StreamingRows(list):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def append(self, row):
+        super().append(row)
+        self.callback(row)
+
+
+def _synthetic_case(name, dtype, device):
+    # Repeated columns deliberately exercise duplicate entries and cancellation.
+    if name == "synthetic:empty":
+        lengths, columns = [0, 0, 0], 7
+    elif name == "synthetic:tail":
+        lengths, columns = [0, 1, 32, 33, 2048, 2049, 65537, 3, 0], 71
+    else:
+        lengths, columns = [0, 1, 7, 8, 16, 32, 33, 4, 2], 41
+    ptr = torch.tensor([0] + list(itertools.accumulate(lengths)), dtype=torch.int64, device=device)
+    size = sum(lengths)
+    idx = (torch.arange(size, device=device, dtype=torch.int64) * 17 + 5) % columns
+    values = _build_dense_matrix(size, 1, dtype, device).reshape(-1) * 0.125
+    return values, idx, ptr, (len(lengths), columns)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="AlphaSparse-style CSR SpMM route benchmark."
-    )
-    parser.add_argument("input", nargs="+", help=".mtx file(s) or directories")
-    parser.add_argument(
-        "--alg", default="auto", help="auto, all, or comma-separated algorithms"
-    )
-    parser.add_argument(
-        "--dtype",
-        default=",".join(DEFAULT_RUN_DTYPE_NAMES),
-        help=(
-            "Comma-separated dtype names. Default: float32,float64. "
-            "all runs float32,float64,complex64,complex128; float16/bfloat16 are opt-in."
-        ),
-    )
-    parser.add_argument(
-        "--op", default="all", help="all or comma-separated ops: non,trans,conj"
-    )
-    parser.add_argument("--index-dtype", default="all", help="int32, int64, or all")
-    parser.add_argument("--layout", default="row", help="row, col, or all")
-    parser.add_argument("--dense-cols", type=int, default=32)
+    parser = argparse.ArgumentParser(description="Native CSR SpMM registered algorithm benchmark")
+    parser.add_argument("input", nargs="*", help="MatrixMarket files or directories")
+    parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--alg", default="auto", help="auto, all/compare, or comma-separated registered names")
+    parser.add_argument("--dtypes", "--dtype", dest="dtype", default="float32,float64")
+    parser.add_argument("--ops", "--op", dest="op", default="all")
+    parser.add_argument("--index-dtypes", "--index-dtype", dest="index_dtype", default="all")
+    parser.add_argument("--indptr-dtypes", default=None, help="default: match column index dtype")
+    parser.add_argument("--layout", default="row")
+    parser.add_argument("--dense-cols", default="32", help="positive integer or comma-separated list")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--csv", default=None, help="Performance CSV path")
-    parser.add_argument(
-        "--no-cusparse",
-        action="store_true",
-        help="Disable vendor sparse reference (cuSPARSE on CUDA, hipSPARSE on ROCm)",
-    )
-    parser.add_argument(
-        "--no-hipsparse",
-        dest="no_cusparse",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--timing", action="store_true", help="Add process_gpu_ms/compute_ms columns"
-    )
-    parser.add_argument(
-        "--exclude-tle",
-        action="store_true",
-        help="Exclude alpha_alg1_tle_opt and alpha_alg1_tle_opt2 from --alg sweeps",
-    )
-    parser.add_argument(
-        "--diagnose", action="store_true", help="Write separate diagnose metadata CSV"
-    )
+    parser.add_argument("--csv-csr", "--csv", dest="csv")
+    parser.add_argument("--no-vendor", "--no-cusparse", "--no-hipsparse", dest="no_cusparse", action="store_true")
+    parser.add_argument("--timing", action="store_true")
+    parser.add_argument("--diagnose", action="store_true")
+    parser.add_argument("--exclude-tle", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
-
-    if not ACCEL.is_available():
-        print("A CUDA/ROCm PyTorch device is not available.")
-        return
-    paths = _resolve_input_paths(args.input)
-    if not paths:
-        print("No .mtx files found.")
-        return
     try:
-        dtype_names = _parse_csv_names(
-            args.dtype,
-            DEFAULT_DTYPE_NAMES,
-            "--dtype",
-            explicit_names=tuple(DTYPE_MAP),
-        )
-        op_names = _parse_csv_names(args.op, DEFAULT_OP_NAMES, "--op")
-        index_dtype_names = _parse_csv_names(
-            args.index_dtype,
-            DEFAULT_INDEX_DTYPE_NAMES,
-            "--index-dtype",
-            explicit_names=tuple(INDEX_DTYPE_MAP),
-        )
-        layout_names = _layout_names(args.layout)
-        alg_names = _parse_algs(args.alg)
+        dtype_names = _parse_csv_names(args.dtype, DEFAULT_DTYPE_NAMES, "--dtypes", tuple(DTYPE_MAP))
+        index_names = _parse_csv_names(args.index_dtype, DEFAULT_INDEX_DTYPE_NAMES, "--index-dtypes")
+        ptr_names = None if args.indptr_dtypes is None else _parse_csv_names(args.indptr_dtypes, DEFAULT_INDEX_DTYPE_NAMES, "--indptr-dtypes")
+        ops = _parse_csv_names(args.op, DEFAULT_OP_NAMES, "--ops")
+        layouts = _layout_names(args.layout)
+        algs = _parse_algs(args.alg)
+        widths = list(dict.fromkeys(int(v) for v in args.dense_cols.split(",")))
+        if not widths or min(widths) <= 0 or args.warmup < 0 or args.iters <= 0:
+            raise ValueError("dense-cols and iters must be positive; warmup must be nonnegative")
     except ValueError as exc:
         parser.error(str(exc))
-
-    torch.manual_seed(int(args.seed))
+    paths = _resolve_input_paths(args.input)
+    if args.synthetic:
+        paths += ["synthetic:short", "synthetic:tail", "synthetic:empty"]
+    if not paths:
+        parser.error("no matrices selected; supply files/directories or --synthetic")
+    if not ACCEL.is_available():
+        raise RuntimeError("selected accelerator is unavailable")
+    torch.manual_seed(args.seed)
+    import triton
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_PROJECT_ROOT,
+                                capture_output=True, text=True, check=False).stdout.strip() or "unknown"
+    except OSError:
+        commit = "unknown"
+    try:
+        device_name = str(ACCEL.get_device_name())
+    except (AttributeError, RuntimeError):
+        device_name = str(accelerator_device())
+    print(json.dumps(dict(device=device_name, backend=fs_common._backend_name(),
+                          torch_version=torch.__version__, triton_version=triton.__version__,
+                          hip_version=getattr(torch.version, "hip", None), cuda_version=getattr(torch.version, "cuda", None),
+                          python_version=platform.python_version(), commit=commit,
+                          warmup=args.warmup, iters=args.iters)), flush=True)
+    print("Native CSR SpMM; Ref=backend policy PyTorch or CPU SciPy (correctness only). "
+          "ms=process_cpu_ms+gpu_ms; phase diagnostics run separately. "
+          "Transpose CSR is rebuilt on every run. Vendor=N/A when unavailable.", flush=True)
     fields = PERF_FIELDS + (TIMING_FIELDS if args.timing else [])
-    rows = []
-    diag_rows = []
-    if args.exclude_tle:
-        print("TLE runtime availability: skipped by --exclude-tle")
-    else:
-        _print_tle_availability(alg_names)
-    vendor_label = _vendor_label()
-    vendor_column = _vendor_column_label()
-    first_dtype = DTYPE_MAP[dtype_names[0]]
-    first_index_dtype = INDEX_DTYPE_MAP[index_dtype_names[0]]
-    vendor_backend, vendor_reason = spmm_ops._spmm_csr_sparse_ref_backend(
-        first_dtype, first_index_dtype, first_index_dtype
-    )
-    for line in fs_common._backend_summary_lines(
-        op_name="SpMM CSR",
-        native_format="CSR",
-        correctness_ref="PyTorch CSR/COO",
-        vendor_backend=vendor_backend,
-        vendor_reason=vendor_reason,
-        run_vendor=not args.no_cusparse,
-    ):
-        print(line)
-    print(
-        f"Vendor sparse baseline: {vendor_label}; unsupported combinations are reported as N/A with reason."
-    )
-    print(
-        f"{'Matrix':<28} {'DType':<10} {'Idx':<5} {'Op':<5} {'Lay':<4} {'Alg':<10} "
-        f"{'ms':>9} {'gpu_ms':>9} {'cpu_ms':>9} {'torch':>9} {vendor_column:>9} "
-        f"{'PT/Alg':>9} {'V/Alg':>9} {'ErrPT':>10} {'Status':>6}"
-    )
-    for dtype_name in dtype_names:
-        dtype = DTYPE_MAP[dtype_name]
-        for index_dtype_name in index_dtype_names:
-            index_dtype = INDEX_DTYPE_MAP[index_dtype_name]
-            for op in op_names:
-                for layout in layout_names:
-                    for path in paths:
-                        try:
-                            case_rows, case_diag = run_one_case(
-                                path,
-                                dtype,
-                                index_dtype_name,
-                                index_dtype,
-                                op,
-                                layout,
-                                alg_names,
-                                args.dense_cols,
-                                args.warmup,
-                                args.iters,
-                                not args.no_cusparse,
-                                args.timing,
-                                args.diagnose,
-                                exclude_tle=args.exclude_tle,
-                            )
-                            rows.extend(case_rows)
-                            diag_rows.extend(case_diag)
-                            for row in case_rows:
-                                _print_row(row)
-                        except Exception as exc:
-                            print(
-                                f"  ERROR on {os.path.basename(path)} dtype={dtype_name} "
-                                f"index_dtype={index_dtype_name} op={op} layout={layout}: {exc}"
-                            )
-    if args.csv:
-        csv_path = _normalize_csv_path(args.csv)
-        _write_csv(csv_path, rows, fields)
+    rows, diag_rows = [], []
+    csv_path = _normalize_csv_path(args.csv) if args.csv else None
+    handle = open(csv_path, "w", newline="", encoding="utf-8") if csv_path else None
+    writer = csv.DictWriter(handle, fieldnames=fields) if handle else None
+    if writer:
+        writer.writeheader()
+        handle.flush()
+    def emit(row):
+        rows.append(row)
+        _print_row(row)
+        if row.get("reason"):
+            print("  " + row["reason"], flush=True)
+        if writer:
+            writer.writerow(row)
+            handle.flush()
+        if args.fail_fast and row["status"] == "FAIL":
+            raise SystemExit("--fail-fast: failed CSR SpMM result was saved")
+    try:
+        for dtype_name, index_name, op, layout, width, path in itertools.product(
+                dtype_names, index_names, ops, layouts, widths, paths):
+            for ptr_name in ptr_names or [index_name]:
+                try:
+                    _, diagnostics = run_one_case(path, DTYPE_MAP[dtype_name], index_name,
+                        INDEX_DTYPE_MAP[index_name], op, layout, algs, width, args.warmup,
+                        args.iters, not args.no_cusparse, args.timing, args.diagnose,
+                        exclude_tle=args.exclude_tle, indptr_dtype_name=ptr_name, emit=emit)
+                    diag_rows.extend(diagnostics)
+                except Exception as exc:
+                    for alg in _expand_algs(algs, op, DTYPE_MAP[dtype_name], args.exclude_tle):
+                        failure = _skip_row(path, DTYPE_MAP[dtype_name], index_name, op,
+                            layout, alg, (None, None), 0, width, "", None, None,
+                            f"case setup/reference failed: {type(exc).__name__}: {exc}", args.timing)
+                        failure.update(status="FAIL", indptr_dtype=ptr_name, nnz=None)
+                        emit(failure)
+    finally:
+        if handle:
+            handle.close()
+    if csv_path:
         root, ext = os.path.splitext(csv_path)
-        best_path = f"{root}.best{ext}"
-        _write_csv(best_path, _best_rows(rows), BEST_FIELDS)
-        print(f"Wrote {len(rows)} rows to {csv_path}")
-        print(f"Wrote best summary to {best_path}")
+        _write_csv(f"{root}.best{ext}", _best_rows(rows), BEST_FIELDS)
         if args.diagnose:
-            diag_path = f"{root}.diagnose{ext}"
-            _write_csv(diag_path, diag_rows, DIAG_FIELDS)
-            print(f"Wrote diagnose metadata to {diag_path}")
+            _write_csv(f"{root}.diagnose{ext}", diag_rows, DIAG_FIELDS)
+        print(f"Wrote {len(rows)} rows to {csv_path}")
+    if any(row["status"] == "FAIL" for row in rows):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

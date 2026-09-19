@@ -518,3 +518,5 @@ outputs compare against CPU int32 references.
 ## License
 
 This project is licensed under the [Apache (Version 2.0) license](./LICENSE).
+
+CSR SpMM registered extensions and complete-run timing: [algorithm/API/validation guide](docs/SPMM_CSR.md). Use `tests/test_spmm_csr.py --synthetic --alg compare --exclude-tle --dtypes all --ops all --timing`; four new routes remain unverified on hardware.
