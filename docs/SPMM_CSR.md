@@ -116,6 +116,18 @@ and vendor-disable aliases remain accepted. Unsupported configurations print rea
 Each algorithm result is flushed to CSV immediately. FAIL rows do not enter speedup
 or best-algorithm selection. The vendor result is also checked against the independent
 correctness reference. Unsupported same-device CSR vendor operations remain N/A.
+The terminal prints one environment line and a compact shared header/result table:
+matrix, dtype, index/pointer types, op, layout, N, algorithm, full-call ms, vendor ms,
+speedup (`x = vendor_ms / ms`), native Check and vendor VCheck. `--timing` keeps the
+same terminal columns; phase timings, errors, configuration and software versions
+remain in CSV. Accuracy failures mark FAIL and continue unless `--fail-fast` is set.
+Compilation, interface and execution exceptions propagate with a traceback;
+previously completed CSV rows remain flushed. Known unsupported combinations print
+deduplicated reasons. A completed measurement remains visible
+in `vendor_ms`, its compatibility alias `cusparse_ms`, and `vendor_raw_ms` even
+when vendor correctness fails. `vendor_status=FAIL` and `vendor_reason` distinguish
+that case from an unavailable interface. Speedup requires both native and vendor
+correctness to pass; failed vendor output is never used as a valid speedup baseline.
 Historical `torch_ms`/speedup fields remain empty: other-format correctness references
 are not performance baselines. All actual parameters are saved in the metadata column.
 

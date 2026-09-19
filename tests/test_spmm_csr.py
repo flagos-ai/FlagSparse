@@ -97,7 +97,7 @@ PERF_FIELDS = [
     "cusparse_reason",
 ]
 
-PERF_FIELDS += ["indptr_dtype", "vendor_ms", "vendor_backend", "vendor_alg",
+PERF_FIELDS += ["indptr_dtype", "vendor_ms", "vendor_raw_ms", "vendor_backend", "vendor_alg",
                 "speedup_vs_vendor", "vendor_reason", "vendor_status", "vendor_error",
                 "max_abs_error", "metadata", "correctness_ref"]
 
@@ -517,10 +517,10 @@ def _time_vendor_sparse_ref(
                 dense_layout=layout,
             )
         except Exception as exc:
-            return None, None, str(exc)
+            raise RuntimeError(f"hipSPARSE setup/run failed: {exc}") from exc
         if sparse_ref["backend"] is None:
             return None, None, sparse_ref["reason"]
-        return sparse_ref["values"], sparse_ref["ms"], None
+        return sparse_ref["values"], sparse_ref["ms"], sparse_ref.get("reason")
     if vendor != "cupy_cusparse":
         return (
             None,
@@ -559,7 +559,7 @@ def _time_vendor_sparse_ref(
         out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
         return out, ms, None
     except Exception as exc:
-        return None, None, str(exc)
+        raise RuntimeError(f"CuPy/cuSPARSE setup/run failed: {exc}") from exc
 
 
 def run_one_case(
@@ -606,20 +606,30 @@ def run_one_case(
             data, indices, indptr, shape, B, op, warmup, iters, layout=layout
         )
 
+    vendor_raw_ms = cusparse_ms
     vendor_profile = _error_profile(cusparse_out, ref, dtype)
     if cusparse_out is not None and vendor_profile["status"] != "PASS":
         cusparse_reason = f"vendor correctness failed: {vendor_profile}"
-        cusparse_ms = None
+        # Preserve a completed vendor measurement even when validation fails.
+        # Availability, correctness and eligibility for speedup are separate.
+    if cusparse_out is None and not cusparse_reason:
+        cusparse_reason = "vendor interface returned no output"
+    _print_vendor_result(path, dtype, index_dtype_name, indptr_dtype_name, op, layout,
+                         dense_cols, vendor_profile, cusparse_ms, vendor_raw_ms, cusparse_reason)
     def record(row):
         row["indptr_dtype"] = indptr_dtype_name
         row["correctness_ref"] = f"{reference_name} (correctness only)"
         row["vendor_ms"] = cusparse_ms
+        row["vendor_raw_ms"] = vendor_raw_ms
         row["vendor_backend"] = fs_common._expected_vendor_sparse_backend()
         row["vendor_alg"] = "default" if cusparse_out is not None else None
         row["vendor_reason"] = cusparse_reason or ""
         row["vendor_status"] = vendor_profile["status"]
         row["vendor_error"] = vendor_profile["global_err"]
-        row["speedup_vs_vendor"] = row.get("cusparse_vs_alg_speedup") if row["status"] == "PASS" else None
+        row["speedup_vs_vendor"] = (
+            row.get("cusparse_vs_alg_speedup")
+            if row["status"] == "PASS" and vendor_profile["status"] == "PASS" else None
+        )
         if emit:
             emit(row)
     rows = _StreamingRows(record)
@@ -628,12 +638,6 @@ def run_one_case(
         data, indices, indptr, shape, op=op, alg="auto"
     )
     selected = _expand_algs(alg_names, op, dtype, exclude_tle=exclude_tle)
-    print(f"Algorithms dtype={dtype} op={op} layout={layout} N={dense_cols}: {', '.join(selected)}", flush=True)
-    if "all" in alg_names:
-        for name, spec in fs.SPMM_CSR_ALGORITHMS.items():
-            if name not in selected:
-                reason = "excluded TLE" if exclude_tle and name in TLE_CSR_SPMM_ALGORITHMS else "unsupported dtype/op"
-                print(f"  excluded {name}: {reason}", flush=True)
     for alg in selected:
         try:
             try:
@@ -657,7 +661,7 @@ def run_one_case(
             torch_profile = _error_profile(out, ref, dtype)
             cusparse_profile = _error_profile(out, cusparse_out, dtype)
         except Exception as exc:
-            failed = not isinstance(exc, (fs.SpmmCsrAlgorithmUnavailable, NotImplementedError))
+            unavailable = isinstance(exc, fs.SpmmCsrAlgorithmUnavailable)
             failure = _skip_row(
                     path,
                     dtype,
@@ -675,8 +679,10 @@ def run_one_case(
                     timing,
                     cusparse_reason=cusparse_reason,
                 )
-            failure["status"] = "FAIL" if failed else "SKIP"
+            failure["status"] = "SKIP" if unavailable else "ERROR"
             rows.append(failure)
+            if not unavailable:
+                raise
             continue
         row = {
             "matrix": os.path.basename(path),
@@ -697,7 +703,10 @@ def run_one_case(
             "torch_ms": torch_ms,
             "cusparse_ms": cusparse_ms,
             "torch_vs_alg_speedup": _ratio(torch_ms, result["ms"]) if torch_profile["status"] == "PASS" else None,
-            "cusparse_vs_alg_speedup": _ratio(cusparse_ms, result["ms"]) if torch_profile["status"] == "PASS" else None,
+            "cusparse_vs_alg_speedup": (
+                _ratio(cusparse_ms, result["ms"])
+                if torch_profile["status"] == "PASS" and vendor_profile["status"] == "PASS" else None
+            ),
             "err_vs_torch": torch_profile["global_err"],
             "err_vs_cusparse": cusparse_profile["global_err"],
             "status": torch_profile["status"],
@@ -770,15 +779,50 @@ def _write_csv(path, rows, fields):
         writer.writerows(rows)
 
 
-def _print_row(row):
-    print(
-        f"{row['matrix']:<28} {row['dtype']:<10} {row['index_dtype']:<5} {row['op']:<5} {row['layout']:<4} {row['alg']:<10} "
-        f"{_fmt(row['ms']):>9} {_fmt(row['gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9} "
-        f"{_fmt(row['torch_ms']):>9} {_fmt(row['cusparse_ms']):>9} "
-        f"{_fmt(row['torch_vs_alg_speedup'], 2):>9} {_fmt(row['cusparse_vs_alg_speedup'], 2):>9} "
-        f"{_fmt(row['err_vs_torch'], 2):>10} {row['status']:>6} "
-        f"ptr={row.get('indptr_dtype')} N={row['dense_cols']} max_abs={row.get('max_abs_error')}"
-    )
+def _console_columns(timing=False):
+    # Keep the terminal compact even with --timing; detailed fields stay in CSV.
+    return [
+        ("matrix", "Matrix", 25), ("dtype", "DType", 10),
+        ("indices", "Idx/Ptr", 11), ("op", "Op", 5),
+        ("layout", "Lay", 3), ("dense_cols", "N", 5),
+        ("alg", "Alg", 24), ("ms", "ms", 9),
+        ("vendor_ms", "Vendor_ms", 9), ("speedup_vs_vendor", "x", 7),
+        ("status", "Check", 6), ("vendor_status", "VCheck", 6),
+    ]
+
+
+def _print_header(timing=False):
+    print(" ".join(f"{label:<{width}}" for _, label, width in _console_columns(timing)), flush=True)
+
+
+def _print_row(row, timing=False):
+    cells = []
+    for key, _, width in _console_columns(timing):
+        value = row.get(key)
+        if key == "indices":
+            value = f"{row.get('index_dtype', 'N/A')}/{row.get('indptr_dtype', 'N/A')}"
+        elif key in ("ms", "vendor_ms", "speedup_vs_vendor"):
+            value = _fmt(value, 2 if key == "speedup_vs_vendor" else 4)
+        elif value is None:
+            value = "N/A"
+        cells.append(f"{str(value):<{width}}")
+    print(" ".join(cells), flush=True)
+
+
+_PRINTED_VENDOR_UNAVAILABLE = set()
+
+
+def _print_vendor_result(path, dtype, index_dtype, indptr_dtype, op, layout, n,
+                         profile, ms, raw_ms, reason):
+    """Normal performance/accuracy status belongs in the table, not extra lines."""
+    if profile["status"] != "SKIP" or reason == "disabled by --no-vendor":
+        return
+    label = _vendor_label()
+    key = (label, str(dtype), index_dtype, indptr_dtype, op, layout, reason)
+    if key not in _PRINTED_VENDOR_UNAVAILABLE:
+        _PRINTED_VENDOR_UNAVAILABLE.add(key)
+        print(f"UNAVAILABLE {label} [{_dtype_name(dtype)} {index_dtype}/{indptr_dtype} {op}/{layout}]: "
+              f"{reason}", file=sys.stderr, flush=True)
 
 
 
@@ -858,14 +902,15 @@ def main():
         device_name = str(ACCEL.get_device_name())
     except (AttributeError, RuntimeError):
         device_name = str(accelerator_device())
-    print(json.dumps(dict(device=device_name, backend=fs_common._backend_name(),
-                          torch_version=torch.__version__, triton_version=triton.__version__,
-                          hip_version=getattr(torch.version, "hip", None), cuda_version=getattr(torch.version, "cuda", None),
-                          python_version=platform.python_version(), commit=commit,
-                          warmup=args.warmup, iters=args.iters)), flush=True)
-    print("Native CSR SpMM; Ref=backend policy PyTorch or CPU SciPy (correctness only). "
-          "ms=process_cpu_ms+gpu_ms; phase diagnostics run separately. "
-          "Transpose CSR is rebuilt on every run. Vendor=N/A when unavailable.", flush=True)
+    runtime_info = dict(device=device_name, backend=fs_common._backend_name(),
+                        torch_version=torch.__version__, triton_version=triton.__version__,
+                        hip_version=getattr(torch.version, "hip", None), cuda_version=getattr(torch.version, "cuda", None),
+                        python_version=platform.python_version(), commit=commit,
+                        warmup=args.warmup, iters=args.iters)
+    vendor_label = "disabled" if args.no_cusparse else _vendor_label()
+    print(f"{runtime_info['backend']} | {device_name} | Vendor={vendor_label} | times=ms, x=Vendor/ms",
+          flush=True)
+    _print_header(timing=args.timing)
     fields = PERF_FIELDS + (TIMING_FIELDS if args.timing else [])
     rows, diag_rows = [], []
     csv_path = _normalize_csv_path(args.csv) if args.csv else None
@@ -874,11 +919,16 @@ def main():
     if writer:
         writer.writeheader()
         handle.flush()
+    reported_unavailable = set()
     def emit(row):
+        metadata = json.loads(row.get("metadata") or "{}")
+        metadata["environment"] = runtime_info
+        row["metadata"] = json.dumps(metadata, default=str, sort_keys=True)
         rows.append(row)
-        _print_row(row)
-        if row.get("reason"):
-            print("  " + row["reason"], flush=True)
+        _print_row(row, timing=args.timing)
+        if row["status"] == "SKIP" and row.get("reason") not in reported_unavailable:
+            reported_unavailable.add(row["reason"])
+            print(f"UNAVAILABLE {row['alg']}: {row['reason']}", file=sys.stderr, flush=True)
         if writer:
             writer.writerow(row)
             handle.flush()
@@ -894,13 +944,10 @@ def main():
                         args.iters, not args.no_cusparse, args.timing, args.diagnose,
                         exclude_tle=args.exclude_tle, indptr_dtype_name=ptr_name, emit=emit)
                     diag_rows.extend(diagnostics)
-                except Exception as exc:
-                    for alg in _expand_algs(algs, op, DTYPE_MAP[dtype_name], args.exclude_tle):
-                        failure = _skip_row(path, DTYPE_MAP[dtype_name], index_name, op,
-                            layout, alg, (None, None), 0, width, "", None, None,
-                            f"case setup/reference failed: {type(exc).__name__}: {exc}", args.timing)
-                        failure.update(status="FAIL", indptr_dtype=ptr_name, nnz=None)
-                        emit(failure)
+                except Exception:
+                    print(f"ERROR matrix={path} dtype={dtype_name} indices={index_name}/{ptr_name} "
+                          f"op={op} layout={layout} N={width}", file=sys.stderr, flush=True)
+                    raise
     finally:
         if handle:
             handle.close()
