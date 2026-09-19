@@ -190,6 +190,11 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
     "spmv_csr": (
         "tests/test_spmv_csr.py",
         "{input}",
+        "--alg", "compare",
+        "--dtypes", "all",
+        "--ops", "all",
+        "--indptr-dtypes", "int32,int64",
+        "--timing",
         "--csv-csr",
         "{csv}",
         "--warmup",

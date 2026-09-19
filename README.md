@@ -265,17 +265,20 @@ python tests/test_spmv_csr.py <dir/> --csv-csr results.csv   # FP32/FP64 × inde
 ```
 
 CSR algorithms: `row_tile`, `row_vector`, `row_split_reduce`, and `row_adaptive_split`
-are explicit FP32/FP64 `op=non` routes with FP64 computation and CUDA/ROCm
-conservative profiles. `auto` preserves the existing default; `compare` runs all
+support all six value dtypes and `non/trans/conj`, with CUDA/ROCm conservative
+profiles. Real FP32/FP64 use FP64 computation; FP16/BF16 use FP32; complex64/128
+use native FP32/FP64 components. `auto` preserves the existing default; `compare` runs all
 supported candidates on the same input. GPU validation is still pending.
 
 ```bash
 python tests/test_spmv_csr.py --synthetic --alg compare --timing --csv-csr spmv.csv
-python tests/test_spmv_csr.py <dir/> --dtypes float32,float64 --alg compare --timing --csv-csr results.csv
+python tests/test_spmv_csr.py <dir/> --dtypes all --ops all --indptr-dtypes int32,int64 --alg compare --timing --csv-csr results.csv
 ```
 
 `ms = process_cpu_ms + gpu_ms` with and without `--timing`; phase diagnostics run
-separately. Every split/adaptive invocation rebuilds its GPU plan. CSV rows name
+separately. All seven algorithms rebuild transpose/conjugate-transpose CSR inside
+each run; this cost is included, unlike older prepare-time transpose measurements.
+Every split/adaptive invocation rebuilds its GPU plan. CSV rows name
 the actual vendor, algorithm, index types, profile and correctness result.
 `test_spmv.py` remains a forwarding entry point. See [CSR algorithm and timing contract](docs/SPMV_CSR.md).
 

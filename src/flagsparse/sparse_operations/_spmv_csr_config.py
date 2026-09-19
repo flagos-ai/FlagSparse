@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 1
+IMPLEMENTATION_VERSION = 2
 NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split")
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
@@ -47,6 +47,15 @@ def normalize_alg(alg):
     return name
 
 
+def compute_dtype(alg, dtype):
+    name = dtype_name(dtype)
+    if name in ("float16", "bfloat16"):
+        return "float32"
+    if name == "float32" and alg in NEW_ALGORITHMS + ("legacy_rowpar",):
+        return "float64"
+    return name
+
+
 def algorithm_spec(alg):
     name = normalize_alg(alg)
     if name == "auto":
@@ -55,22 +64,25 @@ def algorithm_spec(alg):
     return {
         "name": name,
         "implementation_version": IMPLEMENTATION_VERSION,
-        "ops": ("non",) if new else ("non", "trans", "conj"),
-        "value_dtypes": (
-            ("float32", "float64")
-            if new or name == "legacy_bucket_vector"
-            else VALUE_DTYPES
-        ),
+        "ops": ("non", "trans", "conj"),
+        "value_dtypes": VALUE_DTYPES,
         "index_dtypes": (
             ("int32",) if name == "legacy_bucket_vector" else ("int32", "int64")
         ),
         "indptr_dtypes": ("int32", "int64"),
         "backends": ("cuda", "rocm") if new else BACKENDS,
-        "runtime_process": name
-        in ("row_split_reduce", "row_adaptive_split", "legacy_bucket_vector"),
+        "runtime_process": True,
+        "runtime_process_ops": (
+            ("non", "trans", "conj")
+            if name
+            in ("row_split_reduce", "row_adaptive_split", "legacy_bucket_vector")
+            else ("trans", "conj")
+        ),
+        "transpose_strategy": "per_run_csr_rebuild",
         "cross_call_plan_cache": False,
-        "capability_requirements": ("fp64", "int64", "reduction") if new else (),
-        "compute_dtype": "float64" if new else "legacy",
+        "capability_requirements": ("int64", "reduction") if new else (),
+        "compute_dtype": "input_dependent",
+        "compute_dtype_by_input": {dt: compute_dtype(name, dt) for dt in VALUE_DTYPES},
     }
 
 
@@ -102,14 +114,21 @@ def validate_support(alg, op, dtype, indices_dtype, indptr_dtype, caps):
         if value not in spec[key]:
             raise NotImplementedError(f"CSR SpMV {alg} does not support {key}={value}")
     if alg in NEW_ALGORITHMS and not (
-        caps.fp64
-        and caps.int64
+        caps.int64
         and caps.reduction
         and caps.subgroup_width in (32, 64)
         and caps.max_threads_per_block > 0
     ):
         raise NotImplementedError(
             f"CSR SpMV {alg}: unverified capabilities for {caps.backend}/{caps.arch}"
+        )
+    if (
+        alg in NEW_ALGORITHMS
+        and compute_dtype(alg, dtype) in ("float64", "complex128")
+        and not caps.fp64
+    ):
+        raise NotImplementedError(
+            f"CSR SpMV {alg}: FP64 capability required for {dtype}"
         )
 
 
@@ -206,12 +225,7 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False):
     if (
         caps.backend not in ("cuda", "rocm")
         or caps.subgroup_width not in (32, 64)
-        or not (
-            caps.fp64
-            and caps.int64
-            and caps.reduction
-            and caps.max_threads_per_block > 0
-        )
+        or not (caps.int64 and caps.reduction and caps.max_threads_per_block > 0)
     ):
         raise NotImplementedError(
             f"no verified CSR SpMV profile for {caps.backend}/{caps.arch}"

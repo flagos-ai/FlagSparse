@@ -76,8 +76,17 @@ def main():
         )
         print(f"compiled {name} {pointers} {constants}", flush=True)
 
-    for value, col, ptr, indexed in itertools.product(
-        ("fp32", "fp64"), ("i32", "i64"), ("i32", "i64"), (False, True)
+    # Complex pointers expose native real components, never a Triton complex type.
+    value_modes = (
+        ("fp16", False, tl.float32),
+        ("bf16", False, tl.float32),
+        ("fp32", False, tl.float64),
+        ("fp64", False, tl.float64),
+        ("fp32", True, tl.float32),
+        ("fp64", True, tl.float64),
+    )
+    for (value, complex_input, acc), col, ptr, indexed in itertools.product(
+        value_modes, ("i32", "i64"), ("i32", "i64"), (False, True)
     ):
         pointers = dict(
             A="*" + value,
@@ -91,16 +100,34 @@ def main():
             "row_tile_kernel",
             pointers,
             ("N",),
-            dict(INDEXED=indexed, R=2 * width // 8, V=8, STAGES=1),
+            dict(
+                INDEXED=indexed,
+                R=2 * width // 8,
+                V=8,
+                STAGES=1,
+                COMPLEX=complex_input,
+                ACC=acc,
+            ),
             2,
         )
         check(
             "row_vector_kernel",
             pointers,
             ("N",),
-            dict(INDEXED=indexed, B=128, STAGES=1),
+            dict(INDEXED=indexed, B=128, STAGES=1, COMPLEX=complex_input, ACC=acc),
             2,
         )
+        if indexed and col == "i32" and (complex_input or value in ("fp16", "bf16")):
+            for batch in (1, 4):
+                check(
+                    "bucket_rows_kernel",
+                    pointers,
+                    ("N",),
+                    dict(
+                        BATCH=batch, B=128, MAX_SEGS=3, COMPLEX=complex_input, ACC=acc
+                    ),
+                    2,
+                )
     for ptr, adaptive in itertools.product(("i32", "i64"), (False, True)):
         check(
             "classify_kernel",
@@ -123,7 +150,9 @@ def main():
             ("TOTAL", "M"),
             dict(T=1024, B=256),
         )
-    for value, col in itertools.product(("fp32", "fp64"), ("i32", "i64")):
+    for (value, complex_input, acc), col in itertools.product(
+        value_modes, ("i32", "i64")
+    ):
         check(
             "segment_kernel",
             dict(
@@ -132,29 +161,39 @@ def main():
                 X="*" + value,
                 STARTS="*i64",
                 LENGTHS="*i64",
-                PARTIAL="*fp64",
+                PARTIAL="*fp64" if acc == tl.float64 else "*fp32",
             ),
             (),
-            dict(B=128, STAGES=1),
+            dict(B=128, STAGES=1, COMPLEX=complex_input, ACC=acc),
             2,
         )
-    for block in (2, 256):
+    for block, acc, complex_input in itertools.product(
+        (2, 256), ("fp32", "fp64"), (False, True)
+    ):
         check(
             "reduce_level_kernel",
             dict(
-                PARTIAL="*fp64", PREV_PREFIX="*i64", NEXT_PREFIX="*i64", OUTPUT="*fp64"
+                PARTIAL="*" + acc,
+                PREV_PREFIX="*i64",
+                NEXT_PREFIX="*i64",
+                OUTPUT="*" + acc,
             ),
             ("M",),
-            dict(B=block),
+            dict(B=block, COMPLEX=complex_input),
         )
-    for value, empty, partial in itertools.product(
-        ("fp32", "fp64"), (False, True), (False, True)
+    for (value, complex_input, acc), empty, partial in itertools.product(
+        value_modes, (False, True), (False, True)
     ):
         check(
             "finish_kernel",
-            dict(PARTIAL="*fp64", PREFIX="*i64", COUNTS="*i64", Y="*" + value),
+            dict(
+                PARTIAL="*fp64" if acc == tl.float64 else "*fp32",
+                PREFIX="*i64",
+                COUNTS="*i64",
+                Y="*" + value,
+            ),
             ("M",),
-            dict(WRITE_EMPTY=empty, HAS_PARTIAL=partial, B=256),
+            dict(WRITE_EMPTY=empty, HAS_PARTIAL=partial, B=256, COMPLEX=complex_input),
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
@@ -166,6 +205,7 @@ def main():
                 records=records,
             ),
             indent=2,
+            default=str,
         ),
         encoding="utf-8",
     )

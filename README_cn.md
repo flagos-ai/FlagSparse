@@ -235,15 +235,17 @@ python tests/test_spmv_csr.py <目录/> --csv-csr results.csv  # 默认 FP32/FP6
 ```
 
 新增 `row_tile`、`row_vector`、`row_split_reduce`、`row_adaptive_split` 四个显式算法，
-首版支持 FP32/FP64、`op=non`，统一 FP64 计算，提供 CUDA/ROCm 保守配置。
+支持六种 dtype 和 `non/trans/conj`，提供 CUDA/ROCm 保守配置。
+新算法的实数 FP32/FP64 使用 FP64 计算，FP16/BF16 使用 FP32，complex64/128 使用原生 FP32/FP64 分量计算。
 `auto` 保留原默认路径，`compare` 使用同一输入比较支持的算法；实机验证仍待完成。
 
 ```bash
 python tests/test_spmv_csr.py --synthetic --alg compare --timing --csv-csr spmv.csv
-python tests/test_spmv_csr.py <目录/> --dtypes float32,float64 --alg compare --timing --csv-csr results.csv
+python tests/test_spmv_csr.py <目录/> --dtypes all --ops all --indptr-dtypes int32,int64 --alg compare --timing --csv-csr results.csv
 ```
 
 有无 `--timing` 均使用 `ms = process_cpu_ms + gpu_ms`，分段诊断另行运行。
+七个算法的转置/共轭转置都在每次 run 内重建 CSR 并计时，不能直接与旧版 prepare 中完成转置的耗时比较。
 分段/自适应算法每次执行都在 GPU 上重建计划；CSV 记录实际厂商、算法、索引类型、配置和正确性。
 `test_spmv.py` 保留兼容转发。详见 [CSR 算法与计时契约](docs/SPMV_CSR.md)。
 

@@ -344,8 +344,8 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
                 algorithm,
                 value_const="SPMV_CSR_NEW_VALUE_DTYPES",
                 index_const="SUPPORTED_INDEX_DTYPES",
-                ops=("non",),
-                notes="CUDA/ROCm conservative profiles; FP64 compute; hardware validation pending",
+                ops=spmv_ops,
+                notes="CUDA/ROCm; input-dependent accumulation; per-run CSR transpose; hardware validation pending",
             )
             for algorithm in modules["spmv_csr"].get("SPMV_CSR_NEW_ALGORITHMS")
         ),
@@ -356,18 +356,14 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
                 "spmv_csr",
                 "CSR",
                 algorithm,
-                values=(
-                    ("float32", "float64")
-                    if algorithm == "legacy_bucket_vector"
-                    else DEFAULT_VALUE_DTYPES
-                ),
+                values=DEFAULT_VALUE_DTYPES,
                 indices=(
                     ("int32",)
                     if algorithm == "legacy_bucket_vector"
                     else DEFAULT_INDEX_DTYPES
                 ),
                 ops=spmv_ops,
-                notes="named legacy route; original numerical policy retained",
+                notes="named legacy route; existing precision retained; per-run transpose and added bucket dtypes await hardware validation",
             )
             for algorithm in ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
         ),
@@ -629,7 +625,25 @@ def rows_for_spec(
         ops_tuple = ops
 
     return [
-        row(spec, value_dtype, index_dtype, op, status)
+        row(
+            spec,
+            value_dtype,
+            index_dtype,
+            op,
+            (
+                "UNVERIFIED"
+                if status == "SUPPORTED"
+                and spec.module == "spmv_csr"
+                and (
+                    op in ("trans", "conj")
+                    or (
+                        spec.route == "legacy_bucket_vector"
+                        and value_dtype not in ("float32", "float64")
+                    )
+                )
+                else status
+            ),
+        )
         for value_dtype in values
         for index_dtype in indices
         for op in ops_tuple

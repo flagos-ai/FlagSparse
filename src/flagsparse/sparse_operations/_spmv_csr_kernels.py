@@ -6,6 +6,29 @@ import triton.language as tl
 
 
 @triton.jit
+def _product(A, X, pos, col, mask, COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    if COMPLEX:
+        ar = tl.load(A + 2 * pos, mask, 0).to(ACC)
+        ai = tl.load(A + 2 * pos + 1, mask, 0).to(ACC)
+        xr = tl.load(X + 2 * col, mask, 0).to(ACC)
+        xi = tl.load(X + 2 * col + 1, mask, 0).to(ACC)
+        return ar * xr - ai * xi, ar * xi + ai * xr
+    else:
+        a = tl.load(A + pos, mask, 0).to(ACC)
+        x = tl.load(X + col, mask, 0).to(ACC)
+        return a * x, tl.full(pos.shape, 0, ACC)
+
+
+@triton.jit
+def _store_result(Y, row, real, imag, mask, COMPLEX: tl.constexpr):
+    if COMPLEX:
+        tl.store(Y + row * 2, real, mask)
+        tl.store(Y + row * 2 + 1, imag, mask)
+    else:
+        tl.store(Y + row, real, mask)
+
+
+@triton.jit
 def row_tile_kernel(
     A,
     CI,
@@ -18,6 +41,8 @@ def row_tile_kernel(
     R: tl.constexpr,
     V: tl.constexpr,
     STAGES: tl.constexpr,
+    COMPLEX: tl.constexpr = False,
+    ACC: tl.constexpr = tl.float64,
 ):
     ridx = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
     valid = ridx < N
@@ -28,16 +53,18 @@ def row_tile_kernel(
     start = tl.load(RP + row, valid, 0).to(tl.int64)
     end = tl.load(RP + row + 1, valid, 0).to(tl.int64)
     lane = tl.arange(0, V)
-    acc = tl.zeros((R, V), tl.float64)
+    acc = tl.zeros((R, V), ACC)
+    imag = tl.zeros((R, V), ACC)
     steps = tl.max(tl.cdiv(end - start, V), 0)
     for step in tl.range(0, steps, num_stages=STAGES):
         pos = start[:, None] + step * V + lane[None, :]
         mask = valid[:, None] & (pos < end[:, None])
-        a = tl.load(A + pos, mask, 0).to(tl.float64)
         col = tl.load(CI + pos, mask, 0).to(tl.int64)
-        xv = tl.load(X + col, mask, 0).to(tl.float64)
-        acc = acc + a * xv
-    tl.store(Y + row, tl.sum(acc, 1), valid)
+        pr, pi = _product(A, X, pos, col, mask, COMPLEX, ACC)
+        acc = acc + pr
+        if COMPLEX:
+            imag = imag + pi
+    _store_result(Y, row, tl.sum(acc, 1), tl.sum(imag, 1), valid, COMPLEX)
 
 
 @triton.jit
@@ -52,6 +79,8 @@ def row_vector_kernel(
     INDEXED: tl.constexpr,
     B: tl.constexpr,
     STAGES: tl.constexpr,
+    COMPLEX: tl.constexpr = False,
+    ACC: tl.constexpr = tl.float64,
 ):
     pid = tl.program_id(0).to(tl.int64)
     if INDEXED:
@@ -61,15 +90,54 @@ def row_vector_kernel(
     start = tl.load(RP + row).to(tl.int64)
     end = tl.load(RP + row + 1).to(tl.int64)
     lane = tl.arange(0, B)
-    acc = tl.zeros((B,), tl.float64)
+    acc = tl.zeros((B,), ACC)
+    imag = tl.zeros((B,), ACC)
     for step in tl.range(0, tl.cdiv(end - start, B), num_stages=STAGES):
         pos = start + step * B + lane
         mask = pos < end
-        a = tl.load(A + pos, mask, 0).to(tl.float64)
         col = tl.load(CI + pos, mask, 0).to(tl.int64)
-        xv = tl.load(X + col, mask, 0).to(tl.float64)
-        acc = acc + a * xv
-    tl.store(Y + row, tl.sum(acc, 0))
+        pr, pi = _product(A, X, pos, col, mask, COMPLEX, ACC)
+        acc = acc + pr
+        if COMPLEX:
+            imag = imag + pi
+    _store_result(Y, row, tl.sum(acc, 0), tl.sum(imag, 0), True, COMPLEX)
+
+
+@triton.jit
+def bucket_rows_kernel(
+    A,
+    CI,
+    RP,
+    X,
+    Y,
+    ROWS,
+    N,
+    BATCH: tl.constexpr,
+    B: tl.constexpr,
+    MAX_SEGS: tl.constexpr,
+    COMPLEX: tl.constexpr,
+    ACC: tl.constexpr,
+):
+    """Legacy bucket scheduling, including sequential short-row batches."""
+    pid = tl.program_id(0).to(tl.int64)
+    lane = tl.arange(0, B)
+    for batch in range(BATCH):
+        index = pid * BATCH + batch
+        active = index < N
+        row = tl.load(ROWS + index, active, 0).to(tl.int64)
+        start = tl.load(RP + row, active, 0).to(tl.int64)
+        end = tl.load(RP + row + 1, active, 0).to(tl.int64)
+        real = tl.zeros((B,), ACC)
+        imag = tl.zeros((B,), ACC)
+        for step in range(MAX_SEGS):
+            pos = start + step * B + lane
+            mask = active & (pos < end)
+            col = tl.load(CI + pos, mask, 0).to(tl.int64)
+            pr, pi = _product(A, X, pos, col, mask, COMPLEX, ACC)
+            real += pr
+            if COMPLEX:
+                imag += pi
+        _store_result(Y, row, tl.sum(real, 0), tl.sum(imag, 0), active, COMPLEX)
 
 
 @triton.jit
@@ -147,26 +215,45 @@ def descriptors_kernel(
 
 @triton.jit
 def segment_kernel(
-    A, CI, X, STARTS, LENGTHS, PARTIAL, B: tl.constexpr, STAGES: tl.constexpr
+    A,
+    CI,
+    X,
+    STARTS,
+    LENGTHS,
+    PARTIAL,
+    B: tl.constexpr,
+    STAGES: tl.constexpr,
+    COMPLEX: tl.constexpr = False,
+    ACC: tl.constexpr = tl.float64,
 ):
     pid = tl.program_id(0).to(tl.int64)
     start = tl.load(STARTS + pid)
     length = tl.load(LENGTHS + pid)
     lane = tl.arange(0, B)
-    acc = tl.zeros((B,), tl.float64)
+    acc = tl.zeros((B,), ACC)
+    imag = tl.zeros((B,), ACC)
     for step in tl.range(0, tl.cdiv(length, B), num_stages=STAGES):
         offset = step * B + lane
         mask = offset < length
         pos = start + offset
-        a = tl.load(A + pos, mask, 0).to(tl.float64)
         col = tl.load(CI + pos, mask, 0).to(tl.int64)
-        xv = tl.load(X + col, mask, 0).to(tl.float64)
-        acc = acc + a * xv
-    tl.store(PARTIAL + pid, tl.sum(acc, 0))
+        pr, pi = _product(A, X, pos, col, mask, COMPLEX, ACC)
+        acc = acc + pr
+        if COMPLEX:
+            imag = imag + pi
+    _store_result(PARTIAL, pid, tl.sum(acc, 0), tl.sum(imag, 0), True, COMPLEX)
 
 
 @triton.jit
-def reduce_level_kernel(PARTIAL, PREV_PREFIX, NEXT_PREFIX, OUTPUT, M, B: tl.constexpr):
+def reduce_level_kernel(
+    PARTIAL,
+    PREV_PREFIX,
+    NEXT_PREFIX,
+    OUTPUT,
+    M,
+    B: tl.constexpr,
+    COMPLEX: tl.constexpr = False,
+):
     pid = tl.program_id(0).to(tl.int64)
     # A one-element block lets the shared owner search serve scalar programs.
     ids = tl.full((1,), pid, tl.int64)
@@ -175,8 +262,10 @@ def reduce_level_kernel(PARTIAL, PREV_PREFIX, NEXT_PREFIX, OUTPUT, M, B: tl.cons
     prev_base = tl.load(PREV_PREFIX + row - 1, row > 0, 0)
     prev_end = tl.load(PREV_PREFIX + row)
     pos = prev_base + (pid - group_base) * B + tl.arange(0, B)
-    value = tl.load(PARTIAL + pos, pos < prev_end, 0)
-    tl.store(OUTPUT + pid, tl.sum(value, 0))
+    stride: tl.constexpr = 2 if COMPLEX else 1
+    for component in tl.static_range(stride):
+        value = tl.load(PARTIAL + pos * stride + component, pos < prev_end, 0)
+        tl.store(OUTPUT + pid * stride + component, tl.sum(value, 0))
 
 
 @triton.jit
@@ -189,19 +278,20 @@ def finish_kernel(
     WRITE_EMPTY: tl.constexpr,
     HAS_PARTIAL: tl.constexpr,
     B: tl.constexpr,
+    COMPLEX: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
     valid = row < M
     count = tl.load(COUNTS + row, valid, 0)
-    if HAS_PARTIAL:
-        pos = tl.load(PREFIX + row, valid, 0) - 1
-        value = tl.load(PARTIAL + pos, valid & (count > 0), 0)
-    else:
-        value = tl.full((B,), 0, tl.float64)
-    if WRITE_EMPTY:
-        tl.store(Y + row, value, valid)
-    else:
-        tl.store(Y + row, value, valid & (count > 0))
+    stride: tl.constexpr = 2 if COMPLEX else 1
+    for component in tl.static_range(stride):
+        if HAS_PARTIAL:
+            pos = tl.load(PREFIX + row, valid, 0) - 1
+            value = tl.load(PARTIAL + pos * stride + component, valid & (count > 0), 0)
+        else:
+            value = tl.full((B,), 0, PARTIAL.dtype.element_ty)
+        mask = valid if WRITE_EMPTY else valid & (count > 0)
+        tl.store(Y + row * stride + component, value, mask)
 
 
 def build_plan(prepared, config, adaptive):
@@ -278,7 +368,19 @@ def compute(prepared, x, y, alg, config, plan=None):
     m = prepared.n_rows
     if not m:
         return y
-    args = (prepared.data, prepared.kernel_indices, prepared.kernel_indptr, x, y)
+    complex_input = prepared.data.is_complex()
+    acc_dtype = (
+        torch.float64
+        if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128)
+        else torch.float32
+    )
+    acc = tl.float64 if acc_dtype == torch.float64 else tl.float32
+    view = lambda t: (
+        torch.view_as_real(t.resolve_conj()).reshape(-1) if complex_input else t
+    )
+    data, vector, output_view = view(prepared.data), view(x), view(y)
+    args = (data, prepared.kernel_indices, prepared.kernel_indptr, vector, output_view)
+    channels = 2 if complex_input else 1
     if alg in ("row_tile", "row_adaptive_split"):
         rows = None if plan is None else plan["short_rows"]
         n = m if rows is None else rows.numel()
@@ -292,6 +394,8 @@ def compute(prepared, x, y, alg, config, plan=None):
                 R=c["rows_per_program"],
                 V=c["lanes_per_row"],
                 STAGES=c["loop_num_stages"],
+                COMPLEX=complex_input,
+                ACC=acc,
                 num_warps=c["num_warps"],
                 enable_fp_fusion=False,
             )
@@ -307,28 +411,34 @@ def compute(prepared, x, y, alg, config, plan=None):
                 INDEXED=rows is not None,
                 B=c["block_nnz"],
                 STAGES=c["loop_num_stages"],
+                COMPLEX=complex_input,
+                ACC=acc,
                 num_warps=c["num_warps"],
                 enable_fp_fusion=False,
             )
     if plan is not None:
         c = config["row_split_reduce"]
-        partial = torch.empty(plan["total"], dtype=torch.float64, device=y.device)
+        partial = torch.empty(
+            plan["total"] * channels, dtype=acc_dtype, device=y.device
+        )
         prefix = plan["prefix"]
         if plan["total"]:
             segment_kernel[(plan["total"],)](
-                prepared.data,
+                data,
                 prepared.kernel_indices,
-                x,
+                vector,
                 plan["starts"],
                 plan["lengths"],
                 partial,
                 B=c["block_nnz"],
                 STAGES=c["loop_num_stages"],
+                COMPLEX=complex_input,
+                ACC=acc,
                 num_warps=c["num_warps"],
                 enable_fp_fusion=False,
             )
             for next_prefix, total in plan["levels"]:
-                output = torch.empty(total, dtype=torch.float64, device=y.device)
+                output = torch.empty(total * channels, dtype=acc_dtype, device=y.device)
                 reduce_level_kernel[(total,)](
                     partial,
                     prefix,
@@ -336,6 +446,7 @@ def compute(prepared, x, y, alg, config, plan=None):
                     output,
                     m,
                     B=c["reduce_block_size"],
+                    COMPLEX=complex_input,
                     num_warps=c["reduce_num_warps"],
                 )
                 partial, prefix = output, next_prefix
@@ -344,11 +455,12 @@ def compute(prepared, x, y, alg, config, plan=None):
             partial,
             prefix,
             plan["counts"],
-            y,
+            output_view,
             m,
             WRITE_EMPTY=alg == "row_split_reduce",
             HAS_PARTIAL=plan["total"] > 0,
             B=finish_block,
+            COMPLEX=complex_input,
             num_warps=c["reduce_num_warps"],
         )
     return y

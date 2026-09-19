@@ -434,8 +434,8 @@ def prepare_spmv_csc(
     # program per column with a serial segment loop, which on a mean-8-nnz matrix is
     # mostly masked-off loads; delegating measured 4.39x geomean over 240 cases
     # (fp64 5.73x, complex128 8.22x) with 16 mild regressions, worst 0.75x.
-    # prepare_spmv_csr already uses this same transpose-in-prepare technique for its own
-    # trans/conj, so the timing convention matches the cuSPARSE baseline, which
+    # This is a CSC-specific prepared delegate. CSR trans/conj now rebuild their
+    # CSR inside each run; do not infer CSR timing from this delegation. The baseline
     # materialises A.conj().T once outside the timed window.
     # CUDA only: this swaps which kernel actually runs, and the CSR-Vector bucket tiers
     # it lands on were tuned per backend separately.  Elsewhere the original CSC

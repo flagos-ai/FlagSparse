@@ -45,6 +45,8 @@ FIELDS = [
     "config_source",
     "config_rejections",
     "compute_dtype",
+    "component_dtype",
+    "transpose_strategy",
     "input_indices_dtype",
     "input_indptr_dtype",
     "indices_dtype",

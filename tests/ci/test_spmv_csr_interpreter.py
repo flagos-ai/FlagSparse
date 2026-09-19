@@ -41,7 +41,17 @@ policy = load_module("_csr_interpreter_policy", "_spmv_csr_config.py")
 
 
 @pytest.mark.parametrize("alg", policy.NEW_ALGORITHMS)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    ],
+)
 @pytest.mark.parametrize(
     "indices,indptr",
     [
@@ -78,11 +88,12 @@ def test_interpreted_csr_algorithms(alg, dtype, indices, indptr, lengths):
     )
     out = torch.full((len(lengths),), float("nan"), dtype=dtype)
     kernels.compute(prepared, x, out, alg, config, plan)
+    reference_dtype = torch.complex128 if data.is_complex() else torch.float64
     expected = torch.tensor(
         [
             sum(
-                data[int(ptr[r]) : int(ptr[r + 1])].double()
-                * x[col[int(ptr[r]) : int(ptr[r + 1])].long()].double()
+                data[int(ptr[r]) : int(ptr[r + 1])].to(reference_dtype)
+                * x[col[int(ptr[r]) : int(ptr[r + 1])].long()].to(reference_dtype)
             )
             for r in range(len(lengths))
         ],

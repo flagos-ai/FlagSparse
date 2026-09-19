@@ -32,7 +32,9 @@ from tests.pytest.accuracy_utils import (
 from tests.pytest.param_shapes import SPMV_MN_SHAPES
 
 spmv_mod = importlib.import_module("flagsparse.sparse_operations.spmv_csr")
-pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
+pytestmark = pytest.mark.skipif(
+    not accelerator_available(), reason=ACCELERATOR_REQUIRED
+)
 
 
 def _value_dtype_cases():
@@ -366,7 +368,7 @@ def test_spmv_csr_new_boundaries(alg, dtype, col_dtype, ptr_dtype, lengths):
 
 @pytest.mark.spmv_csr
 @pytest.mark.parametrize("alg", ["row_split_reduce", "row_adaptive_split"])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", spmv_mod.SUPPORTED_SPMV_VALUE_DTYPES)
 def test_spmv_csr_multilevel_and_rebuild(alg, dtype, monkeypatch):
     from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
 
@@ -443,20 +445,25 @@ def test_spmv_csr_new_out_and_prepared_validation():
     ):
         with pytest.raises(ValueError):
             spmv_mod.flagsparse_spmv_csr_run(prepared, x, **args)
-    with pytest.raises(NotImplementedError):
-        spmv_mod.prepare_spmv_csr(data, col, ptr, shape, alg="row_vector", op="trans")
+    transposed = spmv_mod.prepare_spmv_csr(
+        data, col, ptr, shape, alg="row_vector", op="trans"
+    )
+    assert transposed.shape == shape
+    assert transposed.kernel_indptr is ptr
 
 
 @pytest.mark.spmv_csr
 @pytest.mark.parametrize("alg", NEW_ALGORITHMS)
-def test_spmv_csr_new_fallback_preserves_selection(alg, monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64, torch.complex128])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmv_csr_new_fallback_preserves_selection(alg, dtype, op, monkeypatch):
     from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
 
-    data, col, ptr, x, shape = _native_case(
-        [0, 3, 65], torch.float32, torch.int64, torch.int64
-    )
+    data, col, ptr, x, shape = _native_case([0, 3, 65], dtype, torch.int64, torch.int64)
+    if op != "non":
+        x = _make_x(shape[0], dtype, data.device)
     config = {"row_vector": {"block_nnz": 64}}
-    prepared = _new_prepared(data, col, ptr, shape, alg, config=config)
+    prepared = _new_prepared(data, col, ptr, shape, alg, config=config, op=op)
     original = kernels.compute
 
     def fail_i64(route, vector, output, algorithm, cfg, plan):
@@ -469,20 +476,22 @@ def test_spmv_csr_new_fallback_preserves_selection(alg, monkeypatch):
     actual, meta = spmv_mod.flagsparse_spmv_csr_run(prepared, x, return_meta=True)
     rtol, atol = close_tolerances(data.dtype)
     torch.testing.assert_close(
-        actual.cpu(), golden_csr(data, col, ptr, x, shape), rtol=rtol, atol=atol
+        actual.cpu(), golden_csr(data, col, ptr, x, shape, op), rtol=rtol, atol=atol
     )
     assert meta["index_fallback_applied"] and meta["alg_resolved"] == alg
     assert meta["indices_dtype"] == "int32" and meta["input_indices_dtype"] == "int64"
+    assert prepared.op == spmv_mod._normalize_spmv_op(op)
     prepared.index_fallback_policy = "strict"
     with pytest.raises(RuntimeError, match="unsupported int64"):
         spmv_mod.flagsparse_spmv_csr_run(prepared, x)
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", NEW_ALGORITHMS)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
+@pytest.mark.parametrize("dtype", spmv_mod.SUPPORTED_SPMV_VALUE_DTYPES)
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize("matrix_name", REGRESSIONS["matrices"])
-def test_spmv_csr_external_matrix_regressions(alg, dtype, matrix_name):
+def test_spmv_csr_external_matrix_regressions(alg, dtype, op, matrix_name):
     """Set FLAGSPARSE_SPMV_CSR_MTX_DIR to run every supplied matrix, including FP32 failures."""
     directory = os.environ.get("FLAGSPARSE_SPMV_CSR_MTX_DIR")
     if not directory:
@@ -494,18 +503,168 @@ def test_spmv_csr_external_matrix_regressions(alg, dtype, matrix_name):
         len(paths) == 1
     ), f"expected exactly one regression input {matrix_name} under {directory}"
     path = paths[0]
-    data, col, ptr, shape = load_csr(
-        path, dtype=dtype, device=accelerator_device()
-    )
+    data, col, ptr, shape = load_csr(path, dtype=dtype, device=accelerator_device())
     torch.manual_seed(2026)
-    x = torch.randn(shape[1], dtype=dtype, device=data.device)
-    prepared = _new_prepared(data, col, ptr, shape, alg)
+    assert not col.numel() or int(col.max()) <= 2147483647
+    col, ptr = col.to(torch.int32), ptr.to(torch.int64)
+    x = torch.randn(
+        shape[1] if op == "non" else shape[0], dtype=dtype, device=data.device
+    )
+    prepared = _new_prepared(data, col, ptr, shape, alg, op=op)
     actual = spmv_mod.flagsparse_spmv_csr_run(prepared, x)
     rtol, atol = close_tolerances(dtype)
     torch.testing.assert_close(
         actual.cpu(),
-        golden_csr(data, col, ptr, x, shape),
+        golden_csr(data, col, ptr, x, shape, op),
         rtol=rtol,
         atol=atol,
         msg=str(path),
+    )
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
+@pytest.mark.parametrize("dtype", spmv_mod.SUPPORTED_SPMV_VALUE_DTYPES)
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize(
+    "col_dtype,ptr_dtype",
+    [
+        (torch.int32, torch.int32),
+        (torch.int32, torch.int64),
+        (torch.int64, torch.int32),
+        (torch.int64, torch.int64),
+    ],
+)
+def test_spmv_csr_full_dtype_op_surface(alg, dtype, op, col_dtype, ptr_dtype):
+    if alg == "legacy_bucket_vector" and col_dtype == torch.int64:
+        pytest.skip("legacy bucket requires int32 column indices")
+    data, col, ptr, _, shape = _native_case(
+        [3, 0, 1, 5], dtype, col_dtype, ptr_dtype, n=7
+    )
+    # Unsorted, duplicate column IDs and an explicit zero are retained by transpose.
+    col.copy_(
+        torch.tensor([5, 1, 5, 2, 6, 0, 3, 0, 1], device=col.device, dtype=col_dtype)
+    )
+    data[0] = 0
+    x = _make_x(shape[1] if op == "non" else shape[0], dtype, data.device)
+    prepared = _new_prepared(data, col, ptr, shape, alg, op=op)
+    assert prepared.shape == shape and prepared.kernel_indptr is ptr
+    output_size = shape[0] if op == "non" else shape[1]
+    out = torch.full((output_size,), float("nan"), dtype=dtype, device=data.device)
+    actual, meta = spmv_mod.flagsparse_spmv_csr_run(
+        prepared, x, out=out, return_meta=True
+    )
+    assert actual is out
+    rtol, atol = close_tolerances(dtype)
+    torch.testing.assert_close(
+        actual.cpu(), golden_csr(data, col, ptr, x, shape, op), rtol=rtol, atol=atol
+    )
+    expected_compute = str(dtype).removeprefix("torch.")
+    if dtype in (torch.float16, torch.bfloat16):
+        expected_compute = "float32"
+    elif dtype == torch.float32 and alg in (*NEW_ALGORITHMS, "legacy_rowpar"):
+        expected_compute = "float64"
+    assert meta["compute_dtype"] == expected_compute
+    assert meta["transpose_strategy"] == (
+        "none" if op == "non" else "per_run_csr_rebuild"
+    )
+    assert meta["alg_resolved"] == alg
+    with pytest.raises(ValueError):
+        spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out[:-1])
+    with pytest.raises(ValueError):
+        spmv_mod.flagsparse_spmv_csr_run(prepared, x[:-1])
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
+@pytest.mark.parametrize("op", ["trans", "conj"])
+def test_spmv_csr_transpose_rebuilt_inside_each_run(alg, op, monkeypatch):
+    data, col, ptr, _, shape = _native_case(
+        [1] * 2051, torch.complex64, torch.int32, torch.int64, n=3
+    )
+    col.zero_()  # Short original rows become one long output row and two empty rows.
+    data.fill_(1 + 0.5j)
+    x = torch.full((shape[0],), 1 + 0.25j, dtype=data.dtype, device=data.device)
+    rebuilds = []
+    original = spmv_mod._transpose_csr_for_spmv
+
+    def record(*args, **kwargs):
+        value = original(*args, **kwargs)
+        rebuilds.append(value)
+        return value
+
+    monkeypatch.setattr(spmv_mod, "_transpose_csr_for_spmv", record)
+    config = (
+        {"row_split_reduce": {"segment_nnz": 8, "reduce_block_size": 2}}
+        if alg in NEW_ALGORITHMS
+        else None
+    )
+    prepared = _new_prepared(data, col, ptr, shape, alg, op=op, config=config)
+    assert not rebuilds
+    saved_data = data.clone()
+    actual, meta = spmv_mod.flagsparse_spmv_csr_run(
+        prepared, x, timing=True, return_meta=True
+    )
+    assert len(rebuilds) == 2  # Complete run and separate phase diagnostic.
+    second, plain = spmv_mod.flagsparse_spmv_csr_run(prepared, -x, return_meta=True)
+    assert len(rebuilds) == 3
+    assert rebuilds[0][2].data_ptr() != rebuilds[1][2].data_ptr()
+    assert prepared.shape == shape and prepared.data is data
+    torch.testing.assert_close(data, saved_data, rtol=0, atol=0)
+    rtol, atol = close_tolerances(data.dtype)
+    ref = golden_csr(data, col, ptr, x, shape, op)
+    torch.testing.assert_close(actual.cpu(), ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(second.cpu(), -ref, rtol=rtol, atol=atol)
+    for timing_meta in (plain, meta):
+        assert (
+            timing_meta["ms"] == timing_meta["gpu_ms"] + timing_meta["process_cpu_ms"]
+        )
+    assert meta["process_gpu_ms"] >= 0 and meta["compute_ms"] >= 0
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.complex64, torch.complex128]
+)
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("shape", [(0, 7), (5, 0), (0, 0), (5, 7)])
+def test_spmv_csr_empty_dtype_ops(alg, dtype, op, shape):
+    device = accelerator_device()
+    data = torch.empty(0, dtype=dtype, device=device)
+    col = torch.empty(0, dtype=torch.int32, device=device)
+    ptr = torch.zeros(shape[0] + 1, dtype=torch.int64, device=device)
+    x = torch.ones(shape[1] if op == "non" else shape[0], dtype=dtype, device=device)
+    prepared = _new_prepared(data, col, ptr, shape, alg, op=op)
+    actual = spmv_mod.flagsparse_spmv_csr_run(prepared, x)
+    assert actual.shape == (shape[0] if op == "non" else shape[1],)
+    assert torch.count_nonzero(actual) == 0
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmv_csr_complex_cancellation(alg, dtype, op):
+    data, col, ptr, _, shape = _native_case(
+        [1025, 0, 1031], dtype, torch.int32, torch.int64, n=3
+    )
+    col.zero_()
+    pattern = torch.tensor(
+        [10000 + 5000j, 1 - 2j, -10000 - 5000j, -1 + 2j],
+        dtype=dtype,
+        device=data.device,
+    )
+    data.copy_(pattern.repeat((data.numel() + 3) // 4)[: data.numel()])
+    x = torch.full(
+        (shape[1] if op == "non" else shape[0],),
+        1 + 0.5j,
+        dtype=dtype,
+        device=data.device,
+    )
+    prepared = _new_prepared(data, col, ptr, shape, alg, op=op)
+    actual = spmv_mod.flagsparse_spmv_csr_run(prepared, x)
+    rtol, atol = close_tolerances(dtype)
+    torch.testing.assert_close(
+        actual.cpu(), golden_csr(data, col, ptr, x, shape, op), rtol=rtol, atol=atol
     )

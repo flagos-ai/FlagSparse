@@ -32,14 +32,33 @@ class ConfigPolicy(unittest.TestCase):
         self.assertEqual(len(policy.list_algorithms()), 7)
         for alg in policy.NEW_ALGORITHMS:
             self.assertIn(alg, policy.list_algorithms("non", "torch.float32", "rocm"))
-            self.assertNotIn(alg, policy.list_algorithms("trans", "float32", "cuda"))
-            self.assertNotIn(alg, policy.list_algorithms("non", "complex64", "cuda"))
+            self.assertIn(alg, policy.list_algorithms("trans", "float32", "cuda"))
+            self.assertIn(alg, policy.list_algorithms("non", "complex64", "cuda"))
             for backend in ("metax", "mthreads", "ascend"):
                 self.assertNotIn(alg, policy.list_algorithms(backend=backend))
         with self.assertRaises(ValueError):
             policy.algorithm_spec("auto")
         with self.assertRaises(ValueError):
             policy.normalize_alg("compare")
+
+    def test_all_dtype_ops_and_precision_requirements(self):
+        no_fp64 = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, False, True, True)
+        for alg in policy.ALGORITHMS:
+            for dtype in policy.VALUE_DTYPES:
+                for op in ("non", "trans", "conj"):
+                    policy.validate_support(alg, op, dtype, "int32", "int64", self.cuda)
+            spec = policy.algorithm_spec(alg)
+            self.assertEqual(spec["compute_dtype_by_input"]["complex64"], "complex64")
+            self.assertEqual(spec["compute_dtype_by_input"]["float16"], "float32")
+        for alg in policy.NEW_ALGORITHMS:
+            policy.resolve_config(alg, no_fp64)
+            for dtype in ("float16", "bfloat16", "complex64"):
+                policy.validate_support(alg, "conj", dtype, "int64", "int32", no_fp64)
+            for dtype in ("float32", "float64", "complex128"):
+                with self.assertRaisesRegex(NotImplementedError, "FP64"):
+                    policy.validate_support(
+                        alg, "trans", dtype, "int64", "int32", no_fp64
+                    )
 
     def test_backend_profiles_and_mixed_indices(self):
         for caps, rows in ((self.cuda, 8), (self.hip, 16)):
@@ -153,6 +172,7 @@ def runtime_namespace():
         "_spmv_phase",
         "_execute_spmv_route",
         "_execute_spmv_route_with_fallback",
+        "_spmv_execution_matrix",
     }
     tree = ast.parse((SOURCE / "spmv_csr.py").read_text(encoding="utf-8"))
     nodes = [
@@ -173,7 +193,9 @@ def runtime_namespace():
                 self.alg, self.backend_caps
             )
             self.config_rejections = []
-            self.data = types.SimpleNamespace(dtype="float32", device="cuda")
+            self.data = types.SimpleNamespace(
+                dtype="float32", device="cuda", is_conj=lambda: False
+            )
             self.kernel_indices = types.SimpleNamespace(dtype="int64")
             self.kernel_indptr = types.SimpleNamespace(dtype="int32")
             self._baseline_compute_dtype = "float64"
@@ -211,7 +233,9 @@ def runtime_namespace():
         "torch": types.SimpleNamespace(empty=Mock(return_value=object())),
         "_ACCEL": types.SimpleNamespace(Event=Event, synchronize=lambda: None),
         "_spmv_device_context": lambda device: nullcontext(),
-        "_validate_spmv_x": lambda x, p: x,
+        "_validate_spmv_x": lambda x, p: types.SimpleNamespace(
+            resolve_conj=lambda: types.SimpleNamespace(contiguous=lambda: x)
+        ),
         "_spmv_check_output": lambda *a: None,
         "get_spmv_csr_algorithm_spec": policy.algorithm_spec,
         "_normalize_spmv_op": lambda op, transpose=False: (
@@ -330,8 +354,8 @@ class IntegrationPolicy(unittest.TestCase):
         rows = ops_support.build_rows(SOURCE)
         for alg in policy.NEW_ALGORITHMS:
             cases = [row for row in rows if row["route"] == alg]
-            self.assertEqual(len(cases), 4)
-            self.assertEqual({row["op"] for row in cases}, {"non"})
+            self.assertEqual(len(cases), 36)
+            self.assertEqual({row["op"] for row in cases}, {"non", "trans", "conj"})
             self.assertEqual({row["status"] for row in cases}, {"UNVERIFIED"})
 
     def test_runner_preserves_algorithm_identity_and_latency(self):
