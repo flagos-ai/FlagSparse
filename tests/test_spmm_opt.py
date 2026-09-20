@@ -14,7 +14,7 @@
 
 """
 SpMM alg1 test: compare base vs optimised path with PyTorch and cuSPARSE timings.
-Alg1 timings report CPU-wall runtime preprocessing plus CUDA-event compute time.
+Alg1 timings report filtered CPU-wall runtime preprocessing plus filtered CUDA-event compute time.
 
 Usage:
     python tests/test_spmm_opt.py <dir/> --dense-cols 32
@@ -26,7 +26,6 @@ import csv
 import glob
 import os
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -40,6 +39,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 import flagsparse.sparse_operations.spmm_csr as spmm_csr_mod
+from utils import cpu_wall_benchmark_filtered, filtered_avg_ms
 
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
@@ -65,14 +65,16 @@ def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
     for _ in range(warmup):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(iters):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / iters
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
@@ -81,14 +83,16 @@ def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
     runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
         prepared
     )
-    ACCEL.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(count):
+    def preprocess_op():
         runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
             prepared
         )
-    ACCEL.synchronize()
-    preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
+        ACCEL.synchronize()
+        return runtime_prepared
+
+    runtime_prepared, preprocess_ms = cpu_wall_benchmark_filtered(
+        preprocess_op, 0, count
+    )
 
     def op():
         out, _ = spmm_csr_mod._triton_spmm_csr_impl_opt_prepared(runtime_prepared, B)
@@ -99,14 +103,16 @@ def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
     for _ in range(warmup):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    compute_ms = start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    compute_ms = filtered_avg_ms(samples)
     return out, preprocess_ms + compute_ms, preprocess_ms, compute_ms
 
 
@@ -146,14 +152,16 @@ def _timed_pytorch(data, indices, indptr, B, shape, warmup, iters):
     for _ in range(warmup):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(iters):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / iters
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _timed_cusparse(data, indices, indptr, B, shape, warmup, iters):
@@ -333,7 +341,7 @@ def run_all_csv(
             print(
                 "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
                 "Alg1 = bucketed CSR SpMM native path with Triton runtime preprocessing. "
-                "Alg1(ms) = A1Prep CPU wall time + A1Comp CUDA event time. "
+                "Alg1(ms) = filtered A1Prep CPU wall time + filtered A1Comp CUDA event time. "
                 "Speedup = reference / Alg1."
             )
             print(SEP)
@@ -495,7 +503,7 @@ def main():
     print(
         "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
         "Alg1 = bucketed CSR SpMM native path with Triton runtime preprocessing. "
-        "Alg1(ms) = A1Prep CPU wall time + A1Comp CUDA event time. "
+        "Alg1(ms) = filtered A1Prep CPU wall time + filtered A1Comp CUDA event time. "
         "Speedup = reference / Alg1."
     )
     print(SEP)

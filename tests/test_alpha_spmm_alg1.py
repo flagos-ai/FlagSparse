@@ -35,6 +35,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from utils import cupy_event_benchmark_filtered, filtered_avg_ms
 
 from flagsparse.sparse_operations.spmm_csr import (
     _normalize_spmm_base_device_props,
@@ -186,14 +187,16 @@ def _benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(max(1, int(iters))):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / max(1, int(iters))
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _prepare_base_inputs(data, indices, indptr, B, shape):
@@ -343,7 +346,9 @@ def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enable
             return cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape), B_cp
 
         sparse, B_cp = prepare()
-        out_cp, compute_ms = _benchmark(lambda: sparse @ B_cp, warmup, iters)
+        out_cp, compute_ms = cupy_event_benchmark_filtered(
+            lambda: sparse @ B_cp, warmup, iters
+        )
         out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
     except Exception as exc:
         return None, None, None, None, str(exc)

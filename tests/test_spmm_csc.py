@@ -40,6 +40,7 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_csr as spmm_ops
+from utils import cupy_event_benchmark_filtered, filtered_avg_ms
 
 
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
@@ -372,15 +373,17 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
     count = max(1, int(iters))
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _time_flagsparse_csc(data, indices, indptr, B, shape, alg, op, warmup, iters, timing=False):
@@ -515,19 +518,9 @@ def _time_cusparse_csc(data, indices, indptr, B, shape, op, layout, warmup, iter
     else:
         raise ValueError(f"unsupported op: {op}")
     fn = lambda: A_eff @ B_cp
-    for _ in range(max(0, int(warmup))):
-        out_cp = fn()
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        out_cp = fn()
-    end.record()
-    end.synchronize()
+    out_cp, elapsed_ms = cupy_event_benchmark_filtered(fn, warmup, iters)
     out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
-    return cp.cuda.get_elapsed_time(start, end) / count, None, out
+    return elapsed_ms, None, out
 
 
 def _run_case(

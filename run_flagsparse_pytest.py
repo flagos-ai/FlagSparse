@@ -3835,8 +3835,8 @@ def main(
             metavar="OP=ARGS",
             help="Extra args appended only to one performance script; repeatable.",
         )
-        parser.add_argument("--benchmark-warmup", type=int, default=5)
-        parser.add_argument("--benchmark-iters", type=int, default=20)
+        parser.add_argument("--benchmark-warmup", type=int, default=10)
+        parser.add_argument("--benchmark-iters", type=int, default=50)
     parser.add_argument(
         "--timeout",
         type=int,

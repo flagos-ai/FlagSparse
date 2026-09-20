@@ -33,6 +33,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as ast_ops
+from utils import cupy_event_benchmark_filtered, filtered_avg_ms
 
 try:
     import cupy as cp
@@ -205,14 +206,16 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _time_flagsparse_csc(
@@ -298,18 +301,8 @@ def _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters):
     else:
         A_eff = A.conj().T
     fn = lambda: A_eff @ x_cp
-    for _ in range(max(0, int(warmup))):
-        _ = fn()
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        _ = fn()
-    end.record()
-    end.synchronize()
-    return cp.cuda.get_elapsed_time(start, end) / count
+    _, elapsed_ms = cupy_event_benchmark_filtered(fn, warmup, iters)
+    return elapsed_ms
 
 
 def _fmt(v):

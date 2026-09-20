@@ -19,7 +19,6 @@ import glob
 import csv
 import math
 import os
-import time
 
 import torch
 
@@ -36,6 +35,7 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
+from utils import filtered_avg_ms
 
 VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
 INDEX_DTYPES = [torch.int32, torch.int64]
@@ -293,14 +293,16 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    e0 = ACCEL.Event(enable_timing=True)
-    e1 = ACCEL.Event(enable_timing=True)
-    e0.record()
+    samples = []
     for _ in range(count):
+        e0 = ACCEL.Event(enable_timing=True)
+        e1 = ACCEL.Event(enable_timing=True)
+        e0.record()
         out = op()
-    e1.record()
-    ACCEL.synchronize()
-    return out, e0.elapsed_time(e1) / count
+        e1.record()
+        ACCEL.synchronize()
+        samples.append(e0.elapsed_time(e1))
+    return out, filtered_avg_ms(samples)
 
 
 def _run_flagsparse_coo_launch(
@@ -435,19 +437,7 @@ def _timed_flagsparse_coo_tocsr_runtime(
         shape=shape,
         assume_sorted=False,
     )
-    y = spmv_op()
-    ACCEL.synchronize()
-    for _ in range(warmup):
-        y = spmv_op()
-    ACCEL.synchronize()
-    e0 = ACCEL.Event(True)
-    e1 = ACCEL.Event(True)
-    e0.record()
-    for _ in range(iters):
-        y = spmv_op()
-    e1.record()
-    ACCEL.synchronize()
-    return y, e0.elapsed_time(e1) / iters
+    return _cuda_event_benchmark(spmv_op, warmup, iters)
 
 
 def _timed_flagsparse_coo_tocsr_prepared(
@@ -457,19 +447,7 @@ def _timed_flagsparse_coo_tocsr_prepared(
     iters,
 ):
     spmv_op = lambda: fs.flagsparse_spmv_coo_tocsr(x=x, prepared=prepared)
-    y = spmv_op()
-    ACCEL.synchronize()
-    for _ in range(warmup):
-        y = spmv_op()
-    ACCEL.synchronize()
-    e0 = ACCEL.Event(True)
-    e1 = ACCEL.Event(True)
-    e0.record()
-    for _ in range(iters):
-        y = spmv_op()
-    e1.record()
-    ACCEL.synchronize()
-    return y, e0.elapsed_time(e1) / iters
+    return _cuda_event_benchmark(spmv_op, warmup, iters)
 
 
 def run_synthetic(
@@ -780,18 +758,8 @@ def _time_pytorch_coo(data, row, col, x, shape, op, warmup, iters):
             shape,
             op,
         )
-    ACCEL.synchronize()
-    for _ in range(warmup):
-        _ = spmv_op()
-    ACCEL.synchronize()
-    e0 = ACCEL.Event(True)
-    e1 = ACCEL.Event(True)
-    e0.record()
-    for _ in range(iters):
-        _ = spmv_op()
-    e1.record()
-    ACCEL.synchronize()
-    return e0.elapsed_time(e1) / iters
+    _, elapsed_ms = _cuda_event_benchmark(spmv_op, warmup, iters)
+    return elapsed_ms
 
 
 def _run_torch_runtime_op(data, row, col, x_2d, shape, op):
@@ -974,12 +942,12 @@ def run_all_dtypes_coo_csv(
         "Vendor setup/conversion is hoisted out of the timed window; CUDA CuPy COO may convert through CSR internally."
     )
     print(
-        "Timing policy: Base/Opt ms = process_cpu_ms + GPU event time. "
+        "Timing policy: Base/Opt ms = process_cpu_ms + filtered GPU event time. "
         "Row-run sort + seg_starts are GPU process; atomic has no process. "
         "PyTorch/CuPy timings use original dtype."
     )
     print(
-        f"{warmup} warmup + {iters} averaged iterations. "
+        f"{warmup} warmup + {iters} filtered timing samples. "
         "--timing splits process_gpu_ms and compute_ms for native COO."
     )
     print("=" * 200)

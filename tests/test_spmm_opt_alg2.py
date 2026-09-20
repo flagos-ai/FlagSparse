@@ -14,7 +14,7 @@
 
 """
 Protected CSR SpMM benchmark: base vs alg1 vs alg2 vs references.
-Alg1/Alg2 totals report CPU-wall preprocessing plus CUDA-event compute time.
+Alg1/Alg2 totals report filtered CPU-wall preprocessing plus filtered CUDA-event compute time.
 
 Usage:
     python tests/test_spmm_opt_alg2.py --synthetic --dense-cols 32 --with-cusparse
@@ -27,7 +27,6 @@ import glob
 import math
 import os
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -42,6 +41,7 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 import flagsparse.sparse_operations.spmm_csr as spmm_csr_mod
 import flagsparse.sparse_operations.spmm_csr_opt_alg2 as spmm_alg2_mod
+from utils import cpu_wall_benchmark_filtered, filtered_avg_ms
 
 from test_spmm_opt import _seeded_dense_matrix, load_mtx_to_csr_torch
 
@@ -169,14 +169,16 @@ def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
     runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
         prepared
     )
-    ACCEL.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(count):
+    def preprocess_op():
         runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
             prepared
         )
-    ACCEL.synchronize()
-    preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
+        ACCEL.synchronize()
+        return runtime_prepared
+
+    runtime_prepared, preprocess_ms = cpu_wall_benchmark_filtered(
+        preprocess_op, 0, count
+    )
 
     def op():
         out, _ = spmm_csr_mod._triton_spmm_csr_impl_opt_prepared(runtime_prepared, B)
@@ -189,14 +191,16 @@ def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
     ACCEL.synchronize()
 
     measured_value = out
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         measured_value = op()
-    end.record()
-    ACCEL.synchronize()
-    compute_ms = start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    compute_ms = filtered_avg_ms(samples)
     return measured_value, preprocess_ms + compute_ms, preprocess_ms, compute_ms
 
 
@@ -208,16 +212,18 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
         prepared.data.dtype,
     )
     prepared.opt_buckets = opt_buckets
-    ACCEL.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(count):
+    def preprocess_op():
         opt_buckets = spmm_alg2_mod._build_spmm_opt_alg2_buckets_triton_symbolic(
             prepared.row_lengths,
             prepared.data.dtype,
         )
+        ACCEL.synchronize()
+        return opt_buckets
+
+    opt_buckets, preprocess_ms = cpu_wall_benchmark_filtered(
+        preprocess_op, 0, count
+    )
     prepared.opt_buckets = opt_buckets
-    ACCEL.synchronize()
-    preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
 
     def op():
         out, meta = spmm_alg2_mod._triton_spmm_csr_impl_opt_alg2_prepared(
@@ -237,14 +243,16 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
     measured_prepared = prepared
     measured_meta = meta
     measured_value = first
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         measured_value, measured_meta = op()
-    end.record()
-    ACCEL.synchronize()
-    compute_ms = start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    compute_ms = filtered_avg_ms(samples)
     return (
         measured_value,
         preprocess_ms + compute_ms,
@@ -307,14 +315,16 @@ def _benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(max(1, int(iters))):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / max(1, int(iters))
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _build_csr_from_row_lengths(
@@ -750,7 +760,7 @@ def main():
         f"{'Err(A1/T)':>10} {'Err(A1/CU)':>10} {'Err(A2/T)':>10} {'Err(A2/CU)':>10} {'Status':>6}"
     )
     print(
-        "A*Prep columns are CPU wall time; A*Comp columns are CUDA event compute time."
+        "A*Prep columns are filtered CPU wall time; A*Comp columns are filtered CUDA event compute time."
     )
     print("=" * 220)
 

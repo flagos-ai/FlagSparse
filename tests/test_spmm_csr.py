@@ -42,6 +42,7 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spmm_csr as spmm_ops
+from utils import cupy_event_benchmark_filtered, filtered_avg_ms
 
 from test_spmm import (
     _build_dense_matrix,
@@ -367,31 +368,20 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(max(1, int(iters))):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / max(1, int(iters))
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _cupy_event_benchmark(op, warmup, iters):
-    import cupy as cp
-
-    out = op()
-    for _ in range(max(0, int(warmup))):
-        out = op()
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    start.record()
-    for _ in range(max(1, int(iters))):
-        out = op()
-    end.record()
-    end.synchronize()
-    return out, cp.cuda.get_elapsed_time(start, end) / max(1, int(iters))
+    return cupy_event_benchmark_filtered(op, warmup, iters)
 
 
 def _time_route(
@@ -611,7 +601,7 @@ def run_one_case(
     if cusparse_out is not None and vendor_profile["status"] != "PASS":
         cusparse_reason = f"vendor correctness failed: {vendor_profile}"
         # Preserve a completed vendor measurement even when validation fails.
-        # Availability, correctness and eligibility for speedup are separate.
+        # Report timing ratios independently of correctness status.
     if cusparse_out is None and not cusparse_reason:
         cusparse_reason = "vendor interface returned no output"
     _print_vendor_result(path, dtype, index_dtype_name, indptr_dtype_name, op, layout,
@@ -626,10 +616,7 @@ def run_one_case(
         row["vendor_reason"] = cusparse_reason or ""
         row["vendor_status"] = vendor_profile["status"]
         row["vendor_error"] = vendor_profile["global_err"]
-        row["speedup_vs_vendor"] = (
-            row.get("cusparse_vs_alg_speedup")
-            if row["status"] == "PASS" and vendor_profile["status"] == "PASS" else None
-        )
+        row["speedup_vs_vendor"] = _ratio(cusparse_ms, row.get("ms"))
         if emit:
             emit(row)
     rows = _StreamingRows(record)
@@ -702,11 +689,8 @@ def run_one_case(
             "process_cpu_ms": result["process_cpu_ms"],
             "torch_ms": torch_ms,
             "cusparse_ms": cusparse_ms,
-            "torch_vs_alg_speedup": _ratio(torch_ms, result["ms"]) if torch_profile["status"] == "PASS" else None,
-            "cusparse_vs_alg_speedup": (
-                _ratio(cusparse_ms, result["ms"])
-                if torch_profile["status"] == "PASS" and vendor_profile["status"] == "PASS" else None
-            ),
+            "torch_vs_alg_speedup": _ratio(torch_ms, result["ms"]),
+            "cusparse_vs_alg_speedup": _ratio(cusparse_ms, result["ms"]),
             "err_vs_torch": torch_profile["global_err"],
             "err_vs_cusparse": cusparse_profile["global_err"],
             "status": torch_profile["status"],
@@ -780,12 +764,20 @@ def _write_csv(path, rows, fields):
 
 
 def _console_columns(timing=False):
-    # Keep the terminal compact even with --timing; detailed fields stay in CSV.
-    return [
+    # Use one schema for headers and rows; keep full-run and phase times distinct.
+    columns = [
         ("matrix", "Matrix", 25), ("dtype", "DType", 10),
         ("indices", "Idx/Ptr", 11), ("op", "Op", 5),
         ("layout", "Lay", 3), ("dense_cols", "N", 5),
         ("alg", "Alg", 24), ("ms", "ms", 9),
+        ("gpu_ms", "gpu_ms", 9), ("process_cpu_ms", "cpu_ms", 9),
+    ]
+    if timing:
+        columns += [
+            ("process_gpu_ms", "procGPU_ms", 10),
+            ("compute_ms", "compute_ms", 10),
+        ]
+    return columns + [
         ("vendor_ms", "Vendor_ms", 9), ("speedup_vs_vendor", "x", 7),
         ("status", "Check", 6), ("vendor_status", "VCheck", 6),
     ]
@@ -801,7 +793,8 @@ def _print_row(row, timing=False):
         value = row.get(key)
         if key == "indices":
             value = f"{row.get('index_dtype', 'N/A')}/{row.get('indptr_dtype', 'N/A')}"
-        elif key in ("ms", "vendor_ms", "speedup_vs_vendor"):
+        elif key in ("ms", "gpu_ms", "process_cpu_ms", "process_gpu_ms",
+                     "compute_ms", "vendor_ms", "speedup_vs_vendor"):
             value = _fmt(value, 2 if key == "speedup_vs_vendor" else 4)
         elif value is None:
             value = "N/A"
