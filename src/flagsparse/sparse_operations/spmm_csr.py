@@ -5426,28 +5426,23 @@ def _benchmark_spmm_csr_sparse_ref(
 
     op_name = _normalize_sparse_reference_op(op)
     dense_layout = str(dense_layout).strip().lower()
-    if op_name != "non":
-        result["backend"] = None
-        result["reason"] = (
-            "CuPy/cuSPARSE CSR SpMM baseline supports op=non only in this runner; "
-            f"op={op_name} is unsupported"
-        )
-        return result
-    if dense_layout != "row":
-        result["backend"] = None
-        result["reason"] = (
-            "CuPy/cuSPARSE CSR SpMM baseline supports row-major dense RHS only "
-            f"in this runner; dense_layout={dense_layout} is unsupported"
-        )
-        return result
-
     data_cp = _cupy_from_torch(data)
     indices_cp = _cupy_from_torch(indices.to(torch.int64))
     indptr_cp = _cupy_from_torch(indptr.to(torch.int64))
-    B_cp = _cupy_from_torch(B)
+    B_cp = cp.asfortranarray(_cupy_from_torch(B))
     A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
+    if op_name == "non":
+        A_eff = A_csr
+    elif op_name == "trans":
+        A_eff = A_csr.transpose().tocsr()
+    elif op_name == "conj":
+        A_eff = A_csr.transpose().conj().tocsr()
+    else:
+        result["backend"] = None
+        result["reason"] = f"unsupported op={op_name}"
+        return result
     values_cp, ms = _benchmark_cuda_op(
-        lambda: A_csr @ B_cp,
+        lambda: A_eff @ B_cp,
         warmup=warmup,
         iters=iters,
     )
@@ -5503,27 +5498,22 @@ def _benchmark_spmm_csc_sparse_ref(
 
     op_name = _normalize_sparse_reference_op(op)
     dense_layout = str(dense_layout).strip().lower()
-    if op_name != "non":
-        result["backend"] = None
-        result["reason"] = (
-            "CuPy/cuSPARSE CSC SpMM baseline supports op=non only in this runner; "
-            f"op={op_name} is unsupported"
-        )
-        return result
-    if dense_layout != "row":
-        result["backend"] = None
-        result["reason"] = (
-            "CuPy/cuSPARSE CSC SpMM baseline supports row-major dense RHS only "
-            f"in this runner; dense_layout={dense_layout} is unsupported"
-        )
-        return result
-
     data_cp = _cupy_from_torch(data)
     indices_cp = _cupy_from_torch(indices.to(torch.int64))
     indptr_cp = _cupy_from_torch(indptr.to(torch.int64))
-    B_cp = _cupy_from_torch(B)
+    B_cp = cp.asfortranarray(_cupy_from_torch(B))
     A_csc = cpx_sparse.csc_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-    values_cp, ms = _benchmark_cuda_op(lambda: A_csc @ B_cp, warmup=warmup, iters=iters)
+    if op_name == "non":
+        A_eff = A_csc
+    elif op_name == "trans":
+        A_eff = A_csc.T
+    elif op_name == "conj":
+        A_eff = A_csc.conj().T
+    else:
+        result["backend"] = None
+        result["reason"] = f"unsupported op={op_name}"
+        return result
+    values_cp, ms = _benchmark_cuda_op(lambda: A_eff @ B_cp, warmup=warmup, iters=iters)
     result["values"] = _torch_from_cupy(values_cp)
     result["ms"] = ms
     result["reason"] = None

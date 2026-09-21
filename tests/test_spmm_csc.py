@@ -475,18 +475,6 @@ def _time_cusparse_csc(data, indices, indptr, B, shape, op, layout, warmup, iter
         return ref["ms"], None, ref["values"]
     if backend is None:
         return None, backend_reason, None
-    if op != "non":
-        return (
-            None,
-            f"CuPy/cuSPARSE CSC SpMM baseline supports op=non only in this runner; op={op} is unsupported",
-            None,
-        )
-    if layout != "row":
-        return (
-            None,
-            f"CuPy/cuSPARSE CSC SpMM baseline supports row-major dense RHS only in this runner; layout={layout} is unsupported",
-            None,
-        )
     reason = _cupy_csc_unavailable_reason()
     if reason:
         return None, reason, None
@@ -657,7 +645,7 @@ def _print_notes(run_cusparse):
         elif (reason := _cupy_csc_unavailable_reason()):
             print(f"{fs_common._expected_vendor_sparse_label()} CSC baseline: unavailable ({reason}); {vendor_short}(ms)=N/A.")
         else:
-            print(f"CuPy CSC baseline: {vendor_short}(ms) uses cupyx.scipy.sparse.csc_matrix @ dense for op=non/layout=row.")
+            print(f"CuPy CSC baseline: {vendor_short}(ms) uses cupyx.scipy.sparse.csc_matrix @ dense for op=non/trans/conj; dense layout materialization is setup.")
     else:
         print("Vendor CSC baseline disabled by --no-cusparse; vendor ms=N/A.")
     print("Timing policy: ms = process_cpu_ms + gpu_ms; CSC SpMM v1 has no process phase.")

@@ -520,18 +520,6 @@ def _time_vendor_sparse_ref(
 
     if data.dtype not in CUSPARSE_DTYPES:
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
-    if op != "non":
-        return (
-            None,
-            None,
-            f"CuPy/cuSPARSE CSR SpMM baseline supports op=non only in this runner; op={op} is unsupported",
-        )
-    if layout != "row":
-        return (
-            None,
-            None,
-            f"CuPy/cuSPARSE CSR SpMM baseline supports row-major dense RHS only in this runner; layout={layout} is unsupported",
-        )
     try:
         import cupy as cp
         import cupyx.scipy.sparse as cpx_sparse
@@ -544,8 +532,17 @@ def _time_vendor_sparse_ref(
         )
         indptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
         B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
+        B_cp = cp.asfortranarray(B_cp)
         A = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-        out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
+        if op == "non":
+            A_eff = A
+        elif op == "trans":
+            A_eff = A.transpose().tocsr()
+        elif op == "conj":
+            A_eff = A.transpose().conj().tocsr()
+        else:
+            return None, None, f"unsupported op={op}"
+        out_cp, ms = _cupy_event_benchmark(lambda: A_eff @ B_cp, warmup, iters)
         out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
         return out, ms, None
     except Exception as exc:

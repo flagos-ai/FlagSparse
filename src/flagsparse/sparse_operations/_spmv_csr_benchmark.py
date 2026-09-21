@@ -123,11 +123,6 @@ def measure_vendor(data, indices, indptr, x, shape, op, warmup, iters):
             finally:
                 common._destroy_spmv_csr_ref_hipsparse_prepared(state)
         elif backend == "cupy_cusparse":
-            if op != "non":
-                result["vendor_reason"] = (
-                    "CuPy transpose changes CSR storage; no native CSR transpose baseline exposed"
-                )
-                return result
             cp = common.cp
             # Use the actual Torch stream on the input device for construction and timing.
             with cp.cuda.Device(data.device.index or 0):
@@ -144,9 +139,18 @@ def measure_vendor(data, indices, indptr, x, shape, op, warmup, iters):
                         ),
                         shape=shape,
                     )
+                    if op == "non":
+                        matrix_eff = matrix
+                    elif op == "trans":
+                        matrix_eff = matrix.T
+                    elif op == "conj":
+                        matrix_eff = matrix.conj().T
+                    else:
+                        result["vendor_reason"] = f"unsupported op={op}"
+                        return result
                     vector = common._cupy_from_torch(x)
                     value_cp, ms = event_benchmark(
-                        lambda: matrix @ vector, warmup, iters
+                        lambda: matrix_eff @ vector, warmup, iters
                     )
                     value = common._torch_from_cupy(value_cp)
             result["vendor_alg"] = "cupy_csr_matvec (library selected)"
