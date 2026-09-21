@@ -493,7 +493,7 @@ class FlagSparseDnVecDescr:
 
 def flagsparse_create_spsv_handle(device=None, stream=None):
     if device is None:
-        device = torch.device("cuda")
+        device = torch.device(_ACCEL_DEVICE_TYPE if _is_mthreads_runtime() else "cuda")
     return FlagSparseSpSVHandle(device=torch.device(device), stream=stream)
 
 
@@ -741,7 +741,7 @@ def _prepare_spsv_csr_ref_hipsparse(
             "hipsparseIndexBase_t",
             ("HIPSPARSE_INDEX_BASE_ZERO",),
         )
-        _hipsparse_create_csr_descriptor(
+        created_spmat = _hipsparse_create_csr_descriptor(
             spmat_ref,
             n_rows,
             n_cols,
@@ -754,6 +754,8 @@ def _prepare_spsv_csr_ref_hipsparse(
             index_base,
             value_type,
         )
+        if created_spmat is not None:
+            spmat = created_spmat
         _hipsparse_set_spmat_attribute(spmat, "fill_mode", fill_mode)
         _hipsparse_set_spmat_attribute(spmat, "diag_type", diag_type)
         _hip_check_result(

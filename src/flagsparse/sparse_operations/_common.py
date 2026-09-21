@@ -1565,6 +1565,28 @@ def _hipsparse_create_coo_descriptor(
     # dense descriptors: callers create a descriptor object and pass
     # descriptor.createRef() as the first argument. Some wrappers also split
     # the COO index type in two.
+    # hip-python 7.x returns the descriptor directly.  Older releases expose
+    # the C out-parameter form instead.  Keep both forms here because the
+    # PyTorch ROCm runtime and hip-python package need not have the same
+    # release number on appliance images.
+    direct_args = (
+        n_rows,
+        n_cols,
+        nnz,
+        row_ptr,
+        col_ptr,
+        values_ptr,
+        index_type,
+        index_base,
+        value_type,
+    )
+    try:
+        return _hip_check_result(
+            hipsparse.hipsparseCreateCoo(*direct_args), "hipsparseCreateCoo"
+        )
+    except TypeError:
+        pass
+
     attempts = (
         (
             spmat_ref,
@@ -1621,23 +1643,29 @@ def _hipsparse_create_csc_descriptor(
     value_type,
 ):
     # The operand order is (colOffsets, rowInd) rather than
-    # (rowOffsets, colInd).
-    return _hip_check_result(
-        hipsparse.hipsparseCreateCsc(
-            spmat_ref,
-            n_rows,
-            n_cols,
-            nnz,
-            col_ptr,
-            row_ptr,
-            values_ptr,
-            col_index_type,
-            row_index_type,
-            index_base,
-            value_type,
-        ),
-        "hipsparseCreateCsc",
+    # (rowOffsets, colInd). hip-python 7.x returns the descriptor, while
+    # earlier bindings write it through ``spmat_ref``.
+    direct_args = (
+        n_rows,
+        n_cols,
+        nnz,
+        col_ptr,
+        row_ptr,
+        values_ptr,
+        col_index_type,
+        row_index_type,
+        index_base,
+        value_type,
     )
+    try:
+        return _hip_check_result(
+            hipsparse.hipsparseCreateCsc(*direct_args), "hipsparseCreateCsc"
+        )
+    except TypeError:
+        return _hip_check_result(
+            hipsparse.hipsparseCreateCsc(spmat_ref, *direct_args),
+            "hipsparseCreateCsc",
+        )
 
 
 def _hipsparse_create_csr_descriptor(
@@ -1653,22 +1681,27 @@ def _hipsparse_create_csr_descriptor(
     index_base,
     value_type,
 ):
-    return _hip_check_result(
-        hipsparse.hipsparseCreateCsr(
-            spmat_ref,
-            n_rows,
-            n_cols,
-            nnz,
-            row_ptr,
-            col_ptr,
-            values_ptr,
-            row_index_type,
-            col_index_type,
-            index_base,
-            value_type,
-        ),
-        "hipsparseCreateCsr",
+    direct_args = (
+        n_rows,
+        n_cols,
+        nnz,
+        row_ptr,
+        col_ptr,
+        values_ptr,
+        row_index_type,
+        col_index_type,
+        index_base,
+        value_type,
     )
+    try:
+        return _hip_check_result(
+            hipsparse.hipsparseCreateCsr(*direct_args), "hipsparseCreateCsr"
+        )
+    except TypeError:
+        return _hip_check_result(
+            hipsparse.hipsparseCreateCsr(spmat_ref, *direct_args),
+            "hipsparseCreateCsr",
+        )
 
 
 def _hipsparse_create_bsr_descriptor(
@@ -2385,7 +2418,7 @@ def _prepare_spmv_coo_ref_hipsparse(
             ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
         )
 
-        _hipsparse_create_coo_descriptor(
+        created_spmat = _hipsparse_create_coo_descriptor(
             spmat_ref,
             n_rows,
             n_cols,
@@ -2397,6 +2430,8 @@ def _prepare_spmv_coo_ref_hipsparse(
             index_base,
             value_type,
         )
+        if created_spmat is not None:
+            spmat = created_spmat
         _hip_check_result(
             hipsparse.hipsparseCreateDnVec(vecx_ref, x_size, x_ptr, value_type),
             "hipsparseCreateDnVec(x)",
@@ -2723,7 +2758,7 @@ def _prepare_spmv_ref_hipsparse(
             if layout == "csr"
             else _hipsparse_create_csc_descriptor
         )
-        make_descriptor(
+        created_spmat = make_descriptor(
             spmat_ref,
             n_rows,
             n_cols,
@@ -2736,6 +2771,8 @@ def _prepare_spmv_ref_hipsparse(
             index_base,
             value_type,
         )
+        if created_spmat is not None:
+            spmat = created_spmat
         _hip_check_result(
             hipsparse.hipsparseCreateDnVec(vecx_ref, x_size, x_ptr, value_type),
             "hipsparseCreateDnVec(x)",
@@ -3344,27 +3381,6 @@ def _prepare_scatter_inputs(
     return sparse_values, indices, kernel_indices, dense_size
 
 
-def _filtered_avg_ms(times):
-    if not times:
-        return None
-    values = [float(t) for t in times]
-    if len(values) == 1:
-        return values[0]
-    ordered = sorted(values)
-    n = len(ordered)
-    if n % 2 == 0:
-        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
-    else:
-        median = ordered[n // 2]
-    if median == 0.0:
-        kept = [t for t in ordered if t == 0.0]
-    else:
-        lo = median * 0.9
-        hi = median * 1.1
-        kept = [t for t in ordered if lo <= t <= hi]
-    return sum(kept) / len(kept) if kept else median
-
-
 def _benchmark_cuda_op(op, warmup, iters):
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
@@ -3376,15 +3392,14 @@ def _benchmark_cuda_op(op, warmup, iters):
     _ACCEL.synchronize()
     if cp is not None:
         cp.cuda.runtime.deviceSynchronize()
-    samples_ms = []
+    start_time = time.perf_counter()
     for _ in range(iters):
-        start_time = time.perf_counter()
         output = op()
-        _ACCEL.synchronize()
-        if cp is not None:
-            cp.cuda.runtime.deviceSynchronize()
-        samples_ms.append((time.perf_counter() - start_time) * 1000.0)
-    return output, _filtered_avg_ms(samples_ms)
+    _ACCEL.synchronize()
+    if cp is not None:
+        cp.cuda.runtime.deviceSynchronize()
+    elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / iters
+    return output, elapsed_ms
 
 
 def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
@@ -3401,34 +3416,26 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
 
         if _is_rocm_runtime() and _hip_runtime_event_available():
             _ACCEL.synchronize()
-            samples_ms = []
+            start_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+            stop_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+            _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
             for _ in range(iters):
-                start_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
-                stop_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
-                _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
                 output = run_fn(state)
-                _hip_check_result(hip.hipEventRecord(stop_ev, 0), "hipEventRecord(stop)")
-                _hip_check_result(
-                    hip.hipEventSynchronize(stop_ev), "hipEventSynchronize(stop)"
-                )
-                samples_ms.append(_hip_event_elapsed_ms(start_ev, stop_ev))
-                _destroy_hip_event(stop_ev)
-                _destroy_hip_event(start_ev)
-                start_ev = None
-                stop_ev = None
-            return output, _filtered_avg_ms(samples_ms)
+            _hip_check_result(hip.hipEventRecord(stop_ev, 0), "hipEventRecord(stop)")
+            _hip_check_result(
+                hip.hipEventSynchronize(stop_ev), "hipEventSynchronize(stop)"
+            )
+            return output, _hip_event_elapsed_ms(start_ev, stop_ev) / iters
 
         _ACCEL.synchronize()
-        samples_ms = []
+        start_ev_torch = _ACCEL.Event(enable_timing=True)
+        end_ev_torch = _ACCEL.Event(enable_timing=True)
+        start_ev_torch.record()
         for _ in range(iters):
-            start_ev_torch = _ACCEL.Event(enable_timing=True)
-            end_ev_torch = _ACCEL.Event(enable_timing=True)
-            start_ev_torch.record()
             output = run_fn(state)
-            end_ev_torch.record()
-            _ACCEL.synchronize()
-            samples_ms.append(start_ev_torch.elapsed_time(end_ev_torch))
-        return output, _filtered_avg_ms(samples_ms)
+        end_ev_torch.record()
+        _ACCEL.synchronize()
+        return output, start_ev_torch.elapsed_time(end_ev_torch) / iters
     finally:
         _destroy_hip_event(stop_ev)
         _destroy_hip_event(start_ev)
@@ -3456,20 +3463,14 @@ def _benchmark_prepared_hip_event_op(
             output = run_fn(state)
 
         _ACCEL.synchronize()
-        samples_ms = []
+        start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+        stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+        _hip_event_record_stream(start_evt, event_stream, "hipEventRecord(start)")
         for _ in range(iters):
-            start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
-            stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
-            _hip_event_record_stream(start_evt, event_stream, "hipEventRecord(start)")
             output = run_fn(state)
-            _hip_event_record_stream(stop_evt, event_stream, "hipEventRecord(stop)")
-            _hip_check_result(hip.hipEventSynchronize(stop_evt), "hipEventSynchronize(stop)")
-            samples_ms.append(_hip_event_elapsed_ms(start_evt, stop_evt))
-            _destroy_hip_event(stop_evt)
-            _destroy_hip_event(start_evt)
-            start_evt = None
-            stop_evt = None
-        return output, _filtered_avg_ms(samples_ms)
+        _hip_event_record_stream(stop_evt, event_stream, "hipEventRecord(stop)")
+        _hip_check_result(hip.hipEventSynchronize(stop_evt), "hipEventSynchronize(stop)")
+        return output, _hip_event_elapsed_ms(start_evt, stop_evt) / iters
     finally:
         _destroy_hip_event(stop_evt)
         _destroy_hip_event(start_evt)

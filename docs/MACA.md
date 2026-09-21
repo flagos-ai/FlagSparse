@@ -55,13 +55,20 @@ python3 -c "from flagsparse.sparse_operations import _common as c; print(c._back
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 0 --timeout 4500 \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args=--no-cusparse \
+  --op-benchmark-args='sddmm_csr=--no-cusparse' \
+  --op-benchmark-args='spsv_coo=--alg-num 4' \
   --results-dir pytest_results_metax_delivery \
   > pytest_results_metax_delivery.log 2>&1 < /dev/null &
 ```
 
-- `--no-cusparse`：C550 上没有可用的厂商稀疏库，SDDMM 的 `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），
-  性能 baseline 只能是 PyTorch；
+- `--op-benchmark-args='sddmm_csr=--no-cusparse'`：C550 上没有可用的厂商稀疏库，且 SDDMM 的
+  `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），因此只对 SDDMM 禁用该参考并改用 PyTorch。
+  `--benchmark-args` 会广播给所有性能脚本；SpSV 不接受 `--no-cusparse`，不能在这里使用全局参数；
+- `--op-benchmark-args='spsv_coo=--alg-num 4'`：MACA 侧实测 `spsv_coo` 的性能阶段要固定 ALG4
+  （`csr_smblk`）才能跑出结果，见 5.1 节。它只传给 `spsv_coo` 的性能脚本，排在 `--delivery-only`
+  自动加的 `--index-dtypes int32 --ops NON` 之后，两者叠加，不会互相覆盖；精度阶段不受影响。
+  这一项**只能写在命令行上，不能放进 runner 的 `DELIVERY_BENCHMARK_ARGS`**：那张表对所有后端生效，
+  而 `--alg-num 4` 在 MUSA、Ascend 上不可用（它们只有 ALG1）；
 - `--timeout 4500`：`--delivery-only` 已把 spmv/spmm/spsv 收窄到 int32 + non，但 **SDDMM 的 4 个 K 值
   不收窄**（交付名里没有 K），实测推算全量至少 3660 秒（7.4 节）。只想快速出数，可以改用
   `--timeout 1200 --op-benchmark-args='sddmm_csr=--k 64'`，但那样 SDDMM 的加速比只含 K=64，和 CUDA 等
@@ -77,9 +84,19 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
 
 精度不走 torch.sparse 是有实测原因的：MACA 的 fp32 CSR 路径会返回非有限值，拿它当参考会把好内核报成错的。
 
-**预期会看到的非 Passed**：`spsv_*` / `spsm_csr` 在走到 `csr_cw`（ALG1，unit 对角）时可能非法访存或挂死，
-记为 `Error` / `Timeout`（第 5 节）；**不要**用 CPU 求解顶替。所有加速比的分母都是 PyTorch，不能和
+**预期会看到的非 Passed**：`spsv_*` 在走到 `csr_cw`（ALG1，unit 对角）时可能非法访存或挂死，
+记为 `Error` / `Timeout`（第 5 节）；`spsm_csr` 已改走 MetaX 的 SMBLK 路径。**不要**用 CPU 求解顶替。
+所有加速比的分母都是 PyTorch，不能和
 CUDA/MUSA 对厂商库的数放在一起比。
+
+runner 的精度阶段总是先收集整个 `tests/pytest`，而 `test_spmv_csr_accuracy.py` 在**导入时**就读
+`tests/data/spmv_csr_regressions.json`。这个文件曾在 09-18 被一次 revert 删掉，测试却留了下来，
+于是任何算子的精度阶段都会在 collection 报 `FileNotFoundError`，表现为 `exit_code=2`、`total=0`
+（不是精度失败，用例根本没开始跑）。**该文件现已恢复**，拉到最新即可，不需要再传 `--ignore`。
+如果你的 checkout 里还缺它，先 `ls tests/data/spmv_csr_regressions.json`；确认缺失又暂时拉不到时，
+可临时给 runner 加 `--pytest-args='--ignore=tests/pytest/test_spmv_csr_accuracy.py'`。
+SMBLK 的实现、精度覆盖、性能运行状态和完整后台命令记录在
+[modified/MACA.md](../modified/MACA.md)。
 
 跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
 
@@ -301,13 +318,14 @@ python -m pytest tests/ci -q --deselect tests/ci/test_installed_wheel.py
 | marker | 状态 |
 | --- | --- |
 | `spsv_csr` | ❌ **崩溃/挂死**，见第 5 节 |
-| `spsm_csr` `spsv_coo` `spsv_sell` `spsm_coo` | ⏸ 未验证，很可能撞上同一问题 |
+| `spsm_csr` | ✅ MetaX SMBLK 路径已验证；详细实现和实测记录见 [modified/MACA.md](../modified/MACA.md) |
+| `spsv_coo` `spsv_sell` `spsm_coo` | ⏸ 未验证，三角求解仍须防挂死 |
 | `alpha_spmm_alg1` | ❌ 缺 TLE。沐曦的 triton 没有 `triton.experimental.tle`，而 FlagOS 的 flagtree（带 TLE）要 GLIBC 2.38，本机是 2.31。只影响这一个算子 |
 | `spmm_csr_opt` `opt_alg1` `opt_alg2` | ⏸ 未验证，风险低，可以跑 |
 | `spmm_bell` | ⏸ 当前 checkout 里没有用例 |
 
-**跑三角类算子必须套 `timeout -s KILL`** —— 内核挂死时 Ctrl-C 送不进去（进程卡在驱动
-调用里），代价是整个容器要重开。
+**跑尚未验证的三角类算子必须套 `timeout -s KILL`** —— 内核挂死时 Ctrl-C 送不进去（进程卡在驱动
+调用里），代价是整个容器要重开。`spsm_csr` 的新路径也建议在批量首跑时保留超时保护。
 
 ```bash
 timeout -s KILL 900 python -m pytest tests/pytest -q -m "spsm_csr"
@@ -357,6 +375,49 @@ FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog python -m pytest tests/pytest -q -m "spsv_c
 CPU 求解和 host/device 拷贝。设备内核崩溃或挂死时，结果应如实记为 `Error` / `Timeout` /
 `NotFound`。精度测试里的 SciPy **参考解**（`tests/pytest/accuracy_utils.py` 的
 `scipy_triangular_solve()`）是另一回事：它只算 oracle，被测算子仍在设备上跑。
+
+### 5.1 SpSV COO 固定 ALG4
+
+交付复现（第 0.5 节）的命令**已经带上** `--op-benchmark-args='spsv_coo=--alg-num 4'`，跑交付时
+不需要再单独执行本节。下面只是需要单独复跑 `spsv_coo` 时的写法：用 `--ops spsv_coo` 代替
+`--delivery-only`，所以要自己写出 `--index-dtypes int32 --ops NON` 来收窄到交付口径。
+`tests/test_spsv.py --csv-coo` 是 runner 对 `spsv_coo` 用的性能脚本，`--alg-num 4` 让它固定走
+`csr_smblk`（ALG4）。命令同时执行精度和性能，性能输入为 `/root/gcx/matrix` 中的 30 个矩阵：
+
+```bash
+RESULT=pytest_results_metax_spsv_coo_alg4_20260920
+
+setsid env \
+  FLAGSPARSE_BACKEND=metax \
+  FLAGSPARSE_MACA_VENDOR=none \
+  FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog \
+  PYTHONPATH=/root/gcx/FlagSparse/src \
+  timeout -s KILL 43200 \
+  python3 -u run_flagsparse_pytest.py \
+    --phase both \
+    --mode normal \
+    --gpus 0 \
+    --ops spsv_coo \
+    --benchmark-input /root/gcx/matrix \
+    --benchmark-warmup 5 \
+    --benchmark-iters 20 \
+    --op-benchmark-args='spsv_coo=--alg-num 4 --index-dtypes int32 --ops NON' \
+    --timeout 7200 \
+    --results-dir "$RESULT" \
+    > "$RESULT.log" 2>&1 < /dev/null &
+
+echo $! > "$RESULT.pid"
+```
+
+用 `tail -f "$RESULT.log"` 查看日志。`FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog` 显式选择 ALG4 的
+非持久化 row-progress kernel；当前 C550 profile 的默认值也是 `rowprog`，这里显式设置是为了避免
+环境或 profile 变化后误走 persistent 路径。`--alg-num 4` 只传给性能脚本，不能改变 runner 精度
+阶段中 `tests/pytest/test_spsv_coo_accuracy.py` 的测试路由；该阶段仍按用例覆盖的算法执行。
+
+如果你的 checkout 里还缺 `tests/data/spmv_csr_regressions.json`（见第 0.5 节），精度阶段会在
+collection 中断，需要在上面的命令里追加
+`--pytest-args='--ignore=tests/pytest/test_spmv_csr_accuracy.py'`；已拉到该文件时不需要。
+本节对应的详细执行台账待 MACA 侧回传后补入 `modified/MACA.md`。
 
 ---
 
@@ -458,7 +519,7 @@ runner 的精度阶段是**一个算子起一个 pytest 进程**（`-m <算子�
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
   --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args=--no-cusparse --op-benchmark-args=spmv_bsr=--resume \
+  --op-benchmark-args='sddmm_csr=--no-cusparse' --op-benchmark-args='spmv_bsr=--resume' \
   --timeout 7200 --results-dir pytest_results_metax_runner_both_w5_i20
 ```
 
@@ -472,7 +533,8 @@ PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gp
 
 `--benchmark-args` 是传给所有性能脚本的字符串，runner 通过 `shlex.split()` 展开。只由
 单个性能脚本支持的参数使用可重复的 `--op-benchmark-args=算子名=参数`；参数部分含空格时
-才需要整体引用。上面的全量命令只向 BSR 传入 `--resume`。`spmv_bsr` 若被 7200 秒超时中断，
+才需要整体引用。上面的全量命令只向 SDDMM 传入 `--no-cusparse`，并向 BSR 传入 `--resume`。
+`spmv_bsr` 若被 7200 秒超时中断，
 可复用同一结果目录续跑：
 
 ```bash
@@ -498,7 +560,7 @@ sampled-dot 输出不正确，不能作为 SDDMM 的精度参考或性能 baseli
 ```bash
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --gpus 0 \
   --ops sddmm_csr --benchmark-input /root/gcx/matrix \
-  --benchmark-warmup 5 --benchmark-iters 20 --benchmark-args=--no-cusparse \
+  --benchmark-warmup 5 --benchmark-iters 20 --op-benchmark-args='sddmm_csr=--no-cusparse' \
   --timeout 7200 --results-dir pytest_results_metax_sddmm_csr_pytorch_full_w5_i20
 ```
 
@@ -531,9 +593,8 @@ setsid env PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR
   --phase performance --mode normal --delivery-only --gpus 0 --timeout 1200 \
   --ops spmm_csr,sddmm_csr \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args=--no-cusparse \
   --op-benchmark-args='spmm_csr=--dtypes float32,float64,complex64,complex128 --index-dtypes int32 --ops non' \
-  --op-benchmark-args='sddmm_csr=--dtype float32,float64 --index-dtype int32 --k 64' \
+  --op-benchmark-args='sddmm_csr=--no-cusparse --dtype float32,float64 --index-dtype int32 --k 64' \
   --results-dir pytest_results_metax_delivery_perf_remaining_w5_i20 \
   > pytest_results_metax_delivery_perf_remaining_w5_i20/runner.log 2>&1 < /dev/null &
 ```
@@ -603,7 +664,7 @@ FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent python tests/test_spsv.py --synthetic
 | 基线列全是 `N/A` | CuPy 是否可用（2.4）；再看 `reason` 字段 |
 | `memory size or pointer value too large to fit in 32 bit` | 私有内存超 4 KB/线程，见第 6 节；调小 BLOCK_NNZ |
 | `memory violation(0x4) ... offset is negative` | 非法访存。加 `CUDA_LAUNCH_BLOCKING=1` 重跑才能定位到真正的内核 |
-| **SpSV / SpSM 挂住不动、Ctrl-C 无效** | 内核死锁（第 5 节），只能等 `timeout -s KILL` 或重开容器。先试 `FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog`。**跑三角类算子永远套 timeout** |
+| **SpSV 或未验证的 SpSM 路径挂住不动、Ctrl-C 无效** | 内核死锁（第 5 节），只能等 `timeout -s KILL` 或重开容器。SpSV 可先试 `FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog`；批量三角测试保留 timeout。 |
 | `libmcruntime.so` / `libnuma.so.1` 找不到 | 环境变量丢了（换容器会丢），重跑第 1 节；`ldd .../torch/lib/*.so \| grep "not found"` 一次列全 |
 | SpMV/SpSV 性能明显偏低 | profile 是 CUDA 平移值，尤其确认 `warp_size`（第 8 节） |
 | 单次失败、重跑就好 | 本机偶发失败率不低，已观察到多次。**重要结论都要多跑几轮**，单次结果不算数 |

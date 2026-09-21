@@ -1031,11 +1031,11 @@ def _run_spmm_csr_base_route_impl(
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
+    B = _materialize_dense_layout(B, dense_layout)
     if timing:
         start = _ACCEL.Event(enable_timing=True)
         end = _ACCEL.Event(enable_timing=True)
         start.record()
-    B = _materialize_dense_layout(B, dense_layout)
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
         prepared.data.dtype,
@@ -1742,11 +1742,11 @@ def _run_spmm_csr_alg1_route(
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
     plan = _spmm_csr_alg1_build_process_plan(prepared, timing=bool(timing))
+    B = _materialize_dense_layout(B, dense_layout)
     if timing:
         start = _ACCEL.Event(enable_timing=True)
         end = _ACCEL.Event(enable_timing=True)
         start.record()
-    B = _materialize_dense_layout(B, dense_layout)
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
         prepared.data.dtype,
@@ -2457,11 +2457,11 @@ def _run_spmm_csr_alg2_route(
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
     plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
+    B = _materialize_dense_layout(B, dense_layout)
     if timing:
         start = _ACCEL.Event(enable_timing=True)
         end = _ACCEL.Event(enable_timing=True)
         start.record()
-    B = _materialize_dense_layout(B, dense_layout)
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
         prepared.data.dtype,
@@ -2551,11 +2551,11 @@ def _run_spmm_csr_alg2_accuracy_impl(
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
     plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
+    B = _materialize_dense_layout(B, dense_layout)
     if timing:
         start = _ACCEL.Event(enable_timing=True)
         end = _ACCEL.Event(enable_timing=True)
         start.record()
-    B = _materialize_dense_layout(B, dense_layout)
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
         prepared.data.dtype,
@@ -2709,20 +2709,39 @@ SPMM_CSR_ALGORITHMS = {
     ),
 }
 
-
-
-def _run_new_spmm_route(prepared, B, *, algorithm, config, config_meta,
-                        timing=False, diagnostics=False, dense_layout="row"):
+def _run_new_spmm_route(
+    prepared,
+    B,
+    *,
+    algorithm,
+    config,
+    config_meta,
+    timing=False,
+    diagnostics=False,
+    dense_layout="row",
+):
     from ._spmm_csr_runtime import run
-    return run(prepared, B, algorithm=algorithm, config=config, config_meta=config_meta,
-               timing=timing, diagnostics=diagnostics, dense_layout=dense_layout)
+
+    return run(
+        prepared,
+        B,
+        algorithm=algorithm,
+        config=config,
+        config_meta=config_meta,
+        timing=timing,
+        diagnostics=diagnostics,
+        dense_layout=dense_layout,
+    )
 
 
 for _name in _new_spmm_policy.NEW_ALGORITHMS:
     SPMM_CSR_ALGORITHMS[_name] = SpmmCsrAlgorithm(
-        _name, _name, tuple(SPMM_OP_NAMES.values()),
+        _name,
+        _name,
+        tuple(SPMM_OP_NAMES.values()),
         (torch.float32, torch.float64, torch.complex64, torch.complex128),
-        partial(_run_new_spmm_route, algorithm=_name))
+        partial(_run_new_spmm_route, algorithm=_name),
+    )
 
 
 def get_spmm_csr_algorithm_spec(alg):
@@ -2734,10 +2753,17 @@ def get_spmm_csr_algorithm_spec(alg):
     algorithm = SPMM_CSR_ALGORITHMS[name]
     if name in _new_spmm_policy.NEW_ALGORITHMS:
         return _new_spmm_policy.algorithm_spec(name)
-    return dict(name=name, ops=algorithm.supported_ops,
-                value_dtypes=tuple(str(v).removeprefix("torch.") for v in algorithm.supported_dtypes),
-                layouts=algorithm.supported_layouts, backends=_new_spmm_policy.BACKENDS,
-                transpose_strategy="per_run_csr_rebuild")
+    return dict(
+        name=name,
+        ops=algorithm.supported_ops,
+        value_dtypes=tuple(
+            str(v).removeprefix("torch.") for v in algorithm.supported_dtypes
+        ),
+        layouts=algorithm.supported_layouts,
+        backends=_new_spmm_policy.BACKENDS,
+        transpose_strategy="per_run_csr_rebuild",
+    )
+
 
 def resolve_spmm_csr_algorithm(alg, op, dtype):
     token = _normalize_spmm_csr_alg(alg)
@@ -5058,7 +5084,7 @@ def _prepare_spmm_ref_hipsparse(
             if sparse_layout == "csr"
             else _hipsparse_create_csc_descriptor
         )
-        make_descriptor(
+        created_spmat = make_descriptor(
             spmat_ref,
             n_rows,
             n_cols,
@@ -5071,6 +5097,8 @@ def _prepare_spmm_ref_hipsparse(
             index_base,
             value_type,
         )
+        if created_spmat is not None:
+            spmat = created_spmat
         _hipsparse_create_dnmat_descriptor(
             matb_ref,
             b_rows,
@@ -5426,23 +5454,28 @@ def _benchmark_spmm_csr_sparse_ref(
 
     op_name = _normalize_sparse_reference_op(op)
     dense_layout = str(dense_layout).strip().lower()
+    if op_name != "non":
+        result["backend"] = None
+        result["reason"] = (
+            "CuPy/cuSPARSE CSR SpMM baseline supports op=non only in this runner; "
+            f"op={op_name} is unsupported"
+        )
+        return result
+    if dense_layout != "row":
+        result["backend"] = None
+        result["reason"] = (
+            "CuPy/cuSPARSE CSR SpMM baseline supports row-major dense RHS only "
+            f"in this runner; dense_layout={dense_layout} is unsupported"
+        )
+        return result
+
     data_cp = _cupy_from_torch(data)
     indices_cp = _cupy_from_torch(indices.to(torch.int64))
     indptr_cp = _cupy_from_torch(indptr.to(torch.int64))
-    B_cp = cp.asfortranarray(_cupy_from_torch(B))
+    B_cp = _cupy_from_torch(B)
     A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-    if op_name == "non":
-        A_eff = A_csr
-    elif op_name == "trans":
-        A_eff = A_csr.transpose().tocsr()
-    elif op_name == "conj":
-        A_eff = A_csr.transpose().conj().tocsr()
-    else:
-        result["backend"] = None
-        result["reason"] = f"unsupported op={op_name}"
-        return result
     values_cp, ms = _benchmark_cuda_op(
-        lambda: A_eff @ B_cp,
+        lambda: A_csr @ B_cp,
         warmup=warmup,
         iters=iters,
     )
@@ -5534,7 +5567,7 @@ def benchmark_spmm_opt_case(
     """Benchmark SpMM base vs opt against the same high-precision PyTorch reference."""
     if value_dtype not in (torch.float32, torch.float64):
         raise TypeError("benchmark_spmm_opt_case only supports float32 and float64")
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
@@ -5661,7 +5694,7 @@ def benchmark_spmm_case(
     """Benchmark Triton CSR SpMM vs PyTorch sparse.mm and CuPy/cuSPARSE CSR @ dense."""
     op_code = _normalize_spmm_op(op)
     op_name = _spmm_op_to_name(op_code)
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
@@ -5901,6 +5934,11 @@ def benchmark_spmm_case(
             cusparse_reason = sparse_ref_reason or "CuPy/cuSPARSE is not available"
         elif value_dtype not in _cupy_supported_dtypes:
             cusparse_reason = "float16/bfloat16 not supported by CuPy sparse; skipped"
+        elif op_code != SPMM_OP_NON:
+            cusparse_reason = (
+                "CuPy/cuSPARSE CSR SpMM baseline supports op=non only in this "
+                f"benchmark; op={op_name} is unsupported"
+            )
         else:
             try:
                 data_cp = _cupy_from_torch(data)
@@ -5910,13 +5948,8 @@ def benchmark_spmm_case(
                 A_csr = cpx_sparse.csr_matrix(
                     (data_cp, indices_cp, indptr_cp), shape=shape
                 )
-                A_eff = A_csr
-                if op_code == SPMM_OP_TRANS:
-                    A_eff = A_csr.transpose().tocsr()
-                elif op_code == SPMM_OP_CONJ_TRANS:
-                    A_eff = A_csr.transpose().conj().tocsr()
                 cusparse_values_cp, cusparse_ms = _benchmark_cuda_op(
-                    lambda: A_eff @ B_cp, warmup=warmup, iters=iters
+                    lambda: A_csr @ B_cp, warmup=warmup, iters=iters
                 )
                 cusparse_values = _torch_from_cupy(cusparse_values_cp)
                 cusparse_metrics = _spmm_validation_metrics(cusparse_values, expected)

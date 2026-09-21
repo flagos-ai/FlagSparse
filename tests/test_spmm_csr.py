@@ -507,7 +507,7 @@ def _time_vendor_sparse_ref(
                 dense_layout=layout,
             )
         except Exception as exc:
-            raise RuntimeError(f"hipSPARSE setup/run failed: {exc}") from exc
+            return None, None, f"hipSPARSE setup/run failed: {exc}"
         if sparse_ref["backend"] is None:
             return None, None, sparse_ref["reason"]
         return sparse_ref["values"], sparse_ref["ms"], sparse_ref.get("reason")
@@ -520,6 +520,20 @@ def _time_vendor_sparse_ref(
 
     if data.dtype not in CUSPARSE_DTYPES:
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
+    if op != "non":
+        return (
+            None,
+            None,
+            "CuPy/cuSPARSE CSR SpMM baseline supports op=non only in this "
+            f"runner; op={op} is unsupported",
+        )
+    if layout != "row":
+        return (
+            None,
+            None,
+            "CuPy/cuSPARSE CSR SpMM baseline supports row-major dense RHS only "
+            f"in this runner; layout={layout} is unsupported",
+        )
     try:
         import cupy as cp
         import cupyx.scipy.sparse as cpx_sparse
@@ -532,21 +546,12 @@ def _time_vendor_sparse_ref(
         )
         indptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
         B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
-        B_cp = cp.asfortranarray(B_cp)
         A = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-        if op == "non":
-            A_eff = A
-        elif op == "trans":
-            A_eff = A.transpose().tocsr()
-        elif op == "conj":
-            A_eff = A.transpose().conj().tocsr()
-        else:
-            return None, None, f"unsupported op={op}"
-        out_cp, ms = _cupy_event_benchmark(lambda: A_eff @ B_cp, warmup, iters)
+        out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
         out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
         return out, ms, None
     except Exception as exc:
-        raise RuntimeError(f"CuPy/cuSPARSE setup/run failed: {exc}") from exc
+        return None, None, f"CuPy/cuSPARSE setup/run failed: {exc}"
 
 
 def run_one_case(
