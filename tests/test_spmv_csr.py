@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import platform
 import subprocess
@@ -153,6 +154,8 @@ def synthetic_cases(torch, dtype, device):
         ("single_long", [1024 * 257 + 1], 1024 * 257 + 7),
     ]
     for name, lengths, n in cases:
+        identity = json.dumps((name, str(dtype), lengths, n, 2026))
+        torch.manual_seed(int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "little") % (2**63))
         ptr = torch.tensor([0] + lengths, dtype=torch.int64).cumsum(0)
         count = int(ptr[-1])
         col = torch.arange(count, dtype=torch.int64) % n
@@ -267,6 +270,11 @@ def main(argv=None):
             p.error("no registered algorithms support the selected combinations")
     else:
         explicit_algorithms = choices(args.alg, ("auto",) + registered)
+    if args.config is not None and (
+        not isinstance(args.config, dict) or args.alg == "compare"
+        or len(explicit_algorithms) != 1 or explicit_algorithms[0] == "auto"
+    ):
+        p.error("--config requires a JSON object and one explicit algorithm")
     fields = FIELDS + (["process_gpu_ms", "compute_ms"] if args.timing else [])
     csv_file = None
     writer = None
@@ -275,6 +283,16 @@ def main(argv=None):
         csv_file = open(args.csv_csr, "w", newline="", encoding="utf-8")
         writer = csv.DictWriter(csv_file, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
+
+    columns = [("matrix", "Matrix", 25), ("dtype", "DType", 10),
+               ("indices", "Idx/Ptr", 11), ("op", "Op", 5), ("alg", "Alg", 24),
+               ("ms", "ms", 9), ("gpu_ms", "gpu_ms", 9), ("process_cpu_ms", "cpu_ms", 9)]
+    if args.timing:
+        columns += [("process_gpu_ms", "procGPU_ms", 10), ("compute_ms", "compute_ms", 10)]
+    columns += [("vendor_ms", "Vendor_ms", 9), ("speedup_vs_vendor", "x", 7),
+                ("status", "Check", 6), ("vendor_status", "VCheck", 6)]
+    print(" ".join(f"{label:<{width}}" for _, label, width in columns), flush=True)
+    reported_unavailable = set()
 
     def emit(row):
         if writer:
@@ -293,9 +311,23 @@ def main(argv=None):
                 }
             )
             csv_file.flush()
-        print(
-            f"{row['matrix']} {row['dtype']} {row['index_dtype']}/{row['indptr_dtype']} {row['op']} {row['alg']}: {row['status']} ms={row.get('ms', 'N/A')} max_error={row.get('max_error', 'N/A')} {row.get('reason') or ''}"
-        )
+        cells = []
+        for key, _, width in columns:
+            value = row.get(key)
+            if key == "matrix":
+                value = Path(value).name
+            elif key == "indices":
+                value = f"{row['index_dtype']}/{row['indptr_dtype']}"
+            elif isinstance(value, (int, float)):
+                value = f"{value:.2f}" if key == "speedup_vs_vendor" else f"{value:.4f}"
+            cells.append(f"{str(value if value is not None else 'N/A'):<{width}}")
+        print(" ".join(cells), flush=True)
+        reason = row.get("reason") if row.get("status") == "SKIP" else None
+        if row.get("vendor_status") in ("N/A", "SKIP") and not args.no_vendor:
+            reason = reason or row.get("vendor_reason")
+        if reason and reason not in reported_unavailable:
+            reported_unavailable.add(reason)
+            print(f"UNAVAILABLE: {reason}", file=sys.stderr, flush=True)
 
     try:
         for dtype_name in dtypes:
@@ -350,6 +382,9 @@ def main(argv=None):
                                 ci, rp = ci.to(getattr(torch, index_name)), rp.to(
                                     getattr(torch, ptr_name)
                                 )
+                                identity = json.dumps((Path(name).name, dtype_name, shape,
+                                                       shape[1] if op == "non" else shape[0], 2026))
+                                torch.manual_seed(int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "little") % (2**63))
                                 x = torch.randn(
                                     shape[1] if op == "non" else shape[0],
                                     dtype=dtype,
@@ -395,9 +430,7 @@ def main(argv=None):
                                                     "vendor correctness check failed"
                                                 )
                                     except Exception as exc:
-                                        vendor.update(
-                                            vendor_status="N/A", vendor_reason=str(exc)
-                                        )
+                                        raise RuntimeError(f"vendor SpMV setup/run failed: {exc}") from exc
                                 base.update(vendor)
                             except Exception as exc:
                                 for alg in algorithms:
@@ -405,26 +438,25 @@ def main(argv=None):
                                         dict(
                                             base,
                                             alg=alg,
-                                            status="FAIL",
+                                            status="ERROR",
                                             reason=str(exc),
                                         )
                                     )
                                     failures += 1
-                                if args.fail_fast:
-                                    raise
-                                continue
+                                print(f"ERROR matrix={name} dtype={dtype_name} indices={index_name}/{ptr_name} op={op}",
+                                      file=sys.stderr, flush=True)
+                                raise
                             for alg in algorithms:
                                 row = dict(base, alg=alg)
                                 try:
-                                    prepared = fs.prepare_spmv_csr(
-                                        data,
-                                        ci,
-                                        rp,
-                                        shape,
-                                        op=op,
-                                        alg=alg,
-                                        config=args.config,
-                                    )
+                                    try:
+                                        prepared = fs.prepare_spmv_csr(
+                                            data, ci, rp, shape, op=op, alg=alg, config=args.config,
+                                        )
+                                    except NotImplementedError as exc:
+                                        row.update(status="SKIP", reason=str(exc))
+                                        emit(row)
+                                        continue
                                     value, meta = measure_route(
                                         prepared,
                                         x,
@@ -445,17 +477,16 @@ def main(argv=None):
                                     )
                                     row["speedup_vs_vendor"] = (
                                         row["vendor_ms"] / row["ms"]
-                                        if ok
-                                        and row["vendor_status"] == "PASS"
-                                        and row["ms"] > 0
+                                        if row.get("vendor_ms") is not None and row["ms"] > 0
                                         else None
                                     )
                                     failures += not ok
-                                except NotImplementedError as exc:
-                                    row.update(status="SKIP", reason=str(exc))
                                 except Exception as exc:
-                                    row.update(status="FAIL", reason=str(exc))
-                                    failures += 1
+                                    row.update(status="ERROR", reason=str(exc))
+                                    emit(row)
+                                    print(f"ERROR matrix={name} dtype={dtype_name} alg={alg} op={op}",
+                                          file=sys.stderr, flush=True)
+                                    raise
                                 emit(row)
                                 if args.fail_fast and row["status"] == "FAIL":
                                     raise RuntimeError(row["reason"])

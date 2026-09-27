@@ -8,7 +8,7 @@ import triton.language as tl
 
 from . import _common as common
 from . import _spmm_csr_config as policy
-from ._spmm_csr_kernels import finish_kernel, reduce_kernel, rows_kernel
+from ._spmm_csr_kernels import finish_kernel, reduce_kernel, row_panel_kernel, rows_kernel
 
 
 def backend_caps(device):
@@ -91,23 +91,24 @@ def _classify(lengths, short, long):
 
 
 def run(prepared, B, *, algorithm, config, config_meta, timing=False,
-        diagnostics=False, dense_layout="row"):
+        diagnostics=False, dense_layout="row", out=None):
     cfg = config
     phases = Phases(timing)
     m, n = prepared.n_rows, int(B.shape[1])
     complex_input = prepared.data.is_complex()
     acc = tl.float64 if B.dtype in (torch.float64, torch.complex128) else tl.float32
     launch = dict(num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
-    counts = {"tile_rows": 0, "kparallel_rows": 0, "split_rows": 0}
+    counts = {"tile_rows": 0, "kparallel_rows": 0, "split_rows": 0, "panel_rows": 0}
     stats = dict(segment_count=0, reduction_levels=0, workspace_peak_bytes=0,
                  descriptor_peak_bytes_estimate=0, segment_batches=0)
     with phases.measure("compute_ms"):
         # Resolving lazy views is numerical input handling and remains inside run.
         A = prepared.data.resolve_conj().resolve_neg().contiguous()
         B = B.resolve_conj().resolve_neg()
-        C = (torch.empty_strided((m, n), (1, max(m, 1)), device=B.device, dtype=B.dtype)
+        C = out if out is not None else (torch.empty_strided((m, n), (1, max(m, 1)), device=B.device, dtype=B.dtype)
              if dense_layout == "col" else torch.empty((m, n), device=B.device, dtype=B.dtype))
-        C.zero_()
+        if algorithm in ("csr_split_nnz_reduce", "csr_adaptive_tile_split"):
+            C.zero_()
 
     def rows(row_ids, tile=False):
         size = m if row_ids is None else row_ids.numel()
@@ -125,7 +126,15 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
                 r, bk, bn, row_ids is not None, False, complex_input, acc, **launch)
 
     if m and n:
-        if algorithm == "csr_row_tile":
+        if algorithm == "csr_row_panel":
+            with phases.measure("compute_ms"):
+                row_panel_kernel[(triton.cdiv(m, cfg["tile_rows"]), triton.cdiv(n, cfg["tile_n"]))](
+                    _view(A), prepared.kernel_indices, prepared.kernel_indptr, _view(B), _view(C),
+                    m, n, B.stride(0), B.stride(1), C.stride(0), C.stride(1),
+                    cfg["tile_rows"], cfg["tile_n"], cfg["panel_accumulators"], complex_input, acc,
+                    **launch)
+            counts["panel_rows"] = m
+        elif algorithm == "csr_row_tile":
             rows(None, True)
             counts["tile_rows"] = m
         elif algorithm == "csr_row_kparallel":
@@ -152,7 +161,7 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
                 complex_component_dtype=("float64" if acc == tl.float64 else "float32") if complex_input else None,
                 validation="unverified", process_cpu_ms=0.0,
                 dense_layout=dense_layout, b_stride=tuple(B.stride()), c_stride=tuple(C.stride()),
-                output_layout=dense_layout, **counts, **stats)
+                output_layout="row" if C.is_contiguous() else "col", **counts, **stats)
     meta.update(phases.results())
     if diagnostics:
         meta["diagnostics"] = {**counts, **stats, "config": dict(cfg),

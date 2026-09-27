@@ -4,11 +4,11 @@ from dataclasses import asdict, dataclass
 
 NEW_ALGORITHMS = (
     "csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce",
-    "csr_adaptive_tile_split",
+    "csr_adaptive_tile_split", "csr_row_panel",
 )
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend", "xpu", "gcu", "mlu")
 DTYPES = ("float32", "float64", "complex64", "complex128")
-IMPLEMENTATION_VERSION = 1
+IMPLEMENTATION_VERSION = 2
 CONFIG_FIELDS = frozenset((
     "tile_rows", "tile_k", "tile_n", "block_k", "block_n", "panels",
     "segment_nnz", "reduce_block_size", "num_warps", "num_stages",
@@ -73,10 +73,15 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
                num_warps=4, num_stages=1, workspace_bytes=256 * 1024 * 1024,
                short_row_threshold=32 if layout == "row" and n <= 32 else 16,
                split_row_threshold=4096 if n >= 128 else 2048)
+    if algorithm == "csr_row_panel":
+        panel_n = 16 if dtype == "complex128" else 32
+        cfg.update(tile_rows=4 if dtype == "complex128" else 8,
+                   tile_n=min(panel_n, 1 << (max(1, n) - 1).bit_length()),
+                   num_warps=2, panel_accumulators=2)
     source = "conservative"
     rejections = []
     if cfg["num_warps"] not in caps.legal_num_warps:
-        rejections.append("default num_warps=4 is unsupported by target")
+        rejections.append(f"default num_warps={cfg['num_warps']} is unsupported by target")
         cfg["num_warps"] = min(caps.legal_num_warps)
     for key, profiles in (
         (caps.backend, BACKEND_PROFILES),
@@ -88,6 +93,8 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
         if profile:
             candidate = {**cfg, **profile}
             try:
+                if set(profile) - set(cfg):
+                    raise ValueError(f"profile has fields not used by {algorithm}: {sorted(set(profile) - set(cfg))}")
                 validate_config(candidate, caps)
             except ValueError as exc:
                 rejections.append(str(exc))
@@ -106,7 +113,8 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
 
 
 def validate_config(cfg, caps):
-    if set(cfg) != CONFIG_FIELDS:
+    fields = CONFIG_FIELDS | ({"panel_accumulators"} if "panel_accumulators" in cfg else set())
+    if set(cfg) != fields:
         raise ValueError(f"invalid configuration fields: {sorted(set(cfg) ^ CONFIG_FIELDS)}")
     for key, value in cfg.items():
         if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 2**63:
@@ -122,6 +130,8 @@ def validate_config(cfg, caps):
         raise ValueError("launch exceeds target thread limit")
     if cfg["num_stages"] != 1:
         raise ValueError("initial CSR SpMM profiles support num_stages=1 only")
+    if cfg.get("panel_accumulators", 2) not in (1, 2, 4):
+        raise ValueError("panel_accumulators must be 1, 2 or 4")
     if cfg["short_row_threshold"] >= cfg["split_row_threshold"]:
         raise ValueError("short_row_threshold must be less than split_row_threshold")
     if cfg["workspace_bytes"] < 48:

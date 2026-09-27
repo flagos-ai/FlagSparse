@@ -2719,6 +2719,7 @@ def _run_new_spmm_route(
     timing=False,
     diagnostics=False,
     dense_layout="row",
+    out=None,
 ):
     from ._spmm_csr_runtime import run
 
@@ -2731,6 +2732,7 @@ def _run_new_spmm_route(
         timing=timing,
         diagnostics=diagnostics,
         dense_layout=dense_layout,
+        out=out,
     )
 
 
@@ -2945,6 +2947,8 @@ def _flagsparse_spmm_csr_run_impl(
         except NotImplementedError as exc:
             raise SpmmCsrAlgorithmUnavailable(str(exc)) from exc
         route_kwargs = dict(config=resolved_config, config_meta=config_meta)
+        if algorithm.name in ("csr_row_tile", "csr_row_kparallel", "csr_row_panel"):
+            route_kwargs["out"] = out
     elif config:
         raise ValueError("config is supported only by the new CSR SpMM algorithms")
     runtime_prepared, op_process_gpu_ms = _materialize_spmm_csr_route_op(
@@ -2960,7 +2964,7 @@ def _flagsparse_spmm_csr_run_impl(
         dense_layout=dense_layout,
         **route_kwargs,
     )
-    if out is not None:
+    if out is not None and C is not out:
         copy_start = _ACCEL.Event(enable_timing=True) if timing else None
         copy_end = _ACCEL.Event(enable_timing=True) if timing else None
         if copy_start is not None:

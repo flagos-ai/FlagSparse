@@ -33,6 +33,7 @@ SCRIPTS = [
     "run_flagsparse_performance.py",
     "run_flagsparse_pytest.py",
     "tests/test_spmv.py",
+    "tests/test_spmv_csr.py",
     "tests/test_spmv_coo.py",
     "tests/test_spmv_csc.py",
     "tests/test_spmv_bsr.py",
@@ -67,3 +68,6 @@ def test_script_help_runs(script):
     )
     combined = (proc.stdout or "") + (proc.stderr or "")
     assert "usage:" in combined.lower()
+    if script in ("tests/test_spmv_csr.py", "tests/test_spmm_csr.py"):
+        for flag in ("--config", "--alg", "--timing", "--csv-csr"):
+            assert flag in combined

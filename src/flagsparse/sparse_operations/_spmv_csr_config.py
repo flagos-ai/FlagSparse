@@ -3,8 +3,8 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 2
-NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split")
+IMPLEMENTATION_VERSION = 3
+NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream")
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend")
@@ -144,6 +144,13 @@ def _defaults(caps):
             "loop_num_stages": 1,
         },
         "row_vector": {"block_nnz": 128, "num_warps": 2, "loop_num_stages": 1},
+        "row_subgroup_stream": {
+            "rows_per_program": caps.subgroup_width,
+            "lanes_per_row": 2,
+            "row_tiles_per_program": 4,
+            "num_warps": 2,
+            "loop_num_stages": 1,
+        },
         "row_split_reduce": {
             "segment_nnz": 1024,
             "block_nnz": 128,
@@ -179,7 +186,7 @@ def _validate_config(resolved, caps):
         or resolved["split_row_threshold"] <= resolved["short_row_threshold"]
     ):
         raise ValueError("require 0 <= short_row_threshold < split_row_threshold")
-    for section in ("row_tile", "row_vector", "row_split_reduce", "process"):
+    for section in ("row_tile", "row_vector", "row_subgroup_stream", "row_split_reduce", "process"):
         for key, value in resolved[section].items():
             if value <= 0:
                 raise ValueError(f"{section}.{key} must be positive")
@@ -198,6 +205,11 @@ def _validate_config(resolved, caps):
         raise ValueError("lanes_per_row exceeds subgroup width")
     if tile["rows_per_program"] * tile["lanes_per_row"] > 65536:
         raise ValueError("row_tile exceeds the supported tile size")
+    stream = resolved["row_subgroup_stream"]
+    if stream["lanes_per_row"] > caps.subgroup_width:
+        raise ValueError("row_subgroup_stream lanes_per_row exceeds subgroup width")
+    if stream["rows_per_program"] * stream["lanes_per_row"] > 65536:
+        raise ValueError("row_subgroup_stream exceeds the supported tile size")
     split = resolved["row_split_reduce"]
     if split["reduce_block_size"] < 2:
         raise ValueError("reduce_block_size must be >= 2 to make reduction progress")
@@ -213,7 +225,7 @@ def _validate_config(resolved, caps):
         raise ValueError("block size exceeds the supported tile size")
 
 
-def resolve_config(alg, caps, config=None, *, return_rejections=False):
+def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_nnz=0):
     if config is not None and not isinstance(config, dict):
         raise TypeError("CSR SpMV config must be a dictionary")
     if alg not in NEW_ALGORITHMS:
@@ -256,24 +268,43 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False):
         warps = max((w for w in (1, 2, 4, 8) if w <= available), default=0)
         if not warps:
             raise NotImplementedError(f"no legal launch profile: {rejections}")
-        for section in ("row_tile", "row_vector", "row_split_reduce", "process"):
+        for section in ("row_tile", "row_vector", "row_subgroup_stream", "row_split_reduce", "process"):
             resolved[section]["num_warps"] = min(resolved[section]["num_warps"], warps)
         resolved["row_split_reduce"]["reduce_num_warps"] = min(4, warps)
         _validate_config(resolved, caps)
         source = f"{caps.backend}:resource-conservative-v1"
+    if alg == "row_subgroup_stream":
+        stream = resolved[alg]
+        # Dimension-only selection: no device statistics or plan construction.
+        lanes = next((v for bound, v in ((4, 2), (8, 4), (16, 8), (32, 16), (64, 32))
+                      if mean_row_nnz < bound), 64)
+        profile_stream = (profile or {}).get(alg, {})
+        if "lanes_per_row" not in profile_stream or source.endswith("conservative-v1"):
+            stream["lanes_per_row"] = min(lanes, caps.subgroup_width)
+        if "rows_per_program" not in profile_stream or source.endswith("conservative-v1"):
+            stream["rows_per_program"] = stream["num_warps"] * caps.subgroup_width // stream["lanes_per_row"]
     if config is not None:
         _merge(resolved, config)
         _validate_config(resolved, caps)
+        stream_override = config.get("row_subgroup_stream", {})
+        if (
+            alg == "row_subgroup_stream"
+            and "rows_per_program" not in stream_override
+            and ("lanes_per_row" in stream_override or "num_warps" in stream_override)
+        ):
+            stream = resolved[alg]
+            stream["rows_per_program"] = stream["num_warps"] * caps.subgroup_width // stream["lanes_per_row"]
         source = "explicit"
+    _validate_config(resolved, caps)
     result = (deepcopy(resolved), source)
     return (*result, rejections) if return_rejections else result
 
 
-def assert_route_match(prepared_alg, prepared_config, alg=None, config=None, caps=None):
+def assert_route_match(prepared_alg, prepared_config, alg=None, config=None, caps=None, mean_row_nnz=0):
     if alg is not None and normalize_alg(alg) not in ("auto", prepared_alg):
         raise ValueError(f"alg does not match prepared.alg={prepared_alg}")
     if config is not None:
-        candidate, _ = resolve_config(prepared_alg, caps, config)
+        candidate, _ = resolve_config(prepared_alg, caps, config, mean_row_nnz=mean_row_nnz)
         if candidate != prepared_config:
             raise ValueError("config does not match prepared.config")
 

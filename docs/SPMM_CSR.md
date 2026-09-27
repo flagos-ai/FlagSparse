@@ -2,7 +2,7 @@
 
 ## Status and invocation
 
-The four extensions are implemented but **unverified on hardware**. No operator,
+The five extensions are implemented but **unverified on hardware**. No operator,
 pytest, interpreter or offline kernel compilation was run on the development host.
 The historical high-level default and registry `auto -> csr_base` are unchanged.
 Use an explicit algorithm to exercise an extension:
@@ -31,6 +31,7 @@ arguments cannot be mixed with the registered route configuration.
 | Name | Execution |
 | --- | --- |
 | `csr_row_tile` | Simultaneous `[R,BK,BN]` multirow tile; masked local row-length loop |
+| `csr_row_panel` | `[R,BN]` accumulators over interleaved nonzeros; no BK reduction |
 | `csr_row_kparallel` | One row/output tile; lane accumulators reduced after the row loop |
 | `csr_split_nnz_reduce` | Cross-program segments, exclusive partial sums, bounded multilevel reduction |
 | `csr_adaptive_tile_split` | Per-call GPU classification and the three mutually exclusive paths above |
@@ -39,7 +40,7 @@ Every name returns the complete output. FP32 and complex64 use FP32 arithmetic;
 FP64 and complex128 use FP64 arithmetic. Complex products use explicit real and
 imaginary components. No new floating-point atomics, precision promotion or relaxed
 tolerances are introduced. Existing accuracy/HP algorithms retain their policy.
-FP16/BF16 are not supported by these four extensions.
+FP16/BF16 are not supported by these five extensions.
 
 For `trans`, the operation is `A.T @ B`; `conj` is `A.conj().T @ B` and never
 conjugates B. Each run builds a transposed CSR with stable sorting, preserving
@@ -151,7 +152,7 @@ full-call latency and metadata. Matrix-suite speedups remain unmeasured.
 
 ## 中文说明
 
-四个新算法已接入注册入口，当前状态均为“尚未实机验证”。默认路由不变。
+五个新算法已接入注册入口，当前状态均为“尚未实机验证”。默认路由不变。
 支持 float32/float64/complex64/complex128 和 non/trans/conj；FP32 与 complex64
 采用 FP32 分量精度，不沿用 SpMV 的 FP32→FP64 策略。
 
@@ -165,4 +166,50 @@ CPU 算法处理时间。阶段计时单独执行，不替代完整调用时间�
 
 多平台通过规范后端名、实际编译目标及能力选择配置；缺少能力信息时明确不可用，
 不借用旧回退冒充新算法。所有平台均需分别完成实机验证。上面的 compare 命令是完整
-比较入口，逐条写入结果，正确性失败不参与加速比及最佳算法排名。
+比较入口，逐条写入结果，有有效计时即计算加速比，正确性独立显示；FAIL 不参与最佳算法排名。
+
+## P1 direct paths and unified validation
+
+`csr_row_panel` maintains one, two or four independent `[R,BN]` accumulators,
+selected by `panel_accumulators` (default 2). Interleaved nonzeros broadcast their
+values across B column panels; accumulators are combined only at the end. Long
+rows execute completely. Default R/BN is 8/32, or 4/16 for complex128, with two
+legal warps and one stage. BN shrinks to the smallest covering power of two for
+narrow N. These defaults are unmeasured candidates, not architecture tuning claims.
+
+`csr_row_tile`, `csr_row_kparallel` and `csr_row_panel` directly overwrite validated
+`out` using its strides, including empty rows. They no longer clear the entire
+output or allocate an intermediate output when out is provided. Without out,
+existing output layout is retained. Split/adaptive initialization is unchanged.
+Implementation version 2 records the actual output strides and panel row count.
+
+The benchmark accepts flat JSON `--config` with one explicit algorithm only:
+
+```bash
+python tests/test_spmm_csr.py ../matrix --alg csr_row_panel --dtypes float32 --dense-cols 32 --config '{"tile_rows":8,"tile_n":32,"panel_accumulators":2}' --timing
+python run_flagsparse_pytest.py --ops spmv_csr,spmm_csr --phase both --mode quick --benchmark-input ../../matrix --results-dir pytest_results_csr_p1
+```
+
+Compare accumulators 1/2/4 and explicit tile_rows 4/8, tile_n 8/16/32 with the same
+input seed, warmup, iterations and full-call timing. Separately compare out and
+allocated-output calls, and the prior implementation for the clear/copy removal.
+Do not replace full-run measurements with the numerical phase.
+
+Existing accuracy tests cover NaN/nonzero-prefilled outputs, object identity and
+input preservation, all four dtypes/three ops, mixed indices, row/column layouts,
+column-panel tails and long rows. Quick mode reduces sizes and index combinations;
+normal mode expands boundaries through N=256. Existing runner commands and markers
+include the extension automatically; no additional test framework is introduced.
+
+Complete a normal CSR sweep, then the original full-operator regression on the
+compute node. Preserve known matrix failures without changing shared tolerance:
+
+```bash
+python run_flagsparse_pytest.py --ops spmv_csr,spmm_csr --phase both --mode normal --benchmark-input ../../matrix --benchmark-warmup 10 --benchmark-iters 50 --op-benchmark-args "spmv_csr=--dtypes all --ops all --index-dtypes int32,int64 --indptr-dtypes int32,int64 --timing" --op-benchmark-args "spmm_csr=--layout all --dense-cols 1,8,16,32,64,128,256 --index-dtypes int32,int64 --indptr-dtypes int32,int64 --timing" --results-dir pytest_results_csr_p1_full
+python run_flagsparse_pytest.py --phase both --mode normal --benchmark-input ../../matrix --results-dir pytest_results_p1_all
+```
+
+新增 csr_row_panel 采用交错非零元的独立面板累加，不保留 BK 维累加器。三个直接
+路径取消独立清零并直接写 out；分段及组合路径保持现状。算法配置按后端能力解析，
+保持原默认路由。CLI 保留处理时间和完整耗时，准确性 FAIL 仍显示有效计时的加速比。
+当前环境仅做静态检查；实机正确性、消融及矩阵性能验收分别在计算节点完成。

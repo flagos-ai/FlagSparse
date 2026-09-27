@@ -27,6 +27,37 @@ from tools.delivery_variants import load_delivery_variants
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_csr_process_completion_does_not_hide_accuracy_failures():
+    result = runner._csr_row_correctness([
+        {"dtype": "float32", "status": "FAIL", "ms": "2", "vendor_ms": "1", "speedup_vs_vendor": "0.5"},
+        {"dtype": "float64", "status": "PASS", "ms": "1", "vendor_ms": "2", "speedup_vs_vendor": "2"},
+    ])
+    assert result["correctness_status"] == "Failed"
+    assert result["row_status_counts"]["PASS"] == result["row_status_counts"]["FAIL"] == 1
+    assert runner._csr_row_correctness([{"status": "SKIP"}])["correctness_status"] == "Skipped"
+
+
+def test_csr_delivery_accuracy_status_is_per_dtype():
+    records = [
+        {"dtype": dtype, "index_dtype": "int32", "op": "non", "matrix": "m", "alg": "a",
+         "status": state, "ms": "2", "vendor_ms": "1", "speedup_vs_vendor": "0.5"}
+        for dtype, state in (("float32", "FAIL"), ("float64", "PASS"))
+    ]
+    phase = {"records": records, "status": "Failed", "process_status": "Passed",
+             **runner._csr_row_correctness(records)}
+    # Use the runner's canonical dtype IDs rather than introducing a new mapping.
+    for dtype, aliases in runner._DELIVERY_PERF_DTYPES.items():
+        if "float64" in aliases:
+            selected = runner._delivery_performance_phase(phase, dtype)
+            assert selected["status"] == "Passed"
+            assert all(row["dtype"] == "float64" for row in selected["records"])
+        if "float32" in aliases:
+            selected = runner._delivery_performance_phase(phase, dtype)
+            assert selected["status"] == "Failed"
+            assert selected["process_status"] == "Passed"
+            assert selected["records"][0]["speedup_vs_vendor"] == "0.5"
+
+
 def _gather_accuracy_artifact(op_dir: Path) -> Path:
     """A raw pytest artifact shaped like the real gather accuracy run.
 

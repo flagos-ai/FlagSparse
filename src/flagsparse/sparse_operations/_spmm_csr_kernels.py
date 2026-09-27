@@ -59,6 +59,73 @@ def rows_kernel(A, I, P, B, C, Rows, Starts, Ends,
 
 
 @triton.jit
+def row_panel_kernel(A, I, P, B, C, M, N,
+                     B0: tl.constexpr, B1: tl.constexpr,
+                     C0: tl.constexpr, C1: tl.constexpr,
+                     R: tl.constexpr, BN: tl.constexpr, ACCUMULATORS: tl.constexpr,
+                     COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    rows = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
+    ns = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN)
+    valid = rows < M
+    starts = tl.load(P + rows, valid, 0).to(tl.int64)
+    ends = tl.load(P + rows + 1, valid, 0).to(tl.int64)
+    longest = tl.max(ends - starts, 0)
+    r0 = tl.zeros((R, BN), ACC)
+    r1 = tl.zeros((R, BN), ACC)
+    r2 = tl.zeros((R, BN), ACC)
+    r3 = tl.zeros((R, BN), ACC)
+    i0 = tl.zeros((R, BN), ACC)
+    i1 = tl.zeros((R, BN), ACC)
+    i2 = tl.zeros((R, BN), ACC)
+    i3 = tl.zeros((R, BN), ACC)
+    for base in range(0, longest, ACCUMULATORS):
+        for slot in tl.static_range(ACCUMULATORS):
+            pos = starts + base + slot
+            mask = valid & (pos < ends)
+            cols = tl.load(I + pos, mask, 0).to(tl.int64)
+            bo = cols[:, None] * B0 + ns[None, :] * B1
+            bm = mask[:, None] & (ns[None, :] < N)
+            if COMPLEX:
+                vr = tl.load(A + 2 * pos, mask, 0).to(ACC)
+                vi = tl.load(A + 2 * pos + 1, mask, 0).to(ACC)
+                br = tl.load(B + 2 * bo, bm, 0).to(ACC)
+                bi = tl.load(B + 2 * bo + 1, bm, 0).to(ACC)
+                real = vr[:, None] * br - vi[:, None] * bi
+                imag = vr[:, None] * bi + vi[:, None] * br
+            else:
+                v = tl.load(A + pos, mask, 0).to(ACC)
+                real = v[:, None] * tl.load(B + bo, bm, 0).to(ACC)
+                imag = tl.zeros((R, BN), ACC)
+            if slot == 0:
+                r0 += real
+                i0 += imag
+            elif slot == 1:
+                r1 += real
+                i1 += imag
+            elif slot == 2:
+                r2 += real
+                i2 += imag
+            else:
+                r3 += real
+                i3 += imag
+    real = r0
+    imag = i0
+    if ACCUMULATORS >= 2:
+        real += r1
+        imag += i1
+    if ACCUMULATORS == 4:
+        real += r2 + r3
+        imag += i2 + i3
+    co = rows[:, None] * C0 + ns[None, :] * C1
+    cm = valid[:, None] & (ns[None, :] < N)
+    if COMPLEX:
+        tl.store(C + 2 * co, real, cm)
+        tl.store(C + 2 * co + 1, imag, cm)
+    else:
+        tl.store(C + co, real, cm)
+
+
+@triton.jit
 def reduce_kernel(X, Y, Starts, Ends, N, K: tl.constexpr, BN: tl.constexpr,
                   COMPLEX: tl.constexpr, ACC: tl.constexpr):
     group = tl.program_id(0).to(tl.int64)

@@ -438,7 +438,7 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
                     values=("float32", "float64", "complex64", "complex128"),
                     indices=("int32", "int64"), ops=("non", "trans", "conj"),
                     notes="Native component precision; per-run transpose; backend capability gated; unverified")
-            for name in ("csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce", "csr_adaptive_tile_split")
+            for name in ("csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce", "csr_adaptive_tile_split", "csr_row_panel")
         ),
         ApiSpec(
             "spmm",
@@ -626,7 +626,7 @@ def rows_for_spec(
         notes.append("new CSR SpMV route requires backend-specific hardware validation")
 
     if spec.module == "spmm_csr" and spec.route in (
-        "csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce", "csr_adaptive_tile_split"
+        "csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce", "csr_adaptive_tile_split", "csr_row_panel"
     ) and status == "SUPPORTED":
         status = "UNVERIFIED"
     ops = spec.ops

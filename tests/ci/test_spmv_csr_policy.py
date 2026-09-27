@@ -28,8 +28,57 @@ class ConfigPolicy(unittest.TestCase):
             "rocm", "gfx90a", "hip", 64, 1024, True, True, True
         )
 
+    def test_stream_dimension_defaults_and_explicit_configuration(self):
+        for mean, lanes in (
+            (0, 2), (3, 2), (4, 4), (8, 8), (16, 16), (32, 32), (64, 64)
+        ):
+            for caps in (self.cuda, self.hip):
+                config, _ = policy.resolve_config(
+                    "row_subgroup_stream", caps, mean_row_nnz=mean
+                )
+                stream = config["row_subgroup_stream"]
+                self.assertEqual(
+                    stream["lanes_per_row"], min(lanes, caps.subgroup_width)
+                )
+                self.assertEqual(
+                    stream["rows_per_program"] * stream["lanes_per_row"],
+                    stream["num_warps"] * caps.subgroup_width,
+                )
+                self.assertEqual(stream["row_tiles_per_program"], 4)
+                policy.assert_route_match(
+                    "row_subgroup_stream", config, config={}, caps=caps,
+                    mean_row_nnz=mean,
+                )
+        config, _ = policy.resolve_config(
+            "row_subgroup_stream", self.hip,
+            {"row_subgroup_stream": {"lanes_per_row": 4, "num_warps": 1}},
+        )
+        self.assertEqual(config["row_subgroup_stream"]["rows_per_program"], 16)
+        for field, value in (
+            ("lanes_per_row", 0), ("lanes_per_row", 128),
+            ("row_tiles_per_program", 0), ("rows_per_program", 3),
+        ):
+            with self.assertRaises(ValueError):
+                policy.resolve_config(
+                    "row_subgroup_stream", self.hip,
+                    {"row_subgroup_stream": {field: value}},
+                )
+
+    def test_stream_profile_and_empty_override_preserve_rows(self):
+        with patch.dict(
+            policy.ARCH_PROFILES,
+            {("rocm", "gfx90a"): {
+                "row_subgroup_stream": {"rows_per_program": 8, "lanes_per_row": 4}
+            }},
+        ):
+            config, _ = policy.resolve_config("row_subgroup_stream", self.hip, {})
+            self.assertEqual(config["row_subgroup_stream"]["rows_per_program"], 8)
+            policy.assert_route_match(
+                "row_subgroup_stream", config, config={}, caps=self.hip
+            )
+
     def test_registry_support(self):
-        self.assertEqual(len(policy.list_algorithms()), 7)
+        self.assertEqual(len(policy.list_algorithms()), 8)
         for alg in policy.NEW_ALGORITHMS:
             self.assertIn(alg, policy.list_algorithms("non", "torch.float32", "rocm"))
             self.assertIn(alg, policy.list_algorithms("trans", "float32", "cuda"))
@@ -194,7 +243,7 @@ def runtime_namespace():
             )
             self.config_rejections = []
             self.data = types.SimpleNamespace(
-                dtype="float32", device="cuda", is_conj=lambda: False
+                dtype="float32", device="cuda", is_conj=lambda: False, numel=lambda: 3
             )
             self.kernel_indices = types.SimpleNamespace(dtype="int64")
             self.kernel_indptr = types.SimpleNamespace(dtype="int32")
@@ -277,15 +326,17 @@ class RuntimePolicy(unittest.TestCase):
         self.assertEqual(detailed["alg_resolved"], p.alg)
 
     def test_row_routes_have_no_plan_and_out_is_forwarded(self):
-        env, p, kernels = runtime_namespace()
-        p.alg = p.alg_requested = "row_tile"
-        out = object()
-        result, meta = env["flagsparse_spmv_csr_run"](
-            p, object(), out=out, return_meta=True, timing=True
-        )
-        self.assertIs(result, out)
-        kernels.build_plan.assert_not_called()
-        self.assertEqual(meta["process_gpu_ms"], 0)
+        for alg in ("row_tile", "row_vector", "row_subgroup_stream"):
+            with self.subTest(alg=alg):
+                env, p, kernels = runtime_namespace()
+                p.alg = p.alg_requested = alg
+                out = object()
+                result, meta = env["flagsparse_spmv_csr_run"](
+                    p, object(), out=out, return_meta=True, timing=True
+                )
+                self.assertIs(result, out)
+                kernels.build_plan.assert_not_called()
+                self.assertEqual(meta["process_gpu_ms"], 0)
 
     def test_prepared_and_legacy_argument_conflicts(self):
         env, p, _ = runtime_namespace()

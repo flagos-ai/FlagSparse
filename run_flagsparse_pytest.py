@@ -2185,6 +2185,18 @@ def _performance_row_status_is_usable(row: dict[str, str]) -> bool:
     return not status or status.upper() in {"PASS", "PASSED", "OK", "SUCCESS"}
 
 
+def _csr_row_correctness(rows):
+    """Accuracy is independent of process completion and timing availability."""
+    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
+    for row in rows:
+        state = str(row.get("status") or "").upper()
+        if state in counts:
+            counts[state] += 1
+    status = ("Failed" if counts["FAIL"] or counts["ERROR"] else
+              "Passed" if counts["PASS"] else "Skipped" if counts["SKIP"] else "NO_TESTS")
+    return {"correctness_status": status, "row_status_counts": counts}
+
+
 def _capability_probe_status(rows: list[dict[str, str]]) -> str:
     """Keep a probe's semantic status when its subprocess exits successfully.
 
@@ -2674,6 +2686,11 @@ def run_performance(
                 if status_from_csv and status not in {"PASS", "PASSED"}
                 else "passed"
             )
+            if op in ("spmv_csr", "spmm_csr"):
+                json_status = (
+                    "timeout" if timed_out else "failed" if returncode != 0
+                    else _csr_row_correctness(rows)["correctness_status"].lower()
+                )
             write_benchmark_json_from_csv(
                 op, csv_path, result_path, rows=rows, status=json_status
             )
@@ -2692,6 +2709,11 @@ def run_performance(
                 )
             )
             result.update(parsed)
+            if op in ("spmv_csr", "spmm_csr"):
+                result["process_status"] = "TIMEOUT" if timed_out else "Passed" if returncode == 0 else "Failed"
+                result.update(_csr_row_correctness(rows))
+                result["status"] = (result["correctness_status"] if returncode == 0 and not timed_out
+                                    else result["process_status"])
             result["data_file"] = str(result_path.relative_to(op_dir.parent))
         except Exception as exc:
             result["csv_parse_error"] = str(exc)
@@ -3209,9 +3231,16 @@ def _delivery_performance_phase(
     result = dict(phase_result)
     result["data"] = selected
     if delivery_rows is not None:
-        result["records"] = delivery_rows
-        result["delivery_row_count"] = len(delivery_rows)
-        result["non_delivery_row_count"] = len(records) - len(delivery_rows)
+        selected_rows = [row for row in delivery_rows
+                         if _row_dtype(row).lower().replace("torch.", "")
+                         in _DELIVERY_PERF_DTYPES[dtype]]
+        result["records"] = selected_rows
+        result["delivery_row_count"] = len(selected_rows)
+        result["non_delivery_row_count"] = len(records) - len(selected_rows)
+        if "correctness_status" in phase_result:
+            result.update(_csr_row_correctness(selected_rows))
+            result["status"] = (result["correctness_status"] if phase_result.get("process_status") == "Passed"
+                                else phase_result.get("process_status", phase_result["status"]))
     return result
 
 

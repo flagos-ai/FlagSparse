@@ -88,6 +88,35 @@ def test_width_and_layout_change_deterministic_thresholds():
     assert wide["split_row_threshold"] == 2 * short["split_row_threshold"]
 
 
+@pytest.mark.parametrize("dtype,rows,limit", [("float32", 8, 32), ("complex128", 4, 16)])
+@pytest.mark.parametrize("n", [0, 1, 7, 31, 33, 128])
+def test_panel_defaults_and_config_isolation(dtype, rows, limit, n):
+    config, _ = policy.resolve_config("csr_row_panel", dtype, n, "row", caps())
+    assert config["tile_rows"] == rows
+    assert config["tile_n"] == min(limit, 1 << (max(1, n) - 1).bit_length())
+    assert config["num_warps"] == 2
+    assert config["panel_accumulators"] == 2
+    for accumulators in (1, 2, 4):
+        explicit, meta = policy.resolve_config("csr_row_panel", dtype, n, "col", caps(),
+                                               {"panel_accumulators": accumulators})
+        assert explicit["panel_accumulators"] == accumulators
+        assert meta["config_source"] == "explicit"
+    for bad in (0, 3, 8):
+        with pytest.raises(ValueError):
+            policy.resolve_config("csr_row_panel", dtype, n, "row", caps(), {"panel_accumulators": bad})
+    with pytest.raises(ValueError, match="unknown"):
+        policy.resolve_config("csr_row_tile", dtype, n, "row", caps(), {"panel_accumulators": 2})
+
+
+def test_panel_profile_does_not_enable_panel_fields_on_other_algorithms(monkeypatch):
+    monkeypatch.setitem(policy.BACKEND_PROFILES, "cuda", {"panel_accumulators": 4})
+    config, meta = policy.resolve_config("csr_row_tile", "float32", 32, "row", caps())
+    assert "panel_accumulators" not in config
+    assert meta["config_rejections"]
+    panel, _ = policy.resolve_config("csr_row_panel", "float32", 32, "row", caps())
+    assert panel["panel_accumulators"] == 4
+
+
 def test_illegal_builtin_profile_is_rejected(monkeypatch):
     monkeypatch.setitem(policy.ARCH_PROFILES, ("cuda", "test"), dict(num_warps=128))
     config, meta = policy.resolve_config("csr_row_tile", "float32", 16, "row", caps())

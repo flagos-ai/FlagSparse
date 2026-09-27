@@ -68,6 +68,33 @@ def row_tile_kernel(
 
 
 @triton.jit
+def row_subgroup_stream_kernel(
+    A, CI, RP, X, Y, M, R: tl.constexpr, V: tl.constexpr,
+    GROUPS: tl.constexpr, STAGES: tl.constexpr,
+    COMPLEX: tl.constexpr, ACC: tl.constexpr,
+):
+    first = tl.program_id(0).to(tl.int64) * R * GROUPS
+    lane = tl.arange(0, V)
+    for group in range(GROUPS):
+        row = first + group * R + tl.arange(0, R)
+        valid = row < M
+        start = tl.load(RP + row, valid, 0).to(tl.int64)
+        end = tl.load(RP + row + 1, valid, 0).to(tl.int64)
+        real = tl.zeros((R, V), ACC)
+        imag = tl.zeros((R, V), ACC)
+        steps = tl.max(tl.cdiv(end - start, V), 0)
+        for step in tl.range(0, steps, num_stages=STAGES):
+            pos = start[:, None] + step * V + lane[None, :]
+            mask = valid[:, None] & (pos < end[:, None])
+            col = tl.load(CI + pos, mask, 0).to(tl.int64)
+            pr, pi = _product(A, X, pos, col, mask, COMPLEX, ACC)
+            real += pr
+            if COMPLEX:
+                imag += pi
+        _store_result(Y, row, tl.sum(real, 1), tl.sum(imag, 1), valid, COMPLEX)
+
+
+@triton.jit
 def row_vector_kernel(
     A,
     CI,
@@ -381,6 +408,14 @@ def compute(prepared, x, y, alg, config, plan=None):
     data, vector, output_view = view(prepared.data), view(x), view(y)
     args = (data, prepared.kernel_indices, prepared.kernel_indptr, vector, output_view)
     channels = 2 if complex_input else 1
+    if alg == "row_subgroup_stream":
+        c = config[alg]
+        row_subgroup_stream_kernel[(triton.cdiv(m, c["rows_per_program"] * c["row_tiles_per_program"]),)](
+            *args, m, R=c["rows_per_program"], V=c["lanes_per_row"],
+            GROUPS=c["row_tiles_per_program"], STAGES=c["loop_num_stages"],
+            COMPLEX=complex_input, ACC=acc, num_warps=c["num_warps"],
+            enable_fp_fusion=False,
+        )
     if alg in ("row_tile", "row_adaptive_split"):
         rows = None if plan is None else plan["short_rows"]
         n = m if rows is None else rows.numel()

@@ -29,6 +29,7 @@ from tests.pytest.accuracy_utils import (
     close_tolerances,
     golden_device,
 )
+from tests.pytest.conftest import QUICK_MODE
 from tests.pytest.param_shapes import SPMV_MN_SHAPES
 
 spmv_mod = importlib.import_module("flagsparse.sparse_operations.spmv_csr")
@@ -209,15 +210,15 @@ def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
     x = torch.randn(9, dtype=torch.float32, device=golden_device())
     ref = dense.to(torch.float64) @ x.to(torch.float64)
     state = {"forced_once": False}
-    original = spmv_mod._triton_spmv_csr_impl_prepared
+    original = spmv_mod._execute_spmv_route
 
-    def fail_int64_once(prepared, x_in, out=None):
+    def fail_int64_once(prepared, x_in, out=None, timing=False):
         if prepared.kernel_indices.dtype == torch.int64 and not state["forced_once"]:
             state["forced_once"] = True
             raise RuntimeError("unsupported int64 kernel indices")
-        return original(prepared, x_in, out=out)
+        return original(prepared, x_in, out=out, timing=timing)
 
-    monkeypatch.setattr(spmv_mod, "_triton_spmv_csr_impl_prepared", fail_int64_once)
+    monkeypatch.setattr(spmv_mod, "_execute_spmv_route", fail_int64_once)
     out = flagsparse_spmv_csr(
         data,
         indices,
@@ -241,12 +242,14 @@ def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
     )
     x = torch.randn(9, dtype=torch.float32, device=device)
 
-    def fail_int64(prepared, x_in, out=None):
+    original = spmv_mod._execute_spmv_route
+
+    def fail_int64(prepared, x_in, out=None, timing=False):
         if prepared.kernel_indices.dtype == torch.int64:
             raise RuntimeError("unsupported int64 kernel indices")
-        return spmv_mod._triton_spmv_csr_impl_prepared(prepared, x_in, out=out)
+        return original(prepared, x_in, out=out, timing=timing)
 
-    monkeypatch.setattr(spmv_mod, "_triton_spmv_csr_impl_prepared", fail_int64)
+    monkeypatch.setattr(spmv_mod, "_execute_spmv_route", fail_int64)
     with pytest.raises(RuntimeError, match="unsupported int64 kernel indices"):
         flagsparse_spmv_csr(
             data,
@@ -278,16 +281,63 @@ def test_spmv_csr_int64_auto_does_not_fallback_when_index_exceeds_int32(monkeypa
         index_fallback_policy="auto",
     )
 
-    def fail_launch(_prepared, _x, use_opt=False, opt_buckets=None):
+    def fail_launch(_prepared, _x, out=None, timing=False):
         raise RuntimeError("unsupported native int64 kernel indices")
 
-    monkeypatch.setattr(spmv_mod, "_run_spmv_prepared", fail_launch)
+    monkeypatch.setattr(spmv_mod, "_execute_spmv_route", fail_launch)
     x = torch.empty(0, dtype=torch.float32, device=device)
     with pytest.raises(RuntimeError, match="int32 fallback is unsafe"):
-        spmv_mod._run_spmv_prepared_with_fallback(prepared, x, use_opt=False)
+        spmv_mod._execute_spmv_route_with_fallback(prepared, x)
 
 
 NEW_ALGORITHMS = spmv_mod.SPMV_CSR_NEW_ALGORITHMS
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("lanes", [2, 8, 32] if QUICK_MODE else [2, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex128])
+def test_spmv_csr_subgroup_stream_blocks(lanes, dtype, monkeypatch):
+    from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
+
+    lengths = [0, 1, lanes - 1, lanes, lanes + 1] * 17 + [2053, 0, 3]
+    data, col, ptr, x, shape = _native_case(lengths, dtype, torch.int64, torch.int32)
+    caps = spmv_mod._spmv_backend_caps(data.device)
+    if lanes > caps.subgroup_width:
+        pytest.skip("logical subgroup exceeds hardware subgroup")
+    config = {"row_subgroup_stream": {"lanes_per_row": lanes, "rows_per_program": 4,
+                                      "row_tiles_per_program": 4}}
+    prepared = _new_prepared(data, col, ptr, shape, "row_subgroup_stream", config=config)
+    snapshots = [value.clone() for value in (data, col, ptr, x)]
+
+    def unexpected_plan(*args, **kwargs):
+        pytest.fail("subgroup stream must not build a row/segment plan")
+
+    monkeypatch.setattr(kernels, "build_plan", unexpected_plan)
+    out = torch.full((shape[0],), float("nan"), dtype=dtype, device=data.device)
+    actual, meta = spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out, config=config,
+                                                 return_meta=True, timing=True)
+    assert actual is out
+    rtol, atol = close_tolerances(dtype)
+    torch.testing.assert_close(actual.cpu(), golden_csr(data, col, ptr, x, shape), rtol=rtol, atol=atol)
+    assert meta["process_gpu_ms"] == 0
+    assert meta["ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+    for value, before in zip((data, col, ptr, x), snapshots):
+        torch.testing.assert_close(value, before, rtol=0, atol=0)
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmv_csr_subgroup_dimension_config(op):
+    data, col, ptr, x, shape = _native_case([1] * 33, torch.float64, torch.int32, torch.int64, n=3)
+    prepared = _new_prepared(data, col, ptr, shape, "row_subgroup_stream", op=op)
+    stream = prepared.config["row_subgroup_stream"]
+    assert stream["lanes_per_row"] == (2 if op == "non" else 8)
+    assert stream["row_tiles_per_program"] == 4
+    with pytest.raises(ValueError, match="positive"):
+        _new_prepared(data, col, ptr, shape, "row_subgroup_stream",
+                      config={"row_subgroup_stream": {"row_tiles_per_program": 0}})
+
+
 REGRESSIONS = json.loads(
     (Path(__file__).resolve().parents[1] / "data/spmv_csr_regressions.json").read_text()
 )
@@ -313,7 +363,7 @@ def _new_prepared(data, col, ptr, shape, alg, **kwargs):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg", ["row_split_reduce", "row_adaptive_split"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_spmv_csr_default_segment_multilevel(alg, dtype):
     data, col, ptr, x, shape = _native_case(
@@ -528,12 +578,13 @@ def test_spmv_csr_external_matrix_regressions(alg, dtype, op, matrix_name):
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize(
     "col_dtype,ptr_dtype",
-    [
+    [(torch.int32, torch.int32), (torch.int64, torch.int64)] if QUICK_MODE else [
         (torch.int32, torch.int32),
         (torch.int32, torch.int64),
         (torch.int64, torch.int32),
         (torch.int64, torch.int64),
     ],
+    ids=["i32-p32", "i64-p64"] if QUICK_MODE else ["i32-p32", "i32-p64", "i64-p32", "i64-p64"],
 )
 def test_spmv_csr_full_dtype_op_surface(alg, dtype, op, col_dtype, ptr_dtype):
     if alg == "legacy_bucket_vector" and col_dtype == torch.int64:

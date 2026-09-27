@@ -25,6 +25,7 @@ from tests import reference_utils
 from flagsparse import prepare_spmm_csr_route, flagsparse_spmm_csr_run
 from flagsparse.sparse_operations._spmm_csr_config import NEW_ALGORITHMS
 
+from tests.pytest.conftest import QUICK_MODE
 from tests.pytest.param_shapes import (
     MNK_SHAPES,
     SPMM_FLOAT_DTYPES,
@@ -331,16 +332,117 @@ def _run_new_or_skip(prepared, B, **kwargs):
 
 
 @pytest.mark.spmm_csr
+@pytest.mark.parametrize("algorithm", ["csr_row_tile", "csr_row_kparallel", "csr_row_panel"])
+@pytest.mark.parametrize("dtype", SPMM_OP_DTYPES)
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("layout", ["row", "col"])
+def test_spmm_csr_direct_output_coverage(algorithm, dtype, op, layout):
+    data, idx, ptr, shape, dense = _new_route_inputs(
+        dtype, torch.int64, torch.int32, lengths=[0, 1, 2, 3, 7, 8, 9, 0, 65])
+    prepared = prepare_spmm_csr_route(data, idx, ptr, shape, op=op, alg=algorithm)
+    left = _apply_dense_op(dense, op)
+    Bcpu = _random_dense((left.shape[1], 33), dtype, "cpu")
+    B = Bcpu.to(data.device)
+    output_shape = (left.shape[0], 33)
+    out = torch.empty(output_shape, dtype=dtype, device=data.device)
+    if layout == "col":
+        B = B.T.contiguous().T
+        out = out.T.contiguous().T
+    snapshots = [value.clone() for value in (data, idx, ptr, B)]
+    ref = left @ Bcpu.to(left.dtype)
+    rtol, atol = _tol(dtype)
+    for fill in (float("nan"), 17.0):
+        out.fill_(fill)
+        actual, meta = _run_new_or_skip(prepared, B, out=out, dense_layout=layout,
+                                       return_meta=True, timing=True)
+        assert actual is out
+        assert meta["c_stride"] == tuple(out.stride())
+        assert meta["output_layout"] == layout
+        assert meta["operator_ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+        torch.testing.assert_close(actual.cpu().to(ref.dtype), ref, rtol=rtol, atol=atol)
+    for value, before in zip((data, idx, ptr, B), snapshots):
+        torch.testing.assert_close(value, before, rtol=0, atol=0)
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("n", [1, 31, 33] if QUICK_MODE else [1, 7, 8, 16, 31, 32, 33, 64, 65, 128, 256])
+@pytest.mark.parametrize("accumulators", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex128])
+def test_spmm_csr_panel_tails(n, accumulators, dtype):
+    lengths = [0, 1, 3, 4, 7, 8, 9, 31, 32, 33] * (2 if QUICK_MODE else 9) + [2053, 0, 2]
+    data, idx, ptr, shape, dense = _new_route_inputs(dtype, torch.int32, torch.int64, lengths)
+    prepared = prepare_spmm_csr_route(data, idx, ptr, shape, alg="csr_row_panel",
+                                     config={"panel_accumulators": accumulators})
+    Bcpu = _random_dense((shape[1], n), dtype, "cpu")
+    out, meta = _run_new_or_skip(prepared, Bcpu.to(data.device), return_meta=True)
+    ref = dense @ Bcpu.to(dense.dtype)
+    rtol, atol = _tol(dtype)
+    torch.testing.assert_close(out.cpu().to(ref.dtype), ref, rtol=rtol, atol=atol)
+    assert meta["config"]["panel_accumulators"] == accumulators
+    assert meta["panel_rows"] == shape[0]
+    assert meta["segment_count"] == 0
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("algorithm", ["csr_row_tile", "csr_row_kparallel", "csr_row_panel"])
+def test_spmm_csr_direct_out_has_no_output_allocation(algorithm, monkeypatch):
+    from flagsparse.sparse_operations import _spmm_csr_runtime as runtime
+
+    data, idx, ptr, shape, _ = _new_route_inputs(torch.float32, torch.int32, torch.int32, [0, 1, 2])
+    prepared = prepare_spmm_csr_route(data, idx, ptr, shape, alg=algorithm)
+    B = torch.ones((shape[1], 7), device=data.device)
+    expected = _run_new_or_skip(prepared, B)
+    out = torch.full_like(expected, float("nan"))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("direct out must not allocate/clear an intermediate output or classify rows")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime.torch, "empty", unexpected)
+        patch.setattr(runtime.torch, "empty_strided", unexpected)
+        patch.setattr(runtime.torch.Tensor, "zero_", unexpected)
+        patch.setattr(runtime, "_classify", unexpected)
+        actual = flagsparse_spmm_csr_run(prepared, B, out=out)
+    assert actual is out
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.spmm_csr
+def test_spmm_csr_panel_configuration_contract():
+    data, idx, ptr, shape, _ = _new_route_inputs(torch.float32, torch.int32, torch.int32, [1, 0])
+    prepared = prepare_spmm_csr_route(data, idx, ptr, shape, alg="csr_row_panel",
+                                     config={"panel_accumulators": 4})
+    B = torch.ones((shape[1], 7), device=data.device)
+    _, meta = _run_new_or_skip(prepared, B, return_meta=True)
+    assert meta["config"]["tile_n"] == 8
+    _, other = _run_new_or_skip(prepared, B, alg="csr_row_tile", return_meta=True)
+    assert "panel_accumulators" not in other["config"]
+    for bad in (0, 3, 8):
+        with pytest.raises(ValueError):
+            flagsparse_spmm_csr_run(prepared, B, config={"panel_accumulators": bad})
+    with pytest.raises(ValueError, match="conflicts"):
+        flagsparse_spmm_csr_run(prepared, B, op="trans")
+
+
+@pytest.mark.spmm_csr
 @pytest.mark.parametrize("algorithm", NEW_ALGORITHMS)
 @pytest.mark.parametrize("dtype", SPMM_OP_DTYPES)
 @pytest.mark.parametrize("op", ("non", "trans", "conj"))
-@pytest.mark.parametrize("index_dtype,ptr_dtype", [(torch.int32, torch.int32), (torch.int32, torch.int64),
-                                                   (torch.int64, torch.int32), (torch.int64, torch.int64)])
+@pytest.mark.parametrize(
+    "index_dtype,ptr_dtype",
+    [(torch.int32, torch.int32), (torch.int64, torch.int64)] if QUICK_MODE else
+    [(torch.int32, torch.int32), (torch.int32, torch.int64),
+     (torch.int64, torch.int32), (torch.int64, torch.int64)],
+    ids=["i32-p32", "i64-p64"] if QUICK_MODE else ["i32-p32", "i32-p64", "i64-p32", "i64-p64"],
+)
 @pytest.mark.parametrize("layout", ("row", "col"))
 def test_spmm_csr_new_routes(algorithm, dtype, op, index_dtype, ptr_dtype, layout):
-    data, idx, ptr, shape, dense = _new_route_inputs(dtype, index_dtype, ptr_dtype)
-    config = dict(segment_nnz=16, short_row_threshold=8, split_row_threshold=32,
-                  reduce_block_size=4, workspace_bytes=1 << 20)
+    lengths = ((0, 1, 7, 8, 17, 65, 3) if QUICK_MODE else
+               (0, 1, 7, 8, 16, 17, 65, 2051, 3))
+    data, idx, ptr, shape, dense = _new_route_inputs(dtype, index_dtype, ptr_dtype, lengths)
+    config = (dict(segment_nnz=16, short_row_threshold=8, split_row_threshold=32,
+                   reduce_block_size=4, workspace_bytes=1 << 20)
+              if algorithm in ("csr_split_nnz_reduce", "csr_adaptive_tile_split") else {})
     prepared = prepare_spmm_csr_route(data, idx, ptr, shape, op=op, alg=algorithm, config=config)
     left = _apply_dense_op(dense, op)
     Bcpu = _random_dense((left.shape[1], 19), dtype, "cpu")
@@ -356,7 +458,7 @@ def test_spmm_csr_new_routes(algorithm, dtype, op, index_dtype, ptr_dtype, layou
     assert prepared.materialized_route is None
     assert meta["alg_resolved"] == algorithm
     assert meta["compute_dtype"] == ("float64" if dtype in (torch.float64, torch.complex128) else "float32")
-    assert meta["workspace_peak_bytes"] <= config["workspace_bytes"]
+    assert meta["workspace_peak_bytes"] <= config.get("workspace_bytes", 256 * 1024 * 1024)
 
 
 @pytest.mark.spmm_csr
