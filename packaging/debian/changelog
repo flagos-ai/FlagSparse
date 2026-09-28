@@ -1,4 +1,4 @@
-flagsparse (1.0.0-1) unstable; urgency=medium
+flagsparse (0.3.0-1) unstable; urgency=medium
 
   * Initial Debian packaging.
 
