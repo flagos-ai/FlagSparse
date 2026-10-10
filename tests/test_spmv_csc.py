@@ -56,6 +56,7 @@ def _dtype_name(dtype):
 
 
 DTYPE_MAP = {
+    "float16": torch.float16,
     "float32": torch.float32,
     "float64": torch.float64,
     "complex64": torch.complex64,
@@ -88,7 +89,7 @@ def _parse_ops(value):
 
 
 def _random_values(shape, dtype, device):
-    if dtype in (torch.float32, torch.float64):
+    if dtype in (torch.float16, torch.float32, torch.float64):
         return torch.randn(shape, dtype=dtype, device=device)
     if dtype == torch.complex64:
         return torch.complex(
@@ -104,7 +105,7 @@ def _random_values(shape, dtype, device):
 
 
 def _reference_dtype(dtype):
-    if dtype == torch.float32:
+    if dtype in (torch.float16, torch.float32):
         return torch.float64
     if dtype == torch.complex64:
         return torch.complex128
@@ -636,7 +637,7 @@ def run_csv(
     print(f"Wrote {len(rows)} rows to {csv_path}")
 
 
-def main():
+def _legacy_main():
     parser = argparse.ArgumentParser(description="Native CSC SpMV benchmark/test.")
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--synthetic", action="store_true")
@@ -720,6 +721,190 @@ def main():
         run_cusparse=not args.no_cusparse,
         fail_fast=args.fail_fast,
     )
+
+
+
+def registered_csc_main(kind="spmv"):
+    """Shared CLI contract for the two existing native CSC entry points."""
+    import hashlib
+    import json
+    import traceback
+    import test_spmm_csc as mm
+    from flagsparse.sparse_operations._spmm_csr_runtime import backend_caps
+    from flagsparse.sparse_operations._spmm_csr_config import resolve_csc_config
+    parser = argparse.ArgumentParser(description=f"Native CSC {kind}; full-run filtered timings")
+    parser.add_argument("mtx", nargs="*")
+    parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--alg", default="auto")
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--dtypes", "--dtype", default="float32,float64,complex64,complex128")
+    parser.add_argument("--index-dtypes", "--index-dtype", default="int32,int64")
+    parser.add_argument("--indptr-dtypes", default=None)
+    parser.add_argument("--ops", default="non" if kind == "spmm" else "non,trans,conj")
+    parser.add_argument("--layout", default="row")
+    parser.add_argument("--dense-cols", default="32")
+    parser.add_argument("--csv-csc", "--csv", default=None)
+    parser.add_argument("--warmup", type=int, default=WARMUP)
+    parser.add_argument("--iters", type=int, default=ITERS)
+    parser.add_argument("--timing", action="store_true")
+    parser.add_argument("--no-vendor", "--no-cusparse", "--no-hipsparse", dest="no_vendor", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true")
+    args = parser.parse_args()
+    config = json.loads(args.config) if args.config else None
+    if config is not None and (not isinstance(config, dict) or args.alg in ("auto", "all", "compare") or "," in args.alg):
+        parser.error("--config requires a JSON object and one explicit algorithm")
+    dtypes = mm._parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
+    indices_types = mm._parse_csv_tokens(args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes")
+    ptr_types = mm._parse_csv_tokens(args.indptr_dtypes, INDEX_DTYPE_MAP, "--indptr-dtypes") if args.indptr_dtypes else None
+    ops = mm._parse_ops(args.ops)
+    layouts = mm._layout_names(args.layout) if kind == "spmm" else ("vector",)
+    widths = [int(token) for token in args.dense_cols.split(",")] if kind == "spmm" else [1]
+    if any(n < 0 for n in widths) or args.warmup < 0 or args.iters < 1:
+        parser.error("dense-cols/warmup must be nonnegative and iters positive")
+    device = accelerator_device()
+    query = fs.list_spmv_csc_algorithms if kind == "spmv" else fs.list_spmm_csc_algorithms
+    spec = fs.get_spmv_csc_algorithm_spec if kind == "spmv" else fs.get_spmm_csc_algorithm_spec
+    prepare = fs.prepare_spmv_csc if kind == "spmv" else fs.prepare_spmm_csc_route
+    run = fs.flagsparse_spmv_csc_run if kind == "spmv" else fs.flagsparse_spmm_csc_run
+    all_names = query()
+    requested = all_names if args.alg in ("compare", "all") else (args.alg,)
+    paths = mm._resolve_input_paths(args.mtx)
+    cases = [(os.path.basename(path), path, None) for path in paths]
+    if args.synthetic:
+        cases = [(f"synthetic_{m}x{k}", None, (m, k)) for m, k in TEST_SIZES] + cases
+    if not cases:
+        parser.error("provide matrices or --synthetic")
+    fields = ["matrix", "dtype", "index_dtype", "indptr_dtype", "op", "layout", "dense_cols", "alg", "n_rows", "n_cols", "nnz",
+              "ms", "gpu_ms", "process_cpu_ms", "vendor_ms", "vendor_backend", "vendor_status", "vendor_reason", "vendor_error", "speedup_vs_vendor",
+              "status", "reason", "max_error", "error_ratio", "config", "metadata", "timing_statistic", "ref", "native_format"]
+    if args.timing:
+        fields += ["process_gpu_ms", "compute_ms"]
+    destination = Path(args.csv_csc or f"{kind}_csc_results.csv")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    print("Native CSC; Ref=PyTorch COO (correctness only). ms=CPUProc+GPU; median +/-10% filtered mean. Phase diagnostics are separate.")
+    print(f"{'Matrix':<26} {'dtype':<10} {'op':<5} {'layout':<6} {'N':>4} {'Algorithm':<28} {'ms':>9} {'GPU':>9} {'CPUProc':>9} {'Vendor':>9} {'V/Alg':>8} {'Status':>6}" + ("   GPUProc   Compute" if args.timing else ""))
+    errors = 0
+    announced = set()
+    with destination.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for matrix, path, synthetic_shape in cases:
+            for dtype in dtypes:
+                for index_dtype in indices_types:
+                    # Index-independent seeds preserve sparse and dense input values.
+                    seed = int.from_bytes(hashlib.sha256(f"{matrix}:{dtype}".encode()).digest()[:4], "little")
+                    torch.manual_seed(seed)
+                    if path:
+                        entries, shape = mm._read_mtx_entries(path)
+                        data, indices, ptr = mm._entries_to_csc(entries, shape, dtype, index_dtype, device)
+                    else:
+                        _, data, indices, ptr, shape = mm._make_synthetic_case(*synthetic_shape, dtype, index_dtype, device)
+                    for ptr_dtype in ptr_types or (index_dtype,):
+                        indptr = ptr.to(ptr_dtype)
+                        for op in ops:
+                            for n in widths:
+                                for layout in layouts:
+                                    torch.manual_seed(seed + n)
+                                    dense_rows = shape[1] if op == "non" else shape[0]
+                                    dense = mm._random_values((dense_rows, n), dtype, device) * 0.125
+                                    if kind == "spmm":
+                                        dense = mm._materialize_dense_layout(dense, layout)
+                                    else:
+                                        dense = dense[:, 0].contiguous()
+                                    reference = mm._torch_spmm_coo_reference(data, indices, indptr, dense[:, None] if kind == "spmv" else dense, shape, dtype, op)
+                                    if kind == "spmv":
+                                        reference = reference[:, 0]
+                                    vendor_ms, vendor_reason, vendor_error, vendor_status = None, "disabled", None, "N/A"
+                                    backend = ast_ops._backend_name()
+                                    if not args.no_vendor:
+                                        try:
+                                            if backend == "rocm":
+                                                helper = ast_ops._benchmark_spmv_csc_sparse_ref if kind == "spmv" else mm.spmm_ops._benchmark_spmm_csc_sparse_ref
+                                                extra = {} if kind == "spmv" else {"dense_layout": layout}
+                                                vendor = helper(data, indices, indptr, dense, shape, args.warmup, args.iters, op=op, **extra)
+                                                vendor_ms, vendor_reason = vendor["ms"], vendor.get("reason")
+                                                actual = vendor.get("values")
+                                            elif backend == "cuda" and op == "non" and cp is not None and dtype != torch.float16:
+                                                a_cp = cpx_sparse.csc_matrix((cp.from_dlpack(data), cp.from_dlpack(indices), cp.from_dlpack(indptr)), shape=shape)
+                                                b_cp = cp.from_dlpack(dense)
+                                                if kind == "spmm":
+                                                    b_cp = cp.asfortranarray(b_cp)
+                                                value, vendor_ms = cupy_event_benchmark_filtered(lambda: a_cp @ b_cp, args.warmup, args.iters)
+                                                actual = torch.utils.dlpack.from_dlpack(value)
+                                                vendor_reason = ""
+                                            else:
+                                                actual = None
+                                                vendor_reason = "native CSC vendor operation unavailable; no converted-format substitute"
+                                            if actual is None:
+                                                vendor_status = "SKIP"
+                                                print(f"Vendor SKIP {matrix} {dtype} {op}: {vendor_reason}")
+                                            if actual is not None:
+                                                vendor_error = mm._error_ratio(actual, reference, dtype)
+                                                vendor_status = "PASS" if vendor_error <= 1 else "FAIL"
+                                        except Exception as exc:
+                                            unsupported = isinstance(exc, NotImplementedError) or any(t in str(exc).lower() for t in ("not supported", "not_supported", "unsupported", "not implemented"))
+                                            vendor_reason, vendor_status = str(exc), "SKIP" if unsupported else "ERROR"
+                                            print(f"Vendor {vendor_status} {matrix} {dtype} {op} {layout} N={n}: {exc}")
+                                            traceback.print_exc()
+                                            if args.fail_fast and vendor_status == "ERROR":
+                                                raise
+                                    chosen, excluded = [], []
+                                    for name in requested:
+                                        resolved = f"{kind}_csc_base" if name == "auto" else name
+                                        try:
+                                            entry = spec(resolved)
+                                            if op not in entry["ops"]:
+                                                raise NotImplementedError(f"does not support op={op}")
+                                            if resolved.startswith("csc_col_"):
+                                                resolve_csc_config(resolved, str(dtype).removeprefix("torch."), n, backend_caps(device), config, op=op)
+                                            chosen.append(resolved)
+                                        except NotImplementedError as exc:
+                                            if args.alg not in ("compare", "all"):
+                                                raise
+                                            excluded.append(f"{resolved}: {exc}")
+                                    key = (dtype, op, layout, n)
+                                    if key not in announced:
+                                        print(f"Algorithms {dtype} {op} {layout} N={n}: {', '.join(chosen)}")
+                                        for reason in excluded:
+                                            print(f"excluded {reason}")
+                                        announced.add(key)
+                                    for name in chosen:
+                                        row = dict(matrix=matrix, dtype=str(dtype).removeprefix("torch."), index_dtype=str(index_dtype).removeprefix("torch."),
+                                                   indptr_dtype=str(ptr_dtype).removeprefix("torch."), op=op, layout=layout, dense_cols=n, alg=name,
+                                                   n_rows=shape[0], n_cols=shape[1], nnz=data.numel(), vendor_ms=vendor_ms, vendor_backend=backend,
+                                                   vendor_reason=vendor_reason, vendor_status=vendor_status, vendor_error=vendor_error,
+                                                   status="ERROR", process_cpu_ms=0.0, native_format="csc", ref="torch_coo_correctness_only",
+                                                   timing_statistic="mean_within_10_percent_of_median")
+                                        try:
+                                            prepared = prepare(data, indices, indptr, shape, op=op, alg=name, config=config)
+                                            # Ensure JIT is excluded even with --warmup=0.
+                                            run(prepared, dense)
+                                            result, elapsed = _cuda_event_benchmark(lambda: run(prepared, dense), args.warmup, args.iters)
+                                            _, meta = run(prepared, dense, return_meta=True, timing=args.timing)
+                                            ratio = mm._error_ratio(result, reference, dtype)
+                                            row.update(ms=elapsed, gpu_ms=elapsed, error_ratio=ratio,
+                                                       max_error=float((result-reference).abs().max().item()) if result.numel() else 0.0,
+                                                       status="PASS" if ratio <= 1 else "FAIL", reason="" if ratio <= 1 else "correctness check failed",
+                                                       config=json.dumps(meta.get("config", {})), metadata=json.dumps(meta, default=str),
+                                                       speedup_vs_vendor=vendor_ms / elapsed if vendor_ms is not None and elapsed > 0 else None,
+                                                       process_gpu_ms=meta.get("process_gpu_ms"), compute_ms=meta.get("compute_ms"))
+                                        except Exception as exc:
+                                            errors += 1
+                                            row["reason"] = str(exc)
+                                            print(f"ERROR {matrix} {dtype} {op} {layout} N={n} {name}: {exc}")
+                                            traceback.print_exc()
+                                        writer.writerow(row)
+                                        handle.flush()
+                                        print(f"{matrix:<26} {row['dtype']:<10} {op:<5} {layout:<6} {n:>4} {name:<28} {_fmt(row.get('ms')):>9} {_fmt(row.get('gpu_ms')):>9} {_fmt(0):>9} {_fmt(vendor_ms):>9} {_fmt(row.get('speedup_vs_vendor')):>8} {row['status']:>6}" +
+                                              (f" {_fmt(row.get('process_gpu_ms')):>9} {_fmt(row.get('compute_ms')):>9}" if args.timing else ""))
+                                        if args.fail_fast and row["status"] == "ERROR":
+                                            raise RuntimeError(row["reason"])
+    if errors:
+        raise SystemExit(1)
+
+
+def main():
+    registered_csc_main("spmv")
 
 
 if __name__ == "__main__":

@@ -2741,7 +2741,7 @@ for _name in _new_spmm_policy.NEW_ALGORITHMS:
         _name,
         _name,
         tuple(SPMM_OP_NAMES.values()),
-        (torch.float32, torch.float64, torch.complex64, torch.complex128),
+        (torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128),
         partial(_run_new_spmm_route, algorithm=_name),
     )
 

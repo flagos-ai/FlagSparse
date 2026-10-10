@@ -521,3 +521,73 @@ outputs compare against CPU int32 references.
 This project is licensed under the [Apache (Version 2.0) license](./LICENSE).
 
 CSR SpMM registered extensions and complete-run timing: [algorithm/API/validation guide](docs/SPMM_CSR.md). Use `tests/test_spmm_csr.py --synthetic --alg compare --exclude-tle --dtypes all --ops all --timing`; four new routes remain unverified on hardware.
+
+
+### Native COO registered extensions (hardware validation pending)
+
+| Operator | Explicit algorithms | Values / operations |
+| --- | --- | --- |
+| SpMV COO | `coo_segmented_atomic`, `coo_rowrun_subgroup` | FP32/FP64/complex64/complex128; non/trans/conj |
+| SpMM COO | `coo_segmented_panel_atomic`, `coo_rowrun_panel` | FP32/FP64/complex64/complex128; non/trans/conj; row/col |
+
+The default routes are unchanged. `prepare_spmv_coo(..., alg=...)` and
+`prepare_spmm_coo_route(...)` retain original COO inputs. Registered runs rebuild
+required conversions, sorting and run boundaries on each invocation. The legacy
+SpMV cached prepared API remains compatible but is excluded from registered timing.
+Atomic routes exchange index roles and conjugate sparse values inside the kernel;
+row-run routes sort by the effective output index. `conj` never conjugates x/B.
+
+Timing is always `ms = process_cpu_ms + gpu_ms`, including transpose, initialization
+and reductions. `--timing` measures diagnostics separately. Historical SpMM timings
+that excluded prepare-time sorting must be remeasured. SpMV keeps component precision;
+SpMM retains FP32→FP64 and complex64→complex128 computation. Accuracy FAIL rows with
+valid measurements retain speedups. Capabilities gate each route; no backend is claimed
+hardware-validated and no unsupported extension silently switches implementation.
+
+```bash
+python tests/test_spmv_coo.py ../../matrix --alg compare --ops all --timing --csv-coo spmv_coo.csv
+python tests/test_spmm_coo.py ../../matrix --alg compare --ops all --layout all --dense-cols 1,8,32,64,128 --timing --csv-coo spmm_coo.csv
+python run_flagsparse_pytest.py --ops spmv_coo,spmm_coo --phase both --mode quick --benchmark-input ../../matrix --results-dir pytest_results_coo_p1
+```
+
+`--config` accepts JSON for one explicit algorithm only. `local_reduce="none"`
+disables local segment reduction for atomic-route ablation. No new test entrypoint
+is required: the existing COO pytest markers and runner include the extensions.
+
+
+### Native CSC column algorithms (hardware validation pending)
+
+CSC SpMV exposes `csc_col_subgroup` for `trans/conj` and
+`csc_col_tile_atomic` for `non`. CSC SpMM exposes `csc_col_panel` for
+`trans/conj` and `csc_col_tile_panel_atomic` for `non`. They read the original
+CSC arrays without sorting, transpose reconstruction, or CSR delegation.
+The four value types are float32, float64, complex64 and complex128, with native
+component precision. Profiles require actual backend launch/atomic/reduction
+capabilities; no hardware performance claim is made. Existing default calls remain
+compatible. Explicit registered base routes rebuild their execution data per run;
+old prepare-excluded measurements must be remeasured.
+
+Both existing CSC benchmark scripts accept `--alg compare`, `--config` (one explicit
+algorithm), `--dtypes`, `--ops`, `--index-dtypes`, `--indptr-dtypes`, `--csv-csc`,
+`--timing` and `--no-vendor`; SpMM also accepts `--layout all` and a comma-separated
+`--dense-cols`. Total time is always CPU process plus the full GPU run. Phase
+diagnostics are separate. Samples outside median +/-10% are removed before the
+arithmetic mean. Accuracy FAIL retains valid performance; execution errors retain
+tracebacks. CSV is flushed per algorithm. Vendor CSC/op availability is explicit;
+converted-format substitutes are not benchmarked. Runner aggregation selects the
+fastest valid time per matrix and condition, including FAIL, then uses geometric mean.
+
+```bash
+python run_flagsparse_pytest.py --ops spmv_csc,spmm_csc --phase both --mode quick --benchmark-input ../../matrix --results-dir pytest_results_csc_p1
+```
+
+Only source/AST checks were performed on the development machine. Run the same
+runner with `--mode normal` on each target compute node for hardware acceptance.
+
+
+FP16 coverage: the CSR/COO/CSC SpMV and SpMM entry points accept `--dtypes float16`.
+New half paths accumulate in FP32 and cast once at the output; conversions and
+FP32 atomic/partial buffers are inside full-run timing. Existing unsupported legacy
+algorithm combinations remain excluded by the registry. Unavailable vendor FP16
+baselines print a reason and record SKIP without skipping native execution.
+Existing pytest parameter grids include half; hardware results remain unverified.

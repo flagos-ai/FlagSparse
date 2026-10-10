@@ -40,6 +40,7 @@ SCRIPTS = [
     "tests/test_spmv_bsr_scipy.py",
     "tests/test_spmm.py",
     "tests/test_spmm_csr.py",
+    "tests/test_spmm_coo.py",
     "tests/test_spmm_csc.py",
     "tests/test_spmm_bsr.py",
     "tests/test_spmm_bell.py",
@@ -70,4 +71,12 @@ def test_script_help_runs(script):
     assert "usage:" in combined.lower()
     if script in ("tests/test_spmv_csr.py", "tests/test_spmm_csr.py"):
         for flag in ("--config", "--alg", "--timing", "--csv-csr"):
+            assert flag in combined
+
+    if script in ("tests/test_spmv_coo.py", "tests/test_spmm_coo.py"):
+        for flag in ("--config", "--alg", "--timing", "--csv-coo", "--ops"):
+            assert flag in combined
+
+    if script in ("tests/test_spmv_csc.py", "tests/test_spmm_csc.py"):
+        for flag in ("--config", "--alg", "--timing", "--csv-csc", "--indptr-dtypes"):
             assert flag in combined

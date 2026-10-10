@@ -430,7 +430,13 @@ def main(argv=None):
                                                     "vendor correctness check failed"
                                                 )
                                     except Exception as exc:
-                                        raise RuntimeError(f"vendor SpMV setup/run failed: {exc}") from exc
+                                        if isinstance(exc, NotImplementedError) or any(token in str(exc).lower() for token in ("unsupported", "not supported", "not_supported", "not implemented")):
+                                            vendor.update(vendor_status="SKIP", vendor_reason=str(exc), vendor_ms=None)
+                                        else:
+                                            raise RuntimeError(f"vendor SpMV setup/run failed: {exc}") from exc
+                                    if vendor.get("vendor_ms") is None:
+                                        vendor["vendor_status"] = "SKIP"
+                                        print(f"Vendor SKIP {dtype}/{op}: {vendor.get('vendor_reason')}")
                                 base.update(vendor)
                             except Exception as exc:
                                 for alg in algorithms:

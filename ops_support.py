@@ -367,6 +367,20 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             )
             if str(algorithm).startswith("legacy_")
         ),
+        *(
+            ApiSpec("spmv", "flagsparse_spmv_coo_run", "spmv_coo", "COO", algorithm,
+                    values=("float32", "float64", "complex64", "complex128"),
+                    index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_coo_ops,
+                    notes="capability-gated native COO; hardware validation pending")
+            for algorithm in ("coo_segmented_atomic", "coo_rowrun_subgroup")
+        ),
+        *(
+            ApiSpec("spmm", "flagsparse_spmm_coo_run", "spmm_coo", "COO", algorithm,
+                    values=("float16", "float32", "float64", "complex64", "complex128"),
+                    index_const="SUPPORTED_INDEX_DTYPES", ops=spmm_coo_ops,
+                    notes="capability-gated native COO; hardware validation pending")
+            for algorithm in ("coo_segmented_panel_atomic", "coo_rowrun_panel")
+        ),
         ApiSpec(
             "spmv",
             "flagsparse_spmv_coo",
@@ -378,6 +392,12 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             ops=spmv_coo_ops,
             notes="COO path stores canonical row/col tensors and supports non/trans/conj",
         ),
+        ApiSpec("spmv", "flagsparse_spmv_csc", "spmv_csc", "CSC", "csc_col_subgroup",
+                    value_const="SUPPORTED_SPMV_CSC_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES",
+                    ops=('trans', 'conj'), notes="Native CSC columns; hardware validation pending"),
+        ApiSpec("spmv", "flagsparse_spmv_csc", "spmv_csc", "CSC", "csc_col_tile_atomic",
+                    value_const="SUPPORTED_SPMV_CSC_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES",
+                    ops=('non',), notes="Native CSC columns; hardware validation pending"),
         ApiSpec(
             "spmv",
             "flagsparse_spmv_csc",
@@ -435,7 +455,7 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
         ),
         *(
             ApiSpec("spmm", "flagsparse_spmm_csr_run", "spmm_csr", "CSR", name,
-                    values=("float32", "float64", "complex64", "complex128"),
+                    values=("float16", "float32", "float64", "complex64", "complex128"),
                     indices=("int32", "int64"), ops=("non", "trans", "conj"),
                     notes="Native component precision; per-run transpose; backend capability gated; unverified")
             for name in ("csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce", "csr_adaptive_tile_split", "csr_row_panel")
@@ -495,6 +515,12 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             ops=spmm_bell_ops,
             notes="spmm_bell_base uses native Blocked-ELL arrays; supports non only; trans/conj reserved but unsupported in v1",
         ),
+        ApiSpec("spmm", "flagsparse_spmm_csc", "spmm_csc", "CSC", "csc_col_panel",
+                    value_const="SUPPORTED_SPMM_CSC_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES",
+                    ops=('trans', 'conj'), notes="Native CSC columns; hardware validation pending"),
+        ApiSpec("spmm", "flagsparse_spmm_csc", "spmm_csc", "CSC", "csc_col_tile_panel_atomic",
+                    value_const="SUPPORTED_SPMM_CSC_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES",
+                    ops=('non',), notes="Native CSC columns; hardware validation pending"),
         ApiSpec(
             "spmm",
             "flagsparse_spmm_csc",
@@ -596,7 +622,7 @@ def rows_for_spec(
 ) -> list[dict[str, str]]:
     module = modules.get(spec.module)
     notes = [spec.notes] if spec.notes else []
-    status = "SUPPORTED"
+    status = "UNVERIFIED" if "hardware validation pending" in spec.notes and spec.fmt in ("COO", "CSC") else "SUPPORTED"
     if module is None:
         return [row(spec, NA, NA, NA, "PARTIAL")]
 

@@ -85,6 +85,7 @@ PERF_FIELDS = [
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
 
 DTYPE_MAP = {
+    "float16": torch.float16,
     "float32": torch.float32,
     "float64": torch.float64,
     "complex64": torch.complex64,
@@ -112,7 +113,7 @@ def _ratio(numerator, denominator):
 
 
 def _reference_dtype(dtype):
-    if dtype == torch.float32:
+    if dtype in (torch.float16, torch.float32):
         return torch.float64
     if dtype == torch.complex64:
         return torch.complex128
@@ -140,6 +141,8 @@ def _error_ratio(actual, expected, dtype):
 
 
 def _parse_csv_tokens(value, mapping, option_name):
+    if str(value).strip().lower() == "all":
+        return list(mapping.values())
     tokens = [token.strip().lower() for token in str(value).split(",") if token.strip()]
     if not tokens:
         raise ValueError(f"{option_name} must not be empty")
@@ -225,7 +228,7 @@ def _stride_string(tensor):
 
 
 def _random_values(shape, dtype, device):
-    if dtype in (torch.float32, torch.float64):
+    if dtype in (torch.float16, torch.float32, torch.float64):
         return torch.randn(shape, dtype=dtype, device=device)
     if dtype == torch.complex64:
         return torch.complex(
@@ -666,7 +669,7 @@ def _print_row(row, timing=False):
     )
 
 
-def main():
+def _legacy_main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--synthetic", action="store_true")
@@ -809,6 +812,11 @@ def main():
     failures = sum(1 for row in rows if row.get("status") in ("FAIL", "ERROR"))
     if failures:
         raise SystemExit(1)
+
+
+def main():
+    from test_spmv_csc import registered_csc_main
+    registered_csc_main("spmm")
 
 
 if __name__ == "__main__":

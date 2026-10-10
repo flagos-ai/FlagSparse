@@ -84,6 +84,7 @@ from .spmm_coo import (
     flagsparse_spmm_coo,
     flagsparse_spmm_coo_run,
     list_spmm_coo_algorithms,
+    get_spmm_coo_algorithm_spec,
     prepare_spmm_coo_route,
     resolve_spmm_coo_algorithm,
 )
@@ -117,6 +118,7 @@ from .spmm_csc import (
     flagsparse_spmm_csc,
     flagsparse_spmm_csc_run,
     list_spmm_csc_algorithms,
+    get_spmm_csc_algorithm_spec,
     prepare_spmm_csc_route,
     resolve_spmm_csc_algorithm,
 )
@@ -150,9 +152,11 @@ from .spmm_csr_opt_alg2 import (
     prepare_spmm_csr_opt_alg2,
     prepare_spmm_csr_opt_alg2_preprocess,
 )
-from .spmv_coo import PreparedCoo, flagsparse_spmv_coo, prepare_spmv_coo
+from .spmv_coo import (PreparedCoo, flagsparse_spmv_coo, prepare_spmv_coo,
+    flagsparse_spmv_coo_run, list_spmv_coo_algorithms, get_spmv_coo_algorithm_spec)
 from .spmv_bsr import PreparedBsrSpmv, flagsparse_spmv_bsr, prepare_spmv_bsr
-from .spmv_csc import PreparedCscSpmv, flagsparse_spmv_csc, prepare_spmv_csc
+from .spmv_csc import (PreparedCscSpmv, flagsparse_spmv_csc, prepare_spmv_csc,
+                       flagsparse_spmv_csc_run, list_spmv_csc_algorithms, get_spmv_csc_algorithm_spec)
 from .spmv_csr import (
     PreparedCsrSpmv,
     flagsparse_spmv_coo_tocsr,
@@ -317,9 +321,11 @@ __all__ = [
     "list_spmm_csr_algorithms",
     "get_spmm_csr_algorithm_spec",
     "list_spmm_coo_algorithms",
+    "get_spmm_coo_algorithm_spec",
     "list_spmm_bsr_algorithms",
     "list_spmm_bell_algorithms",
     "list_spmm_csc_algorithms",
+    "get_spmm_csc_algorithm_spec",
     "prepare_sddmm_csr",
     "build_alpha_spmm_alg1_tle_opt_meta",
     "build_alpha_spmm_alg1_tle_opt2_meta",
@@ -345,9 +351,15 @@ __all__ = [
     "prepare_spmm_csr_opt_alg2",
     "prepare_spmm_csr_opt_alg2_preprocess",
     "prepare_spmv_coo",
+    "flagsparse_spmv_coo_run",
+    "list_spmv_coo_algorithms",
+    "get_spmv_coo_algorithm_spec",
     "prepare_spmv_bsr",
     "prepare_spmv_coo_tocsr",
     "prepare_spmv_csc",
+    "flagsparse_spmv_csc_run",
+    "list_spmv_csc_algorithms",
+    "get_spmv_csc_algorithm_spec",
     "prepare_spmv_csr",
     "resolve_spmm_csr_algorithm",
     "resolve_spmm_coo_algorithm",

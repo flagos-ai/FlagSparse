@@ -46,7 +46,7 @@ _TOCSR_DTYPE_IDS = ("float32", "float64")
 
 
 def _random_dense(shape, dtype, device):
-    if dtype in (torch.float32, torch.float64):
+    if dtype in (torch.float16, torch.float32, torch.float64):
         return torch.randn(shape, dtype=dtype, device=device)
     if dtype == torch.complex64:
         real = torch.randn(shape, dtype=torch.float32, device=device)
@@ -60,7 +60,7 @@ def _random_dense(shape, dtype, device):
 
 
 def _reference_dtype(dtype):
-    if dtype == torch.float32:
+    if dtype in (torch.float16, torch.float32):
         return torch.float64
     if dtype == torch.complex64:
         return torch.complex128
@@ -139,7 +139,8 @@ def _assert_close(actual, expected, dtype):
     "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
 )
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
-def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op):
+@pytest.mark.parametrize("alg", [None, "coo_segmented_atomic", "coo_rowrun_subgroup"], ids=["legacy", "segmented", "subgroup"])
+def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op, alg):
     device = accelerator_device()
     data, indices, dense = _random_coo_mn(M, N, dtype, device)
     row = indices[0].to(index_dtype).contiguous()
@@ -156,7 +157,7 @@ def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op):
         ).to(dtype)
     else:
         ref = (_apply_dense_op(dense, op).to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
-    out = flagsparse_spmv_coo(data, row, col, x.to(device), shape=(M, N), op=op)
+    out = flagsparse_spmv_coo(data, row, col, x.to(device), shape=(M, N), op=op, alg=alg)
     _assert_close(out, ref, dtype)
 
 
@@ -238,7 +239,7 @@ def test_spmv_coo_int64_auto_fallback_to_int32(monkeypatch):
     def fail_int64_once(prepared, x_in, block_size, num_warps, block_inner):
         if prepared.row.dtype == torch.int64 and not state["forced_once"]:
             state["forced_once"] = True
-            raise RuntimeError("forced int64 launch failure")
+            raise RuntimeError("int64 index unsupported (injected compatibility failure)")
         return original(prepared, x_in, block_size, num_warps, block_inner)
 
     monkeypatch.setattr(spmv_coo_mod, "_triton_spmv_coo_kernel", fail_int64_once)
@@ -290,3 +291,100 @@ def test_spmv_coo_tocsr_prepared_path_matches_torch():
     out = flagsparse_spmv_coo_tocsr(x=x.to(device), prepared=prepared)
     rtol, atol = _tol(torch.float32)
     assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("alg", ["coo_segmented_atomic", "coo_rowrun_subgroup"])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("ordered", [False, True], ids=["unsorted", "sorted"])
+def test_spmv_coo_registered_boundaries(alg, op, ordered, monkeypatch):
+    from flagsparse import flagsparse_spmv_coo_run
+    device = accelerator_device()
+    # A long row spans NNZ tiles; row 3 is empty; duplicate coordinates remain.
+    row = torch.tensor([0] * 259 + [2, 1, 2, 4, 0], dtype=torch.int64)
+    col = torch.arange(row.numel(), dtype=torch.int32) % 7
+    values = (torch.arange(row.numel()) % 5 - 2).to(torch.float64)
+    values = torch.complex(values, values.flip(0) / 4)
+    if not ordered:
+        order = torch.arange(row.numel() - 1, -1, -1)
+        row, col, values = row[order], col[order], values[order]
+    dense = torch.zeros((5, 7), dtype=values.dtype)
+    dense.index_put_((row, col.long()), values, accumulate=True)
+    x = torch.ones(7 if op == "non" else 5, dtype=values.dtype) * (1 + 2j)
+    expected = _apply_dense_op(dense, op) @ x
+    a, r, c, x = values.to(device), row.to(device), col.to(device), x.to(device)
+    prepared = prepare_spmv_coo(a, r, c, (5, 7), alg=alg, op=op)
+    original = spmv_coo_mod._coo_sorted_runs
+    calls = []
+    def counted(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(spmv_coo_mod, "_coo_sorted_runs", counted)
+    out = torch.full(expected.shape, float("nan"), dtype=values.dtype, device=device)
+    for timing in (False, True):
+        y, meta = flagsparse_spmv_coo_run(prepared, x, out=out, return_meta=True, timing=timing)
+        assert y is out
+        _assert_close(y, expected, values.dtype)
+        assert meta["operator_ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+    assert len(calls) == (0 if "atomic" in alg else 3)
+    assert torch.equal(a.cpu(), values)
+    with pytest.raises(ValueError, match="op conflicts"):
+        flagsparse_spmv_coo_run(prepared, x, op="trans" if op == "non" else "non")
+    with pytest.raises(ValueError):
+        flagsparse_spmv_coo_run(prepared, x, config={"invalid": 1})
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("alg", ["coo_segmented_atomic", "coo_rowrun_subgroup"])
+@pytest.mark.parametrize("shape", [(0, 0), (0, 7), (5, 0), (5, 7)])
+def test_spmv_coo_registered_empty(alg, shape):
+    device = accelerator_device()
+    values = torch.empty(0, device=device)
+    indices = torch.empty(0, dtype=torch.int64, device=device)
+    y = flagsparse_spmv_coo(values, indices, indices, torch.ones(shape[1], device=device),
+                            shape, alg=alg)
+    assert y.shape == (shape[0],)
+    assert torch.count_nonzero(y) == 0
+
+
+@pytest.fixture(autouse=True)
+def _coo_extension_capability_guard(request):
+    from flagsparse.sparse_operations import spmv_coo as native
+    parameters = getattr(getattr(request.node, "callspec", None), "params", {})
+    alg = parameters.get("alg")
+    if alg not in native._COO_NEW_ALGORITHMS:
+        return
+    dtype = parameters.get("dtype", torch.complex128)
+    try:
+        native._resolve_coo_config(alg, dtype, accelerator_device())
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("policy", ["auto", "strict"])
+@pytest.mark.parametrize("alg", ["coo_segmented_atomic"])
+def test_registered_coo_index_fallback_is_same_algorithm(monkeypatch, policy, alg):
+    device = accelerator_device()
+    a = torch.tensor([2., 3.], device=device)
+    r = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    c = torch.tensor([1, 0], dtype=torch.int64, device=device)
+    x = torch.ones(2, device=device)
+    original = spmv_coo_mod._launch_coo_extension
+    calls = []
+    def injected(data, row, col, starts, B, shape, selected, config, conj=False):
+        calls.append((selected, row.dtype))
+        if row.dtype == torch.int64:
+            raise RuntimeError("int64 index unsupported (injected)")
+        return original(data, row, col, starts, B, shape, selected, config, conj)
+    monkeypatch.setattr(spmv_coo_mod, "_launch_coo_extension", injected)
+    if policy == "strict":
+        with pytest.raises(RuntimeError, match="int64 index unsupported"):
+            flagsparse_spmv_coo(a, r, c, x, (2, 2), alg=alg, index_fallback_policy=policy)
+    else:
+        result = flagsparse_spmv_coo(a, r, c, x, (2, 2), alg=alg, index_fallback_policy=policy)
+        _assert_close(result, a, a.dtype)
+        assert calls == [(alg, torch.int64), (alg, torch.int32)]
+    unsafe = spmv_coo_mod._PreparedCooLaunch(a[:1], r[:1] + 2**31, c[:1], (2**31 + 1, 2))
+    with pytest.raises(RuntimeError, match="unsafe"):
+        spmv_coo_mod._spmv_coo_prepared_with_int32_indices(unsafe, "int64 unsupported")

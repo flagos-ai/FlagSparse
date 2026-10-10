@@ -438,3 +438,64 @@ python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 1024
 本项目采用 [Apache (Version 2.0) license](./LICENSE) 许可证授权。
 
 CSR SpMM 新算法、接口、计时与计算节点验收见 [说明](docs/SPMM_CSR.md)。统一算法比较入口为 `tests/test_spmm_csr.py --synthetic --alg compare --exclude-tle --dtypes all --ops all --timing`；四个新算法目前均未实机验证，默认路由不变。
+
+
+### Native COO registered extensions (hardware validation pending)
+
+| Operator | Explicit algorithms | Values / operations |
+| --- | --- | --- |
+| SpMV COO | `coo_segmented_atomic`, `coo_rowrun_subgroup` | FP32/FP64/complex64/complex128; non/trans/conj |
+| SpMM COO | `coo_segmented_panel_atomic`, `coo_rowrun_panel` | FP32/FP64/complex64/complex128; non/trans/conj; row/col |
+
+新算法不改变默认路由。`prepare_spmv_coo(..., alg=...)` 和
+`prepare_spmm_coo_route(...)` 保存原始 COO；注册 run 每次执行需要的转换、排序和行段构建。
+旧 SpMV prepared 缓存接口保留兼容，但不参与注册 benchmark 的计时。
+atomic 算法在内核中交换索引角色并按需共轭；row-run 每次按实际输出行排序。
+`conj` 表示共轭转置，绝不共轭 x/B。
+
+统一计时为 `ms = process_cpu_ms + gpu_ms`，包含转置、初始化和所有数值归约；
+`--timing` 独立运行诊断，不改变总时间和加速比分母。旧 SpMM prepare 排序未计时的数据需重新测量。
+SpMV 沿用分量精度；SpMM 沿用 FP32→FP64、complex64→complex128。精度 FAIL 保留有效加速比。
+新算法不承诺任何平台已经实测；能力缺失或未知时明确排除，不静默回退。
+
+```bash
+python tests/test_spmv_coo.py ../../matrix --alg compare --ops all --timing --csv-coo spmv_coo.csv
+python tests/test_spmm_coo.py ../../matrix --alg compare --ops all --layout all --dense-cols 1,8,32,64,128 --timing --csv-coo spmm_coo.csv
+python run_flagsparse_pytest.py --ops spmv_coo,spmm_coo --phase both --mode quick --benchmark-input ../../matrix --results-dir pytest_results_coo_p1
+```
+
+`--config` accepts JSON for one explicit algorithm only. `local_reduce="none"`
+disables local segment reduction for atomic-route ablation. No new test entrypoint
+is required: the existing COO pytest markers and runner include the extensions.
+
+
+### CSC 列算法扩展（尚待实机验证）
+
+SpMV 新增 `csc_col_subgroup`（trans/conj）和 `csc_col_tile_atomic`（non）；
+SpMM 新增 `csc_col_panel`（trans/conj）和 `csc_col_tile_panel_atomic`（non）。
+直接读取原始 CSC，不排序、不重建转置矩阵、不委托 CSR。支持四种现有实数/复数
+类型并保持原生分量精度；参数按后端能力验证，不宣称默认参数已经调优。
+原默认调用保持兼容，显式注册的旧 base 路径每次构建执行数据，旧版不含准备工作
+的计时结果需要重新测量。
+
+现有两个 CSC 测试入口支持 `--alg compare/all`、单算法 `--config` JSON、
+`--dtypes/--ops/--index-dtypes/--indptr-dtypes/--csv-csc/--timing/--no-vendor`；
+SpMM 支持 `--layout all` 及逗号分隔的 `--dense-cols`。
+始终使用 CPU 处理时间加完整 GPU 时间；诊断另跑，不用分段之和替换总时间。
+每组计时保留中位数 ±10% 内的样本后取算术平均。精度 FAIL 保留有效性能，
+接口或执行错误打印 traceback，CSV 逐条落盘。汇总按固定条件逐矩阵选最快算法
+后计算几何平均，不因精度 FAIL 删矩阵。厂商原生 CSC/op 不可用时明确记录原因。
+
+```bash
+python run_flagsparse_pytest.py --ops spmv_csc,spmm_csc --phase both --mode quick --benchmark-input ../../matrix --results-dir pytest_results_csc_p1
+```
+
+开发环境仅进行源码和 AST 检查；计算节点再使用同一 runner 的 normal 模式完成
+边界、正确性与完整计时验收，各平台分别记录实际结果。
+
+
+FP16：CSR/COO/CSC 的 SpMV、SpMM 测试入口支持 `--dtypes float16`。
+新增半精度路径使用 FP32 累加，最终转回 FP16；必要转换、atomic 缓冲与分段归约
+均计入完整 run。旧算法未声明支持的组合继续按注册信息排除，不静默切换算法。
+厂商 FP16 baseline 不支持时打印原因并记为 SKIP，不跳过原生算法测试。
+现有 pytest 参数化已加入半精度覆盖，实机结果仍待计算节点验证。

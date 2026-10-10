@@ -65,8 +65,8 @@ GATHER_SCATTER_FLOAT_DTYPES = (
     torch.float32,
     torch.float64,
 )
-SPMV_COO_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
-SPMV_COO_DTYPE_IDS = ("float32", "float64", "complex64", "complex128")
+SPMV_COO_DTYPES = (torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128)
+SPMV_COO_DTYPE_IDS = ("float16", "float32", "float64", "complex64", "complex128")
 SPMM_FLOAT_DTYPES = CORE_DTYPES
 SPMM_FLOAT_DTYPE_IDS = CORE_DTYPE_IDS
 SPMM_OPT_DTYPES = (torch.float32, torch.float64)

@@ -64,7 +64,7 @@ INDEX_DTYPE_MAP = {
     "int32": torch.int32,
     "int64": torch.int64,
 }
-DEFAULT_DTYPE_NAMES = ("float32", "float64", "complex64", "complex128")
+DEFAULT_DTYPE_NAMES = ("float16", "float32", "float64", "complex64", "complex128")
 DEFAULT_RUN_DTYPE_NAMES = ("float32", "float64")
 DEFAULT_INDEX_DTYPE_NAMES = ("int32", "int64")
 DEFAULT_OP_NAMES = tuple(spmm_ops.SPMM_OP_NAMES.values())

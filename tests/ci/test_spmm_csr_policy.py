@@ -147,3 +147,93 @@ def test_numeric_workspace_geometry_is_bounded(n, element_bytes, budget):
     assert 1 <= wave <= min(n, 32)
     assert capacity >= 1
     assert 3 * wave * capacity * element_bytes <= budget
+
+
+@pytest.mark.parametrize("algorithm", policy.COO_ALGORITHMS)
+@pytest.mark.parametrize("backend", policy.BACKENDS)
+def test_coo_profiles_require_actual_capabilities(algorithm, backend):
+    device = caps(backend, fp32_atomic=True, fp64_atomic=True)
+    config, meta = policy.resolve_coo_config(algorithm, "complex128", device, n=7)
+    assert config["num_stages"] == 1
+    assert meta["backend"] == backend
+    assert meta["validation"] == "unverified"
+    with pytest.raises(ValueError):
+        policy.resolve_coo_config(algorithm, "float32", device, {"unknown": 1})
+    with pytest.raises(ValueError):
+        policy.resolve_coo_config(algorithm, "float32", device, {"num_warps": 3})
+
+
+def test_coo_atomic_and_fp64_are_independent_capabilities():
+    with pytest.raises(NotImplementedError, match="fp64_atomic"):
+        policy.resolve_coo_config("coo_segmented_panel_atomic", "float64", caps())
+    config, _ = policy.resolve_coo_config("coo_rowrun_panel", "float64", caps(), n=7)
+    assert config["tile_n"] == 8
+    with pytest.raises(NotImplementedError, match="sort"):
+        policy.resolve_coo_config("coo_rowrun_panel", "float64", caps(stable_sort=None))
+
+
+def test_coo_subgroup_configuration_validates_before_division():
+    with pytest.raises(ValueError):
+        policy.resolve_coo_config("coo_rowrun_subgroup", "float32", caps(), {"lanes_per_row": 0})
+    cfg, _ = policy.resolve_coo_config("coo_rowrun_subgroup", "float32", caps(legal_num_warps=(1,)))
+    assert cfg["num_warps"] == 1
+    assert cfg["rows_per_program"] == 4
+
+
+
+def test_coo_invalid_builtin_profile_is_reported(monkeypatch):
+    monkeypatch.setitem(policy.COO_ARCH_PROFILES, ("cuda", "test"),
+                        {"coo_rowrun_panel": {"num_warps": 3}})
+    cfg, meta = policy.resolve_coo_config("coo_rowrun_panel", "float64", caps())
+    assert cfg["num_warps"] == 2
+    assert meta["rejected_profiles"]
+    with pytest.raises(ValueError):
+        policy.resolve_coo_config("coo_rowrun_panel", "float64", caps(), {"num_warps": 3})
+
+
+@pytest.mark.parametrize("alg,ops", list(policy.CSC_ALGORITHMS.items()))
+@pytest.mark.parametrize("backend", policy.BACKENDS)
+def test_csc_capability_and_config_contract(alg, ops, backend):
+    device = caps(backend, fp32_atomic=True, fp64_atomic=True)
+    cfg, meta = policy.resolve_csc_config(alg, "complex128", 7, device, op=ops[0])
+    assert cfg["num_stages"] == 1
+    assert meta["validation"] == "unverified"
+    with pytest.raises(ValueError):
+        policy.resolve_csc_config(alg, "float32", 7, device, {"unknown": 1}, op=ops[0])
+    with pytest.raises(ValueError):
+        policy.resolve_csc_config(alg, "float32", 7, device, {"num_warps": 3}, op=ops[0])
+    wrong_op = "trans" if ops == ("non",) else "non"
+    with pytest.raises(ValueError, match="op"):
+        policy.resolve_csc_config(alg, "float32", 7, device, op=wrong_op)
+
+
+def test_csc_atomic_capability_and_zero_subgroup():
+    with pytest.raises(NotImplementedError, match="atomic"):
+        policy.resolve_csc_config("csc_col_tile_atomic", "float64", 1, caps(), op="non")
+    with pytest.raises(ValueError):
+        policy.resolve_csc_config("csc_col_subgroup", "float32", 1, caps(), {"lanes_per_column": 0}, op="trans")
+    cfg, _ = policy.resolve_csc_config("csc_col_subgroup", "float32", 1, caps(legal_num_warps=(1,)), op="trans")
+    assert cfg["num_warps"] == 1
+
+
+
+def test_csc_unknown_capability_and_profile_rejection(monkeypatch):
+    with pytest.raises(NotImplementedError):
+        policy.resolve_csc_config("csc_col_panel", "float32", 7, caps(reduction=None), op="trans")
+    monkeypatch.setitem(policy.CSC_ARCH_PROFILES, ("cuda", "test", "csc_col_panel"), {"num_warps": 3})
+    cfg, info = policy.resolve_csc_config("csc_col_panel", "float32", 7, caps(), op="trans")
+    assert cfg["num_warps"] == 2
+    assert info["config_rejections"]
+
+
+@pytest.mark.parametrize("algorithm", policy.NEW_ALGORITHMS)
+def test_spmm_csr_half_uses_fp32_capabilities(algorithm):
+    config, _ = policy.resolve_config(algorithm, "float16", 7, "row", caps(fp64=False))
+    assert config["num_stages"] == 1
+
+
+@pytest.mark.parametrize("algorithm,ops", list(policy.CSC_ALGORITHMS.items()))
+def test_csc_half_does_not_require_fp16_atomic(algorithm, ops):
+    config, _ = policy.resolve_csc_config(algorithm, "float16", 7,
+        caps(fp64=False, fp32_atomic=True, fp64_atomic=False), op=ops[0])
+    assert config["num_stages"] == 1

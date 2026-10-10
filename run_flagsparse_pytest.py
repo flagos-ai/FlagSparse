@@ -293,9 +293,13 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{warmup}",
         "--iters",
         "{iters}",
+        "--alg",
+        "compare",
     ),
     "spmv_csc": (
         "tests/test_spmv_csc.py",
+        "--alg",
+        "compare",
         "{input}",
         "--csv-csc",
         "{csv}",
@@ -359,6 +363,8 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{warmup}",
         "--iters",
         "{iters}",
+        "--alg",
+        "compare",
     ),
     "spmm_bsr": (
         "tests/test_spmm_bsr.py",
@@ -390,6 +396,8 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
     ),
     "spmm_csc": (
         "tests/test_spmm_csc.py",
+        "--alg",
+        "compare",
         "{input}",
         "--csv-csc",
         "{csv}",
@@ -2182,7 +2190,7 @@ def _performance_row_status_is_usable(row: dict[str, str]) -> bool:
     """Whether a benchmark row is eligible for aggregate metrics."""
 
     status = str(row.get("status") or row.get("matrix_status") or "").strip()
-    return not status or status.upper() in {"PASS", "PASSED", "OK", "SUCCESS"}
+    return not status or status.upper() in {"PASS", "PASSED", "OK", "SUCCESS", "FAIL", "FAILED"}
 
 
 def _csr_row_correctness(rows):
@@ -2218,23 +2226,22 @@ def _capability_probe_status(rows: list[dict[str, str]]) -> str:
 
 
 def _performance_row_has_complete_speedup(row: dict[str, str]) -> bool:
-    """Require a passing row and both measurements behind its speedup value.
+    """Require valid timing and baseline measurements, independently of accuracy.
 
-    A speedup alone is not enough: FAIL rows and rows whose baseline is missing were
-    being folded into the per-dtype totals.
+    Accuracy FAIL remains measurable; missing baselines and execution errors do not.
     """
 
     if not _performance_row_status_is_usable(row):
         return False
     speedup_key, base_key, latency_key = _performance_schema(row)
     speedup = _to_float(_row_value(row, speedup_key))
-    if speedup is None or speedup <= 0:
+    if speedup is None or not math.isfinite(speedup) or speedup <= 0:
         return False
     for key in (base_key, latency_key):
         if key is None:
             continue
         measurement = _to_float(_row_value(row, key))
-        if measurement is None or measurement <= 0:
+        if measurement is None or not math.isfinite(measurement) or measurement <= 0:
             return False
     return True
 
@@ -2309,6 +2316,43 @@ def write_benchmark_json_from_csv(
     )
 
 
+def _coo_best_rows(rows):
+    """Select by full latency within identical input conditions, including FAIL."""
+    names = {"coo_rowrun", "coo_atomic", "spmm_coo_alg1", "coo_segmented_atomic",
+             "coo_rowrun_subgroup", "coo_segmented_panel_atomic", "coo_rowrun_panel",
+             "spmv_csc_base", "spmm_csc_base", "csc_col_subgroup", "csc_col_tile_atomic",
+             "csc_col_panel", "csc_col_tile_panel_atomic"}
+    if not rows or not all(row.get("alg") in names | {"auto"} for row in rows):
+        return None
+    best = {}
+    fields = ("matrix", "dtype", "value_dtype", "index_dtype", "row_dtype", "col_dtype",
+              "op", "layout", "dense_cols", "indptr_dtype")
+    for row in rows:
+        elapsed = _to_float(row.get("ms"))
+        if elapsed is None or not math.isfinite(elapsed) or elapsed <= 0 or not _performance_row_status_is_usable(row):
+            continue
+        key = tuple(str(row.get(field, "")) for field in fields)
+        if key not in best or elapsed < float(best[key]["ms"]):
+            best[key] = row
+    return list(best.values())
+
+
+def _coo_geomean_groups(rows):
+    best = _coo_best_rows(rows)
+    if best is None:
+        return None
+    groups = {}
+    for row in best:
+        if not _performance_row_has_complete_speedup(row):
+            continue
+        key = "|".join(str(row.get(field, "")) for field in
+                       ("dtype", "op", "layout", "dense_cols", "index_dtype", "row_dtype", "col_dtype", "indptr_dtype"))
+        speed_key, _, _ = _performance_schema(row)
+        groups.setdefault(key, []).append(float(row[speed_key]))
+    return {key: {"geomean": statistics.geometric_mean(values), "matrix_count": len(values)}
+            for key, values in groups.items()}
+
+
 def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
     grouped: dict[str, dict[str, object]] = {}
     totals: dict[str, list[float]] = {}
@@ -2338,9 +2382,17 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
         if _performance_row_has_complete_speedup(row):
             totals.setdefault(dtype, []).append(speedup)
 
+    best = _coo_best_rows(rows)
+    if best is not None:
+        totals = {}
+        for row in best:
+            if _performance_row_has_complete_speedup(row):
+                key, _, _ = _performance_schema(row)
+                totals.setdefault(_row_dtype(row), []).append(float(row[key]))
     for dtype, values in totals.items():
         if values:
-            grouped[dtype]["speedup"] = statistics.mean(values)
+            grouped[dtype]["speedup"] = (statistics.geometric_mean(values) if best is not None
+                                           else statistics.mean(values))
     return grouped
 
 
@@ -2469,8 +2521,7 @@ def summarize_performance_csv(
     if not rows:
         return summary
 
-    # Aggregate only over rows that passed and carry both measurements behind their
-    # speedup: FAIL rows and rows with a missing baseline used to be folded in.
+    # Accuracy and performance eligibility are independent; require both timings.
     speedup_rows = [row for row in rows if _performance_row_has_complete_speedup(row)]
     summary["speedup_row_count"] = len(speedup_rows)
     if speedup_rows and all(
@@ -2518,6 +2569,25 @@ def summarize_performance_csv(
             else:
                 first_key = sorted(by_column)[0]
                 summary["speedup"] = by_column[first_key]
+    coo_groups = _coo_geomean_groups(rows)
+    if coo_groups is not None:
+        summary["best_algorithm_geomean_by_condition"] = coo_groups
+        best = _coo_best_rows(rows)
+        ratios = [float(row[_performance_schema(row)[0]]) for row in best
+                  if _performance_row_has_complete_speedup(row)]
+        summary["speedup"] = statistics.geometric_mean(ratios) if ratios else None
+        summary["aggregation"] = "best full latency per matrix/condition; geometric mean; accuracy FAIL retained"
+        if any(row.get("native_format") == "csc" for row in rows):
+            summary["matrix_count"] = len({row.get("matrix") for row in rows})
+            summary["coverage_by_condition"] = {}
+            for row in rows:
+                key = "|".join(str(row.get(field, "")) for field in ("dtype", "op", "layout", "dense_cols", "index_dtype", "row_dtype", "col_dtype", "indptr_dtype"))
+                coverage = summary["coverage_by_condition"].setdefault(key, {"matrices": set()})
+                coverage["matrices"].add(row.get("matrix"))
+            for key, coverage in summary["coverage_by_condition"].items():
+                coverage["observed_matrix_count"] = len(coverage.pop("matrices"))
+                coverage["usable_matrix_count"] = coo_groups.get(key, {}).get("matrix_count", 0)
+            summary["missing_speedup_rows"] = [dict(matrix=row.get("matrix"), alg=row.get("alg"), reason=row.get("reason") or row.get("vendor_reason")) for row in rows if not _performance_row_has_complete_speedup(row)]
     return summary
 
 
@@ -2686,7 +2756,7 @@ def run_performance(
                 if status_from_csv and status not in {"PASS", "PASSED"}
                 else "passed"
             )
-            if op in ("spmv_csr", "spmm_csr"):
+            if op in ("spmv_csr", "spmm_csr", "spmv_coo", "spmm_coo", "spmv_csc", "spmm_csc"):
                 json_status = (
                     "timeout" if timed_out else "failed" if returncode != 0
                     else _csr_row_correctness(rows)["correctness_status"].lower()
@@ -2709,7 +2779,7 @@ def run_performance(
                 )
             )
             result.update(parsed)
-            if op in ("spmv_csr", "spmm_csr"):
+            if op in ("spmv_csr", "spmm_csr", "spmv_coo", "spmm_coo", "spmv_csc", "spmm_csc"):
                 result["process_status"] = "TIMEOUT" if timed_out else "Passed" if returncode == 0 else "Failed"
                 result.update(_csr_row_correctness(rows))
                 result["status"] = (result["correctness_status"] if returncode == 0 and not timed_out

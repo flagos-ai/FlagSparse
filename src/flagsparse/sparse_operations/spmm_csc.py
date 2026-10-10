@@ -15,6 +15,7 @@
 """Native CSC SpMM kernels and route helpers."""
 
 from dataclasses import dataclass
+from . import spmv_csc as _csc_native
 
 from ._common import *
 
@@ -23,6 +24,7 @@ import triton.language as tl
 
 
 SUPPORTED_SPMM_CSC_VALUE_DTYPES = (
+    torch.float16,
     torch.float32,
     torch.float64,
     torch.complex64,
@@ -95,7 +97,9 @@ def _normalize_spmm_csc_alg(alg):
     token = "auto" if alg is None else str(alg).strip().lower().replace("-", "_")
     if token in ("auto", "base", "csc_base", "spmm_csc_base"):
         return "auto" if token == "auto" else SPMM_CSC_ALG_BASE
-    raise ValueError("unsupported CSC SpMM algorithm; supported: auto, spmm_csc_base")
+    if token in ("csc_col_panel", "csc_col_tile_panel_atomic"):
+        return token
+    raise ValueError(f"unsupported CSC SpMM algorithm: {alg}")
 
 
 def _normalize_spmm_csc_index_fallback_policy(index_fallback_policy):
@@ -411,7 +415,7 @@ def _prepare_spmm_csc_matrix(data, indices, indptr, shape):
     if not all(t.device == data.device for t in (indices, indptr)):
         raise ValueError("data, indices, indptr must be on the same CUDA device")
     if data.dtype not in SUPPORTED_SPMM_CSC_VALUE_DTYPES:
-        raise TypeError("CSC SpMM supports float32, float64, complex64, and complex128")
+        raise TypeError("CSC SpMM supports float16, float32, float64, complex64, and complex128")
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
     if indptr.dtype not in SUPPORTED_INDEX_DTYPES:
@@ -499,14 +503,23 @@ def prepare_spmm_csc_route(
     op="non",
     alg="auto",
     index_fallback_policy="auto",
+    config=None, _validated=None,
 ):
+    if alg in (None, "auto") and _validated is None and data.dtype == torch.float16:
+        alg = SPMM_CSC_ALG_BASE
+    if alg != "auto" and _validated is None:
+        return _csc_native._prepare_csc_registered(data, indices, indptr, shape, op, None,
+                                                   _normalize_spmm_csc_alg(alg), config, index_fallback_policy, "spmm",
+                                                   {"block_n": block_n, "block_nnz": block_nnz, "max_segments": max_segments})
+    if config is not None:
+        raise ValueError("config requires an explicit algorithm")
     index_fallback_policy = _normalize_spmm_csc_index_fallback_policy(
         index_fallback_policy
     )
     op_code = _normalize_spmm_csc_op(op)
     _ensure_spmm_csc_supported_op(op_code)
     data, indices, indptr, n_rows, n_cols, col_lengths, max_col_nnz = (
-        _prepare_spmm_csc_matrix(data, indices, indptr, shape)
+        _prepare_spmm_csc_matrix(data, indices, indptr, shape) if _validated is None else _validated
     )
     if block_nnz is None:
         block_nnz_use = _select_spmm_csc_block_nnz(
@@ -541,7 +554,7 @@ def prepare_spmm_csc_route(
         try:
             from .sddmm_csr import _build_row_ids
 
-            col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
+            col_ids = _build_row_ids(indptr, int(data.numel()))
         except Exception:
             col_ids = None
     return PreparedCscSpmm(
@@ -1463,13 +1476,17 @@ def resolve_spmm_csc_algorithm(alg, op, dtype):
     return algorithm
 
 
-def list_spmm_csc_algorithms(op=None, dtype=None):
+def list_spmm_csc_algorithms(op=None, dtype=None, backend=None, layout=None):
     op_name = None if op is None else _spmm_csc_op_to_name(op)
     names = []
     for name, algorithm in SPMM_CSC_ALGORITHMS.items():
         if op_name is not None and op_name not in algorithm.supported_ops:
             continue
         if dtype is not None and dtype not in algorithm.supported_dtypes:
+            continue
+        if backend is not None and backend not in _csc_native._csc_spec(name, "spmm")["backends"]:
+            continue
+        if layout is not None and layout not in ("row", "col", "strided"):
             continue
         names.append(name)
     return tuple(names)
@@ -1546,8 +1563,19 @@ def flagsparse_spmm_csc_run(
     return_meta=False,
     timing=False,
     diagnostics=False,
+    config=None, out=None,
 ):
     """Run a registered native CSC SpMM route."""
+    if isinstance(prepared, _csc_native.PreparedCscRoute) and prepared.kind != "spmm":
+        raise TypeError("prepared must describe CSC SpMM")
+    if isinstance(prepared, _csc_native.PreparedCscRoute) or alg in ("csc_col_panel", "csc_col_tile_panel_atomic"):
+        if not isinstance(prepared, _csc_native.PreparedCscRoute):
+            prepared = _csc_native._prepare_csc_registered(prepared.data, prepared.kernel_indices, prepared.kernel_indptr,
+                prepared.shape, prepared.op, None, alg, config, prepared.index_fallback_policy, "spmm")
+        return _csc_native._run_csc_registered(prepared, B, alg=alg, config=config, op=op, out=out,
+                                               return_time=return_time, return_meta=return_meta, timing=timing)
+    if config:
+        raise ValueError("legacy CSC route does not accept config")
     if not isinstance(prepared, PreparedCscSpmm):
         raise TypeError("prepared must be a PreparedCscSpmm instance")
     op_name = prepared.op if op is None else _spmm_csc_op_to_name(op)
@@ -1567,7 +1595,7 @@ def flagsparse_spmm_csc_run(
         prepared,
         B,
         algorithm,
-        collect_timing=bool(timing),
+        collect_timing=False,
     )
     if collect_timing:
         event_end.record()
@@ -1575,6 +1603,9 @@ def flagsparse_spmm_csc_run(
         gpu_ms = event_start.elapsed_time(event_end)
     else:
         gpu_ms = None
+    if timing:
+        _, diagnostic_meta = _run_spmm_csc_prepared_with_fallback(prepared, B, algorithm, collect_timing=True)
+        route_meta.update(diagnostic_meta)
     process_cpu_ms = float(route_meta.get("process_cpu_ms", 0.0) or 0.0)
     operator_ms = process_cpu_ms + float(gpu_ms) if gpu_ms is not None else None
     if return_meta:
@@ -1602,12 +1633,7 @@ def flagsparse_spmm_csc_run(
             "index_fallback_applied": bool(route_meta.get("index_fallback_applied", prepared.index_fallback_applied)),
             "index_fallback_reason": route_meta.get("index_fallback_reason", prepared.index_fallback_reason),
         }
-        if timing:
-            meta["op_total_ms"] = (
-                process_cpu_ms + meta["process_gpu_ms"] + float(meta["compute_ms"] or 0.0)
-            )
-        else:
-            meta["op_total_ms"] = operator_ms
+        meta["op_total_ms"] = operator_ms
         if return_time:
             return C, operator_ms, meta
         return C, meta
@@ -1634,6 +1660,7 @@ def flagsparse_spmm_csc(
     alg="auto",
     timing=False,
     index_fallback_policy="auto",
+    config=None,
 ):
     """CSC SpMM using native Triton CSC kernels."""
     op_explicit = op is not None
@@ -1662,7 +1689,7 @@ def flagsparse_spmm_csc(
             block_nnz=block_nnz,
             max_segments=max_segments,
             op=_spmm_csc_op_to_name(op_code),
-            alg=alg,
+            alg=alg, config=config,
             index_fallback_policy=index_fallback_policy,
         )
     else:
@@ -1679,8 +1706,11 @@ def flagsparse_spmm_csc(
         op=_spmm_csc_op_to_name(op_code),
         return_time=return_time,
         return_meta=return_meta,
-        timing=timing,
+        timing=timing, config=config,
+        out=out if isinstance(prepared, _csc_native.PreparedCscRoute) else None,
     )
+    if isinstance(prepared, _csc_native.PreparedCscRoute):
+        return C
     if out is None:
         return C
     result = C[0] if return_time or return_meta else C
@@ -1698,3 +1728,19 @@ def flagsparse_spmm_csc(
     if return_meta:
         return out, C[1]
     return out
+
+
+
+def get_spmm_csc_algorithm_spec(alg):
+    return _csc_native._csc_spec(_normalize_spmm_csc_alg(alg), "spmm")
+
+
+def _run_csc_extension_route(prepared, B, timing=False):
+    return _csc_native._run_csc_registered(prepared, B, return_meta=True, timing=timing)
+
+
+for _name in ("csc_col_panel", "csc_col_tile_panel_atomic"):
+    SPMM_CSC_ALGORITHMS[_name] = SpmmCscAlgorithm(
+        name=_name, display_name=_name,
+        supported_ops=_csc_native._csc_spec(_name, "spmm")["ops"],
+        supported_dtypes=SUPPORTED_SPMM_CSC_VALUE_DTYPES, run=_run_csc_extension_route)

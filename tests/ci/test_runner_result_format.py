@@ -842,3 +842,41 @@ def test_ascend_benchmark_commands_pass_the_matrix_input_the_script_accepts():
         template = runner.ASCEND_PERFORMANCE_COMMANDS[op]
         assert template[template.index("--input") + 1] == "{input}"
         assert "bfloat16" not in template[template.index("--dtypes") + 1]
+
+
+@pytest.mark.parametrize("op", ["spmv_coo", "spmm_coo"])
+def test_coo_runner_compares_registered_algorithms(op):
+    command = runner.PERFORMANCE_COMMANDS[op]
+    assert command[command.index("--alg") + 1] == "compare"
+
+
+def test_accuracy_failure_keeps_measured_vendor_speedup():
+    row = dict(status="FAIL", ms="2", vendor_ms="1", speedup_vs_vendor="0.5")
+    assert runner._performance_row_has_complete_speedup(row)
+    assert not runner._performance_row_has_complete_speedup(dict(row, status="ERROR"))
+
+
+
+def test_coo_best_aggregation_preserves_width_and_accuracy_fail():
+    rows = [dict(matrix="m", dtype="float32", index_dtype="int32", op="non", layout="row",
+                 dense_cols=str(n), alg=alg, ms=str(ms), vendor_ms="4", speedup_vs_vendor=str(4 / ms), status=status)
+            for n, alg, ms, status in [(7, "coo_rowrun", 4, "PASS"),
+                                       (7, "coo_rowrun_panel", 2, "FAIL"),
+                                       (33, "coo_rowrun_panel", 8, "PASS")]]
+    best = runner._coo_best_rows(rows)
+    assert len(best) == 2
+    assert best[0]["status"] == "FAIL"
+    assert sorted(v["geomean"] for v in runner._coo_geomean_groups(rows).values()) == [0.5, 2.0]
+
+
+
+def test_csc_best_rows_keep_fail_and_separate_pointer_types():
+    rows = [dict(matrix="a", dtype="float32", index_dtype="int32", indptr_dtype=ptr,
+                 op="non", layout="row", dense_cols="7", alg=alg, ms=str(ms),
+                 vendor_ms="4", speedup_vs_vendor=str(4/ms), status=status)
+            for ptr in ("int32", "int64")
+            for alg, ms, status in (("spmm_csc_base", 2, "PASS"), ("csc_col_tile_panel_atomic", 1, "FAIL"))]
+    best = runner._coo_best_rows(rows)
+    assert len(best) == 2
+    assert all(row["status"] == "FAIL" for row in best)
+    assert len(runner._coo_geomean_groups(rows)) == 2

@@ -46,6 +46,10 @@ def backend_caps(device):
         reduction=capability("supports_reduction", default=True if known_target else None),
         stable_sort=capability("supports_stable_sort", default=True if backend in ("cuda", "rocm") else None),
         scan=capability("supports_scan", default=True if backend in ("cuda", "rocm") else None),
+        fp32_atomic=capability("supports_fp32_atomic", default=True if documented_cuda_hip else None),
+        fp64_atomic=capability("supports_fp64_atomic", default=(
+            True if backend == "rocm" and target_name == "hip" else
+            int(getattr(props, "major", 0)) >= 6 if backend == "cuda" and target_name == "cuda" else None)),
     )
 
 
@@ -93,6 +97,9 @@ def _classify(lengths, short, long):
 def run(prepared, B, *, algorithm, config, config_meta, timing=False,
         diagnostics=False, dense_layout="row", out=None):
     cfg = config
+    output_dtype = B.dtype
+    fp32_output = output_dtype == torch.float16 and algorithm in ("csr_split_nnz_reduce", "csr_adaptive_tile_split")
+    buffer_dtype = torch.float32 if fp32_output else output_dtype
     phases = Phases(timing)
     m, n = prepared.n_rows, int(B.shape[1])
     complex_input = prepared.data.is_complex()
@@ -105,8 +112,8 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
         # Resolving lazy views is numerical input handling and remains inside run.
         A = prepared.data.resolve_conj().resolve_neg().contiguous()
         B = B.resolve_conj().resolve_neg()
-        C = out if out is not None else (torch.empty_strided((m, n), (1, max(m, 1)), device=B.device, dtype=B.dtype)
-             if dense_layout == "col" else torch.empty((m, n), device=B.device, dtype=B.dtype))
+        C = out if out is not None and not fp32_output else (torch.empty_strided((m, n), (1, max(m, 1)), device=B.device, dtype=buffer_dtype)
+             if dense_layout == "col" else torch.empty((m, n), device=B.device, dtype=buffer_dtype))
         if algorithm in ("csr_split_nnz_reduce", "csr_adaptive_tile_split"):
             C.zero_()
 
@@ -155,6 +162,12 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
             counts.update(tile_rows=short.numel(), kparallel_rows=medium.numel(), split_rows=long.numel())
             if long.numel():
                 _split(prepared, A, B, C, long, cfg, phases, stats, complex_input, acc, launch)
+    if fp32_output:
+        with phases.measure("compute_ms"):
+            C = C.to(output_dtype)
+            if out is not None:
+                out.copy_(C)
+                C = out
     meta = dict(config_meta, config=dict(cfg), algorithm=algorithm,
                 implementation_version=policy.IMPLEMENTATION_VERSION,
                 compute_dtype="float64" if acc == tl.float64 else "float32",
@@ -173,7 +186,8 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
 def _split(prepared, A, B, C, rows, cfg, phases, stats, complex_input, acc, launch):
     n = B.shape[1]
     bn = cfg["block_n"]
-    element_bytes = B.element_size()
+    partial_dtype = torch.float32 if B.dtype == torch.float16 else B.dtype
+    element_bytes = 4 if B.dtype == torch.float16 else B.element_size()
     # Three equally sized numeric slabs bound X/Y plus allocation transition.
     wave, capacity = policy.workspace_geometry(n, element_bytes, cfg)
     with phases.measure("process_gpu_ms"):
@@ -202,7 +216,7 @@ def _split(prepared, A, B, C, rows, cfg, phases, stats, complex_input, acc, laun
                 stats["descriptor_peak_bytes_estimate"] = max(stats["descriptor_peak_bytes_estimate"],
                     (starts.numel() * 3 + offsets.numel() * 4 + size * 5) * 8)
             with phases.measure("compute_ms"):
-                partial = torch.empty((size, width), device=B.device, dtype=B.dtype)
+                partial = torch.empty((size, width), device=B.device, dtype=partial_dtype)
                 rows_kernel[(size, triton.cdiv(width, bn))](
                     _view(A), prepared.kernel_indices, prepared.kernel_indptr, _view(B), _view(partial),
                     seg_rows, seg_start, seg_end, size, width, B.stride(0), B.stride(1), width, 1, col,
@@ -224,7 +238,7 @@ def _split(prepared, A, B, C, rows, cfg, phases, stats, complex_input, acc, laun
                     reduce_starts = local_offsets[group_rows] + (group_ids - next_offsets[group_rows]) * cfg["reduce_block_size"]
                     reduce_ends = torch.minimum(reduce_starts + cfg["reduce_block_size"], local_offsets[group_rows + 1])
                 with phases.measure("compute_ms"):
-                    reduced = torch.empty((next_size, width), device=B.device, dtype=B.dtype)
+                    reduced = torch.empty((next_size, width), device=B.device, dtype=partial_dtype)
                     peak = max(peak, (partial.numel() + reduced.numel()) * element_bytes)
                     reduce_kernel[(next_size, triton.cdiv(width, bn))](
                         _view(partial), _view(reduced), reduce_starts, reduce_ends, width,

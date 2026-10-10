@@ -33,6 +33,7 @@ pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_
 
 def _value_dtype_cases():
     cases = [
+        ("float16", torch.float16),
         ("float32", torch.float32),
         ("float64", torch.float64),
         ("complex64", torch.complex64),
@@ -42,7 +43,7 @@ def _value_dtype_cases():
 
 
 def _random_values(shape, dtype, device):
-    if dtype in (torch.float32, torch.float64):
+    if dtype in (torch.float16, torch.float32, torch.float64):
         return torch.randn(shape, dtype=dtype, device=device)
     if dtype == torch.complex64:
         return torch.complex(
@@ -58,7 +59,7 @@ def _random_values(shape, dtype, device):
 
 
 def _reference_dtype(dtype):
-    if dtype == torch.float32:
+    if dtype in (torch.float16, torch.float32):
         return torch.float64
     if dtype == torch.complex64:
         return torch.complex128
@@ -259,3 +260,154 @@ def test_spmv_csc_int64_strict_no_fallback(monkeypatch):
             shape=(12, 9),
             index_fallback_policy="strict",
         )
+
+
+from tests.pytest.conftest import QUICK_MODE
+
+
+@pytest.mark.spmv_csc
+@pytest.mark.parametrize("alg,op", [("csc_col_tile_atomic", "non"), ("csc_col_subgroup", "trans"), ("csc_col_subgroup", "conj")])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128])
+@pytest.mark.parametrize("index_dtype,ptr_dtype", [(torch.int32, torch.int64)] if QUICK_MODE else
+                         [(i, p) for i in (torch.int32, torch.int64) for p in (torch.int32, torch.int64)])
+
+def test_spmv_csc_registered_columns(alg, op, dtype, index_dtype, ptr_dtype):
+    from flagsparse.sparse_operations._spmm_csr_config import resolve_csc_config
+    from flagsparse.sparse_operations._spmm_csr_runtime import backend_caps
+    from flagsparse import prepare_spmv_csc, flagsparse_spmv_csc_run
+    device = accelerator_device()
+    try:
+        resolve_csc_config(alg, str(dtype).removeprefix("torch."), 7, backend_caps(device), op=op)
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+    lengths = [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 0, 257 if QUICK_MODE else 2049]
+    ptr = torch.tensor([0] + lengths, dtype=torch.int64).cumsum(0)
+    rows = (torch.arange(int(ptr[-1])) * 7 + 3) % 19
+    torch.manual_seed(20261010)
+    values = _random_values((rows.numel(),), dtype, golden_device())
+    values[::17] = 0
+    matrix = torch.zeros((19, len(lengths)), dtype=_reference_dtype(dtype), device=golden_device())
+    cols = torch.repeat_interleave(torch.arange(len(lengths)), torch.tensor(lengths))
+    matrix.index_put_((rows, cols), values.to(matrix.dtype), accumulate=True)
+    data, indices, indptr = values.to(device), rows.to(device=device, dtype=index_dtype), ptr.to(device=device, dtype=ptr_dtype)
+    dense_rows = len(lengths) if op == "non" else 19
+    dense_cpu = _random_values((dense_rows,), dtype, golden_device())
+    dense = dense_cpu.to(device)
+    effective = matrix if op == "non" else matrix.T if op == "trans" else matrix.conj().T
+    expected = effective @ dense_cpu.to(matrix.dtype)
+    prepared = prepare_spmv_csc(data, indices, indptr, (19, len(lengths)), op=op, alg=alg)
+    before = data.clone()
+    output = torch.full(expected.shape, float("nan"), dtype=dtype, device=device)
+    result, meta = flagsparse_spmv_csc_run(prepared, dense, out=output, timing=True, return_meta=True)
+    assert result is output
+    _assert_close(result, expected, dtype)
+    assert torch.equal(data, before)
+    assert meta["op_total_ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+    assert meta["alg_resolved"] == alg
+    assert not hasattr(prepared, "col_ids")
+    with pytest.raises(ValueError, match="op"):
+        flagsparse_spmv_csc_run(prepared, dense, op="trans" if op == "non" else "non")
+    with pytest.raises(ValueError):
+        flagsparse_spmv_csc_run(prepared, dense, config={"num_warps": 3})
+
+
+@pytest.mark.spmv_csc
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("shape", [(0, 0), (0, 5), (7, 0), (7, 5)])
+def test_spmv_csc_registered_empty(op, shape):
+    from flagsparse import prepare_spmv_csc, flagsparse_spmv_csc_run
+    from flagsparse.sparse_operations._spmm_csr_runtime import backend_caps
+    from flagsparse.sparse_operations._spmm_csr_config import resolve_csc_config
+    alg = 'csc_col_tile_atomic' if op == "non" else 'csc_col_subgroup'
+    device = accelerator_device()
+    try:
+        resolve_csc_config(alg, "float32", 7, backend_caps(device), op=op)
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+    a = torch.empty(0, device=device)
+    i = torch.empty(0, dtype=torch.int64, device=device)
+    p = torch.zeros(shape[1] + 1, dtype=torch.int32, device=device)
+    prepared = prepare_spmv_csc(a, i, p, shape, alg=alg, op=op)
+    length = shape[1] if op == "non" else shape[0]
+    dense = torch.empty((length,), device=device)
+    result = flagsparse_spmv_csc_run(prepared, dense)
+    assert result.shape[0] == (shape[0] if op == "non" else shape[1])
+    assert torch.count_nonzero(result).item() == 0
+
+
+@pytest.mark.spmv_csc
+@pytest.mark.parametrize("policy", ["auto", "strict"])
+def test_spmv_csc_registered_index_fallback(monkeypatch, policy):
+    from flagsparse import flagsparse_spmv_csc_run
+    device = accelerator_device()
+    a = torch.ones(2, device=device)
+    i = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    p = torch.tensor([0, 1, 2], dtype=torch.int64, device=device)
+    prepared = prepare_spmv_csc(a, i, p, (2, 2), alg="csc_col_subgroup", op="trans", index_fallback_policy=policy)
+    original = spmv_csc_mod._launch_csc_columns
+    def inject(data, indices, indptr, *args):
+        if indices.dtype == torch.int64:
+            raise RuntimeError("unsupported int64 index type")
+        return original(data, indices, indptr, *args)
+    monkeypatch.setattr(spmv_csc_mod, "_launch_csc_columns", inject)
+    x = torch.ones(2, device=device)
+    if policy == "strict":
+        with pytest.raises(RuntimeError, match="int64"):
+            flagsparse_spmv_csc_run(prepared, x)
+    else:
+        result, meta = flagsparse_spmv_csc_run(prepared, x, return_meta=True)
+        _assert_close(result, x, torch.float32)
+        assert meta["index_fallback_applied"]
+        assert meta["alg_resolved"] == "csc_col_subgroup"
+        prepared.int32_safe = False
+        with pytest.raises(RuntimeError, match="unsafe"):
+            flagsparse_spmv_csc_run(prepared, x)
+
+
+@pytest.mark.spmv_csc
+def test_spmv_csc_direct_route_does_not_prepare_plan(monkeypatch):
+    from flagsparse import flagsparse_spmv_csc_run
+    device = accelerator_device()
+    a = torch.ones(2, device=device)
+    i = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    p = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    prepared = prepare_spmv_csc(a, i, p, (2, 2), alg="csc_col_subgroup", op="trans")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("direct CSC must not prepare a legacy plan")
+    monkeypatch.setattr(spmv_csc_mod, "prepare_spmv_csc", forbidden)
+    for timing in (False, True):
+        result = flagsparse_spmv_csc_run(prepared, torch.ones(2, device=device), timing=timing)
+        assert torch.equal(result, torch.ones_like(result))
+
+
+@pytest.fixture(autouse=True)
+def _skip_unknown_csc_extension_capabilities(request):
+    if request.node.name.startswith(("test_spmv_csc_registered_index", "test_spmv_csc_direct_route")):
+        from flagsparse.sparse_operations._spmm_csr_config import resolve_csc_config
+        from flagsparse.sparse_operations._spmm_csr_runtime import backend_caps
+        try:
+            resolve_csc_config("csc_col_subgroup", "float32", 1, backend_caps(accelerator_device()), op="trans")
+        except NotImplementedError as exc:
+            pytest.skip(str(exc))
+
+
+@pytest.mark.spmv_csc
+def test_spmv_csc_registered_base_rebuilds_each_run(monkeypatch):
+    from flagsparse import flagsparse_spmv_csc_run
+    device = accelerator_device()
+    a = torch.ones(2, device=device)
+    i = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    p = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    prepared = prepare_spmv_csc(a, i, p, (2, 2), alg="spmv_csc_base")
+    original = spmv_csc_mod.prepare_spmv_csc
+    calls = []
+    def observed(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(spmv_csc_mod, "prepare_spmv_csc", observed)
+    x = torch.ones(2, device=device)
+    flagsparse_spmv_csc_run(prepared, x)
+    assert len(calls) == 1
+    flagsparse_spmv_csc_run(prepared, x, timing=True)
+    assert len(calls) == 3
+    assert all(not call["_allow_delegate"] for call in calls)

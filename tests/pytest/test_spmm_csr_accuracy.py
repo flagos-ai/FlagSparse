@@ -426,7 +426,7 @@ def test_spmm_csr_panel_configuration_contract():
 
 @pytest.mark.spmm_csr
 @pytest.mark.parametrize("algorithm", NEW_ALGORITHMS)
-@pytest.mark.parametrize("dtype", SPMM_OP_DTYPES)
+@pytest.mark.parametrize("dtype", (torch.float16,) + SPMM_OP_DTYPES)
 @pytest.mark.parametrize("op", ("non", "trans", "conj"))
 @pytest.mark.parametrize(
     "index_dtype,ptr_dtype",
@@ -577,3 +577,17 @@ def test_spmm_csr_out_rejects_original_index_storage_after_conversion():
     alias = columns.view(torch.float64).reshape(3, 1)
     with pytest.raises(ValueError, match="overlap"):
         flagsparse_spmm_csr_run(prepared, B, out=alias)
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmm_csr_base_float16(op):
+    data, indices, indptr, shape, dense = _new_route_inputs(torch.float16, torch.int32, torch.int64, (0, 1, 7, 17))
+    prepared = prepare_spmm_csr_route(data, indices, indptr, shape, op=op, alg="csr_base")
+    left = _apply_dense_op(dense, op)
+    rhs = _random_dense((left.shape[1], 7), torch.float16, "cpu")
+    actual = flagsparse_spmm_csr_run(prepared, rhs.to(data.device))
+    expected = left @ rhs.to(left.dtype)
+    rtol, atol = _tol(torch.float16)
+    torch.testing.assert_close(actual.cpu().to(expected.dtype), expected, rtol=rtol, atol=atol)
+    assert actual.dtype == torch.float16

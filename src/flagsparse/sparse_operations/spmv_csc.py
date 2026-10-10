@@ -24,6 +24,7 @@ import triton.language as tl
 _SPMV_CSC_CUDA = _backend_name() == "cuda"
 
 SUPPORTED_SPMV_CSC_VALUE_DTYPES = (
+    torch.float16,
     torch.float32,
     torch.float64,
     torch.complex64,
@@ -42,7 +43,7 @@ _SPMV_CSC_OP_NAME_TO_CODE = {name: code for code, name in SPMV_CSC_OP_NAMES.item
 
 
 def _spmv_csc_dtype_error_message():
-    return "CSC SpMV supports float32, float64, complex64, and complex128"
+    return "CSC SpMV supports float16, float32, float64, complex64, and complex128"
 
 
 def _normalize_spmv_csc_op(op=None, transpose=False):
@@ -332,6 +333,8 @@ def _prepare_spmv_csc_matrix(data, indices, indptr, shape):
     if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
         raise ValueError("data, indices, indptr must be 1D tensors")
     n_rows, n_cols = int(shape[0]), int(shape[1])
+    if n_rows < 0 or n_cols < 0:
+        raise ValueError("shape dimensions must be nonnegative")
     if indptr.numel() != n_cols + 1:
         raise ValueError(
             f"indptr length must be n_cols+1={n_cols + 1}, got {indptr.numel()}"
@@ -375,10 +378,18 @@ def prepare_spmv_csc(
     shape,
     block_nnz=256,
     max_segments=None,
-    transpose=False,
+    transpose=None,
     op=None,
     index_fallback_policy="auto",
+    alg=None, config=None, _validated=None, _allow_delegate=True,
 ):
+    if alg is None and _validated is None and data.dtype == torch.float16:
+        alg = "spmv_csc_base"
+    if alg is not None:
+        return _prepare_csc_registered(data, indices, indptr, shape, op, transpose, alg, config, index_fallback_policy, "spmv",
+                                       {"block_nnz": block_nnz, "max_segments": max_segments})
+    if config is not None:
+        raise ValueError("config requires an explicit algorithm")
     index_fallback_policy = _normalize_spmv_csc_index_fallback_policy(
         index_fallback_policy
     )
@@ -386,7 +397,7 @@ def prepare_spmv_csc(
     if op is not None and bool(transpose) and op_code == SPMV_CSC_OP_NON:
         raise ValueError("transpose=True conflicts with op=non")
     data, indices, indptr, n_rows, n_cols, col_lengths, max_col_nnz = (
-        _prepare_spmv_csc_matrix(data, indices, indptr, shape)
+        _prepare_spmv_csc_matrix(data, indices, indptr, shape) if _validated is None else _validated
     )
     block_nnz_use = int(block_nnz)
     if block_nnz_use <= 0:
@@ -425,7 +436,7 @@ def prepare_spmv_csc(
             # but keeping it local avoids adding a load-time edge between operators.
             from .sddmm_csr import _build_row_ids
 
-            col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
+            col_ids = _build_row_ids(indptr, int(data.numel()))
         except Exception:
             col_ids = None
     # op="trans"/"conj": CSC(A) and CSR(A.T) are the same three arrays, so the
@@ -442,7 +453,7 @@ def prepare_spmv_csc(
     # transpose kernel is kept.
     csr_delegate = None
     if (
-        _SPMV_CSC_CUDA
+        _allow_delegate and _SPMV_CSC_CUDA
         and _spmv_csc_op_transposes(op_code)
         and int(data.numel()) > 0
     ):
@@ -758,8 +769,21 @@ def flagsparse_spmv_csc(
     transpose=None,
     op=None,
     index_fallback_policy="auto",
+    alg=None, config=None, timing=False,
 ):
     """CSC SpMV using native Triton CSC kernels."""
+    if alg is None and prepared is None and data is not None and data.dtype == torch.float16:
+        alg = "spmv_csc_base"
+    if alg is not None or isinstance(prepared, PreparedCscRoute):
+        if prepared is None:
+            prepared = _prepare_csc_registered(data, indices, indptr, shape, op, transpose, alg, config, index_fallback_policy, "spmv",
+                                       {"block_nnz": block_nnz, "max_segments": max_segments})
+        if transpose is not None and bool(transpose) != _spmv_csc_op_transposes(prepared.op):
+            raise ValueError("transpose conflicts with prepared op")
+        return flagsparse_spmv_csc_run(prepared, x, alg=alg, config=config, op=op, out=out,
+                                       return_time=return_time, return_meta=return_meta, timing=timing)
+    if config is not None:
+        raise ValueError("config requires an explicit algorithm")
     op_explicit = op is not None
     op_code = _normalize_spmv_csc_op(
         op,
@@ -826,6 +850,7 @@ def flagsparse_spmv_csc(
     if return_meta:
         meta = {
             "op": _spmv_csc_op_to_name(op_code),
+            "execution_path": "csr_delegate" if prepared.csr_delegate is not None else "native_csc",
             "symbolic_ms": 0.0 if do_timing else None,
             "compute_ms": compute_ms,
             "op_total_ms": op_total_ms,
@@ -842,3 +867,321 @@ def flagsparse_spmv_csc(
     if return_time:
         return y, op_total_ms
     return y
+
+
+@triton.jit
+def _csc_product(A, B, pos, dense_pos, mask, COMPLEX: tl.constexpr, FP64: tl.constexpr, CONJ: tl.constexpr):
+    dtype: tl.constexpr = tl.float64 if FP64 else tl.float32
+    if COMPLEX:
+        ar = tl.load(A + 2 * pos, mask, 0).to(dtype)
+        ai = tl.load(A + 2 * pos + 1, mask, 0).to(dtype)
+        br = tl.load(B + 2 * dense_pos, mask, 0).to(dtype)
+        bi = tl.load(B + 2 * dense_pos + 1, mask, 0).to(dtype)
+        if CONJ:
+            ai = -ai
+        return ar * br - ai * bi, ar * bi + ai * br
+    return tl.load(A + pos, mask, 0).to(dtype) * tl.load(B + dense_pos, mask, 0).to(dtype), tl.full(pos.shape, 0, dtype)
+
+
+@triton.jit
+def _csc_columns_reduce_kernel(A, I, P, B, Y, COLS, N, BS0, BS1, YS0, YS1,
+                               R: tl.constexpr, V: tl.constexpr, SUBGROUP: tl.constexpr,
+                               ACCS: tl.constexpr, COMPLEX: tl.constexpr, FP64: tl.constexpr,
+                               CONJ: tl.constexpr):
+    cols = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    lane = tl.arange(0, V).to(tl.int64)
+    start = tl.load(P + cols, cols < COLS, 0).to(tl.int64)
+    end = tl.load(P + cols + 1, cols < COLS, 0).to(tl.int64)
+    longest = tl.max(end - start, 0)
+    dtype: tl.constexpr = tl.float64 if FP64 else tl.float32
+    re = tl.full((R, V), 0, dtype)
+    im = tl.full((R, V), 0, dtype)
+    re1 = tl.full((R, V), 0, dtype)
+    im1 = tl.full((R, V), 0, dtype)
+    if SUBGROUP:
+        for offset in range(tl.cdiv(longest, V)):
+            pos = start[:, None] + offset * V + lane[None, :]
+            valid = (cols[:, None] < COLS) & (pos < end[:, None])
+            rows = tl.load(I + pos, valid, 0).to(tl.int64)
+            vr, vi = _csc_product(A, B, pos, rows * BS0, valid, COMPLEX, FP64, CONJ)
+            re += vr
+            im += vi
+        rr = tl.sum(re, 1)
+        ii = tl.sum(im, 1)
+        dest = cols * YS0
+        if COMPLEX:
+            tl.store(Y + 2 * dest, rr, cols < COLS)
+            tl.store(Y + 2 * dest + 1, ii, cols < COLS)
+        else:
+            tl.store(Y + dest, rr, cols < COLS)
+    else:
+        ns = tl.program_id(1).to(tl.int64) * V + lane
+        for offset in range(tl.cdiv(longest, ACCS)):
+            for a in tl.static_range(ACCS):
+                pos = start[:, None] + offset * ACCS + a + tl.zeros((1, V), tl.int64)
+                valid = (cols[:, None] < COLS) & (pos < end[:, None]) & (ns[None, :] < N)
+                rows = tl.load(I + pos, valid, 0).to(tl.int64)
+                vr, vi = _csc_product(A, B, pos, rows * BS0 + ns[None, :] * BS1, valid, COMPLEX, FP64, CONJ)
+                if a == 0:
+                    re += vr
+                    im += vi
+                else:
+                    re1 += vr
+                    im1 += vi
+        dest = cols[:, None] * YS0 + ns[None, :] * YS1
+        valid = (cols[:, None] < COLS) & (ns[None, :] < N)
+        if COMPLEX:
+            tl.store(Y + 2 * dest, re + re1, valid)
+            tl.store(Y + 2 * dest + 1, im + im1, valid)
+        else:
+            tl.store(Y + dest, re + re1, valid)
+
+
+@triton.jit
+def _csc_columns_atomic_kernel(A, I, P, B, Y, COLS, N, BS0, BS1, YS0, YS1,
+                               R: tl.constexpr, K: tl.constexpr, BN: tl.constexpr,
+                               COMPLEX: tl.constexpr, FP64: tl.constexpr):
+    cols = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    ks = tl.arange(0, K).to(tl.int64)
+    ns = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN).to(tl.int64)
+    start = tl.load(P + cols, cols < COLS, 0).to(tl.int64)
+    end = tl.load(P + cols + 1, cols < COLS, 0).to(tl.int64)
+    dtype: tl.constexpr = tl.float64 if FP64 else tl.float32
+    dense_pos = cols[:, None] * BS0 + ns[None, :] * BS1
+    dense_mask = (cols[:, None] < COLS) & (ns[None, :] < N)
+    if COMPLEX:
+        br = tl.load(B + 2 * dense_pos, dense_mask, 0).to(dtype)
+        bi = tl.load(B + 2 * dense_pos + 1, dense_mask, 0).to(dtype)
+    else:
+        br = tl.load(B + dense_pos, dense_mask, 0).to(dtype)
+    for offset in range(tl.cdiv(tl.max(end - start, 0), K)):
+        pos = start[:, None] + offset * K + ks[None, :]
+        sparse_mask = (cols[:, None] < COLS) & (pos < end[:, None])
+        rows = tl.load(I + pos, sparse_mask, 0).to(tl.int64)
+        if COMPLEX:
+            ar = tl.load(A + 2 * pos, sparse_mask, 0).to(dtype)
+            ai = tl.load(A + 2 * pos + 1, sparse_mask, 0).to(dtype)
+            re = ar[:, :, None] * br[:, None, :] - ai[:, :, None] * bi[:, None, :]
+            im = ar[:, :, None] * bi[:, None, :] + ai[:, :, None] * br[:, None, :]
+        else:
+            ar = tl.load(A + pos, sparse_mask, 0).to(dtype)
+            re = ar[:, :, None] * br[:, None, :]
+        dest = rows[:, :, None] * YS0 + ns[None, None, :] * YS1
+        valid = sparse_mask[:, :, None] & (ns[None, None, :] < N)
+        if COMPLEX:
+            tl.atomic_add(Y + 2 * dest, re, valid, sem="relaxed")
+            tl.atomic_add(Y + 2 * dest + 1, im, valid, sem="relaxed")
+        else:
+            tl.atomic_add(Y + dest, re, valid, sem="relaxed")
+
+
+def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg):
+    """Shared native CSC launch; all strides are in logical (possibly complex) elements."""
+    vector = dense.ndim == 1
+    n = 1 if vector else dense.shape[1]
+    rows = shape[0] if op == "non" else shape[1]
+    output_shape = (rows,) if vector else (rows, n)
+    result = torch.empty(output_shape, dtype=data.dtype, device=data.device)
+    if op == "non":
+        result.zero_()
+    if not rows or not n or not shape[1]:
+        return result
+    complex_values = data.is_complex()
+    a = torch.view_as_real(data) if complex_values else data
+    b = torch.view_as_real(dense) if complex_values else dense
+    y = torch.view_as_real(result) if complex_values else result
+    common = dict(R=cfg["columns_per_program"], COMPLEX=complex_values,
+                  FP64=data.dtype in (torch.float64, torch.complex128),
+                  num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+    args = (a, indices, indptr, b, y, shape[1], n, dense.stride(0),
+            0 if vector else dense.stride(1), result.stride(0), 0 if vector else result.stride(1))
+    width = cfg.get("block_n", 1)
+    grid = (triton.cdiv(shape[1], cfg["columns_per_program"]), triton.cdiv(n, width))
+    if op == "non":
+        _csc_columns_atomic_kernel[grid](*args, K=cfg["block_nnz"], BN=width, **common)
+    else:
+        _csc_columns_reduce_kernel[grid](*args, V=cfg.get("lanes_per_column", width),
+                                       SUBGROUP=vector, ACCS=cfg.get("panel_accumulators", 1),
+                                       CONJ=op == "conj", **common)
+    return result
+
+
+class PreparedCscRoute:
+    """Validated original CSC inputs; registered runs never retain execution plans."""
+    def __init__(self, data, indices, indptr, shape, op, alg, config, policy, kind):
+        self.data, self.kernel_indices, self.kernel_indptr = data, indices, indptr
+        self.shape = tuple(map(int, shape))
+        self.n_rows, self.n_cols = self.shape
+        self.nnz = data.numel()
+        self.op, self.alg, self.config = op, alg, dict(config or {})
+        self.index_fallback_policy, self.kind = policy, kind
+        self.int32_safe = self.nnz <= _INDEX_LIMIT_INT32 and (not indices.numel() or int(indices.max().item()) <= _INDEX_LIMIT_INT32)
+
+
+def _csc_spec(alg, kind):
+    from ._spmm_csr_config import CSC_ALGORITHMS, BACKENDS
+    base = "spmv_csc_base" if kind == "spmv" else "spmm_csc_base"
+    names = ("csc_col_subgroup", "csc_col_tile_atomic") if kind == "spmv" else ("csc_col_panel", "csc_col_tile_panel_atomic")
+    if alg not in (base, *names):
+        raise ValueError(f"unknown {kind} CSC algorithm {alg!r}")
+    return dict(name=alg, ops=CSC_ALGORITHMS.get(alg, ("non", "trans", "conj")),
+                value_dtypes=SUPPORTED_SPMV_CSC_VALUE_DTYPES, backends=BACKENDS,
+                layouts=("row", "col", "strided"), implementation_version=1,
+                compute_dtype="native_component", validation="unverified")
+
+
+def _prepare_csc_registered(data, indices, indptr, shape, op, transpose, alg, config, policy, kind, legacy_options=None):
+    code = _normalize_spmv_csc_op(op, transpose=bool(transpose))
+    if transpose is not None and op is not None and bool(transpose) != _spmv_csc_op_transposes(code):
+        raise ValueError("transpose conflicts with op")
+    base = "spmv_csc_base" if kind == "spmv" else "spmm_csc_base"
+    selected = base if alg in (None, "auto", "base", "csc_base") else alg
+    spec = _csc_spec(selected, kind)
+    name = _spmv_csc_op_to_name(code)
+    if name not in spec["ops"]:
+        raise ValueError(f"{selected} does not support op={name}")
+    _prepare_spmv_csc_matrix(data, indices, indptr, shape)
+    options = dict(legacy_options or {})
+    if selected != base and any(value is not None and not (kind == "spmv" and key == "block_nnz" and value == 256) for key, value in options.items()):
+        raise ValueError("legacy block parameters conflict with new algorithm; use config")
+    route = PreparedCscRoute(data, indices, indptr, shape, name, selected, config,
+                             _normalize_spmv_csc_index_fallback_policy(policy), kind)
+    route.legacy_options = options if selected == base else {}
+    return route
+
+
+def get_spmv_csc_algorithm_spec(alg):
+    return _csc_spec(alg, "spmv")
+
+
+def list_spmv_csc_algorithms(op=None, dtype=None, backend=None):
+    names = ("spmv_csc_base", "csc_col_subgroup", "csc_col_tile_atomic")
+    return tuple(name for name in names if
+                 (op is None or _spmv_csc_op_to_name(op) in _csc_spec(name, "spmv")["ops"]) and
+                 (dtype is None or dtype in SUPPORTED_SPMV_CSC_VALUE_DTYPES) and
+                 (backend is None or backend in _csc_spec(name, "spmv")["backends"]))
+
+
+def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=None,
+                        return_time=False, return_meta=False, timing=False):
+    from ._spmm_csr_runtime import backend_caps, Phases
+    from ._spmm_csr_config import resolve_csc_config, CSC_ALGORITHMS
+    from ._spmv_csr_config import is_index_compatibility_error
+    if op is not None and _spmv_csc_op_to_name(op) != prepared.op:
+        raise ValueError("op conflicts with prepared CSC")
+    selected = prepared.alg if alg in (None, "auto") else alg
+    spec = _csc_spec(selected, prepared.kind)
+    if prepared.op not in spec["ops"]:
+        raise ValueError(f"{selected} does not support {prepared.op}")
+    cfg_input = config if config is not None else (prepared.config if selected == prepared.alg else {})
+    data, indices, ptr = prepared.data, prepared.kernel_indices, prepared.kernel_indptr
+    vector = prepared.kind == "spmv"
+    expected = prepared.n_cols if prepared.op == "non" else prepared.n_rows
+    if not torch.is_tensor(dense) or dense.ndim != (1 if vector else 2):
+        raise ValueError("dense operand rank does not match operation")
+    if dense.shape[0] != expected or dense.dtype != data.dtype or dense.device != data.device:
+        raise ValueError("dense operand shape/dtype/device mismatch")
+    out_rows = prepared.n_rows if prepared.op == "non" else prepared.n_cols
+    out_shape = (out_rows,) if vector else (out_rows, dense.shape[1])
+    if out is not None:
+        if out.shape != out_shape or out.dtype != data.dtype or out.device != data.device:
+            raise ValueError("out shape/dtype/device mismatch")
+        if any(torch._C._overlaps(out, value) for value in (data, indices, ptr, dense)):
+            raise ValueError("out overlaps an input")
+    cfg, info = {}, dict(backend=_backend_name())
+    if selected in CSC_ALGORITHMS:
+        cfg, info = resolve_csc_config(selected, str(data.dtype).removeprefix("torch."),
+                                       1 if vector else dense.shape[1], backend_caps(data.device), cfg_input, op=prepared.op)
+    elif cfg_input:
+        raise ValueError("legacy CSC route does not accept config")
+    # Range checks precede measurement. Conversion is performed inside each run.
+    safe32 = prepared.int32_safe
+    def execute(phases):
+        fallback_reason = None
+        with phases.measure("process_gpu_ms"):
+            a = data.resolve_conj().contiguous()
+            i, p = indices.contiguous(), ptr.contiguous()
+            b = dense.resolve_conj()
+            if data.dtype == torch.float16:
+                a, b = a.float(), b.float()
+            execution = None
+            if selected not in CSC_ALGORITHMS:
+                if prepared.n_cols > _INDEX_LIMIT_INT32 or prepared.nnz > _INDEX_LIMIT_INT32:
+                    raise ValueError("legacy CSC owner-map exceeds supported int32 address range")
+                lengths = p[1:] - p[:-1]
+                maximum = int(lengths.max().item()) if prepared.n_cols else 0
+                validated = (a, i, p, prepared.n_rows, prepared.n_cols, lengths, maximum)
+                if vector:
+                    execution = prepare_spmv_csc(a, i, p, prepared.shape, op=prepared.op,
+                                                 _validated=validated, _allow_delegate=False, **(prepared.legacy_options if selected == prepared.alg else {}))
+                else:
+                    from .spmm_csc import prepare_spmm_csc_route
+                    execution = prepare_spmm_csc_route(a, i, p, prepared.shape, op=prepared.op,
+                                                       _validated=validated, **(prepared.legacy_options if selected == prepared.alg else {}))
+        def compute(ii, pp):
+            if selected in CSC_ALGORITHMS:
+                return _launch_csc_columns(a, ii, pp, b, prepared.shape, prepared.op, selected, cfg)
+            execution.kernel_indices, execution.kernel_indptr = ii, pp
+            if vector:
+                return _triton_spmv_csc_kernel(execution, b.contiguous(), _normalize_spmv_csc_op(prepared.op))
+            from .spmm_csc import _triton_spmm_csc_base_kernel
+            return _triton_spmm_csc_base_kernel(execution, b)
+        with phases.measure("compute_ms"):
+            try:
+                result = compute(i, p)
+            except (RuntimeError, TypeError) as exc:
+                if prepared.index_fallback_policy != "auto" or not is_index_compatibility_error(exc) or not (i.dtype == torch.int64 or p.dtype == torch.int64):
+                    raise
+                if not safe32:
+                    raise RuntimeError("int32 fallback is unsafe") from exc
+                i, p = i.to(torch.int32), p.to(torch.int32)
+                fallback_reason = str(exc)
+                result = compute(i, p)
+            result = result.to(data.dtype)
+            if out is not None:
+                out.copy_(result)
+                result = out
+        meta = dict(info, alg=selected, alg_requested=alg or prepared.alg, alg_resolved=selected,
+                    config=cfg, op=prepared.op, implementation_version=1, timing_contract_version=2,
+                    compute_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
+                    input_indices_dtype=str(indices.dtype), input_indptr_dtype=str(ptr.dtype),
+                    execution_indices_dtype=str(i.dtype), execution_indptr_dtype=str(p.dtype),
+                    index_fallback_applied=fallback_reason is not None, index_fallback_reason=fallback_reason,
+                    transpose_strategy="native_column_reduce" if prepared.op != "non" else "native_scatter",
+                    native_format="csc", execution_path="native_csc", process_cpu_ms=0.0,
+                    component_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
+                    dense_stride=tuple(dense.stride()), output_stride=tuple(result.stride()))
+        return result, meta
+    measured = return_time or return_meta or timing
+    if measured:
+        start, end = _ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True)
+        start.record()
+    result, meta = execute(Phases(False))
+    if measured:
+        end.record()
+        end.synchronize()
+        meta["gpu_ms"] = start.elapsed_time(end)
+        meta["operator_ms"] = meta["op_total_ms"] = meta["gpu_ms"]
+    if timing:
+        phases = Phases(True)
+        execute(phases)
+        meta.update(phases.results())
+    if return_time and return_meta:
+        return result, meta["operator_ms"], meta
+    if return_time:
+        return result, meta["operator_ms"]
+    return (result, meta) if return_meta else result
+
+
+def flagsparse_spmv_csc_run(prepared, x, *, alg=None, config=None, op=None, out=None,
+                            return_time=False, return_meta=False, timing=False):
+    if isinstance(prepared, PreparedCscRoute) and prepared.kind != "spmv":
+        raise TypeError("prepared must describe CSC SpMV")
+    if not isinstance(prepared, PreparedCscRoute):
+        prepared = _prepare_csc_registered(prepared.data, prepared.kernel_indices, prepared.kernel_indptr,
+                                           prepared.shape, prepared.op, None, alg or "auto", config,
+                                           prepared.index_fallback_policy, "spmv",
+                                           {"block_nnz": prepared.block_nnz, "max_segments": prepared.max_segments}
+                                           if alg in (None, "auto", "spmv_csc_base") else None)
+    return _run_csc_registered(prepared, x, alg=alg, config=config, op=op, out=out,
+                               return_time=return_time, return_meta=return_meta, timing=timing)

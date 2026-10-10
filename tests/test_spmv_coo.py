@@ -45,6 +45,7 @@ WARMUP = 10
 ITERS = 50
 
 DTYPE_MAP = {
+    "float16": torch.float16,
     "float32": torch.float32,
     "float64": torch.float64,
     "complex64": torch.complex64,
@@ -62,6 +63,8 @@ def _dtype_name(dtype):
 
 
 def _parse_csv_tokens(value, mapping, name):
+    if str(value).strip().lower() == "all":
+        return list(mapping.values())
     tokens = [token.strip().lower() for token in value.split(",") if token.strip()]
     if not tokens:
         raise ValueError(f"{name} must not be empty")
@@ -75,6 +78,8 @@ def _parse_csv_tokens(value, mapping, name):
 
 
 def _parse_ops(value):
+    if str(value).strip().lower() == "all":
+        return list(OP_NAMES)
     tokens = [token.strip().lower() for token in value.split(",") if token.strip()]
     if not tokens:
         raise ValueError("--ops must not be empty")
@@ -87,7 +92,7 @@ def _parse_ops(value):
 
 
 def _random_values(shape, dtype, device):
-    if dtype in (torch.float32, torch.float64):
+    if dtype in (torch.float16, torch.float32, torch.float64):
         return torch.randn(shape, dtype=dtype, device=device)
     if dtype == torch.complex64:
         real = torch.randn(shape, dtype=torch.float32, device=device)
@@ -135,7 +140,7 @@ def _allclose_error_ratio(actual, reference, atol, rtol):
 
 
 def _reference_dtype(dtype):
-    if dtype == torch.float32:
+    if dtype in (torch.float16, torch.float32):
         return torch.float64
     if dtype == torch.complex64:
         return torch.complex128
@@ -1133,6 +1138,102 @@ def run_all_dtypes_tocsr_csv(
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 
+def run_registered_coo(paths, args, value_dtypes, index_dtypes, ops):
+    import hashlib
+    import json
+    import traceback
+    config = json.loads(args.config) if args.config else None
+    if config is not None and (args.alg in ("all", "compare", "auto") or not isinstance(config, dict)):
+        raise ValueError("--config requires one explicit algorithm and a JSON object")
+    fields = ["matrix", "dtype", "index_dtype", "op", "alg", "ms", "gpu_ms",
+              "process_cpu_ms", "process_gpu_ms", "compute_ms", "vendor_ms", "vendor_backend",
+              "vendor_status", "vendor_reason", "speedup_vs_vendor", "status", "error", "meta"]
+    handle = None
+    writer = None
+    if args.csv_coo:
+        os.makedirs(os.path.dirname(os.path.abspath(args.csv_coo)), exist_ok=True)
+        handle = open(args.csv_coo, "w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+    print("Native COO; ms=process_cpu_ms+gpu_ms; transpose and plans included; diagnostics measured separately.")
+    print("Matrix DType Idx Op Algorithm ms GPU CPU ProcGPU Compute Vendor V/Alg Status")
+    try:
+        for path in paths:
+            for dtype in value_dtypes:
+                if path == "__coo_synthetic__":
+                    torch.manual_seed(1729)
+                    device = accelerator_device()
+                    shape = (37, 53)
+                    row = torch.randint(shape[0], (257,), device=device)
+                    col = torch.randint(shape[1], (257,), device=device)
+                    data = _random_values((257,), dtype, device)
+                else:
+                    data, row, col, shape = _load_mtx_to_coo_torch(path, dtype=dtype, device=accelerator_device())
+                for op in ops:
+                    seed = int.from_bytes(hashlib.sha256(f"{os.path.basename(path)}:{dtype}:{shape}:{op}".encode()).digest()[:4], "little")
+                    torch.manual_seed(seed)
+                    x = _random_values((_x_size_for_op(shape, op),), dtype, data.device)
+                    reference = _correctness_reference(data, row, col, x, shape, dtype, op=op)
+                    atol, rtol = _tol_for_dtype(dtype)
+                    for index_dtype in index_dtypes:
+                        r, c = row.to(index_dtype), col.to(index_dtype)
+                        vendor = {"ms": None, "backend": None, "reason": "native same-device COO baseline unavailable"}
+                        if not args.no_cusparse and fs_common._is_rocm_runtime():
+                            try:
+                                vendor = fs_common._benchmark_spmv_coo_sparse_ref(data, r, c, x, shape,
+                                    warmup=args.warmup, iters=args.iters, op=op)
+                            except Exception as exc:
+                                if not isinstance(exc, NotImplementedError) and not any(token in str(exc).lower() for token in ("unsupported", "not supported", "not_supported", "not implemented")):
+                                    raise
+                                vendor["reason"] = str(exc)
+                        if vendor.get("ms") is None and not args.no_cusparse:
+                            print(f"Vendor SKIP {dtype}/{op}: {vendor.get('reason')}")
+                        vendor_error = None
+                        if vendor.get("values") is not None:
+                            vendor_error = _allclose_error_ratio(vendor["values"], reference, atol, rtol)
+                        names = fs.list_spmv_coo_algorithms(op=op, dtype=dtype) if args.alg in ("all", "compare") else (args.alg,)
+                        print(f"Algorithms {dtype}/{index_dtype}/{op}: {', '.join(names)}")
+                        for alg in names:
+                            record = dict(matrix=os.path.basename(path), dtype=_dtype_name(dtype),
+                                          index_dtype=_dtype_name(index_dtype), op=op, alg=alg,
+                                          vendor_ms=vendor.get("ms"), vendor_backend=vendor.get("backend"),
+                                          vendor_reason=vendor.get("reason"),
+                                          vendor_status="SKIP" if vendor_error is None else ("PASS" if vendor_error <= 1 else "FAIL"))
+                            try:
+                                prepared = fs.prepare_spmv_coo(data, r, c, shape, op=op, alg=alg, config=config)
+                                # Resolve capabilities outside the timed/warmup loop.
+                                if alg in spmv_coo_mod._COO_NEW_ALGORITHMS:
+                                    spmv_coo_mod._resolve_coo_config(alg, dtype, data.device, config)
+                                y, gpu_ms = _cuda_event_benchmark(lambda: fs.flagsparse_spmv_coo_run(prepared, x), args.warmup, args.iters)
+                                _, meta = fs.flagsparse_spmv_coo_run(prepared, x, return_meta=True, timing=args.timing)
+                                error = _allclose_error_ratio(y, reference, atol, rtol)
+                                total = gpu_ms + meta["process_cpu_ms"]
+                                record.update(ms=total, gpu_ms=gpu_ms, process_cpu_ms=meta["process_cpu_ms"],
+                                    process_gpu_ms=meta.get("process_gpu_ms"), compute_ms=meta.get("compute_ms"),
+                                    speedup_vs_vendor=_speedup_ratio(vendor.get("ms"), total),
+                                    status="PASS" if error <= 1 else "FAIL", error=error, meta=json.dumps(meta, default=str))
+                            except NotImplementedError as exc:
+                                record.update(status="SKIP", error=str(exc))
+                                print(f"excluded {alg}: {exc}")
+                            except Exception as exc:
+                                record.update(status="ERROR", error=str(exc))
+                                traceback.print_exc()
+                                if args.fail_fast:
+                                    if writer:
+                                        writer.writerow(record)
+                                        handle.flush()
+                                    raise
+                            if writer:
+                                writer.writerow(record)
+                                handle.flush()
+                            values = " ".join(str(record.get(k, "N/A")) for k in fields[:5])
+                            times = " ".join(_fmt_ms(record.get(k)) for k in ("ms", "gpu_ms", "process_cpu_ms", "process_gpu_ms", "compute_ms", "vendor_ms"))
+                            print(f"{values} {times} {record.get('speedup_vs_vendor', 'N/A')} {record['status']}")
+    finally:
+        if handle:
+            handle.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SpMV COO test: synthetic dense->COO and optional .mtx, export CSV."
@@ -1146,7 +1247,7 @@ def main():
         "--synthetic", action="store_true", help="Run synthetic dense->COO tests"
     )
     parser.add_argument(
-        "--csv-coo",
+        "--csv-coo", "--csv",
         type=str,
         default=None,
         metavar="FILE",
@@ -1160,13 +1261,13 @@ def main():
         help="Run all dtypes on given .mtx and export COO-to-CSR SpMV results to CSV",
     )
     parser.add_argument(
-        "--dtypes",
+        "--dtypes", "--dtype",
         type=str,
         default="float32,float64,complex64,complex128",
         help="Comma-separated value dtypes: float32,float64,complex64,complex128",
     )
     parser.add_argument(
-        "--index-dtypes",
+        "--index-dtypes", "--index-dtype",
         type=str,
         default="int32,int64",
         help="Comma-separated index dtypes: int32,int64",
@@ -1189,6 +1290,10 @@ def main():
         action="store_true",
         help="Show/export native COO timing breakdown columns",
     )
+    parser.add_argument("--alg", default=None)
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--no-vendor", dest="no_cusparse", action="store_true")
     args = parser.parse_args()
     value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(
@@ -1196,8 +1301,10 @@ def main():
     )
     ops_arg = args.ops or ("non" if args.csv_tocsr else "non,trans,conj")
     ops = _parse_ops(ops_arg)
+    if torch.float16 in value_dtypes and args.alg is None and not args.csv_tocsr:
+        args.alg = "auto"
 
-    if args.synthetic:
+    if args.synthetic and args.alg is None:
         run_synthetic(
             value_dtypes=value_dtypes,
             index_dtypes=index_dtypes,
@@ -1214,6 +1321,16 @@ def main():
             paths.append(p)
         elif os.path.isdir(p):
             paths.extend(sorted(glob.glob(os.path.join(p, "*.mtx"))))
+    if args.alg is not None:
+        if args.csv_tocsr:
+            parser.error("--alg is for native COO, not --csv-tocsr")
+        if args.synthetic:
+            # Existing loader accepts this sentinel without writing a matrix file.
+            paths = ["__coo_synthetic__"]
+        if not paths:
+            parser.error("provide matrices or --synthetic")
+        run_registered_coo(paths, args, value_dtypes, index_dtypes, ops)
+        return
     if args.csv_coo:
         if not paths:
             paths = sorted(glob.glob("*.mtx"))

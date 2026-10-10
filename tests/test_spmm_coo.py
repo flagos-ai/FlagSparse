@@ -22,6 +22,10 @@ The default public route is a sorted row-run Triton COO kernel. A second native
 atomic COO route is retained for internal parity checks and debug.
 """
 
+import json
+import hashlib
+import traceback
+
 import argparse
 import csv
 import glob
@@ -54,7 +58,7 @@ VALUE_DTYPES = [
     torch.complex128,
 ]
 INDEX_DTYPES = [torch.int32, torch.int64]
-CSV_VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
+CSV_VALUE_DTYPES = [torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128]
 CSV_INDEX_DTYPES = [torch.int32, torch.int64]
 OP_NAMES = tuple(ast_ops.SPMM_COO_OP_NAMES.values())
 LAYOUT_NAMES = ("row", "col")
@@ -120,6 +124,8 @@ BEST_FIELDS = [
     "index_dtype",
     "op",
     "layout",
+    "dense_cols",
+    "status",
     "best_alg",
     "best_ms",
     "best_gpu_ms",
@@ -181,8 +187,8 @@ def _parse_algs(value, route="rowrun"):
             return ["coo_rowrun", "coo_atomic"]
         return ["auto"]
     value = str(value).strip().lower()
-    if value in ("auto", "all"):
-        return [value]
+    if value in ("auto", "all", "compare"):
+        return ["all" if value == "compare" else value]
     allowed = set(ast.SPMM_COO_ALGORITHMS)
     aliases = {
         "rowrun": "coo_rowrun",
@@ -222,6 +228,8 @@ def _expand_algs(alg_names, op, dtype):
 
 
 def _parse_csv_tokens(value, mapping, option_name):
+    if str(value).strip().lower() == "all":
+        return list(mapping.values())
     tokens = [token.strip().lower() for token in str(value).split(",") if token.strip()]
     if not tokens:
         raise ValueError(f"{option_name} must not be empty")
@@ -399,7 +407,7 @@ def _write_csv(path, rows, fields):
 def _best_rows(rows):
     groups = {}
     for row in rows:
-        if row.get("status") != "PASS" or row.get("ms") is None:
+        if row.get("ms") is None or row["ms"] <= 0:
             continue
         key = (
             row["matrix"],
@@ -407,10 +415,11 @@ def _best_rows(rows):
             row["index_dtype"],
             row["op"],
             row["layout"],
+            row["dense_cols"],
         )
         groups.setdefault(key, []).append(row)
     best = []
-    for (matrix, dtype, index_dtype, op, layout), group in sorted(groups.items()):
+    for (matrix, dtype, index_dtype, op, layout, dense_cols), group in sorted(groups.items()):
         selected = min(group, key=lambda item: item["ms"])
         best.append(
             {
@@ -419,6 +428,8 @@ def _best_rows(rows):
                 "index_dtype": index_dtype,
                 "op": op,
                 "layout": layout,
+                "dense_cols": dense_cols,
+                "status": selected["status"],
                 "best_alg": selected["alg"],
                 "best_ms": selected["ms"],
                 "best_gpu_ms": selected["gpu_ms"],
@@ -624,10 +635,10 @@ def _cuda_event_benchmark(op, warmup, iters):
 
 
 def _time_coo_algorithm(
-    prepared, B, alg, warmup, iters, timing=False, diagnose=False, layout="row"
+    prepared, B, alg, warmup, iters, timing=False, diagnose=False, layout="row", config=None
 ):
     out, gpu_ms = _cuda_event_benchmark(
-        lambda: ast.flagsparse_spmm_coo_run(prepared, B, alg=alg, dense_layout=layout),
+        lambda: ast.flagsparse_spmm_coo_run(prepared, B, alg=alg, config=config, dense_layout=layout),
         warmup,
         iters,
     )
@@ -635,6 +646,7 @@ def _time_coo_algorithm(
         prepared,
         B,
         alg=alg,
+        config=config,
         dense_layout=layout,
         return_meta=True,
         timing=bool(timing),
@@ -642,6 +654,7 @@ def _time_coo_algorithm(
     )
     process_cpu_ms = float(meta.get("process_cpu_ms", 0.0) or 0.0)
     row = {
+        "meta": json.dumps(meta, default=str),
         "alg": meta.get("alg", alg),
         "ms": process_cpu_ms + gpu_ms,
         "gpu_ms": gpu_ms,
@@ -806,6 +819,7 @@ def run_one_alg_case(
     timing,
     diagnose,
     progress=False,
+    config=None, emit=None, fail_fast=False,
 ):
     matrix_name = os.path.basename(path)
 
@@ -824,13 +838,22 @@ def run_one_alg_case(
 
     device = accelerator_device()
     stage_t0 = _start("load mtx")
-    data, row, col, shape = load_mtx_to_coo_torch(path, dtype=dtype, device=device)
+    if path == "__coo_synthetic__":
+        torch.manual_seed(1729)
+        shape = (37, 53)
+        row = torch.randint(37, (257,), device=device)
+        col = torch.randint(53, (257,), device=device)
+        data = _build_values(257, dtype, device)
+    else:
+        data, row, col, shape = load_mtx_to_coo_torch(path, dtype=dtype, device=device)
     row = row.to(index_dtype)
     col = col.to(index_dtype)
     n_rows, n_cols = shape
     _done("load mtx", stage_t0, f"shape=({n_rows},{n_cols}) nnz={int(data.numel())}")
     b_rows = n_rows if ast_ops._spmm_coo_op_transposes(op) else n_cols
     stage_t0 = _start(f"build dense B shape=({b_rows},{dense_cols})")
+    seed = int.from_bytes(hashlib.sha256(f"{matrix_name}:{dtype}:{shape}:{op}:{dense_cols}".encode()).digest()[:4], "little")
+    torch.manual_seed(seed)
     B = _materialize_dense_layout_for_test(
         _build_dense_matrix(b_rows, dense_cols, dtype, device),
         layout,
@@ -868,22 +891,25 @@ def run_one_alg_case(
     cusparse_ms = None
     cusparse_reason = ""
     if run_cusparse:
-        vendor_label = fs_common._expected_vendor_sparse_label()
-        stage_t0 = _start(f"time {vendor_label} COO reference")
-        cusparse_out, cusparse_ms, cusparse_reason = _time_cusparse_coo(
-            case,
-            ref,
-            dtype,
-            warmup,
-            iters,
-            layout=layout,
-        )
-        _done(
-            f"time {vendor_label} COO reference",
-            stage_t0,
-            f"ms={_fmt_ms(cusparse_ms)} reason={cusparse_reason or ''}",
-        )
+        if fs_common._is_rocm_runtime():
+            state = None
+            try:
+                # Original COO descriptor and original op: no pre-transposed baseline.
+                state = ast_ops._prepare_spmm_coo_ref_hipsparse(data, row, col, B.contiguous(), shape, op=op)
+                cusparse_out, cusparse_ms = _cuda_event_benchmark(
+                    lambda: ast_ops._run_spmm_coo_ref_hipsparse_prepared(state), warmup, iters)
+            except Exception as exc:
+                cusparse_reason = str(exc)
+            finally:
+                if state is not None:
+                    ast_ops._destroy_spmm_coo_ref_hipsparse_prepared(state)
+        elif op == "non":
+            cusparse_out, cusparse_ms, cusparse_reason = _time_cusparse_coo(case, ref, dtype, warmup, iters, layout=layout)
+        else:
+            cusparse_reason = "native COO vendor transpose operation is not wired on this backend"
 
+    if run_cusparse and cusparse_ms is None:
+        print(f"Vendor SKIP {dtype}/{op}/{layout}: {cusparse_reason}")
     rows = []
     diag_rows = []
     try:
@@ -891,6 +917,9 @@ def run_one_alg_case(
         prepared = ast.prepare_spmm_coo_route(data, row, col, shape, op=op, alg="auto")
         _done("prepare COO route", stage_t0, f"row_runs={prepared.n_segs}")
     except Exception as exc:
+        traceback.print_exc()
+        if fail_fast:
+            raise
         _done("prepare COO route", stage_t0, f"failed={exc}")
         for alg in _expand_algs(alg_names, op, dtype):
             rows.append(
@@ -912,9 +941,13 @@ def run_one_alg_case(
                     cusparse_reason=cusparse_reason,
                 )
             )
+        for failed in rows:
+            failed["status"] = "ERROR"
         return rows, diag_rows
 
-    for alg in _expand_algs(alg_names, op, dtype):
+    names = _expand_algs(alg_names, op, dtype)
+    print(f"Algorithms {dtype}/{op}/{layout}/N={dense_cols}: {', '.join(names)}")
+    for alg in names:
         stage_t0 = None
         try:
             ast.resolve_spmm_coo_algorithm(alg, op, dtype)
@@ -928,9 +961,10 @@ def run_one_alg_case(
                 timing=timing,
                 diagnose=diagnose,
                 layout=layout,
+                config=config,
             )
             _done(f"run {alg}", stage_t0, f"ms={_fmt_ms(result['ms'])}")
-        except (ast.SpmmCooAlgorithmUnavailable, ValueError, TypeError) as exc:
+        except (ast.SpmmCooAlgorithmUnavailable, NotImplementedError) as exc:
             if stage_t0 is not None:
                 _done(f"run {alg}", stage_t0, f"skip={exc}")
             rows.append(
@@ -952,12 +986,29 @@ def run_one_alg_case(
                     cusparse_reason=cusparse_reason,
                 )
             )
+            print(f"excluded {alg}: {exc}")
+            continue
+        except Exception as exc:
+            traceback.print_exc()
+            failed = _skip_alg_row(path, dtype, index_dtype_name, op, layout, alg, shape,
+                data.numel(), dense_cols, b_stride, torch_ms, cusparse_ms, str(exc), timing)
+            failed["status"] = "ERROR"
+            rows.append(failed)
+            if emit:
+                emit(failed)
+            if fail_fast:
+                raise
             continue
         out = result.pop("out")
         diagnostics = result.pop("diagnostics")
         torch_profile = _error_profile(out, ref, dtype)
         cusparse_profile = _error_profile(out, cusparse_out, dtype)
         row_out = {
+            "meta": result.get("meta"),
+            "vendor_ms": cusparse_ms,
+            "vendor_backend": fs_common._expected_vendor_sparse_label(),
+            "vendor_status": "SKIP" if cusparse_out is None else _error_profile(cusparse_out, ref, dtype)["status"],
+            "speedup_vs_vendor": _ratio(cusparse_ms, result["ms"]),
             "matrix": os.path.basename(path),
             "dtype": _dtype_name(dtype),
             "index_dtype": index_dtype_name,
@@ -987,6 +1038,8 @@ def run_one_alg_case(
             row_out["process_gpu_ms"] = result["process_gpu_ms"]
             row_out["compute_ms"] = result["compute_ms"]
         rows.append(row_out)
+        if emit:
+            emit(row_out)
         if diagnose:
             diag = {
                 "matrix": os.path.basename(path),
@@ -2281,84 +2334,45 @@ def print_compare_results(results, value_dtype, index_dtype):
     print("-" * 178)
 
 
-def run_all_dtypes_export_csv(
-    paths,
-    csv_path,
-    warmup=10,
-    iters=50,
-    run_cusparse=True,
-    n_dense_cols=32,
-    block_n=DEFAULT_BLOCK_N,
-    block_nnz=DEFAULT_BLOCK_NNZ,
-    route="rowrun",
-    value_dtypes=None,
-    index_dtypes=None,
-    op_names=None,
-    layout_names=None,
-    timing=False,
-    alg_names=None,
-    diagnose=False,
-):
+def run_all_dtypes_export_csv(paths, csv_path, warmup=10, iters=50, run_cusparse=True,
+                              n_dense_cols=32, block_n=DEFAULT_BLOCK_N, block_nnz=DEFAULT_BLOCK_NNZ,
+                              route="rowrun", value_dtypes=None, index_dtypes=None,
+                              op_names=None, layout_names=None, timing=False, alg_names=None,
+                              diagnose=False, config=None, fail_fast=False):
     alg_names = _parse_algs(None, route=route) if alg_names is None else alg_names
     csv_path = _normalize_csv_path(csv_path)
-    rows = []
-    diag_rows = []
-    fieldnames = list(PERF_FIELDS)
-    if timing:
-        fieldnames += TIMING_FIELDS
-    best_path = csv_path[:-4] + ".best.csv"
-    diag_path = csv_path[:-4] + ".diagnose.csv"
-    value_dtypes = CSV_VALUE_DTYPES if value_dtypes is None else value_dtypes
-    index_dtypes = CSV_INDEX_DTYPES if index_dtypes is None else index_dtypes
-    op_names = ["non"] if op_names is None else op_names
-    layout_names = ["row"] if layout_names is None else layout_names
-    for value_dtype in value_dtypes:
-        for index_dtype in index_dtypes:
-            for op_name in op_names:
-                for layout_name in layout_names:
-                    print("=" * 150)
-                    print(
-                        f"COO SpMM registry | dtype={_dtype_name(value_dtype)} index={_dtype_name(index_dtype)} "
-                        f"op={op_name} layout={layout_name} alg={','.join(alg_names)}",
-                        flush=True,
-                    )
-                    for matrix_idx, path in enumerate(paths, start=1):
-                        print(
-                            f"[{matrix_idx}/{len(paths)}] [{os.path.basename(path)}] START",
-                            flush=True,
-                        )
-                        case_rows, case_diag_rows = run_one_alg_case(
-                            path,
-                            value_dtype,
-                            _dtype_name(index_dtype),
-                            index_dtype,
-                            op_name,
-                            layout_name,
-                            alg_names,
-                            n_dense_cols,
-                            warmup,
-                            iters,
-                            run_cusparse,
-                            timing,
-                            diagnose,
-                            progress=True,
-                        )
-                        rows.extend(case_rows)
-                        diag_rows.extend(case_diag_rows)
-                        for row in case_rows:
-                            print(
-                                f"{row['matrix']:<32} {row['alg']:<16} {row['status']:<5} "
-                                f"ms={_fmt_ms(row['ms'])} torch={_fmt_ms(row['torch_ms'])} "
-                                f"err={_fmt_err(row['err_vs_torch'])} reason={row.get('reason') or row.get('cusparse_reason') or ''}",
-                                flush=True,
-                            )
-    _write_csv(csv_path, rows, fieldnames)
-    _write_csv(best_path, _best_rows(rows), BEST_FIELDS)
+    fields = list(PERF_FIELDS) + (TIMING_FIELDS if timing else [])
+    fields += ["vendor_ms", "vendor_backend", "vendor_status", "speedup_vs_vendor", "meta"]
+    rows, diagnostic_rows = [], []
+    widths = n_dense_cols if isinstance(n_dense_cols, list) else [n_dense_cols]
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        def emit(row):
+            writer.writerow(row)
+            handle.flush()
+            rows.append(row)
+            times = " ".join(_fmt_ms(row.get(k)) for k in ("ms", "gpu_ms", "process_cpu_ms", "process_gpu_ms", "compute_ms", "cusparse_ms"))
+            print(f"{row['matrix']} {row['dtype']} {row['index_dtype']} {row['op']} {row['layout']} N={row['dense_cols']} {row['alg']} {times} {_fmt_speedup(row.get('cusparse_ms'), row.get('ms'))} {row['status']}")
+        print("Native COO; ms=CPU+GPU; per-run transpose/plans included; diagnostics measured separately.")
+        print("Matrix DType Idx Op Layout N Algorithm ms GPU CPU ProcGPU Compute Vendor V/Alg Status")
+        for dtype in (CSV_VALUE_DTYPES if value_dtypes is None else value_dtypes):
+            for index in (CSV_INDEX_DTYPES if index_dtypes is None else index_dtypes):
+                for op in (op_names or ["non"]):
+                    for layout in (layout_names or ["row"]):
+                        for width in widths:
+                            for path in paths:
+                                case_rows, diag = run_one_alg_case(path, dtype, _dtype_name(index), index,
+                                    op, layout, alg_names, width, warmup, iters, run_cusparse, timing,
+                                    diagnose, config=config, emit=emit, fail_fast=fail_fast)
+                                # Unsupported rows are returned without running a kernel.
+                                for row in case_rows:
+                                    if not any(row is existing for existing in rows):
+                                        emit(row)
+                                diagnostic_rows.extend(diag)
+    _write_csv(csv_path[:-4] + ".best.csv", _best_rows(rows), BEST_FIELDS)
     if diagnose:
-        _write_csv(diag_path, diag_rows, DIAG_FIELDS)
-        print(f"Wrote {len(diag_rows)} diagnose rows to {diag_path}")
-    print(f"Wrote best rows to {best_path}")
-    print(f"Wrote {len(rows)} rows to {csv_path}")
+        _write_csv(csv_path[:-4] + ".diagnose.csv", diagnostic_rows, DIAG_FIELDS)
 
 
 def run_api_validation_checks():
@@ -2973,7 +2987,7 @@ def main():
         help="Comma-separated index dtype grid for CSV export: int32,int64",
     )
     parser.add_argument(
-        "--op",
+        "--op", "--ops",
         default="non",
         help="SpMM op: non, trans, conj, all, or comma-separated list",
     )
@@ -2984,7 +2998,7 @@ def main():
         help="Dense RHS/output layout: row, col, or all",
     )
     parser.add_argument(
-        "--dense-cols", type=int, default=32, help="Dense RHS column count"
+        "--dense-cols", default="32", help="Dense RHS column count"
     )
     parser.add_argument(
         "--block-n",
@@ -3043,13 +3057,23 @@ def main():
         help="Skip dense-column COO heuristic coverage in synthetic mode",
     )
     parser.add_argument(
-        "--csv",
+        "--csv", "--csv-coo",
         type=str,
         default=None,
         metavar="FILE",
         help="Run selected dtype/index grids on all .mtx and write results to one CSV",
     )
+    parser.add_argument("--config")
+    parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--no-vendor", dest="no_cusparse", action="store_true")
     args = parser.parse_args()
+    widths = [int(v) for v in args.dense_cols.split(",")]
+    if not widths or any(v < 0 for v in widths):
+        parser.error("--dense-cols requires nonnegative integers")
+    args.dense_cols = widths[0] if len(widths) == 1 else widths
+    config = json.loads(args.config) if args.config else None
+    if config is not None and (args.alg in (None, "all", "compare", "auto") or "," in args.alg or not isinstance(config, dict)):
+        parser.error("--config requires a JSON object and one explicit algorithm")
 
     if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
@@ -3073,7 +3097,7 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
-    if args.synthetic:
+    if args.synthetic and args.alg is None:
         run_comprehensive_synthetic(
             warmup=args.warmup,
             iters=args.iters,
@@ -3096,6 +3120,10 @@ def main():
         elif os.path.isdir(path):
             paths.extend(sorted(glob.glob(os.path.join(path, "*.mtx"))))
 
+    if args.synthetic:
+        paths = ["__coo_synthetic__"]
+    if args.alg is not None and args.csv is None:
+        args.csv = "spmm_coo.csv"
     if not paths and not args.csv:
         print(
             "No .mtx files given. Use: python test_spmm_coo.py <file.mtx> [file2.mtx ...] or <dir/>"
@@ -3151,6 +3179,8 @@ def main():
             timing=args.timing,
             alg_names=alg_names,
             diagnose=args.diagnose,
+            config=config,
+            fail_fast=args.fail_fast,
         )
         return
 
