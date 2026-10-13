@@ -1739,7 +1739,7 @@ def _run_csc_extension_route(prepared, B, timing=False):
     return _csc_native._run_csc_registered(prepared, B, return_meta=True, timing=timing)
 
 
-for _name in ("csc_col_panel", "csc_col_tile_panel_atomic"):
+for _name in ("csc_col_panel", "csc_col_tile_panel_atomic", "csc_col_kparallel", "csc_col_split_reduce"):
     SPMM_CSC_ALGORITHMS[_name] = SpmmCscAlgorithm(
         name=_name, display_name=_name,
         supported_ops=_csc_native._csc_spec(_name, "spmm")["ops"],

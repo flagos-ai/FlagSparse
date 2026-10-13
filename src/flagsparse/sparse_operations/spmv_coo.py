@@ -1014,6 +1014,71 @@ def _coo_segmented_panel_kernel(A, Row, Col, B, C, NNZ, N,
 
 
 @triton.jit
+def _coo_stream_panel_kernel(A, Row, Col, B, C, NNZ, N,
+                             bs0, bs1, cs0, cs1,
+                             T: tl.constexpr, BN: tl.constexpr, BLOCKS: tl.constexpr,
+                             COMPLEX: tl.constexpr, CONJ: tl.constexpr,
+                             FP64: tl.constexpr, SEGMENT: tl.constexpr):
+    lane = tl.arange(0, T)
+    n = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN)
+    base = tl.program_id(0).to(tl.int64) * T * BLOCKS
+    acc_type = tl.float64 if FP64 else tl.float32
+    carry_r = tl.full((BN,), 0, acc_type)
+    carry_i = tl.full((BN,), 0, acc_type)
+    carry_row = tl.full((), -1, tl.int64)
+    for block in range(BLOCKS):
+        first = base + block * T
+        if first < NNZ:
+            k = first + lane
+            row = tl.load(Row + k, k < NNZ, -1).to(tl.int64)
+            col = tl.load(Col + k, k < NNZ, 0).to(tl.int64)
+            valid = (k[:, None] < NNZ) & (n[None, :] < N)
+            real, imag = _coo_product(A, B, k[:, None], col[:, None], n[None, :],
+                                     bs0, bs1, valid, COMPLEX, CONJ, FP64)
+            if SEGMENT:
+                first_row = tl.load(Row + first).to(tl.int64)
+                same = carry_row == first_row
+                flush = (carry_row >= 0) & ~same & (n < N)
+                dst = carry_row * cs0 + n * cs1
+                if COMPLEX:
+                    tl.atomic_add(C + 2 * dst, carry_r, flush, sem="relaxed")
+                    tl.atomic_add(C + 2 * dst + 1, carry_i, flush, sem="relaxed")
+                else:
+                    tl.atomic_add(C + dst, carry_r, flush, sem="relaxed")
+                real += tl.where((lane[:, None] == 0) & same, carry_r[None, :], 0)
+                if COMPLEX:
+                    imag += tl.where((lane[:, None] == 0) & same, carry_i[None, :], 0)
+                prev = tl.load(Row + k - 1, (lane > 0) & (k < NNZ), -1)
+                head = (lane == 0) | (row != prev)
+                flags = tl.broadcast_to(head[:, None], (T, BN))
+                real, _ = tl.associative_scan((real, flags), 0, _coo_scan_pair)
+                if COMPLEX:
+                    imag, _ = tl.associative_scan((imag, flags), 0, _coo_scan_pair)
+                last_lane = tl.minimum(T, NNZ - first) - 1
+                nxt = tl.load(Row + k + 1, (lane < last_lane), -1)
+                tail = (row != nxt) & (lane < last_lane)
+                valid = valid & tail[:, None]
+                carry_row = tl.load(Row + first + last_lane).to(tl.int64)
+                carry_r = tl.sum(tl.where(lane[:, None] == last_lane, real, 0), 0)
+                if COMPLEX:
+                    carry_i = tl.sum(tl.where(lane[:, None] == last_lane, imag, 0), 0)
+            dst = row[:, None] * cs0 + n[None, :] * cs1
+            if COMPLEX:
+                tl.atomic_add(C + 2 * dst, real, valid, sem="relaxed")
+                tl.atomic_add(C + 2 * dst + 1, imag, valid, sem="relaxed")
+            else:
+                tl.atomic_add(C + dst, real, valid, sem="relaxed")
+    if SEGMENT:
+        dst = carry_row * cs0 + n * cs1
+        valid = (carry_row >= 0) & (n < N)
+        if COMPLEX:
+            tl.atomic_add(C + 2 * dst, carry_r, valid, sem="relaxed")
+            tl.atomic_add(C + 2 * dst + 1, carry_i, valid, sem="relaxed")
+        else:
+            tl.atomic_add(C + dst, carry_r, valid, sem="relaxed")
+
+
+@triton.jit
 def _coo_rowrun_group_kernel(A, Row, Col, Starts, B, C, RUNS, N,
                              bs0, bs1, cs0, cs1,
                              R: tl.constexpr, V: tl.constexpr,
@@ -1071,8 +1136,12 @@ def _coo_rowrun_group_kernel(A, Row, Col, Starts, B, C, RUNS, N,
 _COO_NEW_ALGORITHMS = (
     "coo_segmented_atomic", "coo_rowrun_subgroup",
     "coo_segmented_panel_atomic", "coo_rowrun_panel",
+    "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic",
 )
-SPMV_COO_ALGORITHMS = ("coo_rowrun", "coo_atomic") + _COO_NEW_ALGORITHMS[:2]
+_COO_ATOMIC_ALGORITHMS = ("coo_atomic", "coo_segmented_atomic", "coo_segmented_panel_atomic",
+                          "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic")
+SPMV_COO_ALGORITHMS = ("coo_rowrun", "coo_atomic", "coo_segmented_atomic",
+                       "coo_rowrun_subgroup", "coo_segmented_stream_atomic")
 
 
 def _resolve_coo_config(alg, dtype, device, config=None, n=1):
@@ -1088,9 +1157,10 @@ def _coo_sorted_runs(data, row, col):
     return data, row, col, starts
 
 
-def _launch_coo_extension(data, row, col, starts, B, shape, alg, cfg, conj=False):
+def _launch_coo_extension(data, row, col, starts, B, shape, alg, cfg, conj=False, compute_dtype=None):
     # B is always a 2D view; SpMV uses a singleton output panel.
-    C = torch.zeros((shape[0], B.shape[1]), device=data.device, dtype=data.dtype)
+    compute_dtype = data.dtype if compute_dtype is None else compute_dtype
+    C = torch.zeros((shape[0], B.shape[1]), device=data.device, dtype=compute_dtype)
     if not data.numel() or not C.numel():
         return C
     complex_ = data.is_complex()
@@ -1099,14 +1169,17 @@ def _launch_coo_extension(data, row, col, starts, B, shape, alg, cfg, conj=False
     c = torch.view_as_real(C) if complex_ else C
     args = (a, row, col)
     common = dict(COMPLEX=complex_, CONJ=conj,
-                  FP64=data.dtype in (torch.float64, torch.complex128),
+                  FP64=compute_dtype in (torch.float64, torch.complex128),
                   num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
-    if "atomic" in alg:
+    if alg in _COO_ATOMIC_ALGORITHMS:
         bn = cfg.get("block_n", 1)
-        _coo_segmented_panel_kernel[(triton.cdiv(data.numel(), cfg["block_nnz"]),
+        stream = alg in ("coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic")
+        kernel = _coo_stream_panel_kernel if stream else _coo_segmented_panel_kernel
+        extra = {"BLOCKS": cfg["blocks_per_program"]} if stream else {}
+        kernel[(triton.cdiv(data.numel(), cfg["block_nnz"] * cfg.get("blocks_per_program", 1)),
                                      triton.cdiv(B.shape[1], bn))](
             *args, b, c, data.numel(), B.shape[1], *B.stride(), *C.stride(),
-            T=cfg["block_nnz"], BN=bn, SEGMENT=cfg["local_reduce"] == "segment", **common)
+            T=cfg["block_nnz"], BN=bn, SEGMENT=cfg["local_reduce"] == "segment", **extra, **common)
     else:
         subgroup = alg == "coo_rowrun_subgroup"
         r = cfg["rows_per_program"] if subgroup else cfg["tile_rows"]
@@ -1137,8 +1210,8 @@ def get_spmv_coo_algorithm_spec(alg):
         raise ValueError(f"unknown COO SpMV algorithm {alg!r}")
     return dict(name=alg, supported_ops=("non", "trans", "conj"),
                 supported_dtypes=SUPPORTED_SPMV_COO_VALUE_DTYPES,
-                implementation_version=1, timing_contract_version=2,
-                requires_sort="atomic" not in alg)
+                implementation_version=2, timing_contract_version=2,
+                requires_sort=alg not in _COO_ATOMIC_ALGORITHMS)
 
 
 def list_spmv_coo_algorithms(op=None, dtype=None, backend=None):
@@ -1211,7 +1284,7 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
             vector = x
             if data.dtype == torch.float16:
                 a, vector = a.float(), x.float()
-            if "atomic" not in selected:
+            if selected not in _COO_ATOMIC_ALGORITHMS:
                 a, r, c, starts = _coo_sorted_runs(a, r, c)
         with phases.measure("compute_ms"):
             reason = None
@@ -1247,7 +1320,8 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
                        backend=_backend_name(),
                        input_indices=(str(row.dtype), str(col.dtype)),
                        execution_indices=(str(r.dtype), str(c.dtype)), fallback_reason=reason,
-                       transpose_strategy="index_roles", implementation_version=1,
+                       transpose_strategy="index_roles", implementation_version=2,
+                       blocks_per_program=cfg.get("blocks_per_program", 1),
                        timing_contract_version=2)
     return _coo_measure_run(execute, return_time, return_meta, timing)
 

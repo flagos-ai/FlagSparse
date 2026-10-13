@@ -2321,7 +2321,9 @@ def _coo_best_rows(rows):
     names = {"coo_rowrun", "coo_atomic", "spmm_coo_alg1", "coo_segmented_atomic",
              "coo_rowrun_subgroup", "coo_segmented_panel_atomic", "coo_rowrun_panel",
              "spmv_csc_base", "spmm_csc_base", "csc_col_subgroup", "csc_col_tile_atomic",
-             "csc_col_panel", "csc_col_tile_panel_atomic"}
+             "csc_col_panel", "csc_col_tile_panel_atomic", "csc_col_vector",
+             "csc_col_kparallel", "csc_col_split_reduce",
+             "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic"}
     if not rows or not all(row.get("alg") in names | {"auto"} for row in rows):
         return None
     best = {}

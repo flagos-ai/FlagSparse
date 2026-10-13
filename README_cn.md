@@ -496,6 +496,39 @@ python run_flagsparse_pytest.py --ops spmv_csc,spmm_csc --phase both --mode quic
 
 FP16：CSR/COO/CSC 的 SpMV、SpMM 测试入口支持 `--dtypes float16`。
 新增半精度路径使用 FP32 累加，最终转回 FP16；必要转换、atomic 缓冲与分段归约
-均计入完整 run。旧算法未声明支持的组合继续按注册信息排除，不静默切换算法。
+均计入完整 run。全部已注册的 CSR/COO/CSC SpMV、SpMM 算法均声明支持 FP16（限各算法原有 op）。
+CSR accuracy/alg1/alg2/TLE 路径在每次 run 内转换 FP32 操作数，执行原算法并转回 FP16；
+保留 accuracy/HP 的数值策略，不切换算法。后端能力和 TLE 可用性检查仍生效。
 厂商 FP16 baseline 不支持时打印原因并记为 SKIP，不跳过原生算法测试。
 现有 pytest 参数化已加入半精度覆盖，实机结果仍待计算节点验证。
+
+
+### COO/CSC 第二阶段算法（待计算节点验收）
+
+默认路由不变。SpMV COO 新增 `coo_segmented_stream_atomic`，SpMM COO 新增
+`coo_segmented_stream_panel_atomic`，均支持 FP16/FP32/FP64/complex64/complex128 和
+non/trans/conj。`blocks_per_program=1/2/4/8`（默认2）控制连续NNZ块数；
+`local_reduce=none/segment` 控制分段合并，输入无需排序。
+SpMM 的新流式算法默认 `conversion_mode=load`，原 `coo_segmented_panel_atomic`
+默认 `materialize`，两者均可显式覆盖；加载转换仍保持 FP32→FP64、complex64→complex128
+的既有计算策略，FP16使用FP32，不改变输出dtype。
+
+CSC trans/conj 新增 SpMV `csc_col_vector`、SpMM `csc_col_kparallel`，以及两者各自的
+`csc_col_split_reduce`。所有路径直接读取CSC，不构造转置矩阵。split每次run重建计划，
+默认分段1024、每层归约256项、工作空间256 MiB；`workspace_bytes`约束数值部分和、
+归约与跨批累加缓冲，输入/最终输出及描述符另计。无浮点atomic，FP16跨批保持FP32。
+现有短列算法可显式测试不同 `block_nnz`、`columns_per_program` 或 `lanes_per_column`。
+配置按后端能力校验，未经实测的平台与参数均不标记为已验证。
+
+沿用 `tests/test_spmv_coo.py`、`test_spmm_coo.py`、`test_spmv_csc.py`、`test_spmm_csc.py`
+和 `run_flagsparse_pytest.py`；`--alg compare` 包含新算法。`--config` 仅用于单个显式算法。
+完整时间始终为 `ms=process_cpu_ms+gpu_ms`，包含所有转换、计划和归并；`--timing`单独诊断。
+精度FAIL保留有效性能，厂商不支持FP16时记录SKIP/N/A，不跳过算子自身正确性检查。
+
+```bash
+python run_flagsparse_pytest.py --ops spmv_coo,spmm_coo,spmv_csc,spmm_csc --phase both --mode quick --benchmark-input ../../matrix --results-dir pytest_results_coo_csc_p2
+```
+
+进一步通过原 `--op-benchmark-args` 透传 `--timing --ops all --dtypes all`；SpMM添加
+`--layout all --dense-cols 1,8,16,32,64,128,256`。性能按固定条件逐矩阵选最快算法后计算几何平均，
+不能把最佳算法上限视为默认路由成绩。当前环境仅做静态检查，不代表硬件验收通过。

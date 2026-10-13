@@ -59,3 +59,36 @@ def test_public_surface_exposes_core_entry_points():
     exported = set(dir(flagsparse))
     assert EXPECTED_TOP_LEVEL <= exported
     assert EXPECTED_TOP_LEVEL <= set(flagsparse.__all__)
+
+
+
+def test_all_registered_spmv_spmm_routes_declare_float16():
+    import torch
+    for operator in ("spmv", "spmm"):
+        for storage in ("csr", "coo", "csc"):
+            query = getattr(flagsparse, f"list_{operator}_{storage}_algorithms")
+            for op in ("non", "trans", "conj"):
+                all_routes = set(query(op=op))
+                half_routes = set(query(op=op, dtype=torch.float16))
+                assert half_routes == all_routes, (operator, storage, op, all_routes - half_routes)
+
+
+
+def test_coo_csc_p2_public_algorithm_queries():
+    import torch
+    from flagsparse import sparse_operations
+    expected = {
+        "spmv_coo": ("coo_segmented_stream_atomic",),
+        "spmm_coo": ("coo_segmented_stream_panel_atomic",),
+        "spmv_csc": ("csc_col_vector", "csc_col_split_reduce"),
+        "spmm_csc": ("csc_col_kparallel", "csc_col_split_reduce"),
+    }
+    for operator, names in expected.items():
+        for namespace in (flagsparse, sparse_operations):
+            query = getattr(namespace, f"list_{operator}_algorithms")
+            spec = getattr(namespace, f"get_{operator}_algorithm_spec")
+            for name in names:
+                assert name in query(op="trans", dtype=torch.float16)
+                assert spec(name)["name"] == name
+                if operator.endswith("csc"):
+                    assert name not in query(op="non")

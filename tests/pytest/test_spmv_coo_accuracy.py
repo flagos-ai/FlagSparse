@@ -139,7 +139,7 @@ def _assert_close(actual, expected, dtype):
     "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
 )
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
-@pytest.mark.parametrize("alg", [None, "coo_segmented_atomic", "coo_rowrun_subgroup"], ids=["legacy", "segmented", "subgroup"])
+@pytest.mark.parametrize("alg", [None, "coo_atomic", "coo_segmented_atomic", "coo_rowrun_subgroup", "coo_segmented_stream_atomic"], ids=["legacy", "atomic", "segmented", "subgroup", "stream"])
 def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op, alg):
     device = accelerator_device()
     data, indices, dense = _random_coo_mn(M, N, dtype, device)
@@ -294,7 +294,7 @@ def test_spmv_coo_tocsr_prepared_path_matches_torch():
 
 
 @pytest.mark.spmv_coo
-@pytest.mark.parametrize("alg", ["coo_segmented_atomic", "coo_rowrun_subgroup"])
+@pytest.mark.parametrize("alg", ["coo_segmented_atomic", "coo_rowrun_subgroup", "coo_segmented_stream_atomic"])
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize("ordered", [False, True], ids=["unsorted", "sorted"])
 def test_spmv_coo_registered_boundaries(alg, op, ordered, monkeypatch):
@@ -335,7 +335,7 @@ def test_spmv_coo_registered_boundaries(alg, op, ordered, monkeypatch):
 
 
 @pytest.mark.spmv_coo
-@pytest.mark.parametrize("alg", ["coo_segmented_atomic", "coo_rowrun_subgroup"])
+@pytest.mark.parametrize("alg", ["coo_segmented_atomic", "coo_rowrun_subgroup", "coo_segmented_stream_atomic"])
 @pytest.mark.parametrize("shape", [(0, 0), (0, 7), (5, 0), (5, 7)])
 def test_spmv_coo_registered_empty(alg, shape):
     device = accelerator_device()
@@ -363,7 +363,7 @@ def _coo_extension_capability_guard(request):
 
 @pytest.mark.spmv_coo
 @pytest.mark.parametrize("policy", ["auto", "strict"])
-@pytest.mark.parametrize("alg", ["coo_segmented_atomic"])
+@pytest.mark.parametrize("alg", ["coo_segmented_atomic", "coo_segmented_stream_atomic"])
 def test_registered_coo_index_fallback_is_same_algorithm(monkeypatch, policy, alg):
     device = accelerator_device()
     a = torch.tensor([2., 3.], device=device)
@@ -388,3 +388,23 @@ def test_registered_coo_index_fallback_is_same_algorithm(monkeypatch, policy, al
     unsafe = spmv_coo_mod._PreparedCooLaunch(a[:1], r[:1] + 2**31, c[:1], (2**31 + 1, 2))
     with pytest.raises(RuntimeError, match="unsafe"):
         spmv_coo_mod._spmv_coo_prepared_with_int32_indices(unsafe, "int64 unsupported")
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("alg", ["coo_segmented_stream_atomic"])
+@pytest.mark.parametrize("blocks", [1, 2, 4, 8])
+@pytest.mark.parametrize("local_reduce", ["none", "segment"])
+def test_spmv_coo_stream_carry_boundaries(alg, blocks, local_reduce):
+    from flagsparse import flagsparse_spmv_coo_run
+    device = accelerator_device()
+    # Several completed segments, a cross-program segment and a padded last tile.
+    row = torch.tensor([0] * 7 + [1] * 34 + [0] * 3 + [2] * 87 + [4, 1, 4], dtype=torch.int64)
+    col = torch.arange(row.numel(), dtype=torch.int64) % 7
+    values = (torch.arange(row.numel()) % 7 - 3).double() / 8
+    dense = torch.zeros((6, 7), dtype=values.dtype)
+    dense.index_put_((row, col), values, accumulate=True)
+    x = torch.arange(7, dtype=values.dtype) / 4
+    prepared = prepare_spmv_coo(values.to(device), row.to(device), col.to(device), (6, 7),
+        alg=alg, config={"block_nnz": 8, "blocks_per_program": blocks, "local_reduce": local_reduce})
+    result = flagsparse_spmv_coo_run(prepared, x.to(device))
+    _assert_close(result, dense @ x, values.dtype)

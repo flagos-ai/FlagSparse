@@ -153,7 +153,8 @@ def workspace_geometry(n, element_bytes, cfg):
 
 # COO shares backend capability contracts; kernels remain in the COO modules.
 COO_ALGORITHMS = ("coo_segmented_atomic", "coo_rowrun_subgroup",
-                  "coo_segmented_panel_atomic", "coo_rowrun_panel")
+                  "coo_segmented_panel_atomic", "coo_rowrun_panel",
+                  "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic")
 COO_ARCH_PROFILES = {}
 COO_BACKEND_PROFILES = {name: {} for name in BACKENDS}
 
@@ -165,18 +166,23 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
         raise TypeError("config must be a dictionary")
     if caps.backend not in BACKENDS or not caps.legal_num_warps or not caps.subgroup_width or caps.int64 is not True:
         raise NotImplementedError(f"COO launch/index capabilities unknown: {caps}")
-    atomic = "atomic" in alg
+    atomic = alg in ("coo_segmented_atomic", "coo_segmented_panel_atomic",
+                     "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic")
     overrides = dict(config or {})
     cfg = dict(num_warps=4 if atomic else 2, num_stages=1)
     if atomic:
-        cfg.update(block_nnz=128 if alg == "coo_segmented_atomic" else 32,
+        cfg.update(block_nnz=128 if alg in ("coo_segmented_atomic", "coo_segmented_stream_atomic") else 32,
                    local_reduce="segment")
-        if alg == "coo_segmented_panel_atomic":
+        if alg in ("coo_segmented_panel_atomic", "coo_segmented_stream_panel_atomic"):
             cfg["block_n"] = min(16, (1 << (max(1, n) - 1).bit_length()))
     elif alg == "coo_rowrun_subgroup":
         cfg.update(lanes_per_row=8, rows_per_program=1)
     else:
         cfg.update(tile_rows=4, tile_n=min(16, (1 << (max(1, n) - 1).bit_length())))
+    if alg in ("coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic"):
+        cfg["blocks_per_program"] = 2
+    if alg in ("coo_segmented_panel_atomic", "coo_segmented_stream_panel_atomic"):
+        cfg["conversion_mode"] = "load" if alg == "coo_segmented_stream_panel_atomic" else "materialize"
     unknown = set(overrides) - set(cfg)
     if unknown:
         raise ValueError(f"unsupported {alg} configuration fields: {sorted(unknown)}")
@@ -191,7 +197,9 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
         for key, value in candidate.items():
             valid = key in cfg and (
                 value in ("segment", "none") if key == "local_reduce" else
+                value in ("load", "materialize") if key == "conversion_mode" else
                 type(value) is int and value > 0 and not value & (value - 1))
+            valid = valid and (key != "blocks_per_program" or value in (1, 2, 4, 8))
             valid = valid and (key != "num_warps" or value in caps.legal_num_warps)
             valid = valid and (key != "num_stages" or value == 1)
             valid = valid and (key != "lanes_per_row" or value <= caps.subgroup_width)
@@ -202,11 +210,16 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
                 rejected.append(f"{source}: illegal {key}={value!r}")
     cfg.update(overrides)
     for key, value in cfg.items():
-        if key == "local_reduce":
+        if key == "conversion_mode":
+            if value not in ("load", "materialize"):
+                raise ValueError("conversion_mode must be load or materialize")
+        elif key == "local_reduce":
             if value not in ("segment", "none"):
                 raise ValueError("local_reduce must be segment or none")
         elif type(value) is not int or value <= 0 or value & (value - 1):
             raise ValueError(f"{key} must be a positive power of two")
+    if cfg.get("blocks_per_program", 1) not in (1, 2, 4, 8):
+        raise ValueError("blocks_per_program must be 1, 2, 4 or 8")
     if (cfg["num_warps"] not in caps.legal_num_warps or cfg["num_stages"] != 1
             or cfg["num_warps"] * caps.subgroup_width > caps.max_threads_per_block):
         raise ValueError("illegal COO launch configuration")
@@ -227,11 +240,14 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
         raise NotImplementedError("COO stable sort/reduction capability unknown")
     return cfg, dict(backend=caps.backend, target=caps.target, arch=caps.arch,
                      config_source="explicit" if overrides else ("architecture" if arch_profile else "backend" if profile else "conservative"),
-                     validation="unverified", config=cfg, rejected_profiles=rejected, implementation_version=1,
+                     validation="unverified", config=cfg, rejected_profiles=rejected, implementation_version=2,
                      timing_contract_version=2)
 
 
 CSC_ALGORITHMS = {
+    "csc_col_vector": ("trans", "conj"),
+    "csc_col_kparallel": ("trans", "conj"),
+    "csc_col_split_reduce": ("trans", "conj"),
     "csc_col_subgroup": ("trans", "conj"),
     "csc_col_tile_atomic": ("non",),
     "csc_col_panel": ("trans", "conj"),
@@ -241,7 +257,7 @@ CSC_ARCH_PROFILES = {}
 CSC_BACKEND_PROFILES = {}
 
 
-def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non"):
+def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", kind="spmm"):
     """Resolve native CSC launch policy without importing an accelerator runtime."""
     if algorithm not in CSC_ALGORITHMS:
         raise ValueError(f"unknown CSC algorithm {algorithm!r}")
@@ -252,7 +268,7 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non"):
     if caps.backend not in BACKENDS or not caps.legal_num_warps or not caps.subgroup_width:
         raise NotImplementedError("CSC launch capabilities unavailable or unknown")
     required = ["int64"]
-    atomic = "atomic" in algorithm
+    atomic = algorithm in ("csc_col_tile_atomic", "csc_col_tile_panel_atomic")
     if dtype in ("float64", "complex128"):
         required.append("fp64")
     if atomic:
@@ -262,13 +278,19 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non"):
     for key in required:
         if getattr(caps, key) is not True:
             raise NotImplementedError(f"CSC {key} capability unavailable for {caps.backend}/{caps.arch}")
-    warps = 4 if atomic else 2
+    if algorithm == "csc_col_split_reduce" and caps.scan is not True:
+        raise NotImplementedError("CSC GPU prefix-plan capability unavailable")
+    warps = 4 if atomic or algorithm in ("csc_col_kparallel", "csc_col_split_reduce") else 2
     if warps not in caps.legal_num_warps:
         warps = max((w for w in caps.legal_num_warps if w <= warps), default=min(caps.legal_num_warps))
-    panel = "panel" in algorithm
     bn = 8 if dtype == "complex128" and not atomic else 16
     cfg = dict(num_warps=warps, num_stages=1)
-    if algorithm == "csc_col_subgroup":
+    if algorithm in ("csc_col_vector", "csc_col_kparallel", "csc_col_split_reduce"):
+        cfg.update(block_nnz=128 if kind == "spmv" or algorithm == "csc_col_vector" else 32,
+                   block_n=1 if kind == "spmv" or algorithm == "csc_col_vector" else min(bn, 1 << (max(1, n)-1).bit_length()))
+        if algorithm == "csc_col_split_reduce":
+            cfg.update(segment_nnz=1024, reduce_block_size=256, workspace_bytes=256 * 1024 * 1024)
+    elif algorithm == "csc_col_subgroup":
         cfg.update(lanes_per_column=8, columns_per_program=warps * caps.subgroup_width // 8)
     elif algorithm == "csc_col_tile_atomic":
         cfg.update(columns_per_program=4, block_nnz=32)
@@ -283,8 +305,12 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non"):
         for key, value in candidate.items():
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{key} must be a positive integer")
-            if key != "num_stages" and value & (value-1):
+            if key not in ("num_stages", "workspace_bytes") and value & (value-1):
                 raise ValueError(f"{key} must be a power of two")
+        if candidate["num_stages"] != 1:
+            raise ValueError("CSC num_stages must be 1")
+        if algorithm == "csc_col_split_reduce" and (candidate["reduce_block_size"] < 2 or candidate["workspace_bytes"] < 64):
+            raise ValueError("split needs reduce_block_size >= 2 and workspace_bytes >= 64")
         if candidate["num_warps"] not in caps.legal_num_warps:
             raise ValueError("num_warps is not supported by this target")
         if candidate["num_warps"] * caps.subgroup_width > caps.max_threads_per_block:

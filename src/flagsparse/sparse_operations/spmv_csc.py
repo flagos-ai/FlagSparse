@@ -975,6 +975,176 @@ def _csc_columns_atomic_kernel(A, I, P, B, Y, COLS, N, BS0, BS1, YS0, YS1,
             tl.atomic_add(Y + dest, re, valid, sem="relaxed")
 
 
+@triton.jit
+def _csc_vector_kernel(A, I, P, B, Y, Owners, Starts, Ends, COUNT, N,
+                       BS0, BS1, YS0, YS1, N_OFFSET,
+                       BK: tl.constexpr, BN: tl.constexpr,
+                       SEGMENTS: tl.constexpr, COMPLEX: tl.constexpr,
+                       FP64: tl.constexpr, CONJ: tl.constexpr, DIRECT: tl.constexpr = False):
+    item = tl.program_id(0).to(tl.int64)
+    col = tl.load(Owners + item) if SEGMENTS else item
+    start = tl.load(Starts + item).to(tl.int64) if SEGMENTS else tl.load(P + col).to(tl.int64)
+    end = tl.load(Ends + item).to(tl.int64) if SEGMENTS else tl.load(P + col + 1).to(tl.int64)
+    k = tl.arange(0, BK)
+    ns = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN)
+    acc_type = tl.float64 if FP64 else tl.float32
+    re = tl.zeros((BK, BN), acc_type)
+    im = tl.zeros((BK, BN), acc_type)
+    for offset in range(tl.cdiv(end - start, BK)):
+        pos = start + offset.to(tl.int64) * BK + k
+        rows = tl.load(I + pos, pos < end, 0).to(tl.int64)
+        valid = (pos[:, None] < end) & (ns[None, :] < N)
+        vr, vi = _csc_product(A, B, pos[:, None],
+                              rows[:, None] * BS0 + (ns[None, :] + N_OFFSET) * BS1,
+                              valid, COMPLEX, FP64, CONJ)
+        re += vr
+        im += vi
+    dst = (col if DIRECT else item) * YS0 + ns * YS1
+    if COMPLEX:
+        tl.store(Y + 2 * dst, tl.sum(re, 0), ns < N)
+        tl.store(Y + 2 * dst + 1, tl.sum(im, 0), ns < N)
+    else:
+        tl.store(Y + dst, tl.sum(re, 0), ns < N)
+
+
+@triton.jit
+def _csc_split_store_kernel(X, Y, Counts, FIRST, COUNT, N, OFFSET, YS0, YS1,
+                            BN: tl.constexpr, COMPLEX: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    n = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN)
+    active = tl.load(Counts + FIRST + row) > 0
+    mask = active & (n < N)
+    src = row * N + n
+    dst = (FIRST + row) * YS0 + (OFFSET + n) * YS1
+    if COMPLEX:
+        tl.store(Y + 2 * dst, tl.load(X + 2 * src, mask, 0), mask)
+        tl.store(Y + 2 * dst + 1, tl.load(X + 2 * src + 1, mask, 0), mask)
+    else:
+        tl.store(Y + dst, tl.load(X + src, mask, 0), mask)
+
+
+def _run_csc_split(data, indices, ptr, dense, shape, op, cfg, phases, stats, output_dtype):
+    # The shared reduction kernels consume only partial sums, never a CSR matrix.
+    from ._spmm_csr_kernels import reduce_kernel, finish_kernel
+    vector = dense.ndim == 1
+    n = 1 if vector else dense.shape[1]
+    columns = shape[1]
+    complex_ = data.is_complex()
+    view = lambda value: torch.view_as_real(value) if complex_ else value
+    acc = tl.float64 if data.dtype in (torch.float64, torch.complex128) else tl.float32
+    element_bytes = data.element_size()
+    launch = dict(num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+    stats.update(segment_count=0, reduction_levels=0, segment_batches=0,
+                 workspace_peak_bytes=0, descriptor_peak_bytes_estimate=0)
+    with phases.measure("compute_ms"):
+        result = torch.zeros((columns, n), device=data.device, dtype=output_dtype)
+    if not columns or not n:
+        return result[:, 0] if vector else result
+    with phases.measure("process_gpu_ms"):
+        starts = ptr[:-1].to(torch.int64)
+        lengths = ptr[1:].to(torch.int64) - starts
+        singles = torch.nonzero((lengths > 0) & (lengths <= cfg["segment_nnz"])).flatten()
+        single_start = starts[singles]
+        single_end = single_start + lengths[singles]
+        counts = torch.where(lengths > cfg["segment_nnz"],
+                             torch.div(lengths + cfg["segment_nnz"] - 1,
+                                       cfg["segment_nnz"], rounding_mode="floor"), 0)
+        offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
+        stats["segment_count"] = int(offsets[-1].item())
+    bn = cfg["block_n"]
+    bs1 = 0 if vector else dense.stride(1)
+    if singles.numel():
+        with phases.measure("compute_ms"):
+            _csc_vector_kernel[(singles.numel(), triton.cdiv(n, bn))](
+                view(data), indices, ptr, view(dense), view(result), singles,
+                single_start, single_end, singles.numel(), n,
+                dense.stride(0), bs1, n, 1, 0,
+                cfg["block_nnz"], bn, True, complex_, acc == tl.float64, op == "conj",
+                DIRECT=True, **launch)
+    stats["descriptor_peak_bytes_estimate"] = sum(t.numel() * t.element_size() for t in
+        (starts, lengths, singles, single_start, single_end, counts, offsets))
+    if not stats["segment_count"]:
+        return result[:, 0] if vector else result
+    # Four slabs cover an accumulator, two reduction buffers and transition room.
+    wave = min(n, bn, cfg["workspace_bytes"] // (4 * element_bytes))
+    if wave < 1:
+        raise ValueError("CSC workspace cannot hold one panel element")
+    capacity = cfg["workspace_bytes"] // (4 * wave * element_bytes)
+    base_descriptors = stats["descriptor_peak_bytes_estimate"]
+    stats["descriptor_peak_bytes_estimate"] = base_descriptors
+    for panel in range(0, n, wave):
+        width = min(wave, n - panel)
+        for first_col in range(0, columns, capacity):
+            last_col = min(columns, first_col + capacity)
+            with phases.measure("process_gpu_ms"):
+                group_offsets = offsets[first_col:last_col + 1]
+                begin, end = int(group_offsets[0].item()), int(group_offsets[-1].item())
+                local_rows = torch.arange(last_col - first_col, device=data.device, dtype=torch.int64)
+            if begin == end:
+                continue
+            with phases.measure("compute_ms"):
+                accumulated = torch.zeros((last_col - first_col, width), device=data.device, dtype=data.dtype)
+            accumulator_bytes = accumulated.numel() * element_bytes
+            for first in range(begin, end, capacity):
+                last = min(end, first + capacity)
+                size = last - first
+                with phases.measure("process_gpu_ms"):
+                    ids = torch.arange(first, last, device=data.device, dtype=torch.int64)
+                    owners = torch.searchsorted(offsets[1:], ids, right=True)
+                    seg_start = starts[owners] + (ids - offsets[owners]) * cfg["segment_nnz"]
+                    seg_end = torch.minimum(seg_start + cfg["segment_nnz"], starts[owners] + lengths[owners])
+                    local_offsets = group_offsets.clamp(first, last) - first
+                    local_counts = local_offsets[1:] - local_offsets[:-1]
+                with phases.measure("compute_ms"):
+                    partial = torch.empty((size, width), device=data.device, dtype=data.dtype)
+                    _csc_vector_kernel[(size, triton.cdiv(width, bn))](
+                        view(data), indices, ptr, view(dense), view(partial), owners,
+                        seg_start, seg_end, size, width, dense.stride(0), bs1, width, 1, panel,
+                        cfg["block_nnz"], bn, True, complex_, acc == tl.float64, op == "conj", **launch)
+                peak = accumulator_bytes + partial.numel() * element_bytes
+                levels = 0
+                while True:
+                    with phases.measure("process_gpu_ms"):
+                        maximum = int(local_counts.max().item())
+                    if maximum <= 1:
+                        break
+                    with phases.measure("process_gpu_ms"):
+                        next_counts = torch.div(local_counts + cfg["reduce_block_size"] - 1,
+                                                cfg["reduce_block_size"], rounding_mode="floor")
+                        next_offsets = torch.cat((counts.new_zeros(1), next_counts.cumsum(0)))
+                        next_size = int(next_offsets[-1].item())
+                        group_ids = torch.arange(next_size, device=data.device, dtype=torch.int64)
+                        group_rows = torch.searchsorted(next_offsets[1:], group_ids, right=True)
+                        reduce_start = local_offsets[group_rows] + (group_ids - next_offsets[group_rows]) * cfg["reduce_block_size"]
+                        reduce_end = torch.minimum(reduce_start + cfg["reduce_block_size"], local_offsets[group_rows + 1])
+                    with phases.measure("compute_ms"):
+                        reduced = torch.empty((next_size, width), device=data.device, dtype=data.dtype)
+                        peak = max(peak, accumulator_bytes + (partial.numel() + reduced.numel()) * element_bytes)
+                        reduce_kernel[(next_size, triton.cdiv(width, bn))](
+                            view(partial), view(reduced), reduce_start, reduce_end, width,
+                            cfg["reduce_block_size"], bn, complex_, acc, **launch)
+                        partial = reduced
+                        del reduced
+                    local_counts, local_offsets = next_counts, next_offsets
+                    levels += 1
+                with phases.measure("compute_ms"):
+                    finish_kernel[(local_rows.numel(), triton.cdiv(width, bn))](
+                        view(partial), view(accumulated), local_rows, local_offsets, local_counts,
+                        width, 0, width, 1, bn, complex_, **launch)
+                    del partial
+                stats["workspace_peak_bytes"] = max(stats["workspace_peak_bytes"], peak)
+                stats["reduction_levels"] = max(stats["reduction_levels"], levels)
+                stats["segment_batches"] += 1
+                stats["descriptor_peak_bytes_estimate"] = max(stats["descriptor_peak_bytes_estimate"],
+                    base_descriptors + (size * 12 + local_rows.numel() * 8) * 8)
+            with phases.measure("compute_ms"):
+                _csc_split_store_kernel[(local_rows.numel(), triton.cdiv(width, bn))](
+                    view(accumulated), view(result), counts, first_col, local_rows.numel(),
+                    width, panel, n, 1, bn, complex_, **launch)
+                del accumulated
+    return result[:, 0] if vector else result
+
+
 def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg):
     """Shared native CSC launch; all strides are in logical (possibly complex) elements."""
     vector = dense.ndim == 1
@@ -990,6 +1160,15 @@ def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg):
     a = torch.view_as_real(data) if complex_values else data
     b = torch.view_as_real(dense) if complex_values else dense
     y = torch.view_as_real(result) if complex_values else result
+    if alg in ("csc_col_vector", "csc_col_kparallel"):
+        _csc_vector_kernel[(shape[1], triton.cdiv(n, cfg["block_n"]))](
+            a, indices, indptr, b, y, indices, indices, indices, shape[1], n,
+            dense.stride(0), 0 if vector else dense.stride(1),
+            result.stride(0), 0 if vector else result.stride(1), 0,
+            cfg["block_nnz"], cfg["block_n"], False, complex_values,
+            data.dtype in (torch.float64, torch.complex128), op == "conj",
+            num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+        return result
     common = dict(R=cfg["columns_per_program"], COMPLEX=complex_values,
                   FP64=data.dtype in (torch.float64, torch.complex128),
                   num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
@@ -1021,12 +1200,14 @@ class PreparedCscRoute:
 def _csc_spec(alg, kind):
     from ._spmm_csr_config import CSC_ALGORITHMS, BACKENDS
     base = "spmv_csc_base" if kind == "spmv" else "spmm_csc_base"
-    names = ("csc_col_subgroup", "csc_col_tile_atomic") if kind == "spmv" else ("csc_col_panel", "csc_col_tile_panel_atomic")
+    names = (("csc_col_subgroup", "csc_col_tile_atomic", "csc_col_vector", "csc_col_split_reduce")
+             if kind == "spmv" else
+             ("csc_col_panel", "csc_col_tile_panel_atomic", "csc_col_kparallel", "csc_col_split_reduce"))
     if alg not in (base, *names):
         raise ValueError(f"unknown {kind} CSC algorithm {alg!r}")
     return dict(name=alg, ops=CSC_ALGORITHMS.get(alg, ("non", "trans", "conj")),
                 value_dtypes=SUPPORTED_SPMV_CSC_VALUE_DTYPES, backends=BACKENDS,
-                layouts=("row", "col", "strided"), implementation_version=1,
+                layouts=("row", "col", "strided"), implementation_version=2,
                 compute_dtype="native_component", validation="unverified")
 
 
@@ -1055,7 +1236,7 @@ def get_spmv_csc_algorithm_spec(alg):
 
 
 def list_spmv_csc_algorithms(op=None, dtype=None, backend=None):
-    names = ("spmv_csc_base", "csc_col_subgroup", "csc_col_tile_atomic")
+    names = ("spmv_csc_base", "csc_col_subgroup", "csc_col_tile_atomic", "csc_col_vector", "csc_col_split_reduce")
     return tuple(name for name in names if
                  (op is None or _spmv_csc_op_to_name(op) in _csc_spec(name, "spmv")["ops"]) and
                  (dtype is None or dtype in SUPPORTED_SPMV_CSC_VALUE_DTYPES) and
@@ -1064,6 +1245,7 @@ def list_spmv_csc_algorithms(op=None, dtype=None, backend=None):
 
 def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=None,
                         return_time=False, return_meta=False, timing=False):
+    from contextlib import nullcontext
     from ._spmm_csr_runtime import backend_caps, Phases
     from ._spmm_csr_config import resolve_csc_config, CSC_ALGORITHMS
     from ._spmv_csr_config import is_index_compatibility_error
@@ -1091,7 +1273,7 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
     cfg, info = {}, dict(backend=_backend_name())
     if selected in CSC_ALGORITHMS:
         cfg, info = resolve_csc_config(selected, str(data.dtype).removeprefix("torch."),
-                                       1 if vector else dense.shape[1], backend_caps(data.device), cfg_input, op=prepared.op)
+                                       1 if vector else dense.shape[1], backend_caps(data.device), cfg_input, op=prepared.op, kind=prepared.kind)
     elif cfg_input:
         raise ValueError("legacy CSC route does not accept config")
     # Range checks precede measurement. Conversion is performed inside each run.
@@ -1118,7 +1300,10 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
                     from .spmm_csc import prepare_spmm_csc_route
                     execution = prepare_spmm_csc_route(a, i, p, prepared.shape, op=prepared.op,
                                                        _validated=validated, **(prepared.legacy_options if selected == prepared.alg else {}))
+        stats = {}
         def compute(ii, pp):
+            if selected == "csc_col_split_reduce":
+                return _run_csc_split(a, ii, pp, b, prepared.shape, prepared.op, cfg, phases, stats, data.dtype)
             if selected in CSC_ALGORITHMS:
                 return _launch_csc_columns(a, ii, pp, b, prepared.shape, prepared.op, selected, cfg)
             execution.kernel_indices, execution.kernel_indptr = ii, pp
@@ -1126,7 +1311,7 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
                 return _triton_spmv_csc_kernel(execution, b.contiguous(), _normalize_spmv_csc_op(prepared.op))
             from .spmm_csc import _triton_spmm_csc_base_kernel
             return _triton_spmm_csc_base_kernel(execution, b)
-        with phases.measure("compute_ms"):
+        with (nullcontext() if selected == "csc_col_split_reduce" else phases.measure("compute_ms")):
             try:
                 result = compute(i, p)
             except (RuntimeError, TypeError) as exc:
@@ -1137,12 +1322,13 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
                 i, p = i.to(torch.int32), p.to(torch.int32)
                 fallback_reason = str(exc)
                 result = compute(i, p)
+        with phases.measure("compute_ms"):
             result = result.to(data.dtype)
             if out is not None:
                 out.copy_(result)
                 result = out
         meta = dict(info, alg=selected, alg_requested=alg or prepared.alg, alg_resolved=selected,
-                    config=cfg, op=prepared.op, implementation_version=1, timing_contract_version=2,
+                    config=cfg, op=prepared.op, implementation_version=2, timing_contract_version=2,
                     compute_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
                     input_indices_dtype=str(indices.dtype), input_indptr_dtype=str(ptr.dtype),
                     execution_indices_dtype=str(i.dtype), execution_indptr_dtype=str(p.dtype),
@@ -1151,6 +1337,7 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
                     native_format="csc", execution_path="native_csc", process_cpu_ms=0.0,
                     component_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
                     dense_stride=tuple(dense.stride()), output_stride=tuple(result.stride()))
+        meta.update(stats)
         return result, meta
     measured = return_time or return_meta or timing
     if measured:

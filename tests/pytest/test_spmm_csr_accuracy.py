@@ -591,3 +591,37 @@ def test_spmm_csr_base_float16(op):
     rtol, atol = _tol(torch.float16)
     torch.testing.assert_close(actual.cpu().to(expected.dtype), expected, rtol=rtol, atol=atol)
     assert actual.dtype == torch.float16
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("algorithm", [
+    "csr_base_accuracy", "spmm_csr_alg1", "spmm_csr_alg2",
+    "spmm_csr_alg2_accuracy", "spmm_csr_alg2_accuracy_hp",
+    "alpha_alg1_tle_opt", "alpha_alg1_tle_opt2",
+])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("layout", ["row", "col"])
+def test_spmm_csr_half_legacy_algorithms(algorithm, op, layout):
+    data, indices, indptr, shape, dense = _new_route_inputs(
+        torch.float16, torch.int32, torch.int64, (0, 1, 7, 17, 65))
+    prepared = prepare_spmm_csr_route(data, indices, indptr, shape, op=op, alg=algorithm)
+    left = _apply_dense_op(dense, op)
+    rhs = _random_dense((left.shape[1], 7), torch.float16, "cpu")
+    B = rhs.to(data.device)
+    if layout == "col":
+        B = B.T.contiguous().T
+    from flagsparse.sparse_operations.spmm_csr import resolve_spmm_csr_algorithm
+    if layout not in resolve_spmm_csr_algorithm(algorithm, op, torch.float16).supported_layouts:
+        pytest.skip(f"{algorithm} does not support {layout} layout")
+    out = torch.full((left.shape[0], 7), float("nan"), dtype=torch.float16, device=data.device)
+    actual, meta = _run_new_or_skip(prepared, B, out=out, dense_layout=layout,
+                                    timing=True, return_meta=True)
+    assert actual is out
+    assert actual.dtype == torch.float16
+    assert prepared.data.dtype == torch.float16
+    assert meta["alg_resolved"] == algorithm
+    assert meta["execution_dtype"] == "float32"
+    assert meta["operator_ms"] == meta["process_cpu_ms"] + meta["gpu_ms"]
+    expected = left @ rhs.to(left.dtype)
+    rtol, atol = _tol(torch.float16)
+    torch.testing.assert_close(actual.cpu().to(expected.dtype), expected, rtol=rtol, atol=atol)

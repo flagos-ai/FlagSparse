@@ -587,7 +587,35 @@ runner with `--mode normal` on each target compute node for hardware acceptance.
 
 FP16 coverage: the CSR/COO/CSC SpMV and SpMM entry points accept `--dtypes float16`.
 New half paths accumulate in FP32 and cast once at the output; conversions and
-FP32 atomic/partial buffers are inside full-run timing. Existing unsupported legacy
-algorithm combinations remain excluded by the registry. Unavailable vendor FP16
+FP32 atomic/partial buffers are inside full-run timing. All registered CSR/COO/CSC SpMV and SpMM algorithms declare FP16 for their supported operations. Legacy CSR accuracy/alg1/alg2/TLE routes execute the same algorithm on FP32 operands and cast back within each run; accuracy/HP numerical policies remain unchanged. Backend and TLE availability checks still apply. Unavailable vendor FP16
 baselines print a reason and record SKIP without skipping native execution.
 Existing pytest parameter grids include half; hardware results remain unverified.
+
+
+### COO/CSC phase 2 algorithms (hardware validation pending)
+
+Defaults are unchanged. COO adds SpMV `coo_segmented_stream_atomic` and SpMM
+`coo_segmented_stream_panel_atomic` for FP16/FP32/FP64/complex64/complex128 and all three ops.
+`blocks_per_program` accepts 1/2/4/8 (default 2); `local_reduce=none/segment` ablates scan/carry
+aggregation without requiring sorted input. SpMM stream defaults to `conversion_mode=load`;
+existing `coo_segmented_panel_atomic` retains `materialize`. Both modes preserve FP32-to-FP64,
+complex64-to-complex128 and FP16-to-FP32 computation, with the original output dtype.
+
+Native CSC trans/conj adds SpMV `csc_col_vector`, SpMM `csc_col_kparallel`, and
+`csc_col_split_reduce` in both registries. Split plans are rebuilt every run, using 1024-NNZ
+segments, 256-input hierarchical reductions and a default 256 MiB numeric workspace.
+`workspace_bytes` includes partials, reduction buffers and cross-batch accumulators; inputs,
+final outputs and descriptor storage are separate. FP16 partials remain FP32 until final store.
+No floating-point atomics or CSR conversion is used by these CSC transpose algorithms.
+Existing short-column algorithms keep their defaults and accept explicit tile/subgroup configs.
+
+The existing four benchmark scripts, accuracy markers and `run_flagsparse_pytest.py` enumerate
+these routes with `--alg compare`. Use `--config` only with one explicit algorithm. Complete
+latency remains `ms=process_cpu_ms+gpu_ms`, including conversions, plans and all reductions;
+`--timing` runs diagnostics separately. Accuracy FAIL retains valid timing. An unsupported
+vendor FP16 baseline is SKIP/N/A and does not suppress native accuracy tests.
+
+Use the existing quick/normal runner and `--op-benchmark-args` for dtype/op, layout, N and timing
+coverage. Compare all 30 matrices, retaining FAIL timing; report individual algorithms and
+per-matrix best results separately from default routing. Only static checks were performed
+locally; compilation, correctness and performance require validation on each target device.

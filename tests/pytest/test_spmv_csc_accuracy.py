@@ -266,7 +266,7 @@ from tests.pytest.conftest import QUICK_MODE
 
 
 @pytest.mark.spmv_csc
-@pytest.mark.parametrize("alg,op", [("csc_col_tile_atomic", "non"), ("csc_col_subgroup", "trans"), ("csc_col_subgroup", "conj")])
+@pytest.mark.parametrize("alg,op", [("csc_col_tile_atomic", "non"), ("csc_col_subgroup", "trans"), ("csc_col_subgroup", "conj"), ("csc_col_vector", "trans"), ("csc_col_vector", "conj"), ("csc_col_split_reduce", "trans"), ("csc_col_split_reduce", "conj")])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128])
 @pytest.mark.parametrize("index_dtype,ptr_dtype", [(torch.int32, torch.int64)] if QUICK_MODE else
                          [(i, p) for i in (torch.int32, torch.int64) for p in (torch.int32, torch.int64)])
@@ -312,13 +312,12 @@ def test_spmv_csc_registered_columns(alg, op, dtype, index_dtype, ptr_dtype):
 
 
 @pytest.mark.spmv_csc
-@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("alg,op", [('csc_col_tile_atomic', 'non'), ('csc_col_subgroup', 'trans'), ('csc_col_subgroup', 'conj'), ('csc_col_vector', 'trans'), ('csc_col_vector', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj')])
 @pytest.mark.parametrize("shape", [(0, 0), (0, 5), (7, 0), (7, 5)])
-def test_spmv_csc_registered_empty(op, shape):
+def test_spmv_csc_registered_empty(alg, op, shape):
     from flagsparse import prepare_spmv_csc, flagsparse_spmv_csc_run
     from flagsparse.sparse_operations._spmm_csr_runtime import backend_caps
     from flagsparse.sparse_operations._spmm_csr_config import resolve_csc_config
-    alg = 'csc_col_tile_atomic' if op == "non" else 'csc_col_subgroup'
     device = accelerator_device()
     try:
         resolve_csc_config(alg, "float32", 7, backend_caps(device), op=op)
@@ -337,19 +336,21 @@ def test_spmv_csc_registered_empty(op, shape):
 
 @pytest.mark.spmv_csc
 @pytest.mark.parametrize("policy", ["auto", "strict"])
-def test_spmv_csc_registered_index_fallback(monkeypatch, policy):
+@pytest.mark.parametrize("alg", ["csc_col_subgroup", "csc_col_vector", "csc_col_split_reduce"])
+def test_spmv_csc_registered_index_fallback(monkeypatch, policy, alg):
     from flagsparse import flagsparse_spmv_csc_run
     device = accelerator_device()
     a = torch.ones(2, device=device)
     i = torch.tensor([0, 1], dtype=torch.int64, device=device)
     p = torch.tensor([0, 1, 2], dtype=torch.int64, device=device)
-    prepared = prepare_spmv_csc(a, i, p, (2, 2), alg="csc_col_subgroup", op="trans", index_fallback_policy=policy)
-    original = spmv_csc_mod._launch_csc_columns
+    prepared = prepare_spmv_csc(a, i, p, (2, 2), alg=alg, op="trans", index_fallback_policy=policy)
+    target = "_run_csc_split" if alg == "csc_col_split_reduce" else "_launch_csc_columns"
+    original = getattr(spmv_csc_mod, target)
     def inject(data, indices, indptr, *args):
         if indices.dtype == torch.int64:
             raise RuntimeError("unsupported int64 index type")
         return original(data, indices, indptr, *args)
-    monkeypatch.setattr(spmv_csc_mod, "_launch_csc_columns", inject)
+    monkeypatch.setattr(spmv_csc_mod, target, inject)
     x = torch.ones(2, device=device)
     if policy == "strict":
         with pytest.raises(RuntimeError, match="int64"):
@@ -358,20 +359,21 @@ def test_spmv_csc_registered_index_fallback(monkeypatch, policy):
         result, meta = flagsparse_spmv_csc_run(prepared, x, return_meta=True)
         _assert_close(result, x, torch.float32)
         assert meta["index_fallback_applied"]
-        assert meta["alg_resolved"] == "csc_col_subgroup"
+        assert meta["alg_resolved"] == alg
         prepared.int32_safe = False
         with pytest.raises(RuntimeError, match="unsafe"):
             flagsparse_spmv_csc_run(prepared, x)
 
 
 @pytest.mark.spmv_csc
-def test_spmv_csc_direct_route_does_not_prepare_plan(monkeypatch):
+@pytest.mark.parametrize("alg", ["csc_col_subgroup", "csc_col_vector", "csc_col_split_reduce"])
+def test_spmv_csc_direct_route_does_not_prepare_plan(monkeypatch, alg):
     from flagsparse import flagsparse_spmv_csc_run
     device = accelerator_device()
     a = torch.ones(2, device=device)
     i = torch.tensor([0, 1], dtype=torch.int32, device=device)
     p = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
-    prepared = prepare_spmv_csc(a, i, p, (2, 2), alg="csc_col_subgroup", op="trans")
+    prepared = prepare_spmv_csc(a, i, p, (2, 2), alg=alg, op="trans")
     def forbidden(*args, **kwargs):
         raise AssertionError("direct CSC must not prepare a legacy plan")
     monkeypatch.setattr(spmv_csc_mod, "prepare_spmv_csc", forbidden)
@@ -386,7 +388,8 @@ def _skip_unknown_csc_extension_capabilities(request):
         from flagsparse.sparse_operations._spmm_csr_config import resolve_csc_config
         from flagsparse.sparse_operations._spmm_csr_runtime import backend_caps
         try:
-            resolve_csc_config("csc_col_subgroup", "float32", 1, backend_caps(accelerator_device()), op="trans")
+            resolve_csc_config(getattr(request.node, "callspec").params.get("alg", "csc_col_subgroup"),
+                               "float32", 1, backend_caps(accelerator_device()), op="trans", kind="spmv")
         except NotImplementedError as exc:
             pytest.skip(str(exc))
 
@@ -411,3 +414,57 @@ def test_spmv_csc_registered_base_rebuilds_each_run(monkeypatch):
     flagsparse_spmv_csc_run(prepared, x, timing=True)
     assert len(calls) == 3
     assert all(not call["_allow_delegate"] for call in calls)
+
+
+@pytest.mark.spmv_csc
+@pytest.mark.parametrize("budget", [128, 1 << 20])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.complex128])
+def test_spmv_csc_split_workspace_and_rebuild(budget, dtype, monkeypatch):
+    from flagsparse import prepare_spmv_csc, flagsparse_spmv_csc_run
+    from flagsparse.sparse_operations import spmv_csc as native
+    from flagsparse.sparse_operations._spmm_csr_config import resolve_csc_config
+    from flagsparse.sparse_operations._spmm_csr_runtime import backend_caps
+    device = accelerator_device()
+    try:
+        resolve_csc_config("csc_col_split_reduce", str(dtype).removeprefix("torch."), 7,
+                           backend_caps(device), op="conj", kind="spmv")
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+    lengths = [0, 1, 8, 9, 145 if QUICK_MODE else 2065, 0, 17]
+    ptr = torch.tensor([0] + lengths, dtype=torch.int64).cumsum(0)
+    rows = torch.arange(int(ptr[-1]), dtype=torch.int64) % 11
+    columns = torch.repeat_interleave(torch.arange(len(lengths)), torch.tensor(lengths))
+    values = ((torch.arange(rows.numel()) % 7 - 3).float() / 16).to(dtype)
+    if dtype.is_complex:
+        values = values + 0.125j
+    matrix = torch.zeros((11, len(lengths)), dtype=_reference_dtype(dtype))
+    matrix.index_put_((rows, columns), values.to(matrix.dtype), accumulate=True)
+    B = torch.ones((11,), dtype=dtype)
+    if dtype.is_complex:
+        B = B * (1 + 0.25j)
+    expected = matrix.conj().T @ B.to(matrix.dtype)
+    cfg = dict(segment_nnz=8, reduce_block_size=4 if QUICK_MODE else 256, workspace_bytes=budget)
+    prepared = prepare_spmv_csc(
+        values.to(device), rows.to(device), ptr.to(device), (11, len(lengths)),
+        alg="csc_col_split_reduce", op="conj", config=cfg)
+    original = native._run_csc_split
+    calls = []
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(native, "_run_csc_split", counted)
+    output = torch.full(expected.shape, float("nan"), dtype=dtype, device=device)
+    for timing in (False, True):
+        actual, meta = flagsparse_spmv_csc_run(prepared, B.to(device), out=output,
+                                             timing=timing, return_meta=True)
+        assert actual is output
+        _assert_close(actual, expected, dtype)
+        assert 0 < meta["workspace_peak_bytes"] <= budget
+        assert meta["segment_count"] > 0
+        assert meta["operator_ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+        if budget == 128:
+            assert meta["segment_batches"] > 1
+        else:
+            assert meta["reduction_levels"] >= 2
+    assert len(calls) == 3
+    assert torch.equal(prepared.data.cpu(), values)

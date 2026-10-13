@@ -69,6 +69,7 @@ ops:
   - id: spmv_coo
     description: |
       Computes sparse matrix-vector multiplication for a COO matrix.
+      Includes per-run segmented stream atomic algorithms; default route unchanged.
     for:
       - flagsparse_spmv_coo
       - prepare_spmv_coo
@@ -89,6 +90,7 @@ ops:
   - id: spmv_csc
     description: |
       Computes sparse matrix-vector multiplication for a CSC matrix.
+      Includes native column-vector and bounded split-reduce trans/conj algorithms.
     for:
       - flagsparse_spmv_csc
       - prepare_spmv_csc
@@ -164,6 +166,7 @@ ops:
   - id: spmm_coo
     description: |
       Computes sparse matrix-dense matrix multiplication for a COO matrix.
+      Includes streamed panels and load-time precision conversion; default route unchanged.
     for:
       - flagsparse_spmm_coo
       - prepare_spmm_coo_route
@@ -220,6 +223,7 @@ ops:
   - id: spmm_csc
     description: |
       Computes sparse matrix-dense matrix multiplication for a CSC matrix.
+      Includes native column k-parallel and bounded split-reduce trans/conj algorithms.
     for:
       - flagsparse_spmm_csc
       - flagsparse_spmm_csc_run

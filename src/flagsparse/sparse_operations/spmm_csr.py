@@ -2628,6 +2628,7 @@ SPMM_CSR_ALGORITHMS = {
         display_name="BaseAccuracy",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2640,6 +2641,7 @@ SPMM_CSR_ALGORITHMS = {
         display_name="TLEOpt",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2652,6 +2654,7 @@ SPMM_CSR_ALGORITHMS = {
         display_name="TLEOpt2",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2664,6 +2667,7 @@ SPMM_CSR_ALGORITHMS = {
         display_name="Alg1",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2676,6 +2680,7 @@ SPMM_CSR_ALGORITHMS = {
         display_name="Alg2",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2688,6 +2693,7 @@ SPMM_CSR_ALGORITHMS = {
         display_name="Alg2Accuracy",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2700,6 +2706,7 @@ SPMM_CSR_ALGORITHMS = {
         display_name="Alg2AccuracyHP",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2956,6 +2963,18 @@ def _flagsparse_spmm_csr_run_impl(
         op_name,
         timing=bool(timing),
     )
+    # Keep each legacy algorithm's scheduling and numerical strategy. Half inputs
+    # use its existing FP32 execution path, with conversion inside this run.
+    half_legacy = prepared.data.dtype == torch.float16 and algorithm.name not in _new_spmm_policy.NEW_ALGORITHMS
+    conversion_phases = None
+    if half_legacy:
+        import copy
+        from ._spmm_csr_runtime import Phases
+        conversion_phases = Phases(timing)
+        with conversion_phases.measure("process_gpu_ms"):
+            runtime_prepared = copy.copy(runtime_prepared)
+            runtime_prepared.data = runtime_prepared.data.float()
+            B = B.float()
     C, route_meta = algorithm.run(
         runtime_prepared,
         B,
@@ -2964,6 +2983,14 @@ def _flagsparse_spmm_csr_run_impl(
         dense_layout=dense_layout,
         **route_kwargs,
     )
+    if half_legacy:
+        with conversion_phases.measure("compute_ms"):
+            C = C.to(torch.float16)
+        route_meta.update(input_dtype="float16", execution_dtype="float32", output_dtype="float16",
+                          dtype_strategy="same_algorithm_fp32_execution", dtype_contract_version=1)
+        if timing:
+            for key, value in conversion_phases.results().items():
+                route_meta[key] = float(route_meta.get(key) or 0.0) + value
     if out is not None and C is not out:
         copy_start = _ACCEL.Event(enable_timing=True) if timing else None
         copy_end = _ACCEL.Event(enable_timing=True) if timing else None

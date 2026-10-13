@@ -118,9 +118,12 @@ def _scipy_reference(Asp, B, op, dtype):
     "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
 )
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
-@pytest.mark.parametrize("alg", [None, "coo_segmented_panel_atomic", "coo_rowrun_panel"], ids=["legacy", "segmented_panel", "rowrun_panel"])
+@pytest.mark.parametrize("alg", [None, "coo_atomic", "spmm_coo_alg1", "coo_segmented_panel_atomic", "coo_rowrun_panel", "coo_segmented_stream_panel_atomic"], ids=["legacy", "atomic", "alg1", "segmented_panel", "rowrun_panel", "stream_panel"])
 @pytest.mark.parametrize("layout", ["row", "col"])
 def test_spmm_coo_matches_dense_reference(M, N, K, dtype_name, dtype, index_dtype, op, alg, layout):
+    from flagsparse import list_spmm_coo_algorithms
+    if alg is not None and alg not in list_spmm_coo_algorithms(op=op, dtype=dtype):
+        pytest.skip(f"{alg} does not support {dtype}/{op}")
     device = accelerator_device()
     golden = golden_device()
     Asp = _random_coo_mk(M, K, dtype, golden)
@@ -222,7 +225,7 @@ def test_spmm_coo_rejects_invalid_ops_and_shapes():
 
 
 @pytest.mark.spmm_coo
-@pytest.mark.parametrize("alg", ["coo_segmented_panel_atomic", "coo_rowrun_panel"])
+@pytest.mark.parametrize("alg", ["coo_segmented_panel_atomic", "coo_rowrun_panel", "coo_segmented_stream_panel_atomic"])
 @pytest.mark.parametrize("width", [1, 7, 33] if QUICK_MODE else [1, 7, 8, 16, 31, 32, 33, 64, 65, 128])
 def test_spmm_coo_registered_panel_boundaries(alg, width, monkeypatch):
     from flagsparse import prepare_spmm_coo_route, flagsparse_spmm_coo_run
@@ -260,7 +263,7 @@ def test_spmm_coo_registered_panel_boundaries(alg, width, monkeypatch):
 
 
 @pytest.mark.spmm_coo
-@pytest.mark.parametrize("alg", ["coo_segmented_panel_atomic", "coo_rowrun_panel"])
+@pytest.mark.parametrize("alg", ["coo_segmented_panel_atomic", "coo_rowrun_panel", "coo_segmented_stream_panel_atomic"])
 @pytest.mark.parametrize("shape,width", [((0, 0), 0), ((0, 7), 3), ((5, 0), 7), ((5, 7), 0), ((5, 7), 3)])
 def test_spmm_coo_registered_empty(alg, shape, width):
     device = accelerator_device()
@@ -305,3 +308,43 @@ def test_spmm_coo_registered_config_isolation(alg):
         flagsparse_spmm_coo_run(prepared, B, alg="coo_rowrun_panel", config={"local_reduce": "none"})
     with pytest.raises(ValueError, match="overlap"):
         flagsparse_spmm_coo_run(prepared, B, out=B)
+
+
+@pytest.mark.spmm_coo
+@pytest.mark.parametrize("alg", ["coo_segmented_panel_atomic", "coo_segmented_stream_panel_atomic"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.complex64])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("mode", ["load", "materialize"])
+def test_spmm_coo_conversion_storage_and_precision(alg, dtype, op, mode, monkeypatch):
+    from flagsparse import prepare_spmm_coo_route, flagsparse_spmm_coo_run
+    from flagsparse.sparse_operations import spmv_coo as native
+    from flagsparse.sparse_operations.spmm_coo import _spmm_coo_compute_dtype
+    device = accelerator_device()
+    row = torch.tensor([0] * 67 + [2] * 71 + [0, 1, 2], dtype=torch.int64)
+    col = torch.arange(row.numel(), dtype=torch.int64) % 5
+    values = ((torch.arange(row.numel()) % 5 - 2).float() / 8).to(dtype)
+    if dtype.is_complex:
+        values = values + 0.125j
+    matrix = torch.zeros((3, 5), dtype=_reference_dtype(dtype))
+    matrix.index_put_((row, col), values.to(matrix.dtype), accumulate=True)
+    dense_rows = 5 if op == "non" else 3
+    B = torch.ones((dense_rows, 7), dtype=dtype)
+    if dtype.is_complex:
+        B = B * (1 + 0.5j)
+    effective = matrix if op == "non" else matrix.T if op == "trans" else matrix.conj().T
+    expected = effective @ B.to(matrix.dtype)
+    original = native._launch_coo_extension
+    seen = []
+    def observed(data, *args, **kwargs):
+        seen.append((data.dtype, kwargs.get("compute_dtype")))
+        return original(data, *args, **kwargs)
+    monkeypatch.setattr(native, "_launch_coo_extension", observed)
+    prepared = prepare_spmm_coo_route(values.to(device), row.to(device), col.to(device),
+        (3, 5), alg=alg, op=op, config={"conversion_mode": mode})
+    result, meta = flagsparse_spmm_coo_run(prepared, B.to(device), return_meta=True)
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(result.cpu().to(expected.dtype), expected, rtol=rtol, atol=atol)
+    compute = _spmm_coo_compute_dtype(dtype)
+    assert seen == [(dtype if mode == "load" else compute, compute)]
+    assert meta["conversion_mode"] == mode
+    assert result.dtype == dtype

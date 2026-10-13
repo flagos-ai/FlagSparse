@@ -237,3 +237,63 @@ def test_csc_half_does_not_require_fp16_atomic(algorithm, ops):
     config, _ = policy.resolve_csc_config(algorithm, "float16", 7,
         caps(fp64=False, fp32_atomic=True, fp64_atomic=False), op=ops[0])
     assert config["num_stages"] == 1
+
+
+@pytest.mark.parametrize("algorithm", ["coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic"])
+def test_coo_stream_configuration(algorithm):
+    device = caps(fp32_atomic=True, fp64_atomic=True)
+    cfg, _ = policy.resolve_coo_config(algorithm, "float64", device)
+    assert cfg["blocks_per_program"] == 2
+    for blocks in (0, 3, 16):
+        with pytest.raises(ValueError):
+            policy.resolve_coo_config(algorithm, "float64", device, {"blocks_per_program": blocks})
+    with pytest.raises(NotImplementedError):
+        policy.resolve_coo_config(algorithm, "float64", caps(fp64_atomic=True, scan=None))
+    cfg, _ = policy.resolve_coo_config(algorithm, "float64", caps(fp64_atomic=True, scan=None),
+                                       {"local_reduce": "none"})
+    assert cfg["local_reduce"] == "none"
+
+
+@pytest.mark.parametrize("algorithm", ["coo_segmented_panel_atomic", "coo_segmented_stream_panel_atomic"])
+def test_coo_conversion_configuration(algorithm):
+    device = caps(fp32_atomic=True, fp64_atomic=True)
+    for mode in ("load", "materialize"):
+        cfg, _ = policy.resolve_coo_config(algorithm, "float64", device, {"conversion_mode": mode})
+        assert cfg["conversion_mode"] == mode
+    with pytest.raises(ValueError):
+        policy.resolve_coo_config(algorithm, "float64", device, {"conversion_mode": "unknown"})
+
+
+@pytest.mark.parametrize("kind,bk,bn", [("spmv", 128, 1), ("spmm", 32, 8)])
+def test_csc_split_configuration(kind, bk, bn):
+    cfg, _ = policy.resolve_csc_config("csc_col_split_reduce", "complex128", 7, caps(),
+                                       op="trans", kind=kind)
+    assert cfg["block_nnz"] == bk and cfg["block_n"] == bn
+    for invalid in ({"reduce_block_size": 1}, {"workspace_bytes": 32}, {"num_stages": 2}):
+        with pytest.raises(ValueError):
+            policy.resolve_csc_config("csc_col_split_reduce", "float32", 7, caps(), invalid, op="trans", kind=kind)
+    with pytest.raises(NotImplementedError):
+        policy.resolve_csc_config("csc_col_split_reduce", "float32", 7, caps(scan=None), op="trans", kind=kind)
+
+
+@pytest.mark.parametrize("k", [4, 8, 16, 32])
+@pytest.mark.parametrize("algorithm", ["csc_col_tile_atomic", "csc_col_tile_panel_atomic"])
+def test_csc_short_column_candidates(algorithm, k):
+    cfg, _ = policy.resolve_csc_config(algorithm, "float32", 7, caps(fp32_atomic=True),
+                                       {"block_nnz": k}, op="non")
+    assert cfg["block_nnz"] == k
+
+
+@pytest.mark.parametrize("lanes", [2, 4, 8, 16, 32, 64])
+def test_csc_subgroup_candidates(lanes):
+    cfg, _ = policy.resolve_csc_config("csc_col_subgroup", "float32", 1,
+        caps("rocm", subgroup_width=64), {"lanes_per_column": lanes}, op="trans")
+    assert cfg["columns_per_program"] * lanes == cfg["num_warps"] * 64
+
+
+def test_coo_stream_invalid_profile_does_not_override_conservative(monkeypatch):
+    monkeypatch.setitem(policy.COO_ARCH_PROFILES, ("cuda", "test"),
+                        {"coo_segmented_stream_atomic": {"blocks_per_program": 16}})
+    cfg, info = policy.resolve_coo_config("coo_segmented_stream_atomic", "float32", caps(fp32_atomic=True))
+    assert cfg["blocks_per_program"] == 2
+    assert info["rejected_profiles"]

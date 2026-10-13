@@ -118,13 +118,13 @@ def _command_specs(
             *no_cusparse,
         ],
         "spmv-coo": [
-            "tests/test_spmv_coo.py", "--synthetic", "--alg", "compare",
+            "tests/test_spmv_coo.py", "--synthetic", "--alg", "compare", "--dtypes", "all",
             "--ops", "all", "--timing", "--csv-coo", str(results_dir / "spmv_coo.csv"),
             "--warmup", str(args.warmup), "--iters", str(args.iters), *no_cusparse,
         ],
         "spmv-csc": [
             "tests/test_spmv_csc.py",
-            "--alg", "compare", "--timing",
+            "--alg", "compare", "--timing", "--dtypes", "all",
             "--csv-csc", str(results_dir / "spmv_csc.csv"),
             "--synthetic",
             "--warmup",
@@ -159,13 +159,15 @@ def _command_specs(
             *no_cusparse,
         ],
         "spmm-coo": [
-            "tests/test_spmm_coo.py", "--synthetic", "--alg", "compare",
+            "tests/test_spmm_coo.py", "--synthetic", "--alg", "compare", "--dtypes", "all",
+            "--layout", "all", "--dense-cols", "1,32,65",
             "--ops", "all", "--timing", "--csv-coo", str(results_dir / "spmm_coo.csv"),
             "--warmup", str(args.warmup), "--iters", str(args.iters), *no_cusparse,
         ],
         "spmm-csc": [
             "tests/test_spmm_csc.py",
-            "--alg", "compare", "--timing",
+            "--alg", "compare", "--timing", "--dtypes", "all",
+            "--layout", "all", "--dense-cols", "1,32,65",
             "--csv-csc", str(results_dir / "spmm_csc.csv"),
             "--synthetic",
             "--ops",

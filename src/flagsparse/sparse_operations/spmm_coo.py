@@ -2135,7 +2135,7 @@ def _run_spmm_coo_extension_route(prepared, B, *, alg, timing=False,
                                    return_meta=True)
 
 
-for _name in ("coo_segmented_panel_atomic", "coo_rowrun_panel"):
+for _name in ("coo_segmented_panel_atomic", "coo_rowrun_panel", "coo_segmented_stream_panel_atomic"):
     SPMM_COO_ALGORITHMS[_name] = SpmmCooAlgorithm(
         name=_name, display_name=_name, supported_ops=("non", "trans", "conj"),
         supported_dtypes=(torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128),
@@ -2200,7 +2200,7 @@ def get_spmm_coo_algorithm_spec(alg):
     return dict(name=name, supported_ops=spec.supported_ops,
                 supported_dtypes=spec.supported_dtypes, layouts=("row", "col"),
                 implementation_version=2, timing_contract_version=2,
-                requires_sort="atomic" not in name)
+                requires_sort=name not in _coo_native._COO_ATOMIC_ALGORITHMS)
 
 
 def _select_spmm_coo_auto_alg(prepared):
@@ -2259,14 +2259,15 @@ def flagsparse_spmm_coo_run(prepared, B, *, alg=None, config=None, op=None,
         raise ValueError("legacy COO algorithms do not accept config")
     def execute(phases):
         with phases.measure("process_gpu_ms"):
-            a = prepared.data.to(compute_dtype).contiguous()
+            storage_dtype = prepared.data.dtype if cfg.get("conversion_mode") == "load" else compute_dtype
+            a = prepared.data.resolve_conj().to(storage_dtype).contiguous()
             r, c = (prepared.row, prepared.col) if prepared.op == "non" else (prepared.col, prepared.row)
             # Range checked in prepare, but conversion belongs to each run.
             r, c = r.to(torch.int32).contiguous(), c.to(torch.int32).contiguous()
-            bc = _materialize_dense_layout(B.to(compute_dtype), dense_layout)
+            bc = _materialize_dense_layout(B.resolve_conj().to(storage_dtype), dense_layout)
             starts = None
             if new:
-                if "atomic" not in selected:
+                if selected not in _coo_native._COO_ATOMIC_ALGORITHMS:
                     a, r, c, starts = _coo_native._coo_sorted_runs(a, r, c)
             else:
                 if prepared.op == "conj" and a.is_complex():
@@ -2283,7 +2284,7 @@ def flagsparse_spmm_coo_run(prepared, B, *, alg=None, config=None, op=None,
         with phases.measure("compute_ms"):
             if new:
                 C = _coo_native._launch_coo_extension(a, r, c, starts, bc, shape, selected, cfg,
-                                                      prepared.op == "conj")
+                                                      prepared.op == "conj", compute_dtype=compute_dtype)
                 route_meta = {}
             elif selected != "spmm_coo_alg1":
                 C, route_meta = algorithm.run(execution, bc, timing=False,
@@ -2294,6 +2295,8 @@ def flagsparse_spmm_coo_run(prepared, B, *, alg=None, config=None, op=None,
                 C = out
         return C, dict(route_meta | info, alg=selected, alg_requested=requested,
                        alg_resolved=selected, op=prepared.op, compute_dtype=str(compute_dtype),
+                       conversion_mode=cfg.get("conversion_mode", "materialize"),
+                       blocks_per_program=cfg.get("blocks_per_program", 1), implementation_version=2,
                        component_dtype="float64" if compute_dtype in (torch.float64, torch.complex128) else "float32",
                        backend=_common_mod._backend_name(),
                        input_indices=(str(prepared.row.dtype), str(prepared.col.dtype)),
