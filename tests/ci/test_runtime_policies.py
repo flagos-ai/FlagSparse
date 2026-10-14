@@ -308,10 +308,45 @@ def test_spmm_bsr_algorithm_normalization(alg):
     assert normalized in ("auto", "spmm_bsr_base")
 
 
-@pytest.mark.parametrize("alg", ["auto", "base", "spmm_csc_base"])
+@pytest.mark.parametrize("alg", ["auto", "base", *spmm_csc_ops.SPMM_CSC_ALGORITHMS])
 def test_spmm_csc_algorithm_normalization(alg):
     normalized = spmm_csc_ops._normalize_spmm_csc_alg(alg)
-    assert normalized in ("auto", "spmm_csc_base")
+    expected = "spmm_csc_base" if alg == "base" else alg
+    assert normalized == expected
+    assert spmm_csc_ops._normalize_spmm_csc_alg(alg.upper().replace("_", "-")) == expected
+
+
+@pytest.mark.parametrize("alg", ["csc_col_kparallel", "csc_col_split_reduce"])
+def test_spmm_csc_legacy_prepared_switches_to_extension(monkeypatch, alg):
+    from types import SimpleNamespace
+
+    prepared = SimpleNamespace(
+        data=object(), kernel_indices=object(), kernel_indptr=object(),
+        shape=(3, 5), op="trans", index_fallback_policy="strict",
+    )
+    execution, dense, output = object(), object(), object()
+    config = {"block_nnz": 32}
+
+    def prepare(*args):
+        assert args == (
+            prepared.data, prepared.kernel_indices, prepared.kernel_indptr,
+            prepared.shape, "trans", None, alg, config, "strict", "spmm",
+        )
+        return execution
+
+    def run(route, B, **kwargs):
+        assert route is execution and B is dense
+        assert kwargs["alg"] == alg
+        assert kwargs["config"] is config
+        assert kwargs["op"] == "trans"
+        assert kwargs["out"] is output
+        return output
+
+    monkeypatch.setattr(spmm_csc_ops._csc_native, "_prepare_csc_registered", prepare)
+    monkeypatch.setattr(spmm_csc_ops._csc_native, "_run_csc_registered", run)
+    assert spmm_csc_ops.flagsparse_spmm_csc_run(
+        prepared, dense, alg=alg, op="trans", config=config, out=output,
+    ) is output
 
 
 @pytest.mark.parametrize("alg", ["auto", "base", "spmm_bell_base"])

@@ -318,6 +318,24 @@ from tests.pytest.conftest import QUICK_MODE
 
 
 @pytest.mark.spmm_csc
+def test_spmm_csc_compare_registry_contract():
+    from flagsparse.sparse_operations import spmm_csc as ops
+
+    names = ops.list_spmm_csc_algorithms()
+    assert set(names) == set(ops.SPMM_CSC_ALGORITHMS)
+    assert {"csc_col_kparallel", "csc_col_split_reduce"} <= set(names)
+    for name in names:
+        spec = ops.get_spmm_csc_algorithm_spec(name)
+        assert spec["name"] == name
+        for op in ("non", "trans", "conj"):
+            selected = ops.list_spmm_csc_algorithms(op=op, dtype=torch.float32)
+            assert (name in selected) == (op in spec["ops"])
+            if name in selected:
+                route = ops.resolve_spmm_csc_algorithm(name, op, torch.float32)
+                assert route.name == name
+
+
+@pytest.mark.spmm_csc
 @pytest.mark.parametrize("alg,op", [("csc_col_tile_panel_atomic", "non"), ("csc_col_panel", "trans"), ("csc_col_panel", "conj"), ("csc_col_kparallel", "trans"), ("csc_col_kparallel", "conj"), ("csc_col_split_reduce", "trans"), ("csc_col_split_reduce", "conj")])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128])
 @pytest.mark.parametrize("index_dtype,ptr_dtype", [(torch.int32, torch.int64)] if QUICK_MODE else

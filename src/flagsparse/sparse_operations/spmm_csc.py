@@ -43,6 +43,12 @@ SPMM_CSC_SUPPORTED_OP_NAMES = ("non", "trans", "conj")
 _SPMM_CSC_OP_NAME_TO_CODE = {name: code for code, name in SPMM_CSC_OP_NAMES.items()}
 
 SPMM_CSC_ALG_BASE = "spmm_csc_base"
+_SPMM_CSC_EXTENSION_ALGORITHMS = (
+    "csc_col_panel",
+    "csc_col_tile_panel_atomic",
+    "csc_col_kparallel",
+    "csc_col_split_reduce",
+)
 _SPMM_CSC_RESERVED_OP_MESSAGE = "spmm_csc_base supports op='non', 'trans', and 'conj'"
 
 
@@ -97,7 +103,7 @@ def _normalize_spmm_csc_alg(alg):
     token = "auto" if alg is None else str(alg).strip().lower().replace("-", "_")
     if token in ("auto", "base", "csc_base", "spmm_csc_base"):
         return "auto" if token == "auto" else SPMM_CSC_ALG_BASE
-    if token in ("csc_col_panel", "csc_col_tile_panel_atomic"):
+    if token in _SPMM_CSC_EXTENSION_ALGORITHMS:
         return token
     raise ValueError(f"unsupported CSC SpMM algorithm: {alg}")
 
@@ -1568,7 +1574,8 @@ def flagsparse_spmm_csc_run(
     """Run a registered native CSC SpMM route."""
     if isinstance(prepared, _csc_native.PreparedCscRoute) and prepared.kind != "spmm":
         raise TypeError("prepared must describe CSC SpMM")
-    if isinstance(prepared, _csc_native.PreparedCscRoute) or alg in ("csc_col_panel", "csc_col_tile_panel_atomic"):
+    alg = None if alg is None else _normalize_spmm_csc_alg(alg)
+    if isinstance(prepared, _csc_native.PreparedCscRoute) or alg in _SPMM_CSC_EXTENSION_ALGORITHMS:
         if not isinstance(prepared, _csc_native.PreparedCscRoute):
             prepared = _csc_native._prepare_csc_registered(prepared.data, prepared.kernel_indices, prepared.kernel_indptr,
                 prepared.shape, prepared.op, None, alg, config, prepared.index_fallback_policy, "spmm")
@@ -1739,7 +1746,7 @@ def _run_csc_extension_route(prepared, B, timing=False):
     return _csc_native._run_csc_registered(prepared, B, return_meta=True, timing=timing)
 
 
-for _name in ("csc_col_panel", "csc_col_tile_panel_atomic", "csc_col_kparallel", "csc_col_split_reduce"):
+for _name in _SPMM_CSC_EXTENSION_ALGORITHMS:
     SPMM_CSC_ALGORITHMS[_name] = SpmmCscAlgorithm(
         name=_name, display_name=_name,
         supported_ops=_csc_native._csc_spec(_name, "spmm")["ops"],
