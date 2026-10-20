@@ -30,6 +30,11 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+if __package__:
+    from .utils import filtered_avg_ms
+else:
+    from utils import filtered_avg_ms
+
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_bell as bell_ops
@@ -91,6 +96,8 @@ DTYPE_MAP = {
     "complex128": torch.complex128,
 }
 INDEX_DTYPE_MAP = {"int32": torch.int32, "int64": torch.int64}
+
+
 
 
 def _dtype_name(dtype):
@@ -381,15 +388,17 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
     count = max(1, int(iters))
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _time_flagsparse_bell(data, indices, B, shape, block_dim, alg, op, warmup, iters, timing=False):

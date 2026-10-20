@@ -32,6 +32,12 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+if __package__:
+    from .utils import filtered_avg_ms, cupy_event_benchmark_filtered
+else:
+    from utils import filtered_avg_ms, cupy_event_benchmark_filtered
+
 import flagsparse as fs
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmv_bsr as bsr_ops
@@ -436,14 +442,16 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _time_flagsparse_bsr(data, indices, indptr, x, shape, block_dim, op, alg, warmup, iters, timing=False):
@@ -579,18 +587,8 @@ def _time_cusparse(data, indices, indptr, x, shape, block_dim, op, warmup, iters
             fn = lambda: A.conj().T @ x_cp
         else:
             fn = lambda: A @ x_cp
-        for _ in range(max(0, int(warmup))):
-            _ = fn()
-        cp.cuda.runtime.deviceSynchronize()
-        start = cp.cuda.Event()
-        end = cp.cuda.Event()
-        count = max(1, int(iters))
-        start.record()
-        for _ in range(count):
-            _ = fn()
-        end.record()
-        end.synchronize()
-        return cp.cuda.get_elapsed_time(start, end) / count, fallback_note
+        _, elapsed_ms = cupy_event_benchmark_filtered(fn, warmup, iters)
+        return elapsed_ms, fallback_note
 
     try:
         return run_with_index_dtype(indices.dtype)

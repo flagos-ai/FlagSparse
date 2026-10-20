@@ -34,6 +34,12 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+if __package__:
+    from .utils import filtered_avg_ms
+else:
+    from utils import filtered_avg_ms
+
 import flagsparse as ast
 import flagsparse.sparse_operations._common as ast_common
 import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
@@ -190,14 +196,16 @@ def _benchmark_flagsparse_spmv(
     for _ in range(warmup):
         _ = spmv_op()
     ACCEL.synchronize()
-    start_ev = ACCEL.Event(enable_timing=True)
-    end_ev = ACCEL.Event(enable_timing=True)
-    start_ev.record()
+    samples = []
     for _ in range(iters):
+        start_ev = ACCEL.Event(enable_timing=True)
+        end_ev = ACCEL.Event(enable_timing=True)
+        start_ev.record()
         y = spmv_op()
-    end_ev.record()
-    ACCEL.synchronize()
-    return y, start_ev.elapsed_time(end_ev) / iters
+        end_ev.record()
+        ACCEL.synchronize()
+        samples.append(start_ev.elapsed_time(end_ev))
+    return y, filtered_avg_ms(samples)
 
 
 def _materialize_csr_op_for_timing(data, indices, indptr, shape, op):
@@ -383,14 +391,16 @@ def _time_pytorch_spmv(data, indices, indptr, x, shape, warmup, iters, op="non")
     for _ in range(warmup):
         _ = spmv_op()
     ACCEL.synchronize()
-    start_ev = ACCEL.Event(enable_timing=True)
-    end_ev = ACCEL.Event(enable_timing=True)
-    start_ev.record()
+    samples = []
     for _ in range(iters):
+        start_ev = ACCEL.Event(enable_timing=True)
+        end_ev = ACCEL.Event(enable_timing=True)
+        start_ev.record()
         _ = spmv_op()
-    end_ev.record()
-    ACCEL.synchronize()
-    return start_ev.elapsed_time(end_ev) / iters
+        end_ev.record()
+        ACCEL.synchronize()
+        samples.append(start_ev.elapsed_time(end_ev))
+    return filtered_avg_ms(samples)
 
 
 def _tolerance(value_dtype):

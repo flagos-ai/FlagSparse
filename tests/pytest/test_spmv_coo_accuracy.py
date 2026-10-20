@@ -292,3 +292,121 @@ def test_spmv_coo_tocsr_prepared_path_matches_torch():
     out = flagsparse_spmv_coo_tocsr(x=x.to(device), prepared=prepared)
     rtol, atol = _tol(torch.float32)
     assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)
+
+
+# Explicit migrated algorithms share this operator's marker, golden and tolerance.
+_MIGRATED_ROUTES = (('coo_segmented_atomic', 'non'), ('coo_segmented_atomic', 'trans'), ('coo_segmented_atomic', 'conj'), ('coo_rowrun_subgroup', 'non'), ('coo_rowrun_subgroup', 'trans'), ('coo_rowrun_subgroup', 'conj'), ('coo_segmented_stream_atomic', 'non'), ('coo_segmented_stream_atomic', 'trans'), ('coo_segmented_stream_atomic', 'conj'))
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("alg,op", _MIGRATED_ROUTES, ids=[f"{a}-{o}" for a, o in _MIGRATED_ROUTES])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128], ids=["float16", "float32", "float64", "complex64", "complex128"])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
+
+def test_spmv_coo_migrated_routes(alg, op, dtype, index_dtype):
+    import importlib
+    from tests.pytest.conftest import QUICK_MODE
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmv_coo")
+    device = accelerator_device()
+    # Repeated coordinates, unsorted inner indices, an empty row/column and tile tails.
+    rows = torch.tensor([0, 4, 0, 6, 4, 1, 6, 0, 4], dtype=torch.int64)
+    cols = torch.tensor([2, 0, 2, 3, 1, 4, 0, 1, 1], dtype=torch.int64)
+    real = torch.tensor([1, -2, 3, 0, -1, 2, 1, -3, 4], dtype=torch.float64) / 8
+    values = (torch.complex(real, real.flip(0)) if dtype.is_complex else real).to(dtype)
+    shape = (9, 7)
+    reference_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    dense = torch.zeros(shape, dtype=reference_dtype)
+    dense.index_put_((rows, cols), values.to(reference_dtype), accumulate=True)
+    first, second = rows.to(device=device, dtype=index_dtype), cols.to(device=device, dtype=index_dtype)
+    data = values.to(device)
+    input_rows = shape[1] if op == "non" else shape[0]
+    operand = (torch.arange(input_rows, dtype=torch.float64) % 7 - 3) / 8
+    if dtype.is_complex:
+        operand = torch.complex(operand, operand.flip(0) / 2)
+    operand = operand.to(dtype)
+    expected_matrix = dense if op == "non" else dense.T.conj() if op == "conj" else dense.T
+    expected = (expected_matrix @ operand.to(reference_dtype)).to(dtype)
+    operand = operand.to(device)
+
+    try:
+        prepared = module.prepare_spmv_coo(data, first, second, shape, op=op, alg=alg)
+        backing = torch.full((expected.numel() * 2,), float("nan"), dtype=dtype, device=device)
+        out = backing[::2]
+        result = module.flagsparse_spmv_coo_run(prepared, operand, out=out)
+        direct = module.flagsparse_spmv_coo(data, first, second, operand, shape, op=op, alg=alg)
+    except NotImplementedError as exc:
+        pytest.skip(f"backend capability unavailable: {exc}")
+    assert result is out
+    rtol, atol = close_tolerances(dtype)
+    torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+    torch.testing.assert_close(direct.cpu(), expected, rtol=rtol, atol=atol)
+    with pytest.raises(ValueError, match="op"):
+        module.flagsparse_spmv_coo_run(prepared, operand, op="trans" if op == "non" else "non")
+
+
+    with pytest.raises(ValueError, match="sort_by_row"):
+        module.prepare_spmv_coo(data, first, second, shape, op=op, alg=alg,
+                                sort_by_row=alg != "coo_rowrun_subgroup")
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("blocks,reduce", [(1, "segment"), (2, "segment"), (4, "segment"), (8, "segment"), (2, "none")])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmv_coo_stream_carry_boundaries(blocks, reduce, dtype, op):
+    import importlib
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmv_coo")
+    device = accelerator_device()
+    count = 521
+    # A long adjacent run crosses both block and program boundaries; remaining
+    # coordinates revisit the same output non-contiguously, including a tail.
+    rows = torch.cat((torch.zeros(401, dtype=torch.int64), torch.arange(120) % 5))
+    cols = torch.arange(count) % 7
+    data = (torch.arange(count, dtype=torch.float64) % 9 - 4) / 16
+    if dtype.is_complex:
+        data = torch.complex(data, data.flip(0) / 2)
+    data = data.to(dtype)
+    shape = (5, 7)
+    golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    matrix = torch.zeros(shape, dtype=golden_dtype)
+    matrix.index_put_((rows, cols), data.to(golden_dtype), accumulate=True)
+    matrix = matrix if op == "non" else matrix.T.conj() if op == "conj" else matrix.T
+    operand = torch.ones(matrix.shape[1], dtype=golden_dtype)
+    operand = operand.to(dtype)
+    expected = (matrix @ operand.to(golden_dtype)).to(dtype)
+    cfg = dict(block_nnz=32, blocks_per_program=blocks, local_reduce=reduce)
+    try:
+        prepared = module.prepare_spmv_coo(data.to(device), rows.to(device), cols.to(device), shape,
+            op=op, alg="coo_segmented_stream_atomic", config=cfg)
+        actual, meta = module.flagsparse_spmv_coo_run(prepared, operand.to(device), return_meta=True, timing=True)
+        rtol, atol = close_tolerances(dtype)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+        assert meta["operator_ms"] == meta["gpu_ms"]
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("alg,op", _MIGRATED_ROUTES)
+@pytest.mark.parametrize("shape", [(0, 0), (3, 0), (0, 5), (3, 5)])
+def test_spmv_coo_migrated_empty(alg, op, shape):
+    import importlib
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmv_coo")
+    device = accelerator_device()
+    data = torch.empty(0, dtype=torch.float32, device=device)
+    first = torch.empty(0, dtype=torch.int64, device=device)
+    second = first
+    input_rows, output_rows = shape[1], shape[0]
+    if op != "non":
+        input_rows, output_rows = output_rows, input_rows
+    operand = torch.ones((input_rows,), device=device)
+    out = torch.full((output_rows,), float("nan"), device=device)
+    try:
+        prepared = module.prepare_spmv_coo(data, first, second, shape, op=op, alg=alg)
+        result = module.flagsparse_spmv_coo_run(prepared, operand, out=out)
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+    assert result is out
+    assert torch.equal(result.cpu(), torch.zeros_like(result.cpu()))

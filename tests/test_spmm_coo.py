@@ -40,6 +40,11 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+if __package__:
+    from .utils import filtered_avg_ms, cupy_event_benchmark_filtered
+else:
+    from utils import filtered_avg_ms, cupy_event_benchmark_filtered
+
 import flagsparse as ast
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmm_coo as ast_ops
@@ -146,6 +151,8 @@ DEFAULT_BLOCK_NNZ = 256
 DUPLICATE_CASE_DENSE_COLS = 48
 
 
+
+
 def _dtype_name(dtype):
     return str(dtype).replace("torch.", "")
 
@@ -180,6 +187,8 @@ def _parse_algs(value, route="rowrun"):
             return ["coo_rowrun", "coo_atomic"]
         return ["auto"]
     value = str(value).strip().lower()
+    if value == "compare":
+        value = "all"
     if value in ("auto", "all"):
         return [value]
     allowed = set(ast.SPMM_COO_ALGORITHMS)
@@ -636,15 +645,17 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
     count = max(1, int(iters))
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _time_coo_algorithm(
@@ -812,21 +823,7 @@ def _time_cusparse_coo(prepared_case, ref_C, dtype, warmup, iters, layout="row")
 
 
 def _cupy_event_benchmark(op, arg, warmup, iters):
-    import cupy as cp
-
-    out = None
-    for _ in range(max(0, int(warmup))):
-        out = op(arg)
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        out = op(arg)
-    end.record()
-    end.synchronize()
-    return out, cp.cuda.get_elapsed_time(start, end) / count
+    return cupy_event_benchmark_filtered(lambda: op(arg), warmup, iters)
 
 
 def run_one_alg_case(
@@ -844,6 +841,7 @@ def run_one_alg_case(
     timing,
     diagnose,
     progress=False,
+    input_arrays=None,
 ):
     matrix_name = os.path.basename(path)
 
@@ -862,7 +860,8 @@ def run_one_alg_case(
 
     device = accelerator_device()
     stage_t0 = _start("load mtx")
-    data, row, col, shape = load_mtx_to_coo_torch(path, dtype=dtype, device=device)
+    data, row, col, shape = (load_mtx_to_coo_torch(path, dtype=dtype, device=device)
+                             if input_arrays is None else input_arrays)
     row = row.to(index_dtype)
     col = col.to(index_dtype)
     n_rows, n_cols = shape
@@ -959,8 +958,12 @@ def run_one_alg_case(
         try:
             ast.resolve_spmm_coo_algorithm(alg, op, dtype)
             stage_t0 = _start(f"run {alg}")
+            # Canonical legacy preparation discards duplicates. Explicit native
+            # extensions must prepare from the original COO, outside sampling.
+            route_prepared = (ast.prepare_spmm_coo_route(data, row, col, shape, op=op, alg=alg)
+                              if alg in ast_ops.SPMM_COO_NEW_ALGORITHMS else prepared)
             result = _time_coo_algorithm(
-                prepared,
+                route_prepared,
                 B,
                 alg,
                 warmup,
@@ -1556,6 +1559,7 @@ def run_one_mtx(
             pytorch_op,
             warmup=warmup,
             iters=iters,
+            filter_samples=True,
         )
     except Exception as exc:
         reason = str(exc)
@@ -1589,6 +1593,7 @@ def run_one_mtx(
                 ast_ops._destroy_spmm_coo_ref_hipsparse_prepared,
                 warmup=warmup,
                 iters=iters,
+                filter_samples=True,
             )
             cusparse_metrics = ast_ops._spmm_validation_metrics(cs_C_t, ref_C)
             result["cusparse_abs_err"] = cusparse_metrics["max_abs_error"]
@@ -1647,18 +1652,10 @@ def run_one_mtx(
                 A_coo.sum_duplicates()
 
                 def _run_cusparse_timing(rhs):
-                    ACCEL.synchronize()
-                    for _ in range(warmup):
-                        _ = cupyx.cusparse.spmm(A_coo, rhs)
-                    ACCEL.synchronize()
-                    start = ACCEL.Event(enable_timing=True)
-                    end = ACCEL.Event(enable_timing=True)
-                    start.record()
-                    for _ in range(iters):
-                        _ = cupyx.cusparse.spmm(A_coo, rhs)
-                    end.record()
-                    ACCEL.synchronize()
-                    return start.elapsed_time(end) / iters
+                    _, elapsed = cupy_event_benchmark_filtered(
+                        lambda: cupyx.cusparse.spmm(A_coo, rhs), warmup, iters
+                    )
+                    return elapsed
 
                 try:
                     result["cusparse_ms"] = _run_cusparse_timing(B_cp)
@@ -1936,7 +1933,7 @@ def _benchmark_spmm_coo_synthetic_policy(
     pytorch_ms = None
     try:
         pytorch_values, pytorch_ms = ast_ops._benchmark_cuda_op(
-            pytorch_op, warmup=warmup, iters=iters
+            pytorch_op, warmup=warmup, iters=iters, filter_samples=True
         )
     except Exception as exc:
         pytorch_reason = (
@@ -1965,6 +1962,7 @@ def _benchmark_spmm_coo_synthetic_policy(
                 ast_ops._destroy_spmm_coo_ref_hipsparse_prepared,
                 warmup=warmup,
                 iters=iters,
+                filter_samples=True,
             )
             cusparse_summary = ast_ops._spmm_validation_metrics(
                 cusparse_values, expected
@@ -2018,6 +2016,7 @@ def _benchmark_spmm_coo_synthetic_policy(
                     lambda: cupyx.cusparse.spmm(A_coo, B_cp),
                     warmup=warmup,
                     iters=iters,
+                    filter_samples=True,
                 )
                 cusparse_values = torch.utils.dlpack.from_dlpack(
                     cusparse_values_cp.toDlpack()
@@ -3123,6 +3122,33 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
+    if args.synthetic and args.alg is not None:
+        device = accelerator_device()
+        data = torch.tensor([1, -2, 3, 1, 0], dtype=value_dtype, device=device)
+        row = torch.tensor([0, 3, 0, 6, 3], dtype=index_dtype, device=device)
+        col = torch.tensor([1, 2, 1, 4, 0], dtype=index_dtype, device=device)
+        rows = []
+        for op_name in op_names:
+            for layout_name in layout_names:
+                result, _ = run_one_alg_case(
+                    "synthetic", value_dtype, _dtype_name(index_dtype), index_dtype,
+                    op_name, layout_name, alg_names, args.dense_cols, args.warmup,
+                    args.iters, not args.no_cusparse, args.timing, args.diagnose,
+                    input_arrays=(data, row, col, (7, 5)),
+                )
+                rows.extend(result)
+                for item in result:
+                    print(f"{item['alg']} {op_name}/{layout_name}: {item['status']} "
+                          f"ms={item['ms']} vendor={item['cusparse_ms']} "
+                          f"speedup={item.get('cusparse_vs_alg_speedup')} {item.get('reason', '')}")
+        if args.csv:
+            output = Path(_normalize_csv_path(args.csv))
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=PERF_FIELDS + (TIMING_FIELDS if args.timing else []), extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+        return
     if args.synthetic:
         run_comprehensive_synthetic(
             warmup=args.warmup,

@@ -1270,6 +1270,7 @@ def _benchmark_spmm_bsr_sparse_ref(
         _destroy_spmm_bsr_ref_hipsparse_prepared,
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     result["values"] = values.contiguous()
     result["ms"] = ms

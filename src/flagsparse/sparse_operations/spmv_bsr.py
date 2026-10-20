@@ -344,6 +344,7 @@ def _benchmark_spmv_bsr_sparse_ref(
         _destroy_spmv_bsr_ref_hipsparse_prepared,
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     result["values"] = values
     result["ms"] = ms

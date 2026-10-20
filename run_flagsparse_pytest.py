@@ -2899,6 +2899,12 @@ def run_performance(
             "routing yet: add it to GENERIC_BENCHMARK_BACKENDS or "
             "PROBE_ONLY_BACKENDS",
         )
+    # Keep default delivery on test_spmm.py. Only an explicit registered-algorithm
+    # request selects the existing CSR scanner and its CSV option.
+    if op == "spmm_csr" and template and template[0] == "tests/test_spmm.py":
+        if any(arg == "--alg" or arg.startswith("--alg=") for arg in extra_args):
+            template = tuple("tests/test_spmm_csr.py" if arg == "tests/test_spmm.py"
+                             else "--csv-csr" if arg == "--csv" else arg for arg in template)
     if not template:
         return _not_configured(op, "performance", "no performance command mapping")
 

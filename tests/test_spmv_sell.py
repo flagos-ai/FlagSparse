@@ -224,13 +224,13 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
         out=out, out_dtype=out_arg,
     )
     row["triton_max_error"] = _error(first, ref)
-    _, row["triton_ms"] = _benchmark_cuda_op(ours, warmup, iters)
+    _, row["triton_ms"] = _benchmark_cuda_op(ours, warmup, iters, filter_samples=True)
 
     try:
         compute = torch.float32 if vdt in (torch.float16, torch.bfloat16, torch.int8) else vdt
         A = torch.sparse_csr_tensor(ptr_d.long(), cols_d.long(), data.to(compute), (m, k))
         xc = x.to(compute)
-        _, row["pytorch_ms"] = _benchmark_cuda_op(lambda: A @ xc, warmup, iters)
+        _, row["pytorch_ms"] = _benchmark_cuda_op(lambda: A @ xc, warmup, iters, filter_samples=True)
     except Exception as exc:  # e.g. MUSA registers no sparse matmul
         row["pytorch_reason"] = f"{type(exc).__name__}: {exc}"
 
@@ -242,7 +242,7 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
             plan = cusparse_baseline.prepare_spmv_sell(values, sell_cols, offsets, x, y, (m, k), slice_size, compute)
             plan.run()
             row["cusparse_max_error"] = _error(y, ref)
-            _, row["cusparse_ms"] = _benchmark_cuda_op(plan.run, warmup, iters)
+            _, row["cusparse_ms"] = _benchmark_cuda_op(plan.run, warmup, iters, filter_samples=True)
             plan.close()
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"

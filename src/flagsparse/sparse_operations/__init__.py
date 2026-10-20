@@ -208,6 +208,16 @@ _BENCHMARK_EXPORTS = {
     "comprehensive_spsm_test",
 }
 
+from .spmv_coo import (flagsparse_spmv_coo_run, list_spmv_coo_algorithms, get_spmv_coo_algorithm_spec)
+
+from .spmv_csc import (flagsparse_spmv_csc_run, list_spmv_csc_algorithms, get_spmv_csc_algorithm_spec)
+
+from .spmm_coo import (get_spmm_coo_algorithm_spec)
+
+from .spmm_csc import (get_spmm_csc_algorithm_spec)
+
+from .spmm_csr import (get_spmm_csr_algorithm_spec)
+
 __all__ = [
     "PreparedCoo",
     "PreparedCooSpmmRoute",
@@ -271,14 +281,17 @@ __all__ = [
     "flagsparse_spgemm_csr",
     "SPMM_COO_ASCEND_DISPATCH",
     "flagsparse_spmm_coo",
+    "get_spmm_coo_algorithm_spec",
     "flagsparse_spmm_bsr",
     "flagsparse_spmm_bsr_run",
     "flagsparse_spmm_bell",
     "flagsparse_spmm_bell_run",
     "flagsparse_spmm_csc",
+    "get_spmm_csc_algorithm_spec",
     "flagsparse_spmm_csc_run",
     "flagsparse_spmm_coo_run",
     "flagsparse_spmm_csr",
+    "get_spmm_csr_algorithm_spec",
     "flagsparse_spmm_csr_run",
     "flagsparse_spmm_csr_opt",
     "flagsparse_spmm_csr_opt_alg1",
@@ -286,9 +299,15 @@ __all__ = [
     "flagsparse_spmm_csr_opt_alg2",
     "flagsparse_spmm_csr_opt_alg2_preprocess",
     "flagsparse_spmv_coo",
+    "flagsparse_spmv_coo_run",
+    "list_spmv_coo_algorithms",
+    "get_spmv_coo_algorithm_spec",
     "flagsparse_spmv_bsr",
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spmv_csc",
+    "flagsparse_spmv_csc_run",
+    "list_spmv_csc_algorithms",
+    "get_spmv_csc_algorithm_spec",
     "flagsparse_spmv_sell",
     "dense_to_sell",
     "csr_to_sell",

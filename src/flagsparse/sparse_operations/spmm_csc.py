@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 
 from ._common import *
+from . import _common as _common_mod
 from ._rocm_sparse_cache import TensorPlanCache
 
 import triton
@@ -124,7 +125,9 @@ def _normalize_spmm_csc_alg(alg):
     token = "auto" if alg is None else str(alg).strip().lower().replace("-", "_")
     if token in ("auto", "base", "csc_base", "spmm_csc_base"):
         return "auto" if token == "auto" else SPMM_CSC_ALG_BASE
-    raise ValueError("unsupported CSC SpMM algorithm; supported: auto, spmm_csc_base")
+    if token in SPMM_CSC_NEW_ALGORITHMS:
+        return token
+    raise ValueError(f"unsupported CSC SpMM algorithm: {alg!r}")
 
 
 def _normalize_spmm_csc_index_fallback_policy(index_fallback_policy):
@@ -132,6 +135,10 @@ def _normalize_spmm_csc_index_fallback_policy(index_fallback_policy):
     if policy not in ("auto", "strict"):
         raise ValueError("index_fallback_policy must be 'auto' or 'strict'")
     return policy
+
+
+SPMM_CSC_NEW_ALGORITHMS = ("csc_col_panel", "csc_col_tile_panel_atomic",
+                           "csc_col_kparallel", "csc_col_split_reduce")
 
 
 class PreparedCscSpmm:
@@ -539,7 +546,16 @@ def prepare_spmm_csc_route(
     op="non",
     alg="auto",
     index_fallback_policy="auto",
+    config=None,
 ):
+    if _normalize_spmm_csc_alg(alg) in SPMM_CSC_NEW_ALGORITHMS:
+        from .spmv_csc import _prepare_csc_registered
+
+        return _prepare_csc_registered(data, indices, indptr, shape, op, None,
+            _normalize_spmm_csc_alg(alg), config, index_fallback_policy, "spmm",
+            {"block_n": block_n, "block_nnz": block_nnz, "max_segments": max_segments})
+    if config is not None:
+        raise ValueError("config requires a CSC extension algorithm")
     index_fallback_policy = _normalize_spmm_csc_index_fallback_policy(
         index_fallback_policy
     )
@@ -1550,6 +1566,28 @@ SPMM_CSC_ALGORITHMS = {
 }
 
 
+def _run_spmm_csc_extension(prepared, B, **kwargs):
+    from .spmv_csc import _run_csc_registered
+
+    return _run_csc_registered(prepared, B, **kwargs)
+
+
+for _name in SPMM_CSC_NEW_ALGORITHMS:
+    SPMM_CSC_ALGORITHMS[_name] = SpmmCscAlgorithm(
+        name=_name, display_name=_name,
+        supported_ops=("non",) if _name == "csc_col_tile_panel_atomic" else ("trans", "conj"),
+        supported_dtypes=(torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128),
+        run=_run_spmm_csc_extension,
+    )
+
+
+def get_spmm_csc_algorithm_spec(alg):
+    from .spmv_csc import _csc_spec
+
+    name = _normalize_spmm_csc_alg(alg)
+    return _csc_spec(SPMM_CSC_ALG_BASE if name == "auto" else name, "spmm")
+
+
 def resolve_spmm_csc_algorithm(alg, op, dtype):
     token = _normalize_spmm_csc_alg(alg)
     if token == "auto":
@@ -1566,7 +1604,11 @@ def resolve_spmm_csc_algorithm(alg, op, dtype):
     return algorithm
 
 
-def list_spmm_csc_algorithms(op=None, dtype=None):
+def list_spmm_csc_algorithms(op=None, dtype=None, backend=None, layout=None):
+    if backend is not None and backend not in {spec.name for spec in _common_mod.backend_specs()}:
+        return ()
+    if layout is not None and layout not in ("row", "col", "strided"):
+        return ()
     op_name = None if op is None else _spmm_csc_op_to_name(op)
     names = []
     for name, algorithm in SPMM_CSC_ALGORITHMS.items():
@@ -1667,6 +1709,8 @@ def flagsparse_spmm_csc_run(
     B,
     *,
     alg=None,
+    config=None,
+    out=None,
     op=None,
     return_time=False,
     return_meta=False,
@@ -1674,6 +1718,18 @@ def flagsparse_spmm_csc_run(
     diagnostics=False,
 ):
     """Run a registered native CSC SpMM route."""
+    from .spmv_csc import PreparedCscRoute, _run_csc_registered
+
+    selected = prepared.alg if alg is None else _normalize_spmm_csc_alg(alg)
+    if isinstance(prepared, PreparedCscRoute):
+        if prepared.kind != "spmm":
+            raise TypeError("prepared must describe CSC SpMM")
+        return _run_csc_registered(prepared, B, alg=alg, config=config, op=op, out=out,
+                                  return_time=return_time, return_meta=return_meta, timing=timing)
+    if selected in SPMM_CSC_NEW_ALGORITHMS:
+        raise ValueError("prepare with alg before selecting a CSC extension")
+    if config is not None or out is not None:
+        raise ValueError("legacy run uses its original configuration and output contract")
     if not isinstance(prepared, PreparedCscSpmm):
         raise TypeError("prepared must be a PreparedCscSpmm instance")
     op_name = prepared.op if op is None else _spmm_csc_op_to_name(op)
@@ -1760,8 +1816,27 @@ def flagsparse_spmm_csc(
     alg="auto",
     timing=False,
     index_fallback_policy="auto",
+    *, config=None,
 ):
     """CSC SpMM using native Triton CSC kernels."""
+    from .spmv_csc import PreparedCscRoute
+
+    if _normalize_spmm_csc_alg(alg) in SPMM_CSC_NEW_ALGORITHMS or isinstance(prepared, PreparedCscRoute):
+        code = _normalize_spmm_csc_op(op, transpose=bool(transpose))
+        if op is not None and transpose is not None and bool(transpose) != _spmm_csc_op_transposes(code):
+            raise ValueError("transpose conflicts with op")
+        if prepared is None:
+            prepared = prepare_spmm_csc_route(data, indices, indptr, shape,
+                op=_spmm_csc_op_to_name(code), alg=alg, config=config,
+                block_n=block_n, block_nnz=block_nnz, max_segments=max_segments,
+                index_fallback_policy=index_fallback_policy)
+        elif shape is not None and tuple(shape) != prepared.shape:
+            raise ValueError("shape conflicts with prepared CSC")
+        requested_op = None if op is None and transpose is None else _spmm_csc_op_to_name(code)
+        return flagsparse_spmm_csc_run(prepared, B, alg=alg, config=config, op=requested_op,
+            out=out, return_time=return_time, return_meta=return_meta, timing=timing)
+    if config is not None:
+        raise ValueError("config requires a CSC extension algorithm")
     # float16 is not in SUPPORTED_SPMM_CSC_VALUE_DTYPES: the `non` route scatters
     # into C with tl.atomic_add (see _spmm_csc_non_real_kernel), and fp16
     # atomic_add is not reliably available on every backend -- mixed_spmx.py's

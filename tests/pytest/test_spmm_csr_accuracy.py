@@ -300,3 +300,126 @@ def test_spmm_csr_opt_matches_torch(M, N, K, dtype, index_dtype):
     out = flagsparse_spmm_csr_opt(B=B.to(device), prepared=prepared)
     rtol, atol = _tol(dtype)
     assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)
+
+
+# Explicit migrated algorithms share this operator's marker, golden and tolerance.
+_MIGRATED_ROUTES = (('csr_row_tile', 'non'), ('csr_row_tile', 'trans'), ('csr_row_tile', 'conj'), ('csr_row_kparallel', 'non'), ('csr_row_kparallel', 'trans'), ('csr_row_kparallel', 'conj'), ('csr_row_panel', 'non'), ('csr_row_panel', 'trans'), ('csr_row_panel', 'conj'), ('csr_split_nnz_reduce', 'non'), ('csr_split_nnz_reduce', 'trans'), ('csr_split_nnz_reduce', 'conj'), ('csr_adaptive_tile_split', 'non'), ('csr_adaptive_tile_split', 'trans'), ('csr_adaptive_tile_split', 'conj'))
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("alg,op", _MIGRATED_ROUTES, ids=[f"{a}-{o}" for a, o in _MIGRATED_ROUTES])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128], ids=["float16", "float32", "float64", "complex64", "complex128"])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
+@pytest.mark.parametrize("layout", ["row", "col"])
+def test_spmm_csr_migrated_routes(alg, op, dtype, index_dtype, layout):
+    import importlib
+    from tests.pytest.conftest import QUICK_MODE
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+    device = accelerator_device()
+    # Repeated coordinates, unsorted inner indices, an empty row/column and tile tails.
+    rows = torch.tensor([0, 4, 0, 6, 4, 1, 6, 0, 4], dtype=torch.int64)
+    cols = torch.tensor([2, 0, 2, 3, 1, 4, 0, 1, 1], dtype=torch.int64)
+    real = torch.tensor([1, -2, 3, 0, -1, 2, 1, -3, 4], dtype=torch.float64) / 8
+    values = (torch.complex(real, real.flip(0)) if dtype.is_complex else real).to(dtype)
+    shape = (9, 7)
+    reference_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    dense = torch.zeros(shape, dtype=reference_dtype)
+    dense.index_put_((rows, cols), values.to(reference_dtype), accumulate=True)
+    order = torch.argsort(rows, stable=True)
+    values = values[order]
+    first = cols[order].to(device=device, dtype=index_dtype)
+    counts = torch.bincount(rows, minlength=shape[0])
+    ptr_dtype = torch.int64 if index_dtype == torch.int32 else torch.int32
+    second = torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0))).to(device=device, dtype=ptr_dtype)
+    data = values.to(device)
+    input_rows = shape[1] if op == "non" else shape[0]
+    n = 7 if QUICK_MODE else 33
+    operand = (torch.arange(input_rows * n, dtype=torch.float64).reshape(input_rows, n) % 11 - 5) / 8
+    if dtype.is_complex:
+        operand = torch.complex(operand, operand.flip(0) / 2)
+    operand = operand.to(dtype)
+    expected_matrix = dense if op == "non" else dense.T.conj() if op == "conj" else dense.T
+    expected = (expected_matrix @ operand.to(reference_dtype)).to(dtype)
+    operand = operand.to(device)
+    if layout == "col":
+        operand = operand.T.contiguous().T
+    try:
+        prepared = module.prepare_spmm_csr_route(data, first, second, shape, op=op, alg=alg)
+        backing = torch.full((expected.shape[0], expected.shape[1] * 2), float("nan"), dtype=dtype, device=device)
+        out = backing[:, ::2]
+        result = module.flagsparse_spmm_csr_run(prepared, operand, out=out)
+        direct = module.flagsparse_spmm_csr(data, first, second, operand.T, shape, op=op, op_b="trans", out_dtype=dtype, alg=alg)
+    except NotImplementedError as exc:
+        pytest.skip(f"backend capability unavailable: {exc}")
+    assert result is out
+    rtol, atol = close_tolerances(dtype)
+    torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+    torch.testing.assert_close(direct.cpu(), expected, rtol=rtol, atol=atol)
+    with pytest.raises(ValueError, match="op"):
+        module.flagsparse_spmm_csr_run(prepared, operand, op="trans" if op == "non" else "non")
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.complex128])
+def test_spmm_csr_split_bounded_workspace(dtype):
+    import importlib
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+    device = accelerator_device()
+    counts = torch.tensor([0, 1, 73, 8, 0], dtype=torch.int64)
+    ptr = torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0)))
+    index = torch.arange(int(ptr[-1])) % 19
+    data = torch.ones(index.numel(), dtype=dtype)
+    if dtype.is_complex:
+        data = data * (1 + 0.5j)
+    outer = torch.repeat_interleave(torch.arange(5), counts)
+    golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    matrix = torch.zeros((5, 19), dtype=golden_dtype)
+    matrix.index_put_((outer, index), data.to(golden_dtype), accumulate=True)
+    operand = torch.ones((19, 7), dtype=golden_dtype)
+    operand = operand.to(dtype)
+    expected = (matrix @ operand.to(golden_dtype)).to(dtype)
+    cfg = dict(segment_nnz=8, reduce_block_size=2, workspace_bytes=256, block_k=8, block_n=4)
+    try:
+        prepared = module.prepare_spmm_csr_route(data.to(device), index.to(device), ptr.to(device), (5, 19),
+            op="non", alg="csr_split_nnz_reduce", config=cfg)
+        actual, meta = module.flagsparse_spmm_csr_run(prepared, operand.to(device), return_meta=True, timing=True)
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+    rtol, atol = close_tolerances(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+    assert meta["workspace_peak_bytes"] <= cfg["workspace_bytes"]
+    assert meta["segment_batches"] > 1
+    assert meta["reduction_levels"] >= 0
+    wider = dict(cfg, workspace_bytes=65536)
+    again, wider_meta = module.flagsparse_spmm_csr_run(prepared, operand.to(device), config=wider, return_meta=True)
+    torch.testing.assert_close(again.cpu(), expected, rtol=rtol, atol=atol)
+    assert wider_meta["reduction_levels"] > 1
+    assert meta["process_cpu_ms"] == 0
+    assert meta["operator_ms"] == meta["gpu_ms"]
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("alg,op", _MIGRATED_ROUTES)
+@pytest.mark.parametrize("shape", [(0, 0), (3, 0), (0, 5), (3, 5)])
+def test_spmm_csr_migrated_empty(alg, op, shape):
+    import importlib
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+    device = accelerator_device()
+    data = torch.empty(0, dtype=torch.float32, device=device)
+    first = torch.empty(0, dtype=torch.int64, device=device)
+    second = torch.zeros(shape[0] + 1, dtype=torch.int32, device=device)
+    input_rows, output_rows = shape[1], shape[0]
+    if op != "non":
+        input_rows, output_rows = output_rows, input_rows
+    operand = torch.ones((input_rows, 7), device=device)
+    out = torch.full((output_rows, 7), float("nan"), device=device)
+    try:
+        prepared = module.prepare_spmm_csr_route(data, first, second, shape, op=op, alg=alg)
+        result = module.flagsparse_spmm_csr_run(prepared, operand, out=out)
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+    assert result is out
+    assert torch.equal(result.cpu(), torch.zeros_like(result.cpu()))

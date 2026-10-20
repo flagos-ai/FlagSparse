@@ -33,6 +33,12 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+if __package__:
+    from .utils import filtered_avg_ms
+else:
+    from utils import filtered_avg_ms
+
 import flagsparse as fs
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
@@ -45,6 +51,7 @@ WARMUP = 10
 ITERS = 50
 
 DTYPE_MAP = {
+    "float16": torch.float16,
     "float32": torch.float32,
     "float64": torch.float64,
     "complex64": torch.complex64,
@@ -62,6 +69,8 @@ def _dtype_name(dtype):
 
 
 def _parse_csv_tokens(value, mapping, name):
+    if str(value).strip().lower() == "all":
+        return list(mapping.values())
     tokens = [token.strip().lower() for token in value.split(",") if token.strip()]
     if not tokens:
         raise ValueError(f"{name} must not be empty")
@@ -75,6 +84,8 @@ def _parse_csv_tokens(value, mapping, name):
 
 
 def _parse_ops(value):
+    if str(value).strip().lower() == "all":
+        return list(OP_NAMES)
     tokens = [token.strip().lower() for token in value.split(",") if token.strip()]
     if not tokens:
         raise ValueError("--ops must not be empty")
@@ -291,14 +302,16 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    e0 = ACCEL.Event(enable_timing=True)
-    e1 = ACCEL.Event(enable_timing=True)
-    e0.record()
+    samples = []
     for _ in range(count):
+        e0 = ACCEL.Event(enable_timing=True)
+        e1 = ACCEL.Event(enable_timing=True)
+        e0.record()
         out = op()
-    e1.record()
-    ACCEL.synchronize()
-    return out, e0.elapsed_time(e1) / count
+        e1.record()
+        ACCEL.synchronize()
+        samples.append(e0.elapsed_time(e1))
+    return out, filtered_avg_ms(samples)
 
 
 def _run_flagsparse_coo_launch(
@@ -436,19 +449,7 @@ def _timed_flagsparse_coo_tocsr_runtime(
         shape=shape,
         assume_sorted=False,
     )
-    y = spmv_op()
-    ACCEL.synchronize()
-    for _ in range(warmup):
-        y = spmv_op()
-    ACCEL.synchronize()
-    e0 = ACCEL.Event(True)
-    e1 = ACCEL.Event(True)
-    e0.record()
-    for _ in range(iters):
-        y = spmv_op()
-    e1.record()
-    ACCEL.synchronize()
-    return y, e0.elapsed_time(e1) / iters
+    return _cuda_event_benchmark(spmv_op, warmup, iters)
 
 
 def _timed_flagsparse_coo_tocsr_prepared(
@@ -458,19 +459,7 @@ def _timed_flagsparse_coo_tocsr_prepared(
     iters,
 ):
     spmv_op = lambda: fs.flagsparse_spmv_coo_tocsr(x=x, prepared=prepared)
-    y = spmv_op()
-    ACCEL.synchronize()
-    for _ in range(warmup):
-        y = spmv_op()
-    ACCEL.synchronize()
-    e0 = ACCEL.Event(True)
-    e1 = ACCEL.Event(True)
-    e0.record()
-    for _ in range(iters):
-        y = spmv_op()
-    e1.record()
-    ACCEL.synchronize()
-    return y, e0.elapsed_time(e1) / iters
+    return _cuda_event_benchmark(spmv_op, warmup, iters)
 
 
 def run_synthetic(
@@ -781,18 +770,8 @@ def _time_pytorch_coo(data, row, col, x, shape, op, warmup, iters):
             shape,
             op,
         )
-    ACCEL.synchronize()
-    for _ in range(warmup):
-        _ = spmv_op()
-    ACCEL.synchronize()
-    e0 = ACCEL.Event(True)
-    e1 = ACCEL.Event(True)
-    e0.record()
-    for _ in range(iters):
-        _ = spmv_op()
-    e1.record()
-    ACCEL.synchronize()
-    return e0.elapsed_time(e1) / iters
+    _, elapsed_ms = _cuda_event_benchmark(spmv_op, warmup, iters)
+    return elapsed_ms
 
 
 def _run_torch_runtime_op(data, row, col, x_2d, shape, op):
@@ -1166,6 +1145,100 @@ def run_all_dtypes_tocsr_csv(
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 
+def _run_registered_scan(args, value_dtypes, index_dtypes, ops):
+    """Explicit algorithm scan; the established default benchmark stays unchanged."""
+    import hashlib
+    import json
+    import traceback
+
+    config = json.loads(args.config) if args.config else None
+    if config is not None and (not isinstance(config, dict) or args.alg in ("all", "compare", "auto") or "," in args.alg):
+        raise ValueError("--config requires one explicit algorithm and a JSON object")
+    paths = []
+    for path in args.mtx:
+        paths.extend(sorted(glob.glob(os.path.join(path, "*.mtx"))) if os.path.isdir(path) else [path])
+    if args.synthetic:
+        paths = [None]
+    if not paths:
+        raise ValueError("algorithm scanning requires matrix inputs or --synthetic")
+    output = Path(args.csv_coo or "spmv_coo_algorithms.csv")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["matrix", "value_dtype", "index_dtype", "op", "alg", "ms", "gpu_ms",
+              "process_cpu_ms", "process_gpu_ms", "compute_ms", "cusparse_ms",
+              "speedup_vs_vendor", "status", "err", "reason", "metadata"]
+    print("Explicit native COO scan; full-run GPU event samples; diagnostics do not replace samples. Row-run sorting is included; static input validation is setup.")
+    print(f"{'Matrix':28} {'dtype':10} {'idx':6} {'op':5} {'Algorithm':34} {'ms':>10} {'CPU':>9} {'ProcGPU':>9} {'Compute':>9} {'Vendor':>9} {'V/Alg':>8} Status")
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for dtype in value_dtypes:
+            for path in paths:
+                seed = int.from_bytes(hashlib.sha256(f"{path}:{dtype}".encode()).digest()[:4], "little")
+                torch.manual_seed(seed)
+                device = accelerator_device()
+                if path is None:
+                    data = torch.tensor([1, -2, 3, 1, 0], dtype=dtype, device=device)
+                    first = torch.tensor([0, 3, 0, 6, 3], device=device)
+                    second = torch.tensor([1, 2, 1, 4, 0], device=device)
+                    shape = (7, 5)
+                else:
+                    data, first, second, shape = _load_mtx_to_coo_torch(path, dtype=dtype, device=device)
+                for index_dtype in index_dtypes:
+                    ii, jj = first.to(index_dtype), second.to(index_dtype)
+                    for op in ops:
+                        torch.manual_seed(seed)
+                        x = _random_values((_x_size_for_op(shape, op),), torch.float32 if dtype == torch.float16 else dtype, device).to(dtype)
+                        reference = _correctness_reference(data, ii, jj, x, shape, dtype, op=op)
+                        atol, rtol = _tol_for_dtype(dtype)
+                        vendor_ms, vendor_reason = None, "disabled"
+                        if not args.no_cusparse:
+                            try:
+                                ref = fs_common._benchmark_spmv_coo_sparse_ref(data, ii, jj, x, shape, warmup=args.warmup, iters=args.iters, op=op)
+                                vendor_ms, vendor_reason = ref.get("ms"), ref.get("reason", "")
+                            except Exception as exc:
+                                vendor_reason = str(exc)
+                                traceback.print_exc()
+                        names = (fs.list_spmv_coo_algorithms(op=op, dtype=dtype)
+                                 if args.alg in ("all", "compare") else args.alg.split(","))
+                        print(f"Algorithms {dtype}/{index_dtype}/{op}: {', '.join(names)}")
+                        for alg in names:
+                            row = dict(matrix=os.path.basename(path) if path else "synthetic", value_dtype=_dtype_name(dtype),
+                                       index_dtype=_dtype_name(index_dtype), op=op, alg=alg,
+                                       cusparse_ms=vendor_ms, reason=vendor_reason, process_cpu_ms=0.0)
+                            try:
+                                if dtype != torch.float16 and alg in ("auto", "coo_rowrun", "coo_atomic"):
+                                    fn = _time_flagsparse_coo_atomic if alg == "coo_atomic" else _time_flagsparse_coo_row_run
+                                    meta = fn(data, ii, jj, x, shape, op, args.warmup, args.iters, timing=args.timing)
+                                    y, gpu_ms = meta["out"], meta["gpu_ms"]
+                                else:
+                                    prepared = fs.prepare_spmv_coo(data, ii, jj, shape, op=op, alg=alg, config=config)
+                                    y, gpu_ms = _cuda_event_benchmark(lambda: fs.flagsparse_spmv_coo_run(prepared, x), args.warmup, args.iters)
+                                    _, meta = fs.flagsparse_spmv_coo_run(prepared, x, return_meta=True, timing=args.timing)
+                                err = _allclose_error_ratio(y, reference, atol, rtol)
+                                row.update(ms=gpu_ms, gpu_ms=gpu_ms, err=err,
+                                    status="PASS" if math.isfinite(err) and err <= 1 else "FAIL",
+                                    speedup_vs_vendor=vendor_ms / gpu_ms if vendor_ms is not None and gpu_ms > 0 else None,
+                                    process_gpu_ms=meta.get("process_gpu_ms"), compute_ms=meta.get("compute_ms"),
+                                    metadata=json.dumps({k: v for k, v in meta.items() if k != "out"}, default=str))
+                            except NotImplementedError as exc:
+                                row.update(status="SKIP", reason=str(exc))
+                            except Exception as exc:
+                                row.update(status="ERROR", reason=str(exc))
+                                traceback.print_exc()
+                                writer.writerow(row)
+                                handle.flush()
+                                if getattr(args, "fail_fast", False):
+                                    raise
+                                continue
+                            writer.writerow(row)
+                            handle.flush()
+                            fmt_ms = lambda value: "N/A" if value is None else f"{value:.4f}"
+                            print(f"{row['matrix'][:28]:28} {row['value_dtype']:10} {row['index_dtype']:6} {op:5} {alg:34} "
+                                  f"{fmt_ms(row.get('ms')):>10} {fmt_ms(row.get('process_cpu_ms')):>9} "
+                                  f"{fmt_ms(row.get('process_gpu_ms')):>9} {fmt_ms(row.get('compute_ms')):>9} "
+                                  f"{fmt_ms(vendor_ms):>9} {fmt_ms(row.get('speedup_vs_vendor')):>8} {row['status']}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SpMV COO test: synthetic dense->COO and optional .mtx, export CSV."
@@ -1222,6 +1295,8 @@ def main():
         action="store_true",
         help="Show/export native COO timing breakdown columns",
     )
+    parser.add_argument("--alg", default=None, help="Explicit algorithm or all/compare; omit for existing delivery")
+    parser.add_argument("--config", default=None, help="JSON configuration for one explicit algorithm")
     args = parser.parse_args()
     value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(
@@ -1230,6 +1305,13 @@ def main():
     ops_arg = args.ops or ("non" if args.csv_tocsr else "non,trans,conj")
     ops = _parse_ops(ops_arg)
 
+    if args.alg is not None:
+        if args.csv_tocsr:
+            parser.error("native algorithm selection cannot be used with --csv-tocsr")
+        _run_registered_scan(args, value_dtypes, index_dtypes, ops)
+        return
+    if args.config is not None:
+        parser.error("--config requires --alg")
     if args.synthetic:
         run_synthetic(
             value_dtypes=value_dtypes,

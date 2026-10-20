@@ -1282,16 +1282,19 @@ def benchmark_spmm_opt_alg2_case(
         lambda: flagsparse_spmm_csr(data, indices, indptr, B, shape),
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     opt_values, opt_ms = _benchmark_cuda_op(
         lambda: flagsparse_spmm_csr_opt(B=B, prepared=prepared_opt),
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     alg2_values, alg2_ms = _benchmark_cuda_op(
         lambda: flagsparse_spmm_csr_opt_alg2(B=B, prepared=prepared_alg2),
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
 
     indptr64 = indptr.to(torch.int64)
@@ -1313,7 +1316,7 @@ def benchmark_spmm_opt_alg2_case(
         )
         _, torch_ms = _benchmark_cuda_op(
             lambda: torch.sparse.mm(pt_sparse, B), warmup=warmup, iters=iters
-        )
+        , filter_samples=True)
     except Exception:
         torch_ms = None
 

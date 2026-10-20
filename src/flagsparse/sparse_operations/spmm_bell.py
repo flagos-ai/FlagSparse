@@ -1024,6 +1024,7 @@ def _benchmark_spmm_bell_sparse_ref(
         _destroy_spmm_bell_ref_hipsparse_prepared,
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     result["values"] = values.contiguous()
     result["ms"] = ms

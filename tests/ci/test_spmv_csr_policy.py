@@ -29,7 +29,7 @@ class ConfigPolicy(unittest.TestCase):
         )
 
     def test_registry_support(self):
-        self.assertEqual(len(policy.list_algorithms()), 7)
+        self.assertEqual(len(policy.list_algorithms()), 8)
         for alg in policy.NEW_ALGORITHMS:
             self.assertIn(alg, policy.list_algorithms("non", "torch.float32", "rocm"))
             self.assertIn(alg, policy.list_algorithms("trans", "float32", "cuda"))
@@ -452,3 +452,57 @@ class IntegrationPolicy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_stream_configuration_uses_shape_only_and_preserves_explicit_values():
+    caps = policy.BackendCaps("rocm", "gfx936", "hip", 64, 1024, True, True, True)
+    cfg, _ = policy.resolve_config("row_subgroup_stream", caps, mean_row_nnz=3)
+    assert cfg["row_subgroup_stream"]["lanes_per_row"] == 2
+    assert cfg["row_subgroup_stream"]["rows_per_program"] == 64
+    cfg, _ = policy.resolve_config("row_subgroup_stream", caps,
+        {"row_subgroup_stream": {"lanes_per_row": 8, "row_tiles_per_program": 2}}, mean_row_nnz=3)
+    assert cfg["row_subgroup_stream"]["lanes_per_row"] == 8
+    assert cfg["row_subgroup_stream"]["row_tiles_per_program"] == 2
+
+
+def _extension_policies():
+    # Import only pure Python policy sources; never initialize torch or a driver.
+    package = types.ModuleType("_migrated_policy_tests")
+    package.__path__ = [str(SOURCE)]
+    sys.modules[package.__name__] = package
+    result = []
+    for filename in ("_spmm_csr_config", "_spmx_column_config"):
+        name = f"{package.__name__}.{filename}"
+        spec = importlib.util.spec_from_file_location(name, SOURCE / f"{filename}.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        if filename == "_spmm_csr_config":
+            module.set_known_backends(("cuda", "rocm", "iluvatar"))
+        result.append(module)
+    return result
+
+
+def test_migrated_policies_validate_capabilities_and_workspace():
+    csr, column = _extension_policies()
+    caps = csr.BackendCaps("rocm", "hip", "gfx936", 64, 1024, (1, 2, 4, 8),
+                           True, True, True, True, True, True, True)
+    for alg in csr.NEW_ALGORITHMS:
+        cfg, info = csr.resolve_config(alg, "complex128", 33, "col", caps)
+        assert info["backend_caps"]["backend"] == "rocm"
+        assert cfg["workspace_bytes"] == 256 * 1024 * 1024
+        assert csr.algorithm_spec(alg)["validation"] == "unverified"
+        wave, capacity = csr.workspace_geometry(33, 16, cfg)
+        assert 3 * wave * capacity * 16 <= cfg["workspace_bytes"]
+    for alg in column.COO_ALGORITHMS:
+        cfg, _ = column.resolve_coo_config(alg, "float64", caps)
+        assert cfg["num_warps"] in caps.legal_num_warps
+    for alg, ops in column.CSC_ALGORITHMS.items():
+        cfg, _ = column.resolve_csc_config(alg, "complex128", 7, caps, op=ops[0])
+        assert cfg["num_warps"] in caps.legal_num_warps
+    with unittest.TestCase().assertRaises(NotImplementedError):
+        csr.resolve_config("csr_row_panel", "float32", 7, "row", csr.BackendCaps("unknown"))
+    with unittest.TestCase().assertRaises(ValueError):
+        column.resolve_coo_config("coo_segmented_stream_atomic", "float32", caps, {"blocks_per_program": 3})
+    with unittest.TestCase().assertRaises(ValueError):
+        column.resolve_csc_config("csc_col_vector", "float32", 1, caps, {"num_warps": 3}, op="trans")

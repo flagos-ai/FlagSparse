@@ -85,3 +85,11 @@ def test_gpu_environment_check_can_run_without_gpu():
     assert "torch.cuda.is_available" in text
     assert "nvidia-smi" in text
     assert "metadata" in text
+
+
+def test_migrated_algorithms_use_existing_accuracy_files_and_markers():
+    for op in ("spmv_csr", "spmm_csr", "spmv_coo", "spmm_coo", "spmv_csc", "spmm_csc"):
+        source = _read(PROJECT_ROOT / "tests" / "pytest" / f"test_{op}_accuracy.py")
+        assert f"@pytest.mark.{op}" in source
+        assert f"def test_{op}_migrated_routes" in source
+        assert f"def test_{op}_migrated_empty" in source

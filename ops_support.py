@@ -306,6 +306,25 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
         else ("non",)
     )
     return (
+        *(
+            ApiSpec(
+                operator, f"flagsparse_{operator}_{fmt.lower()}", f"{operator}_{fmt.lower()}",
+                fmt, name, values=("float16", "float32", "float64", "complex64", "complex128"),
+                indices=DEFAULT_INDEX_DTYPES,
+                ops=(modules["_spmx_column_config"].get("CSC_ALGORITHMS")[name]
+                     if fmt == "CSC" else ("non", "trans", "conj")),
+                notes="explicit native extension; main preparation contract; hardware validation pending",
+            )
+            for operator, fmt, source, constant in (
+                ("spmm", "CSR", "_spmm_csr_config", "NEW_ALGORITHMS"),
+                ("spmm", "COO", "spmm_coo", "SPMM_COO_NEW_ALGORITHMS"),
+                ("spmm", "CSC", "spmm_csc", "SPMM_CSC_NEW_ALGORITHMS"),
+                ("spmv", "COO", "spmv_coo", "SPMV_COO_ALGORITHMS"),
+                ("spmv", "CSC", "spmv_csc", "SPMV_CSC_NEW_ALGORITHMS"),
+            )
+            for name in (modules[source].get(constant) or ())
+            if name not in ("coo_rowrun", "coo_atomic")
+        ),
         ApiSpec(
             "gather",
             "flagsparse_gather",

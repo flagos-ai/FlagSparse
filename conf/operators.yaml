@@ -102,6 +102,9 @@ ops:
     for:
       - flagsparse_spmv_coo
       - prepare_spmv_coo
+      - flagsparse_spmv_coo_run
+      - list_spmv_coo_algorithms
+      - get_spmv_coo_algorithm_spec
     labels:
       - flagsparse
       - sparse
@@ -119,6 +122,9 @@ ops:
     for:
       - flagsparse_spmv_csc
       - prepare_spmv_csc
+      - flagsparse_spmv_csc_run
+      - list_spmv_csc_algorithms
+      - get_spmv_csc_algorithm_spec
     labels:
       - flagsparse
       - sparse
@@ -188,6 +194,8 @@ ops:
       Computes sparse matrix-dense matrix multiplication for a CSR matrix.
     for:
       - flagsparse_spmm_csr
+      - get_spmm_csr_algorithm_spec
+      - list_spmm_csr_algorithms
       - flagsparse_spmm_csr_run
       - prepare_spmm_csr_route
     labels:
@@ -206,6 +214,8 @@ ops:
       Computes sparse matrix-dense matrix multiplication for a COO matrix.
     for:
       - flagsparse_spmm_coo
+      - get_spmm_coo_algorithm_spec
+      - list_spmm_coo_algorithms
     labels:
       - flagsparse
       - sparse
@@ -258,6 +268,8 @@ ops:
       Computes sparse matrix-dense matrix multiplication for a CSC matrix.
     for:
       - flagsparse_spmm_csc
+      - get_spmm_csc_algorithm_spec
+      - list_spmm_csc_algorithms
       - flagsparse_spmm_csc_run
       - prepare_spmm_csc_route
     labels:

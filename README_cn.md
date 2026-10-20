@@ -454,3 +454,60 @@ python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 1024
 ## 授权许可
 
 本项目采用 [Apache (Version 2.0) license](./LICENSE) 许可证授权。
+
+## 显式 SpMV/SpMM 差异算法
+
+| Operator | Explicit algorithms |
+| --- | --- |
+| SpMV CSR | `row_subgroup_stream` |
+| SpMM CSR | `csr_row_tile`, `csr_row_kparallel`, `csr_row_panel`, `csr_split_nnz_reduce`, `csr_adaptive_tile_split` |
+| SpMV COO | `coo_segmented_atomic`, `coo_rowrun_subgroup`, `coo_segmented_stream_atomic` |
+| SpMM COO | `coo_segmented_panel_atomic`, `coo_rowrun_panel`, `coo_segmented_stream_panel_atomic` |
+| SpMV CSC | `csc_col_subgroup`, `csc_col_tile_atomic`, `csc_col_vector`, `csc_col_split_reduce` |
+| SpMM CSC | `csc_col_panel`, `csc_col_tile_panel_atomic`, `csc_col_kparallel`, `csc_col_split_reduce` |
+
+以上算法通过原 API 的关键字 `alg/config` 使用，不切换默认路由。新增查询接口
+`list_*_algorithms`、`get_*_algorithm_spec` 与 prepare/run 已同步公开导出。
+支持 FP16、FP32、FP64、complex64、complex128；CSR SpMV 另支持 BF16。
+CSC 的 tile atomic 支持 non，其他新 CSC 算法支持 trans/conj；CSR/COO 支持三种 op。
+conj 仅共轭稀疏值，不共轭向量或稠密矩阵。显式新算法不接受其未声明的 mixed/out_dtype
+组合；未指定算法的原有混合精度调用保持原行为。
+
+精度沿用迁入算法：CSR SpMV 的 FP32 使用 FP64；COO SpMM 的 FP32/complex64 分别
+使用 FP64/complex128，包括 ROCm。其他新算法使用原分量精度，FP16 使用 FP32。
+COO stream 的 `blocks_per_program` 可选 1/2/4/8；`local_reduce="none"` 用于关闭局部归约。
+COO SpMM panel atomic 的 `conversion_mode` 可选 materialize/load；新 stream 默认 load。
+CSR/CSC split 的 `workspace_bytes` 默认 256 MiB；数值工作空间与描述符单独记录。
+
+执行边界遵循 main：CSR SpMV 沿用原 prepared；CSR SpMM 沿用原 route，包括已有 CUDA
+转置准备。分段/自适应计划在 run 内构建。显式 COO 保存原坐标，rowrun 在 run 内排序，
+atomic 不排序。CSC 直接读取原 CSC，不构造 owner-map 或转换 CSR。旧 COO/CSC prepared
+不能直接切换新算法，需要以原始输入重新 prepare；避免共用已排序/合并过的数据。
+算法切换不继承其他算法的专用配置；不扩大原有缓存、图捕获和直接绑定的适用范围。
+
+原测试入口及默认交付不变。六个算子可通过 `--alg compare` 扫描；SpMM CSR 在 runner
+收到显式 `--alg` 时使用原 `test_spmm_csr.py` 并映射 CSV 参数，默认仍使用 `test_spmm.py`。
+统一命令示例见英文 README 同名章节；新增准确性用例仍属于原六个 pytest marker，
+不另建入口，也不修改共享容差。性能应按 main 当前入口的准备/采样口径重新测量。
+
+**这些迁入算法均尚未实机验收。** 当前环境仅审查源码、AST 和 diff，没有运行算子、
+pytest、解释器测试或离线编译。COO stream 的 carry 布局修正仍需 CUDA/HIP 编译验证。
+
+显式 COO SpMV 扫描的 `ms` 对所有算法使用完整事件采样，分段诊断不替换该值；
+原默认 benchmark 入口保持不变。省略 `sort_by_row` 保留旧默认行为；显式传入时，
+必须与所选算法的排序需求一致。
+
+### SpMV/SpMM 性能采样过滤
+
+现有 SpMV/SpMM 性能脚本复用 update 的统计规则：warmup 后逐次采样，
+保留中位数 ±10% 内的耗时，再取算术平均；没有保留样本时返回中位数。
+`tests/utils.py` 提供脚本辅助函数，CSR SpMV 专用入口已有同等规则。
+库内公共墙钟/厂商描述符计时通过 `filter_samples=True` 显式启用，
+SpMV/SpMM 的对应参考路径已接入；其他算子仍保留公共函数的原默认行为。
+
+prepare、转置、稳态、图重放和首次调用的原计时范围保持各入口约定。
+`first_call_ms` 仍是单次冷调用，不做重复采样过滤；采样模式变化后的结果
+应重新测量，不能把与旧整段循环平均的差异当成算法提速。
+此过滤只针对重复耗时样本，不修改准确性容差、FAIL 汇总规则或算法选择。
+原 runner 命令继续有效；`benchmark/test_sparse_perf.py` 仍是占位入口。
+新增统计与描述符生命周期策略用例供 CI 执行，本地只做静态检查。

@@ -42,6 +42,11 @@ except Exception as exc:  # pragma: no cover - optional diagnostic dependency
 else:
     SCIPY_IMPORT_ERROR = None
 
+if __package__:
+    from .utils import cpu_wall_benchmark_filtered
+else:
+    from utils import cpu_wall_benchmark_filtered
+
 from test_spmv_bsr import (  # noqa: E402
     DEFAULT_BLOCK_DIMS,
     DTYPE_MAP,
@@ -86,6 +91,8 @@ from test_spmv_bsr import (  # noqa: E402
 )
 
 
+
+
 def _scipy_unavailable_reason():
     if np is None or scipy_bsr_matrix is None:
         return f"NumPy/SciPy is not available: {SCIPY_IMPORT_ERROR}"
@@ -114,14 +121,7 @@ def _time_scipy_bsr_cpu(data, indices, indptr, x, shape, block_dim, op, warmup, 
     else:
         fn = lambda: A @ x_padded
 
-    out = None
-    for _ in range(max(0, int(warmup))):
-        out = fn()
-    count = max(1, int(iters))
-    start = time.perf_counter()
-    for _ in range(count):
-        out = fn()
-    elapsed_ms = (time.perf_counter() - start) * 1000.0 / count
+    out, elapsed_ms = cpu_wall_benchmark_filtered(fn, warmup, iters)
     return elapsed_ms, None, out
 
 

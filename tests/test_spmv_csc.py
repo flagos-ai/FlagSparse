@@ -31,6 +31,12 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+if __package__:
+    from .utils import filtered_avg_ms, cupy_event_benchmark_filtered
+else:
+    from utils import filtered_avg_ms, cupy_event_benchmark_filtered
+
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as ast_ops
 
@@ -55,6 +61,7 @@ def _dtype_name(dtype):
 
 
 DTYPE_MAP = {
+    "float16": torch.float16,
     "float32": torch.float32,
     "float64": torch.float64,
     "complex64": torch.complex64,
@@ -64,6 +71,8 @@ INDEX_DTYPE_MAP = {"int32": torch.int32, "int64": torch.int64}
 
 
 def _parse_csv_tokens(value, mapping, option_name):
+    if str(value).strip().lower() == "all":
+        return list(mapping.values())
     tokens = [token.strip().lower() for token in str(value).split(",") if token.strip()]
     if not tokens:
         raise ValueError(f"{option_name} must not be empty")
@@ -111,6 +120,11 @@ def _reference_dtype(dtype):
 
 
 def _reference_tolerance(dtype):
+    if dtype == torch.float16:
+        from tests.pytest.accuracy_utils import close_tolerances
+
+        rtol, atol = close_tolerances(dtype)
+        return atol, rtol
     if dtype in (torch.float32, torch.complex64):
         return 1.3e-6, 1e-3
     if dtype in (torch.float64, torch.complex128):
@@ -205,14 +219,16 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _time_flagsparse_csc(
@@ -298,18 +314,8 @@ def _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters):
     else:
         A_eff = A.conj().T
     fn = lambda: A_eff @ x_cp
-    for _ in range(max(0, int(warmup))):
-        _ = fn()
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        _ = fn()
-    end.record()
-    end.synchronize()
-    return cp.cuda.get_elapsed_time(start, end) / count
+    _, elapsed_ms = cupy_event_benchmark_filtered(fn, warmup, iters)
+    return elapsed_ms
 
 
 def _fmt(v):
@@ -643,6 +649,101 @@ def run_csv(
     print(f"Wrote {len(rows)} rows to {csv_path}")
 
 
+def _run_registered_scan(args, value_dtypes, index_dtypes, ops):
+    """Explicit algorithm scan; the established default benchmark stays unchanged."""
+    import hashlib
+    import json
+    import traceback
+
+    config = json.loads(args.config) if args.config else None
+    if config is not None and (not isinstance(config, dict) or args.alg in ("all", "compare", "auto") or "," in args.alg):
+        raise ValueError("--config requires one explicit algorithm and a JSON object")
+    paths = []
+    for path in args.mtx:
+        paths.extend(sorted(glob.glob(os.path.join(path, "*.mtx"))) if os.path.isdir(path) else [path])
+    if args.synthetic:
+        paths = [None]
+    if not paths:
+        raise ValueError("algorithm scanning requires matrix inputs or --synthetic")
+    output = Path(args.csv_csc or "spmv_csc_algorithms.csv")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["matrix", "value_dtype", "index_dtype", "op", "alg", "ms", "gpu_ms",
+              "process_cpu_ms", "process_gpu_ms", "compute_ms", "cusparse_ms",
+              "speedup_vs_vendor", "status", "err", "reason", "metadata"]
+    print("Explicit native csc scan; prepare outside sampling; existing event sampling policy.")
+    print(f"{'Matrix':28} {'dtype':10} {'idx':6} {'op':5} {'Algorithm':34} {'ms':>10} {'CPU':>9} {'ProcGPU':>9} {'Compute':>9} {'Vendor':>9} {'V/Alg':>8} Status")
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for dtype in value_dtypes:
+            for path in paths:
+                seed = int.from_bytes(hashlib.sha256(f"{path}:{dtype}".encode()).digest()[:4], "little")
+                torch.manual_seed(seed)
+                device = accelerator_device()
+                if path is None:
+                    data = torch.tensor([1, -2, 3, 1, 0], dtype=dtype, device=device)
+                    first = torch.tensor([3, 0, 0, 3, 6], device=device)
+                    second = torch.tensor([0, 1, 3, 4, 4, 5], device=device)
+                    shape = (7, 5)
+                else:
+                    data, first, second, shape = load_mtx_to_csc_torch(path, dtype=dtype, device=device)
+                for index_dtype in index_dtypes:
+                    ii, jj = first.to(index_dtype), second.to(index_dtype)
+                    for op in ops:
+                        torch.manual_seed(seed)
+                        x = _random_values((_x_size_for_op(shape, op),), torch.float32 if dtype == torch.float16 else dtype, device).to(dtype)
+                        reference = (_pytorch_reference(data.float(), ii, jj, x.float(), shape, torch.float32, op).to(dtype)
+                                     if dtype == torch.float16 else _pytorch_reference(data, ii, jj, x, shape, dtype, op))
+                        atol, rtol = _reference_tolerance(dtype)
+                        vendor_ms, vendor_reason = None, "disabled"
+                        if not args.no_cusparse:
+                            try:
+                                vendor_ms = _time_cusparse(data, ii, jj, x, shape, op, args.warmup, args.iters)
+                                vendor_reason = "" if vendor_ms is not None else "native vendor CSC unavailable"
+                            except Exception as exc:
+                                vendor_reason = str(exc)
+                                traceback.print_exc()
+                        names = (fs.list_spmv_csc_algorithms(op=op, dtype=dtype)
+                                 if args.alg in ("all", "compare") else args.alg.split(","))
+                        print(f"Algorithms {dtype}/{index_dtype}/{op}: {', '.join(names)}")
+                        for alg in names:
+                            row = dict(matrix=os.path.basename(path) if path else "synthetic", value_dtype=_dtype_name(dtype),
+                                       index_dtype=_dtype_name(index_dtype), op=op, alg=alg,
+                                       cusparse_ms=vendor_ms, reason=vendor_reason, process_cpu_ms=0.0)
+                            try:
+                                if dtype == torch.float16 and alg in ("auto", "spmv_csc_base"):
+                                    fn = lambda: fs.flagsparse_spmv_csc(data, ii, jj, x, shape, op=op)
+                                    y, gpu_ms = _cuda_event_benchmark(fn, args.warmup, args.iters)
+                                    meta = {"execution_path": "legacy_mixed", "compute_ms": gpu_ms}
+                                else:
+                                    prepared = fs.prepare_spmv_csc(data, ii, jj, shape, op=op, alg=alg, config=config)
+                                    y, gpu_ms = _cuda_event_benchmark(lambda: fs.flagsparse_spmv_csc_run(prepared, x), args.warmup, args.iters)
+                                    _, meta = fs.flagsparse_spmv_csc_run(prepared, x, return_meta=True, timing=args.timing)
+                                err = _allclose_error_ratio(y, reference, atol, rtol)
+                                row.update(ms=gpu_ms, gpu_ms=gpu_ms, err=err,
+                                    status="PASS" if math.isfinite(err) and err <= 1 else "FAIL",
+                                    speedup_vs_vendor=vendor_ms / gpu_ms if vendor_ms is not None and gpu_ms > 0 else None,
+                                    process_gpu_ms=meta.get("process_gpu_ms"), compute_ms=meta.get("compute_ms"),
+                                    metadata=json.dumps(meta, default=str))
+                            except NotImplementedError as exc:
+                                row.update(status="SKIP", reason=str(exc))
+                            except Exception as exc:
+                                row.update(status="ERROR", reason=str(exc))
+                                traceback.print_exc()
+                                writer.writerow(row)
+                                handle.flush()
+                                if getattr(args, "fail_fast", False):
+                                    raise
+                                continue
+                            writer.writerow(row)
+                            handle.flush()
+                            fmt_ms = lambda value: "N/A" if value is None else f"{value:.4f}"
+                            print(f"{row['matrix'][:28]:28} {row['value_dtype']:10} {row['index_dtype']:6} {op:5} {alg:34} "
+                                  f"{fmt_ms(row.get('ms')):>10} {fmt_ms(row.get('process_cpu_ms')):>9} "
+                                  f"{fmt_ms(row.get('process_gpu_ms')):>9} {fmt_ms(row.get('compute_ms')):>9} "
+                                  f"{fmt_ms(vendor_ms):>9} {fmt_ms(row.get('speedup_vs_vendor')):>8} {row['status']}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Native CSC SpMV benchmark/test.")
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
@@ -666,6 +767,8 @@ def main():
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--alg", default=None, help="Explicit algorithm or all/compare; omit for existing delivery")
+    parser.add_argument("--config", default=None, help="JSON configuration for one explicit algorithm")
     args = parser.parse_args()
     try:
         value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
@@ -675,6 +778,11 @@ def main():
         ops = _parse_ops(args.ops)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.alg is not None:
+        _run_registered_scan(args, value_dtypes, index_dtypes, ops)
+        return
+    if args.config is not None:
+        parser.error("--config requires --alg")
     if args.synthetic:
         run_synthetic(
             value_dtypes=value_dtypes,

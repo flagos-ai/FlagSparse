@@ -39,6 +39,12 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+if __package__:
+    from .utils import filtered_avg_ms
+else:
+    from utils import filtered_avg_ms
+
 import flagsparse as fs
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
@@ -125,14 +131,16 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(warmup):
         out = op()
     ACCEL.synchronize()
-    e0 = ACCEL.Event(enable_timing=True)
-    e1 = ACCEL.Event(enable_timing=True)
-    e0.record()
+    samples = []
     for _ in range(count):
+        e0 = ACCEL.Event(enable_timing=True)
+        e1 = ACCEL.Event(enable_timing=True)
+        e0.record()
         out = op()
-    e1.record()
-    ACCEL.synchronize()
-    return out, e0.elapsed_time(e1) / count
+        e1.record()
+        ACCEL.synchronize()
+        samples.append(e0.elapsed_time(e1))
+    return out, filtered_avg_ms(samples)
 
 
 def _timed_spmv(prepared, x, warmup, iters, use_opt, timing=False):
@@ -220,14 +228,16 @@ def _timed_pytorch(data, indices, indptr, x, shape, warmup, iters):
     for _ in range(warmup):
         op()
     ACCEL.synchronize()
-    e0 = ACCEL.Event(enable_timing=True)
-    e1 = ACCEL.Event(enable_timing=True)
-    e0.record()
+    samples = []
     for _ in range(iters):
+        e0 = ACCEL.Event(enable_timing=True)
+        e1 = ACCEL.Event(enable_timing=True)
+        e0.record()
         op()
-    e1.record()
-    ACCEL.synchronize()
-    return y, e0.elapsed_time(e1) / iters
+        e1.record()
+        ACCEL.synchronize()
+        samples.append(e0.elapsed_time(e1))
+    return y, filtered_avg_ms(samples)
 
 
 def _timed_cusparse(data, indices, indptr, x, shape, warmup, iters):

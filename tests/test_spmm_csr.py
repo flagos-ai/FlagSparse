@@ -35,6 +35,11 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+if __package__:
+    from .utils import filtered_avg_ms, cupy_event_benchmark_filtered
+else:
+    from utils import filtered_avg_ms, cupy_event_benchmark_filtered
+
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spmm_csr as spmm_ops
@@ -64,16 +69,6 @@ DEFAULT_INDEX_DTYPE_NAMES = ("int32", "int64")
 DEFAULT_OP_NAMES = tuple(spmm_ops.SPMM_OP_NAMES.values())
 CUSPARSE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 TLE_CSR_SPMM_ALGORITHMS = {"alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"}
-MAIN_CSR_SPMM_ALGORITHMS = {
-    "csr_base",
-    "csr_base_accuracy",
-    "alpha_alg1_tle_opt",
-    "alpha_alg1_tle_opt2",
-    "spmm_csr_alg1",
-    "spmm_csr_alg2",
-    "spmm_csr_alg2_accuracy",
-    "spmm_csr_alg2_accuracy_hp",
-}
 
 PERF_FIELDS = [
     "matrix",
@@ -147,6 +142,8 @@ BEST_FIELDS = [
 ]
 
 LAYOUT_NAMES = ("row", "col")
+
+
 
 
 def _dtype_name(dtype):
@@ -265,6 +262,8 @@ def _parse_csv_names(value, all_names, option_name, explicit_names=None):
 
 def _parse_algs(value):
     value = str(value).strip().lower()
+    if value == "compare":
+        value = "all"
     if value in ("auto", "all"):
         return [value]
     allowed = set(fs.SPMM_CSR_ALGORITHMS)
@@ -341,35 +340,24 @@ def _print_tle_availability(alg_names):
 
 
 def _cuda_event_benchmark(op, warmup, iters):
-    out = None
+    out = op()  # Mandatory cold/JIT call stays outside events, even with warmup=0.
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(max(1, int(iters))):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / max(1, int(iters))
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _cupy_event_benchmark(op, warmup, iters):
-    import cupy as cp
-
-    out = None
-    for _ in range(max(0, int(warmup))):
-        out = op()
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    start.record()
-    for _ in range(max(1, int(iters))):
-        out = op()
-    end.record()
-    end.synchronize()
-    return out, cp.cuda.get_elapsed_time(start, end) / max(1, int(iters))
+    return cupy_event_benchmark_filtered(op, warmup, iters)
 
 
 def _time_route(
@@ -584,7 +572,7 @@ def run_one_case(
     for alg in _expand_algs(alg_names, op, dtype, exclude_tle=exclude_tle):
         try:
             resolved = fs.resolve_spmm_csr_algorithm(alg, op, dtype)
-            if layout == "col" and resolved.name not in MAIN_CSR_SPMM_ALGORITHMS:
+            if layout == "col" and "col" not in fs.get_spmm_csr_algorithm_spec(resolved.name)["layouts"]:
                 rows.append(
                     _skip_row(
                         path,
@@ -761,7 +749,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--csv", default=None, help="Performance CSV path")
+    parser.add_argument("--csv", "--csv-csr", dest="csv", default=None, help="Performance CSV path")
     parser.add_argument(
         "--no-cusparse",
         action="store_true",

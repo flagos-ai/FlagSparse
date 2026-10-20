@@ -37,6 +37,11 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+if __package__:
+    from .utils import filtered_avg_ms, cupy_event_benchmark_filtered
+else:
+    from utils import filtered_avg_ms, cupy_event_benchmark_filtered
+
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_csr as spmm_ops
@@ -46,7 +51,7 @@ VALUE_DTYPES = (torch.float16, torch.float32, torch.float64, torch.complex64, to
 INDEX_DTYPES = (torch.int32, torch.int64)
 OPS = ("non", "trans", "conj")
 SUPPORTED_OPS = OPS
-ALGS = ("auto", "spmm_csc_base", "base", "all")
+ALGS = ("auto", "base", "all", "compare", *fs.SPMM_CSC_ALGORITHMS)
 TEST_SIZES = ((64, 96, 16), (160, 1024, 32), (128, 256, 48))
 WARMUP = 10
 ITERS = 50
@@ -92,6 +97,8 @@ DTYPE_MAP = {
     "complex128": torch.complex128,
 }
 INDEX_DTYPE_MAP = {"int32": torch.int32, "int64": torch.int64}
+
+
 
 
 def _dtype_name(dtype):
@@ -179,12 +186,13 @@ def _parse_algs(value):
 
 
 def _expand_algs(algs, op, dtype):
-    del dtype
     if op not in SUPPORTED_OPS:
         return []
     out = []
     for alg in algs:
-        if alg in ("auto", "all"):
+        if alg in ("all", "compare"):
+            out.extend(fs.list_spmm_csc_algorithms(op=op, dtype=dtype))
+        elif alg == "auto":
             out.append("spmm_csc_base")
         else:
             out.append(alg)
@@ -378,15 +386,17 @@ def _cuda_event_benchmark(op, warmup, iters):
     for _ in range(max(0, int(warmup))):
         out = op()
     ACCEL.synchronize()
-    start = ACCEL.Event(enable_timing=True)
-    end = ACCEL.Event(enable_timing=True)
     count = max(1, int(iters))
-    start.record()
+    samples = []
     for _ in range(count):
+        start = ACCEL.Event(enable_timing=True)
+        end = ACCEL.Event(enable_timing=True)
+        start.record()
         out = op()
-    end.record()
-    ACCEL.synchronize()
-    return out, start.elapsed_time(end) / count
+        end.record()
+        ACCEL.synchronize()
+        samples.append(start.elapsed_time(end))
+    return out, filtered_avg_ms(samples)
 
 
 def _time_flagsparse_csc(data, indices, indptr, B, shape, alg, op, warmup, iters, timing=False):
@@ -478,18 +488,6 @@ def _time_cusparse_csc(data, indices, indptr, B, shape, op, layout, warmup, iter
         return ref["ms"], None, ref["values"]
     if backend is None:
         return None, backend_reason, None
-    if op != "non":
-        return (
-            None,
-            f"CuPy/cuSPARSE CSC SpMM baseline supports op=non only in this runner; op={op} is unsupported",
-            None,
-        )
-    if layout != "row":
-        return (
-            None,
-            f"CuPy/cuSPARSE CSC SpMM baseline supports row-major dense RHS only in this runner; layout={layout} is unsupported",
-            None,
-        )
     reason = _cupy_csc_unavailable_reason()
     if reason:
         return None, reason, None
@@ -521,19 +519,9 @@ def _time_cusparse_csc(data, indices, indptr, B, shape, op, layout, warmup, iter
     else:
         raise ValueError(f"unsupported op: {op}")
     fn = lambda: A_eff @ B_cp
-    for _ in range(max(0, int(warmup))):
-        out_cp = fn()
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        out_cp = fn()
-    end.record()
-    end.synchronize()
+    out_cp, elapsed_ms = cupy_event_benchmark_filtered(fn, warmup, iters)
     out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
-    return cp.cuda.get_elapsed_time(start, end) / count, None, out
+    return elapsed_ms, None, out
 
 
 def _run_case(

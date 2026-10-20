@@ -22,6 +22,11 @@ from ._common import *
 from . import mixed_spmx as _mixed_spmx
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
+from functools import partial
+
+from . import _spmm_csr_config as _csr_extension_config
+
+_csr_extension_config.set_known_backends(spec.name for spec in _common_mod.backend_specs())
 
 
 def _ascend_csr_row_ids(indptr, n_rows):
@@ -783,6 +788,7 @@ class PreparedCsrSpmmRoute:
         "alg",
         "materialized_op",
         "materialized_route",
+        "config",
     )
 
     def __init__(
@@ -813,6 +819,7 @@ class PreparedCsrSpmmRoute:
         # Filled in by prepare_spmm_csr_route for trans/conj; see the note there.
         self.materialized_op = None
         self.materialized_route = None
+        self.config = None
 
 
 def _normalize_spmm_csr_alg(alg):
@@ -927,6 +934,8 @@ def _validate_spmm_route_runtime_inputs(prepared, B):
 
 
 def _spmm_csr_route_from_materialized(prepared, data, indices, indptr, shape, op_name):
+    if indices.numel() and int(indices.max().item()) > _INDEX_LIMIT_INT32:
+        raise ValueError("transposed CSR column indices exceed the int32 execution range")
     kernel_indptr = indptr.to(torch.int64)
     row_lengths = (
         kernel_indptr[1:] - kernel_indptr[:-1]
@@ -2636,6 +2645,18 @@ def _run_spmm_csr_alg2_accuracy_impl(
     return C, meta
 
 
+def _run_spmm_csr_extension(prepared, B, *, algorithm, config=None,
+                            config_meta=None, timing=False, diagnostics=False,
+                            dense_layout="row", out=None):
+    from . import _spmm_csr_runtime
+
+    B = _validate_spmm_route_runtime_inputs(prepared, B)
+    return _spmm_csr_runtime.run(
+        prepared, B, algorithm=algorithm, config=config, config_meta=config_meta,
+        timing=timing, diagnostics=diagnostics, dense_layout=dense_layout, out=out,
+    )
+
+
 SPMM_CSR_ALGORITHMS = {
     "csr_base": SpmmCsrAlgorithm(
         name="csr_base",
@@ -2731,6 +2752,28 @@ SPMM_CSR_ALGORITHMS = {
 }
 
 
+SPMM_CSR_NEW_ALGORITHMS = _csr_extension_config.NEW_ALGORITHMS
+for _algorithm_name in SPMM_CSR_NEW_ALGORITHMS:
+    SPMM_CSR_ALGORITHMS[_algorithm_name] = SpmmCsrAlgorithm(
+        name=_algorithm_name, display_name=_algorithm_name,
+        supported_ops=tuple(SPMM_OP_NAMES.values()),
+        supported_dtypes=tuple(getattr(torch, name) for name in _csr_extension_config.DTYPES),
+        run=partial(_run_spmm_csr_extension, algorithm=_algorithm_name),
+    )
+
+
+def get_spmm_csr_algorithm_spec(alg):
+    name = _normalize_spmm_csr_alg(alg)
+    if name in SPMM_CSR_NEW_ALGORITHMS:
+        return _csr_extension_config.algorithm_spec(name)
+    if name not in SPMM_CSR_ALGORITHMS:
+        raise ValueError(f"unknown CSR SpMM algorithm {alg!r}")
+    algorithm = SPMM_CSR_ALGORITHMS[name]
+    return dict(name=name, ops=algorithm.supported_ops,
+                value_dtypes=tuple(str(dtype).removeprefix("torch.") for dtype in algorithm.supported_dtypes),
+                layouts=("row", "col"))
+
+
 def resolve_spmm_csr_algorithm(alg, op, dtype):
     token = _normalize_spmm_csr_alg(alg)
     if token == "auto":
@@ -2749,10 +2792,15 @@ def resolve_spmm_csr_algorithm(alg, op, dtype):
     return algorithm
 
 
-def list_spmm_csr_algorithms(op=None, dtype=None):
+def list_spmm_csr_algorithms(op=None, dtype=None, backend=None, layout=None):
     op_name = None if op is None else _spmm_op_to_name(op)
     names = []
     for name, algorithm in SPMM_CSR_ALGORITHMS.items():
+        spec = get_spmm_csr_algorithm_spec(name)
+        if backend is not None and backend not in spec.get("backends", _csr_extension_config.BACKENDS):
+            continue
+        if layout is not None and layout not in spec["layouts"]:
+            continue
         if op_name is not None and op_name not in algorithm.supported_ops:
             continue
         if dtype is not None and dtype not in algorithm.supported_dtypes:
@@ -2761,7 +2809,7 @@ def list_spmm_csr_algorithms(op=None, dtype=None):
     return tuple(names)
 
 
-def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"):
+def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto", config=None):
     """Prepare matrix-level CSR SpMM metadata for the route-based run API."""
     op_code = _normalize_spmm_op(op)
     op_name = _spmm_op_to_name(op_code)
@@ -2789,6 +2837,12 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
         op=op_name,
         alg=resolved_alg,
     )
+    if config is not None:
+        if resolved_alg not in SPMM_CSR_NEW_ALGORITHMS:
+            raise ValueError("config requires an explicit CSR extension algorithm")
+        if not isinstance(config, dict):
+            raise TypeError("config must be a dictionary")
+        route.config = dict(config)
     if op_name != "non" and _backend_name() == "cuda":
         # Materialise A.T (A.conj().T for conj) here instead of on every run.  The
         # transpose is a sort + bincount + cumsum over nnz, and it used to run inside
@@ -2815,6 +2869,8 @@ def flagsparse_spmm_csr_run(
     B,
     *,
     alg=None,
+    config=None,
+    out=None,
     op=None,
     dense_layout="auto",
     return_time=False,
@@ -2835,17 +2891,7 @@ def flagsparse_spmm_csr_run(
     alg_name = prepared.alg if alg is None else _normalize_spmm_csr_alg(alg)
     algorithm = resolve_spmm_csr_algorithm(alg_name, op_name, prepared.data.dtype)
     dense_layout = _normalize_dense_layout(dense_layout)
-    col_major_algorithms = {
-        "csr_base",
-        "csr_base_accuracy",
-        "alpha_alg1_tle_opt",
-        "alpha_alg1_tle_opt2",
-        "spmm_csr_alg1",
-        "spmm_csr_alg2",
-        "spmm_csr_alg2_accuracy",
-        "spmm_csr_alg2_accuracy_hp",
-    }
-    if dense_layout == "col" and algorithm.name not in col_major_algorithms:
+    if dense_layout == "col" and "col" not in get_spmm_csr_algorithm_spec(algorithm.name)["layouts"]:
         raise SpmmCsrAlgorithmUnavailable(
             "col-major layout is currently supported only by CSR SpMM main algorithms"
         )
@@ -2859,6 +2905,38 @@ def flagsparse_spmm_csr_run(
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
+
+    extension = algorithm.name in SPMM_CSR_NEW_ALGORITHMS
+    if extension and op_name != prepared.op:
+        raise ValueError("op conflicts with prepared CSR route")
+    expected_rows = prepared.n_rows if op_name == "non" else prepared.n_cols
+    expected_inner = prepared.n_cols if op_name == "non" else prepared.n_rows
+    if B.shape[0] != expected_inner:
+        raise ValueError(f"B.shape[0] must be {expected_inner}")
+    if out is not None:
+        if not torch.is_tensor(out) or tuple(out.shape) != (expected_rows, B.shape[1]):
+            raise ValueError("out has an incompatible shape")
+        if out.dtype != B.dtype or out.device != B.device:
+            raise ValueError("out dtype and device must match B")
+        if any(torch._C._overlaps(out, value) for value in
+               (prepared.data, prepared.kernel_indices, prepared.kernel_indptr, B)):
+            raise ValueError("out must not overlap an input")
+        from ._spmm_csr_runtime import output_has_internal_overlap
+        if output_has_internal_overlap(out):
+            raise ValueError("out must have non-overlapping storage")
+    route_kwargs = {}
+    if extension:
+        from . import _spmm_csr_runtime
+
+        overrides = config if config is not None else (prepared.config if alg_name == prepared.alg else None)
+        caps = _spmm_csr_runtime.backend_caps(B.device)
+        resolved_config, config_meta = _csr_extension_config.resolve_config(
+            algorithm.name, str(B.dtype).removeprefix("torch."), int(B.shape[1]),
+            dense_layout, caps, overrides, op=op_name,
+        )
+        route_kwargs.update(config=resolved_config, config_meta=config_meta, out=out)
+    elif config is not None:
+        raise ValueError("config is not supported by this legacy CSR algorithm")
 
     start = (
         _ACCEL.Event(enable_timing=True) if (return_time or return_meta) else None
@@ -2878,7 +2956,11 @@ def flagsparse_spmm_csr_run(
         timing=bool(timing),
         diagnostics=bool(diagnostics),
         dense_layout=dense_layout,
+        **route_kwargs,
     )
+    if out is not None and C is not out:
+        out.copy_(C)
+        C = out
     if end is not None:
         end.record()
         _ACCEL.synchronize()
@@ -2909,6 +2991,13 @@ def flagsparse_spmm_csr_run(
             "c_stride": route_meta.get("c_stride"),
             "output_layout": route_meta.get("output_layout"),
         }
+        if extension:
+            meta.update({key: value for key, value in route_meta.items()
+                         if key not in ("process_gpu_ms", "compute_ms")})
+            meta["transpose_strategy"] = (
+                "prepare_csr_rebuild" if prepared.materialized_op == op_name and op_name != "non"
+                else "run_csr_rebuild" if op_name != "non" else "none"
+            )
         if timing:
             meta["process_gpu_ms"] = process_gpu_ms
             meta["compute_ms"] = route_meta.get("compute_ms")
@@ -4430,6 +4519,11 @@ def flagsparse_spmm_csr(
     *,
     op_b=None,
     out_dtype=None,
+    alg=None,
+    config=None,
+    prepared=None,
+    dense_layout="auto",
+    timing=False,
 ):
     """CSR SpMM using Triton.
 
@@ -4441,6 +4535,28 @@ def flagsparse_spmm_csr(
     float32 run in ``mixed_spmx``.
     """
     B = _apply_spmm_op_b(B, op_b)
+    if alg is not None or prepared is not None or config is not None:
+        if any(value is not None for value in (block_n, block_nnz, max_segments)):
+            raise ValueError("legacy launch parameters cannot be combined with a registered route")
+        op_code = _normalize_spmm_op(op, transpose=False if transpose is None else bool(transpose))
+        if op is not None and transpose is not None and bool(transpose) != _spmm_op_transposes(op_code):
+            raise ValueError("transpose conflicts with op")
+        if prepared is None:
+            prepared = prepare_spmm_csr_route(
+                data, indices, indptr, shape, op=_spmm_op_to_name(op_code),
+                alg="auto" if alg is None else alg, config=config,
+            )
+        elif op is None and transpose is None:
+            op_code = _normalize_spmm_op(prepared.op)
+        if shape is not None and tuple(shape) != prepared.shape:
+            raise ValueError("shape conflicts with prepared CSR")
+        if out_dtype is not None and out_dtype != prepared.data.dtype:
+            raise TypeError("explicit CSR algorithms require out_dtype to match sparse data")
+        return flagsparse_spmm_csr_run(
+            prepared, B, alg=alg, config=config, op=_spmm_op_to_name(op_code),
+            dense_layout=dense_layout, out=out, timing=timing,
+            return_time=return_time, return_meta=return_meta,
+        )
     if torch.is_tensor(data) and _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype):
         C = _mixed_spmx.spmm_csr_mixed(
             data, indices, indptr, B, shape, op=op, transpose=transpose,
@@ -5513,6 +5629,7 @@ def _benchmark_spmm_csr_sparse_ref(
             _destroy_spmm_csr_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
+            filter_samples=True,
         )
         result["values"] = values
         result["ms"] = ms
@@ -5541,7 +5658,7 @@ def _benchmark_spmm_csr_sparse_ref(
                 fn = lambda: torch.sparse.mm(matrix.transpose(0, 1), B)
             else:
                 fn = lambda: torch.sparse.mm(matrix.conj().transpose(0, 1), B)
-            values, ms = _benchmark_cuda_op(fn, warmup, iters)
+            values, ms = _benchmark_cuda_op(fn, warmup, iters, filter_samples=True)
             result["values"] = values
             result["ms"] = ms
             result["reason"] = "ops-sparse bridge unavailable; PyTorch-NPU fallback"
@@ -5576,6 +5693,7 @@ def _benchmark_spmm_csr_sparse_ref(
         lambda: A_csr @ B_cp,
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     result["values"] = _torch_from_cupy(values_cp)
     result["ms"] = ms
@@ -5621,6 +5739,7 @@ def _benchmark_spmm_csc_sparse_ref(
             _destroy_spmm_csc_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
+            filter_samples=True,
         )
         result["values"] = values
         result["ms"] = ms
@@ -5649,7 +5768,7 @@ def _benchmark_spmm_csc_sparse_ref(
     indptr_cp = _cupy_from_torch(indptr.to(torch.int64))
     B_cp = _cupy_from_torch(B)
     A_csc = cpx_sparse.csc_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-    values_cp, ms = _benchmark_cuda_op(lambda: A_csc @ B_cp, warmup=warmup, iters=iters)
+    values_cp, ms = _benchmark_cuda_op(lambda: A_csc @ B_cp, warmup=warmup, iters=iters, filter_samples=True)
     result["values"] = _torch_from_cupy(values_cp)
     result["ms"] = ms
     result["reason"] = None
@@ -5687,6 +5806,7 @@ def benchmark_spmm_opt_case(
         lambda: flagsparse_spmm_csr(data, indices, indptr, B, shape),
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
 
     _ACCEL.synchronize()
@@ -5698,6 +5818,7 @@ def benchmark_spmm_opt_case(
         lambda: flagsparse_spmm_csr_opt(B=B, prepared=prepared),
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
 
     indptr64 = indptr.to(torch.int64)
@@ -5724,7 +5845,7 @@ def benchmark_spmm_opt_case(
             device=device,
         )
         pt_op = lambda: torch.sparse.mm(pt_sparse, B)
-        _, pt_ms = _benchmark_cuda_op(pt_op, warmup=warmup, iters=iters)
+        _, pt_ms = _benchmark_cuda_op(pt_op, warmup=warmup, iters=iters, filter_samples=True)
     except Exception:
         pt_ms = None
 
@@ -5845,6 +5966,7 @@ def benchmark_spmm_case(
         lambda: flagsparse_spmm_csr(**triton_kwargs),
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
 
     indptr64 = indptr.to(torch.int64)
@@ -5986,7 +6108,7 @@ def benchmark_spmm_case(
     try:
         pytorch_values, pytorch_ms = _benchmark_cuda_op(
             pytorch_op, warmup=warmup, iters=iters
-        )
+        , filter_samples=True)
     except Exception as exc:
         pytorch_reason = (
             str(exc) if pytorch_reason is None else f"{pytorch_reason}; timing: {exc}"
@@ -6053,7 +6175,7 @@ def benchmark_spmm_case(
                     A_eff = A_csr.transpose().conj().tocsr()
                 cusparse_values_cp, cusparse_ms = _benchmark_cuda_op(
                     lambda: A_eff @ B_cp, warmup=warmup, iters=iters
-                )
+                , filter_samples=True)
                 cusparse_values = _torch_from_cupy(cusparse_values_cp)
                 cusparse_metrics = _spmm_validation_metrics(cusparse_values, expected)
                 cusparse_match = cusparse_metrics["strict_allclose_match"]

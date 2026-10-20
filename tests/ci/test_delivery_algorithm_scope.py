@@ -80,3 +80,16 @@ def test_a_failed_row_of_another_dtype_does_not_fail_this_one():
         _row("auto", "a", 0.0, status="FAIL", dtype="float64"),
     ]
     assert _project(rows)["status"] == "PASS"
+
+
+def test_csr_spmm_default_delivery_still_uses_main_script():
+    assert runner.PERFORMANCE_COMMANDS["spmm_csr"][0] == "tests/test_spmm.py"
+
+
+def test_explicit_csr_spmm_scan_selects_existing_scanner_in_source():
+    import inspect
+
+    source = inspect.getsource(runner.run_performance)
+    assert 'arg == "--alg" or arg.startswith("--alg=")' in source
+    assert '"tests/test_spmm_csr.py"' in source
+    assert '"--csv-csr" if arg == "--csv"' in source

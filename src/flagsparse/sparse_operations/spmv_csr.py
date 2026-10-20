@@ -33,6 +33,7 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "row_vector",
     "row_split_reduce",
     "row_adaptive_split",
+    "row_subgroup_stream",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1508,7 +1509,8 @@ def _configure_spmv_route(prepared, alg, config=None):
         caps,
     )
     actual, source, rejections = _csr_config.resolve_config(
-        resolved, caps, config, return_rejections=True
+        resolved, caps, config, return_rejections=True,
+        mean_row_nnz=prepared.data.numel() / max(prepared.n_cols if prepared.transpose else prepared.n_rows, 1)
     )
     if (
         resolved == "row_tile"
@@ -1847,7 +1849,8 @@ def flagsparse_spmv_csr_run(
         if op is not None and _normalize_spmv_op(op) != prepared.op:
             raise ValueError("op does not match prepared.op")
         _csr_config.assert_route_match(
-            prepared.alg, prepared.config, alg, config, prepared.backend_caps
+            prepared.alg, prepared.config, alg, config, prepared.backend_caps,
+            mean_row_nnz=prepared.data.numel() / max(prepared.n_cols if prepared.transpose else prepared.n_rows, 1),
         )
         # Check overlap before contiguous materialization can hide an aliased x view.
         checked_x = _validate_spmv_x(x, prepared)
@@ -2075,6 +2078,7 @@ def flagsparse_spmv_csr(
                 requested if alg is not None or use_opt is not None else None,
                 config,
                 prepared.backend_caps,
+                mean_row_nnz=prepared.data.numel() / max(prepared.n_cols if prepared.transpose else prepared.n_rows, 1),
             )
     return flagsparse_spmv_csr_run(
         prepared,

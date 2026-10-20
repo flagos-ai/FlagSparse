@@ -41,6 +41,12 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+if __package__:
+    from .utils import cupy_event_benchmark_filtered
+else:
+    from utils import cupy_event_benchmark_filtered
+
 import flagsparse as ast
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmm_csr as ast_ops
@@ -442,6 +448,7 @@ def _benchmark_triton_spmm(
         steady_op,
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     return result, steady_ms, first_call_ms
 
@@ -613,6 +620,7 @@ def run_one_mtx(
                 pytorch_op,
                 warmup=warmup,
                 iters=iters,
+                filter_samples=True,
             )
         except Exception as exc:
             result["pytorch_reason"] = str(exc)
@@ -741,18 +749,9 @@ def run_one_mtx(
                         A_eff = A_csr.transpose().conj().tocsr()
                     baseline_op = lambda: A_eff @ B_cp  # noqa: E731
 
-                ACCEL.synchronize()
-                for _ in range(warmup):
-                    _ = baseline_op()
-                ACCEL.synchronize()
-                start = ACCEL.Event(enable_timing=True)
-                end = ACCEL.Event(enable_timing=True)
-                start.record()
-                for _ in range(iters):
-                    _ = baseline_op()
-                end.record()
-                ACCEL.synchronize()
-                result["cusparse_ms"] = start.elapsed_time(end) / iters
+                _, result["cusparse_ms"] = cupy_event_benchmark_filtered(
+                    baseline_op, warmup, iters
+                )
 
                 cs_C = baseline_op()
                 cs_C_t = torch.utils.dlpack.from_dlpack(cs_C.toDlpack())

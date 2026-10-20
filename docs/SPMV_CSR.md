@@ -2,11 +2,11 @@
 
 ## Algorithms and types
 
-All seven registered algorithms implement `non`, `trans`, and `conj`, with
+All eight registered algorithms implement `non`, `trans`, and `conj`, with
 float16, bfloat16, float32, float64, complex64 and complex128 inputs. `conj` means
 `A.conj().T @ x`, not conjugation of x. Output dtype matches the input dtype.
 
-The four new algorithms retain CUDA/ROCm profiles only. Other backends keep their
+The five new algorithms retain CUDA/ROCm profiles only. Other backends keep their
 existing paths; an explicit unsupported new algorithm must raise. Support
 declarations are not hardware validation. The dtype/op expansion is **unverified
 on hardware**; no operator, interpreter, pytest or GPU compilation was run in the
@@ -21,7 +21,7 @@ development environment for this expansion.
 The new row kernels use separate real/imaginary accumulators and no floating-point
 atomics. Split partials and every reduction level retain the selected component
 precision. Legacy segbin retains its atomics. The bucket algorithm retains its own
-bucket/batched-row scheduling. It requires int32 column indices; the other six
+bucket/batched-row scheduling. It requires int32 column indices; the other seven
 algorithms accept int32/int64 columns. All accept int32/int64 row pointers.
 
 ## Invocation and timing
@@ -93,3 +93,13 @@ prepared 保存原始 CSR；每次 run 重建转置 CSR，按新行长分类，�
 转置和执行计划构建计入 process_gpu_ms，完整调用 gpu_ms 包含全部必要工作。
 有无 --timing 均使用 ms=process_cpu_ms+gpu_ms，不能用分段之和替代完整耗时。
 本次仅进行源码和静态检查；实机准确性、性能及旧失败矩阵的复测尚待计算节点完成。
+
+## Explicit subgroup stream extension
+
+`row_subgroup_stream` processes four consecutive row tiles per program by default.
+Its subgroup width is chosen from matrix dimensions/nnz without a statistics plan;
+`config={"row_subgroup_stream": {"lanes_per_row": 8, "row_tiles_per_program": 4}}`
+overrides it. It uses the existing main prepared/run boundary and does not enter
+row_tile-specific ROCm NNZ binding or graph replay. It retains FP64 accumulation
+for FP32, FP32 for FP16/BF16 and native complex component precision. It is not
+selected by default and remains unverified on hardware.

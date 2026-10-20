@@ -540,3 +540,89 @@ outputs compare against CPU int32 references.
 ## License
 
 This project is licensed under the [Apache (Version 2.0) license](./LICENSE).
+
+## Explicit SpMV/SpMM algorithm extensions
+
+| Operator | Explicit algorithms |
+| --- | --- |
+| SpMV CSR | `row_subgroup_stream` |
+| SpMM CSR | `csr_row_tile`, `csr_row_kparallel`, `csr_row_panel`, `csr_split_nnz_reduce`, `csr_adaptive_tile_split` |
+| SpMV COO | `coo_segmented_atomic`, `coo_rowrun_subgroup`, `coo_segmented_stream_atomic` |
+| SpMM COO | `coo_segmented_panel_atomic`, `coo_rowrun_panel`, `coo_segmented_stream_panel_atomic` |
+| SpMV CSC | `csc_col_subgroup`, `csc_col_tile_atomic`, `csc_col_vector`, `csc_col_split_reduce` |
+| SpMM CSC | `csc_col_panel`, `csc_col_tile_panel_atomic`, `csc_col_kparallel`, `csc_col_split_reduce` |
+
+Defaults, mixed-type entry points and C API kernel contracts are unchanged. These
+algorithms are selected with keyword `alg`, optionally `config`, through the
+existing operator or prepare/run API. Unsupported explicit combinations raise;
+no backend fallback is reported under a new algorithm name. Query the operator's
+`list_*_algorithms` / `get_*_algorithm_spec` before selection. Enumeration describes
+support; device capabilities are checked when the execution configuration is bound.
+
+The extensions accept FP16, FP32, FP64, complex64 and complex128. CSR SpMV also
+accepts BF16. CSC tile-atomic algorithms implement `non`; other CSC extensions
+implement `trans/conj` directly from CSC. CSR and COO extensions support all three
+ops. `conj` conjugates sparse values only. CSR SpMV FP32 accumulates in FP64;
+COO SpMM retains FP32→FP64 and complex64→complex128 accumulation, including on
+ROCm. Other extensions use FP32 for FP16 and the native real component precision.
+Widened `out_dtype` and mixed operands retain the existing default paths; they
+are not silently substituted for an explicitly selected extension.
+
+Preparation and timing follow each main entry point. CSR SpMV uses its existing
+prepared contract. CSR SpMM reuses the existing route preparation (including its
+CUDA transpose preparation), while segment/adaptive plans are invocation-local.
+Explicit COO extensions retain original coordinates, with sorting/run construction
+inside row-run execution and no sorting for atomics. CSC extensions do not build
+owner maps or convert formats. Old COO/CSC prepared objects must be prepared again
+with `alg` before selecting a new algorithm; canonical/coalesced data cannot recover
+original duplicates. Algorithm-specific configuration does not follow an algorithm
+switch. New algorithms do not enter legacy graph replay or special structural/value
+caches. Output initialization, conversions, atomic operations and reduction remain
+inside the corresponding run. Split workspace defaults to 256 MiB, configurable
+with `workspace_bytes`; numeric workspace and descriptor usage are reported separately.
+
+Existing benchmark sampling and default delivery remain unchanged. `--alg compare`
+is an alias for `all` in the registered scanners; omit it to retain default delivery.
+For CSR SpMM the runner selects `test_spmm_csr.py` only when `--alg` is explicitly
+passed through, and maps the output CSV argument. For example:
+
+```bash
+python run_flagsparse_pytest.py --ops spmv_csr,spmm_csr,spmv_coo,spmm_coo,spmv_csc,spmm_csc \
+  --phase both --mode quick --benchmark-input ../../matrix \
+  --op-benchmark-args "spmv_csr=--alg compare" \
+  --op-benchmark-args "spmm_csr=--alg compare --exclude-tle" \
+  --op-benchmark-args "spmv_coo=--alg compare" \
+  --op-benchmark-args "spmm_coo=--alg compare" \
+  --op-benchmark-args "spmv_csc=--alg compare" \
+  --op-benchmark-args "spmm_csc=--alg compare" \
+  --results-dir pytest_results_migrated_algorithms
+```
+
+Accuracy cases use the existing six markers and shared tolerances, including
+stream carry, mixed indices, complex transpose, empty outputs and bounded split
+workspace. **Hardware validation is pending for every migrated algorithm.** Local
+verification is limited to source/AST/diff checks; no operator, pytest, interpreter
+or offline kernel compilation has been run. In particular the stream carry layout
+repair must be compiled and tested on CUDA and HIP before calling it verified.
+
+In explicit COO SpMV scans, `ms` uses the full event sample for every algorithm;
+phase diagnostics do not replace it. The original default benchmark entry remains unchanged.
+Omitted `sort_by_row` keeps the legacy default; when supplied with an explicit algorithm,
+it must agree with that algorithm's sorting requirement.
+
+### SpMV/SpMM timing sample filtering
+
+The existing SpMV/SpMM scripts reuse update's timing statistic: collect individual
+post-warmup samples, retain values within ±10% of their median, then average them
+(fall back to the median if none remain). `tests/utils.py` supplies script helpers;
+the dedicated CSR SpMV entry already uses the same rule. Shared wall-clock and
+prepared vendor measurements opt in with `filter_samples=True` for SpMV/SpMM;
+other operators retain the shared helpers' original default behavior.
+
+Each entry retains its preparation, transpose, steady-state and graph boundaries.
+`first_call_ms` remains a single cold call. Re-measure before comparing results
+with the former batched-loop averages: sampling changes are not algorithm gains.
+Accuracy tolerances, FAIL aggregation and algorithm selection are unchanged.
+Existing runner commands remain valid; `benchmark/test_sparse_perf.py` remains
+a placeholder. Statistic and descriptor-lifecycle tests were added for CI; local
+validation is limited to source and static checks.

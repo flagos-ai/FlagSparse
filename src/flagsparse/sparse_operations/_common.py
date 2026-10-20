@@ -3220,6 +3220,7 @@ def _benchmark_spmv_csc_sparse_ref(
             _destroy_spmv_csc_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
+            filter_samples=True,
         )
         result["values"] = values
         result["ms"] = ms
@@ -3235,6 +3236,7 @@ def _benchmark_spmv_csc_sparse_ref(
         lambda: _apply_cupy_spmv_op(matrix, x_cp, op_name),
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     result["values"] = _torch_from_cupy(values_cp)
     result["ms"] = ms
@@ -3273,6 +3275,7 @@ def _benchmark_spmv_csr_sparse_ref(
             _destroy_spmv_csr_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
+            filter_samples=True,
         )
         result["values"] = values
         result["ms"] = ms
@@ -3288,6 +3291,7 @@ def _benchmark_spmv_csr_sparse_ref(
         lambda: _apply_cupy_spmv_op(matrix, x_cp, op_name),
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     result["values"] = _torch_from_cupy(values_cp)
     result["ms"] = ms
@@ -3298,6 +3302,7 @@ def _benchmark_spmv_csr_sparse_ref(
             lambda: _apply_cupy_spmv_op(matrix_csc, x_cp, op_name),
             warmup=warmup,
             iters=iters,
+            filter_samples=True,
         )
         _ = values_csc
         result["csc_ms"] = csc_ms
@@ -3386,6 +3391,7 @@ def _benchmark_spmv_coo_sparse_ref(
             _destroy_spmv_coo_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
+            filter_samples=True,
         )
         result["values"] = values
         result["ms"] = ms
@@ -3409,6 +3415,7 @@ def _benchmark_spmv_coo_sparse_ref(
         lambda: _apply_cupy_sparse_matmul_op(matrix_csr, x_cp, op_name),
         warmup=warmup,
         iters=iters,
+        filter_samples=True,
     )
     result["values"] = _torch_from_cupy(values_cp)
     result["ms"] = ms
@@ -3573,7 +3580,28 @@ def _prepare_scatter_inputs(
     return sparse_values, indices, kernel_indices, dense_size
 
 
-def _benchmark_cuda_op(op, warmup, iters):
+def _filtered_benchmark_avg_ms(times, tolerance=0.10):
+    if not times:
+        return None
+    values = [float(t) for t in times]
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values)
+    n = len(ordered)
+    if n % 2 == 0:
+        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    else:
+        median = ordered[n // 2]
+    if median == 0.0:
+        kept = [t for t in ordered if t == 0.0]
+    else:
+        lo = median * (1.0 - float(tolerance))
+        hi = median * (1.0 + float(tolerance))
+        kept = [t for t in ordered if lo <= t <= hi]
+    return sum(kept) / len(kept) if kept else median
+
+
+def _benchmark_cuda_op(op, warmup, iters, *, filter_samples=False):
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
 
@@ -3584,6 +3612,16 @@ def _benchmark_cuda_op(op, warmup, iters):
     _ACCEL.synchronize()
     if cp is not None:
         cp.cuda.runtime.deviceSynchronize()
+    if filter_samples:
+        samples = []
+        for _ in range(iters):
+            start_time = time.perf_counter()
+            output = op()
+            _ACCEL.synchronize()
+            if cp is not None:
+                cp.cuda.runtime.deviceSynchronize()
+            samples.append((time.perf_counter() - start_time) * 1000.0)
+        return output, _filtered_benchmark_avg_ms(samples)
     start_time = time.perf_counter()
     for _ in range(iters):
         output = op()
@@ -3594,7 +3632,9 @@ def _benchmark_cuda_op(op, warmup, iters):
     return output, elapsed_ms
 
 
-def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
+def _benchmark_prepared_cuda_op(
+    prepare_fn, run_fn, destroy_fn, warmup, iters, *, filter_samples=False
+):
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
     state = None
@@ -3610,6 +3650,15 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
             _ACCEL.synchronize()
             start_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
             stop_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+            if filter_samples:
+                samples = []
+                for _ in range(iters):
+                    _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
+                    output = run_fn(state)
+                    _hip_check_result(hip.hipEventRecord(stop_ev, 0), "hipEventRecord(stop)")
+                    _hip_check_result(hip.hipEventSynchronize(stop_ev), "hipEventSynchronize(stop)")
+                    samples.append(_hip_event_elapsed_ms(start_ev, stop_ev))
+                return output, _filtered_benchmark_avg_ms(samples)
             _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
             for _ in range(iters):
                 output = run_fn(state)
@@ -3622,6 +3671,15 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
         _ACCEL.synchronize()
         start_ev_torch = _ACCEL.Event(enable_timing=True)
         end_ev_torch = _ACCEL.Event(enable_timing=True)
+        if filter_samples:
+            samples = []
+            for _ in range(iters):
+                start_ev_torch.record()
+                output = run_fn(state)
+                end_ev_torch.record()
+                _ACCEL.synchronize()
+                samples.append(start_ev_torch.elapsed_time(end_ev_torch))
+            return output, _filtered_benchmark_avg_ms(samples)
         start_ev_torch.record()
         for _ in range(iters):
             output = run_fn(state)
