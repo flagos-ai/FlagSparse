@@ -31,7 +31,7 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
     if config is not None and not isinstance(config, dict):
         raise TypeError("config must be a dictionary")
     if caps.backend not in _csr_policy.BACKENDS or not caps.legal_num_warps or not caps.subgroup_width or caps.int64 is not True:
-        raise NotImplementedError(f"COO launch/index capabilities unknown: {caps}")
+        raise _csr_policy.BackendCapabilityUnavailable(f"COO launch/index capabilities unknown: {caps}")
     atomic = alg in ("coo_segmented_atomic", "coo_segmented_panel_atomic",
                      "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic")
     overrides = dict(config or {})
@@ -94,16 +94,16 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
     if cfg.get("lanes_per_row", 1) > caps.subgroup_width:
         raise ValueError("lanes_per_row exceeds backend subgroup width")
     if dtype in ("float64", "complex128") and caps.fp64 is not True:
-        raise NotImplementedError("COO FP64 capability unavailable or unknown")
+        raise _csr_policy.BackendCapabilityUnavailable("COO FP64 capability unavailable or unknown")
     if atomic:
         feature = "fp64_atomic" if dtype in ("float64", "complex128") else "fp32_atomic"
         supported = getattr(caps, feature)
         if supported is not True:
-            raise NotImplementedError(f"{feature} unavailable or unknown on {caps.backend}")
+            raise _csr_policy.BackendCapabilityUnavailable(f"{feature} unavailable or unknown on {caps.backend}")
         if cfg["local_reduce"] == "segment" and caps.scan is not True:
-            raise NotImplementedError("COO segmented scan capability unknown")
+            raise _csr_policy.BackendCapabilityUnavailable("COO segmented scan capability unknown")
     elif caps.stable_sort is not True or caps.reduction is not True:
-        raise NotImplementedError("COO stable sort/reduction capability unknown")
+        raise _csr_policy.BackendCapabilityUnavailable("COO stable sort/reduction capability unknown")
     return cfg, dict(backend=caps.backend, target=caps.target, arch=caps.arch,
                      config_source="explicit" if overrides else ("architecture" if arch_profile else "backend" if profile else "conservative"),
                      validation="unverified", config=cfg, rejected_profiles=rejected, implementation_version=2,
@@ -134,7 +134,7 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
     if dtype not in DTYPES:
         raise TypeError(f"unsupported CSC dtype {dtype}")
     if caps.backend not in _csr_policy.BACKENDS or not caps.legal_num_warps or not caps.subgroup_width:
-        raise NotImplementedError("CSC launch capabilities unavailable or unknown")
+        raise _csr_policy.BackendCapabilityUnavailable("CSC launch capabilities unavailable or unknown")
     required = ["int64"]
     atomic = algorithm in ("csc_col_tile_atomic", "csc_col_tile_panel_atomic")
     if dtype in ("float64", "complex128"):
@@ -145,9 +145,9 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
         required.append("reduction")
     for key in required:
         if getattr(caps, key) is not True:
-            raise NotImplementedError(f"CSC {key} capability unavailable for {caps.backend}/{caps.arch}")
+            raise _csr_policy.BackendCapabilityUnavailable(f"CSC {key} capability unavailable for {caps.backend}/{caps.arch}")
     if algorithm == "csc_col_split_reduce" and caps.scan is not True:
-        raise NotImplementedError("CSC GPU prefix-plan capability unavailable")
+        raise _csr_policy.BackendCapabilityUnavailable("CSC GPU prefix-plan capability unavailable")
     warps = 4 if atomic or algorithm in ("csc_col_kparallel", "csc_col_split_reduce") else 2
     if warps not in caps.legal_num_warps:
         warps = max((w for w in caps.legal_num_warps if w <= warps), default=min(caps.legal_num_warps))

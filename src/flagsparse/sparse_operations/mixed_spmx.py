@@ -68,6 +68,59 @@ def _requested_out_dtype(out, out_dtype):
     return out_dtype if out_dtype is not None else (None if out is None else out.dtype)
 
 
+def remember_registered_inputs(prepared, inputs):
+    """Retain source storage for alias validation, not an execution-plan cache."""
+    prepared.original_inputs = tuple(inputs)
+    return prepared
+
+
+def validate_registered_output_alias(prepared, rhs, out, inputs=()):
+    """Check before contiguous, transpose or dtype copies can hide aliases."""
+    if out is None:
+        return
+    if not torch.is_tensor(out):
+        raise TypeError("out must be a tensor")
+    sources = tuple(inputs) + getattr(prepared, "original_inputs", ()) + (rhs,)
+    if any(torch.is_tensor(value) and torch._C._overlaps(out, value) for value in sources):
+        raise ValueError("out must not overlap original input storage")
+
+
+def resolve_registered_types(a_dtype, rhs_dtype, *, out=None, out_dtype=None):
+    """Resolve storage/output types without allocating or selecting an algorithm.
+
+    Non-half compute policies remain owned by the selected algorithm. This is
+    deliberately separate from the legacy mixed dispatch and its INT8 routes.
+    """
+    output_dtype = _requested_out_dtype(out, out_dtype) or a_dtype
+    if rhs_dtype != a_dtype:
+        raise TypeError("registered routes require matching sparse and dense input dtypes")
+    allowed = (a_dtype, torch.float32) if a_dtype in _HALF else (a_dtype,)
+    if output_dtype not in allowed:
+        raise TypeError(f"unsupported registered type combination: {a_dtype}, "
+                        f"{rhs_dtype} -> {output_dtype}")
+    return {
+        "a_dtype": a_dtype,
+        "rhs_dtype": rhs_dtype,
+        "compute_dtype": torch.float32 if a_dtype in _HALF else None,
+        "output_dtype": output_dtype,
+    }
+
+
+def apply_registered_op_b(B, op_b):
+    """Apply an operation as a view; resolving conjugation belongs inside run."""
+    token = "non" if op_b is None else str(op_b).strip().lower()
+    token = {"0": "non", "n": "non", "non_trans": "non", "1": "trans", "t": "trans",
+             "2": "conj", "c": "conj", "conj_trans": "conj"}.get(token, token)
+    if token not in ("non", "trans", "conj"):
+        raise ValueError("op_b must be non, trans, or conj")
+    if token == "non":
+        return B
+    if not torch.is_tensor(B) or B.ndim != 2:
+        raise ValueError("B must be a 2D tensor")
+    result = B.transpose(0, 1)
+    return result.conj() if token == "conj" else result
+
+
 def spmv_needs_mixed(data_dtype, x_dtype, out, out_dtype, *, coo=False):
     """Whether an SpMV call is one of the combinations handled in this module."""
     requested = _requested_out_dtype(out, out_dtype)

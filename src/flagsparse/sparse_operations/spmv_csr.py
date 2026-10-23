@@ -101,6 +101,7 @@ class PreparedCsrSpmv:
     """Cached CSR metadata for repeated SpMV calls on the same sparse matrix."""
 
     __slots__ = (
+        "original_inputs",
         "data",
         "kernel_indices",
         "kernel_indptr",
@@ -994,6 +995,8 @@ def prepare_spmv_csr(
     alg="auto",
     config=None,
 ):
+    from .mixed_spmx import remember_registered_inputs
+    original_inputs = (data, indices, indptr)
     index_fallback_policy = _normalize_spmv_index_fallback_policy(index_fallback_policy)
     op_code = _normalize_spmv_op(op, transpose=transpose)
     requested_alg = _csr_config.normalize_alg(alg)
@@ -1058,7 +1061,7 @@ def prepare_spmv_csr(
         from . import _spmv_csr_transpose
         prepared.non_gather_plan = _spmv_csr_transpose.make_plan(
             kernel_indices, kernel_indptr, None, n_rows)
-    return prepared
+    return remember_registered_inputs(prepared, original_inputs)
 
 
 def _get_spmv_baseline_data(prepared):
@@ -1475,9 +1478,20 @@ def _spmv_backend_caps(device):
     )
 
 
-def list_spmv_csr_algorithms(op=None, dtype=None, backend=None):
+def list_spmv_csr_algorithms(op=None, dtype=None, backend=None, *, rhs_dtype=None,
+                             out_dtype=None):
     op_name = None if op is None else _spmv_op_to_name(op)
-    return _csr_config.list_algorithms(op_name, dtype, backend)
+    names = _csr_config.list_algorithms(op_name, dtype, backend)
+    if rhs_dtype is not None or out_dtype is not None:
+        if dtype is None:
+            raise ValueError("dtype is required for type-combination filtering")
+        try:
+            _mixed_spmx.resolve_registered_types(
+                dtype, dtype if rhs_dtype is None else rhs_dtype, out_dtype=out_dtype
+            )
+        except TypeError:
+            return ()
+    return names
 
 
 def get_spmv_csr_algorithm_spec(alg):
@@ -1629,14 +1643,14 @@ def _configure_spmv_route(prepared, alg, config=None):
     return prepared
 
 
-def _spmv_check_output(out, prepared, x):
+def _spmv_check_output(out, prepared, x, output_dtype=None):
     if out is None:
         return
     if not torch.is_tensor(out) or not _is_accel_tensor(out):
         raise ValueError("out must be an accelerator tensor")
     if (
         out.device != prepared.data.device
-        or out.dtype != prepared.data.dtype
+        or out.dtype != (prepared.data.dtype if output_dtype is None else output_dtype)
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
@@ -1832,6 +1846,7 @@ def flagsparse_spmv_csr_run(
     config=None,
     op=None,
     out=None,
+    out_dtype=None,
     timing=False,
     return_time=False,
     return_meta=False,
@@ -1841,6 +1856,8 @@ def flagsparse_spmv_csr_run(
     timing adds diagnostics from a separate run. It never changes ms = cpu + gpu.
     No segmented execution plan is retained between calls.
     """
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, x, out)
     if not isinstance(prepared, PreparedCsrSpmv):
         raise TypeError("prepared must be PreparedCsrSpmv")
     with _spmv_device_context(prepared.data.device):
@@ -1854,19 +1871,30 @@ def flagsparse_spmv_csr_run(
         )
         # Check overlap before contiguous materialization can hide an aliased x view.
         checked_x = _validate_spmv_x(x, prepared)
-        _spmv_check_output(out, prepared, x)
+        types = _mixed_spmx.resolve_registered_types(
+            prepared.data.dtype, x.dtype, out=out, out_dtype=out_dtype
+        )
+        output_dtype = types["output_dtype"]
+        _spmv_check_output(out, prepared, x, output_dtype)
         x = checked_x
+        def execute(route, diagnostics=False):
+            target = out
+            if target is None and output_dtype != route.data.dtype:
+                target = torch.empty(
+                    route.n_cols if route.transpose else route.n_rows,
+                    dtype=output_dtype, device=route.data.device,
+                )
+            return _execute_spmv_route_with_fallback(route, x, target, timing=diagnostics)
+
         if not (return_time or return_meta or timing):
-            return _execute_spmv_route_with_fallback(prepared, x, out)[0]
+            return execute(prepared)[0]
         _ACCEL.synchronize()
         result, gpu_ms = _spmv_phase(
-            lambda: _execute_spmv_route_with_fallback(prepared, x, out), True
+            lambda: execute(prepared), True
         )
         y, phases, actual = result
         if timing:
-            _, phases, _ = _execute_spmv_route_with_fallback(
-                actual, x, out, timing=True
-            )
+            _, phases, _ = execute(actual, diagnostics=True)
         spec = get_spmv_csr_algorithm_spec(actual.alg)
         compute_dtype = _csr_config.compute_dtype(actual.alg, actual.data.dtype)
         scatter = _spmv_transpose_scatter_enabled(actual)
@@ -1904,7 +1932,9 @@ def flagsparse_spmv_csr_run(
                 "prepared_structure_gather" if _spmv_transpose_scatter_enabled(actual)
                 else "per_run_csr_rebuild" if prepared.transpose else "none"
             ),
-            "output_dtype": str(actual.data.dtype).removeprefix("torch."),
+            "output_dtype": str(output_dtype).removeprefix("torch."),
+            "a_dtype": str(prepared.data.dtype).removeprefix("torch."),
+            "rhs_dtype": str(x.dtype).removeprefix("torch."),
             "index_fallback_applied": actual.index_fallback_applied,
             "index_fallback_reason": actual.index_fallback_reason,
             "ms": ms,
@@ -1956,8 +1986,11 @@ def flagsparse_spmv_csr(
     bfloat16 -> float32, int8 -> int32 or float32. A real matrix times a complex
     ``x`` writes the complex type. Those combinations run in ``mixed_spmx``.
     """
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, x, out, (data, indices, indptr))
     if (
         prepared is None
+        and alg is None and config is None and use_opt is None
         and torch.is_tensor(data)
         and _mixed_spmx.spmv_needs_mixed(
             data.dtype, x.dtype if torch.is_tensor(x) else None, out, out_dtype
@@ -2084,6 +2117,7 @@ def flagsparse_spmv_csr(
         prepared,
         x,
         out=out,
+        out_dtype=out_dtype,
         timing=timing,
         return_time=return_time,
         return_meta=return_meta,

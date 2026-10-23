@@ -3092,13 +3092,17 @@ def main():
         help="Skip dense-column COO heuristic coverage in synthetic mode",
     )
     parser.add_argument(
-        "--csv",
+        "--csv", "--csv-coo",
         type=str,
         default=None,
         metavar="FILE",
         help="Run selected dtype/index grids on all .mtx and write results to one CSV",
     )
+    from benchmark_utils import add_type_combo_arguments, run_type_combo_benchmark
+    add_type_combo_arguments(parser, spmm=True)
     args = parser.parse_args()
+    if run_type_combo_benchmark("spmm_coo", args, parser):
+        return
 
     if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
@@ -3230,9 +3234,10 @@ def main():
         )
         import q4_variant_bench
 
-        q4_variant_bench.run_and_append(
-            "spmm_coo", paths, csv_path, args.warmup, args.iters
-        )
+        if not any(token.split("=", 1)[0] == "--alg" for token in sys.argv[1:]):
+            q4_variant_bench.run_and_append(
+                "spmm_coo", paths, csv_path, args.warmup, args.iters
+            )
         return
 
     print("=" * 140)

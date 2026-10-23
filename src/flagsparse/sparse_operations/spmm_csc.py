@@ -26,6 +26,8 @@ import triton.language as tl
 
 
 SUPPORTED_SPMM_CSC_VALUE_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
     torch.float32,
     torch.float64,
     torch.complex64,
@@ -145,6 +147,7 @@ class PreparedCscSpmm:
     """Prepared CSC metadata for native SpMM routes."""
 
     __slots__ = (
+        "original_inputs",
         "data",
         "kernel_indices",
         "kernel_indptr",
@@ -548,12 +551,14 @@ def prepare_spmm_csc_route(
     index_fallback_policy="auto",
     config=None,
 ):
+    from .mixed_spmx import remember_registered_inputs
+    original_inputs = (data, indices, indptr)
     if _normalize_spmm_csc_alg(alg) in SPMM_CSC_NEW_ALGORITHMS:
         from .spmv_csc import _prepare_csc_registered
 
-        return _prepare_csc_registered(data, indices, indptr, shape, op, None,
+        return remember_registered_inputs(_prepare_csc_registered(data, indices, indptr, shape, op, None,
             _normalize_spmm_csc_alg(alg), config, index_fallback_policy, "spmm",
-            {"block_n": block_n, "block_nnz": block_nnz, "max_segments": max_segments})
+            {"block_n": block_n, "block_nnz": block_nnz, "max_segments": max_segments}), original_inputs)
     if config is not None:
         raise ValueError("config requires a CSC extension algorithm")
     index_fallback_policy = _normalize_spmm_csc_index_fallback_policy(
@@ -604,7 +609,7 @@ def prepare_spmm_csc_route(
                 col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
         except Exception:
             col_ids = None
-    return PreparedCscSpmm(
+    return remember_registered_inputs(PreparedCscSpmm(
         data=data,
         kernel_indices=indices,
         kernel_indptr=indptr,
@@ -620,7 +625,7 @@ def prepare_spmm_csc_route(
         op=_spmm_csc_op_to_name(op_code),
         alg=resolved_alg,
         index_fallback_policy=index_fallback_policy,
-    )
+    ), original_inputs)
 
 
 def _validate_spmm_csc_B(B, prepared, op_code):
@@ -1576,7 +1581,7 @@ for _name in SPMM_CSC_NEW_ALGORITHMS:
     SPMM_CSC_ALGORITHMS[_name] = SpmmCscAlgorithm(
         name=_name, display_name=_name,
         supported_ops=("non",) if _name == "csc_col_tile_panel_atomic" else ("trans", "conj"),
-        supported_dtypes=(torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=(torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128),
         run=_run_spmm_csc_extension,
     )
 
@@ -1604,7 +1609,16 @@ def resolve_spmm_csc_algorithm(alg, op, dtype):
     return algorithm
 
 
-def list_spmm_csc_algorithms(op=None, dtype=None, backend=None, layout=None):
+def list_spmm_csc_algorithms(op=None, dtype=None, backend=None, layout=None, *, rhs_dtype=None, out_dtype=None):
+    from . import mixed_spmx
+    if rhs_dtype is not None or out_dtype is not None:
+        if dtype is None:
+            raise ValueError("dtype is required for type-combination filtering")
+        try:
+            mixed_spmx.resolve_registered_types(
+                dtype, dtype if rhs_dtype is None else rhs_dtype, out_dtype=out_dtype)
+        except TypeError:
+            return ()
     if backend is not None and backend not in {spec.name for spec in _common_mod.backend_specs()}:
         return ()
     if layout is not None and layout not in ("row", "col", "strided"):
@@ -1692,9 +1706,12 @@ def _run_spmm_csc_prepared_with_fallback(prepared, B, algorithm, collect_timing=
     try:
         return algorithm.run(prepared, B, timing=bool(collect_timing))
     except RuntimeError as exc:
+        from ._spmv_csr_config import is_index_compatibility_error
+
         if (
             prepared.index_fallback_policy != "auto"
             or not _spmm_csc_uses_int64_indices(prepared)
+            or not is_index_compatibility_error(exc)
         ):
             raise
         fallback_prepared = _spmm_csc_prepared_with_int32_indices(prepared, exc)
@@ -1711,27 +1728,33 @@ def flagsparse_spmm_csc_run(
     alg=None,
     config=None,
     out=None,
+    out_dtype=None,
     op=None,
+    op_b=None,
     return_time=False,
     return_meta=False,
     timing=False,
     diagnostics=False,
 ):
     """Run a registered native CSC SpMM route."""
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, B, out)
+    from . import mixed_spmx
     from .spmv_csc import PreparedCscRoute, _run_csc_registered
 
+    if not isinstance(prepared, (PreparedCscRoute, PreparedCscSpmm)):
+        raise TypeError("prepared must describe CSC SpMM")
+    B = mixed_spmx.apply_registered_op_b(B, op_b)
     selected = prepared.alg if alg is None else _normalize_spmm_csc_alg(alg)
     if isinstance(prepared, PreparedCscRoute):
         if prepared.kind != "spmm":
             raise TypeError("prepared must describe CSC SpMM")
         return _run_csc_registered(prepared, B, alg=alg, config=config, op=op, out=out,
-                                  return_time=return_time, return_meta=return_meta, timing=timing)
+                                  out_dtype=out_dtype, return_time=return_time, return_meta=return_meta, timing=timing)
     if selected in SPMM_CSC_NEW_ALGORITHMS:
         raise ValueError("prepare with alg before selecting a CSC extension")
-    if config is not None or out is not None:
-        raise ValueError("legacy run uses its original configuration and output contract")
-    if not isinstance(prepared, PreparedCscSpmm):
-        raise TypeError("prepared must be a PreparedCscSpmm instance")
+    if config is not None:
+        raise ValueError("legacy run uses its original configuration contract")
     op_name = prepared.op if op is None else _spmm_csc_op_to_name(op)
     _ensure_spmm_csc_supported_op(_normalize_spmm_csc_op(op_name))
     if op_name != prepared.op:
@@ -1739,18 +1762,59 @@ def flagsparse_spmm_csc_run(
     alg_name = prepared.alg if alg is None else _normalize_spmm_csc_alg(alg)
     algorithm = resolve_spmm_csc_algorithm(alg_name, op_name, prepared.data.dtype)
     B = _validate_spmm_csc_B(B, prepared, _normalize_spmm_csc_op(op_name))
+    output_dtype = mixed_spmx.resolve_registered_types(
+        prepared.data.dtype, B.dtype, out=out, out_dtype=out_dtype
+    )["output_dtype"]
+    if out is not None:
+        rows = prepared.n_rows if op_name == "non" else prepared.n_cols
+        if out.shape != (rows, B.shape[1]) or out.dtype != output_dtype or out.device != B.device:
+            raise ValueError("out shape/dtype/device mismatch")
+        if any(torch._C._overlaps(out, value) for value in
+               (prepared.data, prepared.kernel_indices, prepared.kernel_indptr, B)):
+            raise ValueError("out overlaps an input")
+        from ._spmm_csr_runtime import output_has_internal_overlap
+        if output_has_internal_overlap(out):
+            raise ValueError("out must have non-overlapping storage")
     collect_timing = bool(return_time or return_meta)
     if collect_timing:
         _ACCEL.synchronize()
         event_start = _ACCEL.Event(enable_timing=True)
         event_end = _ACCEL.Event(enable_timing=True)
         event_start.record()
+    execution = prepared
+    conversion_events = None
+    if timing:
+        conversion_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
+        conversion_events[0].record()
+    operand = B.resolve_conj()
+    half_input = prepared.data.dtype in (torch.float16, torch.bfloat16)
+    if half_input:
+        from copy import copy
+
+        execution = copy(prepared)
+        execution.data = prepared.data.float()
+        operand = operand.float()
+    if conversion_events is not None:
+        conversion_events[1].record()
     C, route_meta = _run_spmm_csc_prepared_with_fallback(
-        prepared,
-        B,
+        execution,
+        operand,
         algorithm,
         collect_timing=bool(timing),
     )
+    output_events = None
+    if timing:
+        output_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
+        output_events[0].record()
+    C = C.to(output_dtype)
+    if out is not None:
+        out.copy_(C)
+        C = out
+    if output_events is not None:
+        output_events[1].record()
+        output_events[1].synchronize()
+        route_meta["compute_ms"] = float(route_meta.get("compute_ms") or 0.0) + output_events[0].elapsed_time(output_events[1])
+        route_meta["process_gpu_ms"] = float(route_meta.get("process_gpu_ms") or 0.0) + conversion_events[0].elapsed_time(conversion_events[1])
     if collect_timing:
         event_end.record()
         _ACCEL.synchronize()
@@ -1765,6 +1829,11 @@ def flagsparse_spmm_csc_run(
             "display_name": algorithm.display_name,
             "op": op_name,
             "logical_shape": prepared.shape,
+            "a_dtype": str(prepared.data.dtype),
+            "rhs_dtype": str(B.dtype),
+            "output_dtype": str(output_dtype),
+            "compute_dtype": "torch.float32" if half_input else str(prepared.data.dtype),
+            "conversion_mode": "materialize" if half_input else "native",
             "block_n": route_meta.get("block_n", prepared.block_n),
             "block_nnz": route_meta.get("block_nnz", prepared.block_nnz),
             "launch_backend": route_meta.get("launch_backend"),
@@ -1816,12 +1885,20 @@ def flagsparse_spmm_csc(
     alg="auto",
     timing=False,
     index_fallback_policy="auto",
-    *, config=None,
+    *, config=None, out_dtype=None, op_b=None,
 ):
     """CSC SpMM using native Triton CSC kernels."""
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, B, out, (data, indices, indptr))
     from .spmv_csc import PreparedCscRoute
+    from . import mixed_spmx
+    B = mixed_spmx.apply_registered_op_b(B, op_b)
 
-    if _normalize_spmm_csc_alg(alg) in SPMM_CSC_NEW_ALGORITHMS or isinstance(prepared, PreparedCscRoute):
+    input_dtype = prepared.data.dtype if prepared is not None else getattr(data, "dtype", None)
+    explicit_half = input_dtype in (torch.float16, torch.bfloat16) and (
+        alg not in (None, "auto") or out_dtype is not None or prepared is not None
+    )
+    if _normalize_spmm_csc_alg(alg) in SPMM_CSC_NEW_ALGORITHMS or isinstance(prepared, PreparedCscRoute) or explicit_half:
         code = _normalize_spmm_csc_op(op, transpose=bool(transpose))
         if op is not None and transpose is not None and bool(transpose) != _spmm_csc_op_transposes(code):
             raise ValueError("transpose conflicts with op")
@@ -1834,7 +1911,11 @@ def flagsparse_spmm_csc(
             raise ValueError("shape conflicts with prepared CSC")
         requested_op = None if op is None and transpose is None else _spmm_csc_op_to_name(code)
         return flagsparse_spmm_csc_run(prepared, B, alg=alg, config=config, op=requested_op,
-            out=out, return_time=return_time, return_meta=return_meta, timing=timing)
+            out=out, out_dtype=out_dtype, return_time=return_time, return_meta=return_meta, timing=timing)
+    if out_dtype is not None:
+        input_dtype = prepared.data.dtype if prepared is not None else data.dtype
+        if out_dtype != input_dtype:
+            raise NotImplementedError("select a CSC extension algorithm for wide output")
     if config is not None:
         raise ValueError("config requires a CSC extension algorithm")
     # float16 is not in SUPPORTED_SPMM_CSC_VALUE_DTYPES: the `non` route scatters

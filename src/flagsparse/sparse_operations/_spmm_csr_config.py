@@ -15,14 +15,15 @@
 """Pure Python contracts for the native CSR SpMM extensions (no GPU imports)."""
 
 from dataclasses import asdict, dataclass
+from ._spmv_csr_config import BackendCapabilityUnavailable
 
 NEW_ALGORITHMS = (
     "csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce",
     "csr_adaptive_tile_split", "csr_row_panel",
 )
 BACKENDS = ()
-DTYPES = ("float16", "float32", "float64", "complex64", "complex128")
-IMPLEMENTATION_VERSION = 2
+DTYPES = ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")
+IMPLEMENTATION_VERSION = 3
 CONFIG_FIELDS = frozenset((
     "tile_rows", "tile_k", "tile_n", "block_k", "block_n", "panels",
     "segment_nnz", "reduce_block_size", "num_warps", "num_stages",
@@ -54,6 +55,7 @@ def algorithm_spec(name):
     if name not in NEW_ALGORITHMS:
         raise ValueError(f"unknown new CSR SpMM algorithm {name!r}")
     return dict(name=name, ops=("non", "trans", "conj"), value_dtypes=DTYPES,
+                half_output_dtypes={dt: (dt, "float32") for dt in ("float16", "bfloat16")},
                 layouts=("row", "col", "strided"), backends=BACKENDS,
                 index_dtypes=("int32", "int64"), execution_column_dtype="int32",
                 compute_dtype="native_component", implementation_version=IMPLEMENTATION_VERSION,
@@ -84,7 +86,7 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
         raise TypeError(f"{algorithm} does not support {dtype}")
     reason = capability_reason(caps, dtype, op=op, algorithm=algorithm)
     if reason:
-        raise NotImplementedError(reason)
+        raise BackendCapabilityUnavailable(reason)
     cfg = dict(tile_rows=4, tile_k=8, tile_n=8 if dtype == "complex128" else 16,
                block_k=32, block_n=16 if dtype == "complex128" else 32,
                panels=1, segment_nnz=1024, reduce_block_size=256,

@@ -87,7 +87,18 @@ def _params_for_item(item) -> dict[str, object]:
     callspec = getattr(item, "callspec", None)
     if callspec is None:
         return {}
-    return dict(callspec.params)
+    params = dict(callspec.params)
+    if "registered_half_combinations" in item.name or "registered_wide_output" in item.name:
+        # Store the numeric contract explicitly, not just encoded in pytest IDs.
+        dtype = params.get("dtype")
+        params.update(a_dtype=dtype, rhs_dtype=dtype, compute_dtype="torch.float32",
+                      output_dtype="torch.float32" if params.get("wide") else dtype,
+                      op_a=params.get("op", "non"), op_b=params.get("op_b", "non"))
+    elif "output_dtype" in params and str(params.get("dtype")) in ("torch.float16", "torch.bfloat16"):
+        params.update(a_dtype=params["dtype"], rhs_dtype=params["dtype"], compute_dtype="torch.float32",
+                      op_a=params.get("op", "trans" if "csc_split" in item.name else "non"),
+                      op_b=params.get("op_b", "non"))
+    return params
 
 
 def _operator_marks(item) -> list[str]:

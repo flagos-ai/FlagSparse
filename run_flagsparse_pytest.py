@@ -365,8 +365,6 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv-csr",
         "{csv}",
-        "--alg",
-        "auto",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -2284,6 +2282,8 @@ def _to_float(value: object) -> float | None:
 
 
 def _row_dtype(row: dict[str, str]) -> str:
+    if row.get("type_combo"):
+        return str(row["type_combo"])
     return str(
         row.get("dtype")
         or row.get("value_dtype")
@@ -2476,6 +2476,9 @@ def _performance_row_status_is_usable(row: dict[str, str]) -> bool:
     """Whether a benchmark row is eligible for aggregate metrics."""
 
     status = str(row.get("status") or row.get("matrix_status") or "").strip()
+    if row.get("type_combo") and status.upper() == "FAIL":
+        # Accuracy is retained independently for explicit mixed-precision scans.
+        return True
     return not status or status.upper() in {"PASS", "PASSED", "OK", "SUCCESS"}
 
 
@@ -2902,7 +2905,7 @@ def run_performance(
     # Keep default delivery on test_spmm.py. Only an explicit registered-algorithm
     # request selects the existing CSR scanner and its CSV option.
     if op == "spmm_csr" and template and template[0] == "tests/test_spmm.py":
-        if any(arg == "--alg" or arg.startswith("--alg=") for arg in extra_args):
+        if any(arg.split("=", 1)[0] in ("--alg", "--type-combos") for arg in extra_args):
             template = tuple("tests/test_spmm_csr.py" if arg == "tests/test_spmm.py"
                              else "--csv-csr" if arg == "--csv" else arg for arg in template)
     if not template:

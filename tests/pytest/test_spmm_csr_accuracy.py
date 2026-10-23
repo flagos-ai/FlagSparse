@@ -361,43 +361,49 @@ def test_spmm_csr_migrated_routes(alg, op, dtype, index_dtype, layout):
 
 
 @pytest.mark.spmm_csr
-@pytest.mark.parametrize("dtype", [torch.float16, torch.complex128])
-def test_spmm_csr_split_bounded_workspace(dtype):
-    import importlib
-
-    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
-    device = accelerator_device()
-    counts = torch.tensor([0, 1, 73, 8, 0], dtype=torch.int64)
-    ptr = torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0)))
-    index = torch.arange(int(ptr[-1])) % 19
-    data = torch.ones(index.numel(), dtype=dtype)
-    if dtype.is_complex:
-        data = data * (1 + 0.5j)
-    outer = torch.repeat_interleave(torch.arange(5), counts)
-    golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
-    matrix = torch.zeros((5, 19), dtype=golden_dtype)
-    matrix.index_put_((outer, index), data.to(golden_dtype), accumulate=True)
-    operand = torch.ones((19, 7), dtype=golden_dtype)
-    operand = operand.to(dtype)
-    expected = (matrix @ operand.to(golden_dtype)).to(dtype)
-    cfg = dict(segment_nnz=8, reduce_block_size=2, workspace_bytes=256, block_k=8, block_n=4)
+@pytest.mark.parametrize("dtype,output_dtype", [(torch.complex128, torch.complex128), (torch.float16, torch.float16), (torch.float16, torch.float32), (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)])
+def test_spmm_csr_split_bounded_workspace(dtype, output_dtype):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     try:
+        import importlib
+
+        module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+        device = accelerator_device()
+        counts = torch.tensor([0, 1, 73, 8, 0], dtype=torch.int64)
+        ptr = torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0)))
+        index = torch.arange(int(ptr[-1])) % 19
+        data = torch.ones(index.numel(), dtype=dtype)
+        if dtype.is_complex:
+            data = data * (1 + 0.5j)
+        outer = torch.repeat_interleave(torch.arange(5), counts)
+        golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
+        matrix = torch.zeros((5, 19), dtype=golden_dtype)
+        matrix.index_put_((outer, index), data.to(golden_dtype), accumulate=True)
+        operand = torch.ones((19, 7), dtype=golden_dtype)
+        operand = operand.to(dtype)
+        expected = (matrix @ operand.to(golden_dtype)).to(output_dtype)
+        cfg = dict(segment_nnz=8, reduce_block_size=2, workspace_bytes=256, block_k=8, block_n=4)
+        from flagsparse.sparse_operations._common import _backend_name
+        if 'csr_split_nnz_reduce' not in module.list_spmm_csr_algorithms(
+            op='non', dtype=dtype, rhs_dtype=dtype, out_dtype=output_dtype, backend=_backend_name()
+        ):
+            pytest.skip("algorithm does not declare this type/op/backend combination")
         prepared = module.prepare_spmm_csr_route(data.to(device), index.to(device), ptr.to(device), (5, 19),
             op="non", alg="csr_split_nnz_reduce", config=cfg)
-        actual, meta = module.flagsparse_spmm_csr_run(prepared, operand.to(device), return_meta=True, timing=True)
-    except NotImplementedError as exc:
+        actual, meta = module.flagsparse_spmm_csr_run(prepared, operand.to(device), out_dtype=output_dtype, return_meta=True, timing=True)
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+        assert meta["workspace_peak_bytes"] <= cfg["workspace_bytes"]
+        assert meta["segment_batches"] > 1
+        assert meta["reduction_levels"] >= 0
+        wider = dict(cfg, workspace_bytes=65536)
+        again, wider_meta = module.flagsparse_spmm_csr_run(prepared, operand.to(device), config=wider, out_dtype=output_dtype, return_meta=True)
+        torch.testing.assert_close(again.cpu(), expected, rtol=rtol, atol=atol)
+        assert wider_meta["reduction_levels"] > 1
+        assert meta["process_cpu_ms"] == 0
+        assert meta["operator_ms"] == meta["gpu_ms"]
+    except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
-    rtol, atol = close_tolerances(dtype)
-    torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
-    assert meta["workspace_peak_bytes"] <= cfg["workspace_bytes"]
-    assert meta["segment_batches"] > 1
-    assert meta["reduction_levels"] >= 0
-    wider = dict(cfg, workspace_bytes=65536)
-    again, wider_meta = module.flagsparse_spmm_csr_run(prepared, operand.to(device), config=wider, return_meta=True)
-    torch.testing.assert_close(again.cpu(), expected, rtol=rtol, atol=atol)
-    assert wider_meta["reduction_levels"] > 1
-    assert meta["process_cpu_ms"] == 0
-    assert meta["operator_ms"] == meta["gpu_ms"]
 
 
 @pytest.mark.spmm_csr
@@ -423,3 +429,74 @@ def test_spmm_csr_migrated_empty(alg, op, shape):
         pytest.skip(str(exc))
     assert result is out
     assert torch.equal(result.cpu(), torch.zeros_like(result.cpu()))
+
+
+from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
+
+
+@pytest.mark.parametrize("index_pair", [(torch.int32, torch.int64)] if _MIXED_QUICK_MODE else [
+    (torch.int32, torch.int32), (torch.int32, torch.int64),
+    (torch.int64, torch.int32), (torch.int64, torch.int64),
+], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("alg", [
+    "csr_row_tile", "csr_row_kparallel", "csr_row_panel",
+    "csr_split_nnz_reduce", "csr_adaptive_tile_split",
+    "csr_base", "csr_base_accuracy", "spmm_csr_alg1", "spmm_csr_alg2",
+    "spmm_csr_alg2_accuracy", "spmm_csr_alg2_accuracy_hp",
+])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("op_b", ["non", "trans", "conj"])
+@pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
+@pytest.mark.parametrize("layout", ["row", "col"])
+def test_spmm_csr_registered_wide_output(alg, dtype, op, op_b, wide, layout, index_pair):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    try:
+        import importlib
+
+        module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+        output_dtype = torch.float32 if wide else dtype
+        device = accelerator_device()
+        values = torch.tensor([1, 0.00390625, -0.125, 0.5], dtype=dtype, device=device)
+        cols = torch.tensor([0, 0, 1, 2], dtype=index_pair[0], device=device)
+        ptr = torch.tensor([0, 3, 3, 4], dtype=index_pair[1], device=device)
+        matrix = torch.zeros((3, 4), dtype=torch.float64)
+        matrix.index_put_(
+            (torch.tensor([0, 0, 0, 2]), cols.cpu().long()),
+            values.cpu().double(), accumulate=True,
+        )
+        n = 7 if _MIXED_QUICK_MODE else 33
+        inner = 4 if op == "non" else 3
+        effective_b = torch.full((inner, n), 1.0078125, dtype=dtype, device=device)
+        if layout == "col":
+            effective_b = effective_b.T.contiguous().T
+        B = effective_b if op_b == "non" else effective_b.T
+        expected = ((matrix if op == "non" else matrix.T) @ effective_b.cpu().double()).to(output_dtype)
+        backing = torch.full((expected.shape[0], 2 * n), float("nan"), dtype=output_dtype, device=device)
+        out = backing[:, ::2]
+        from flagsparse.sparse_operations._common import _backend_name
+        if alg not in module.list_spmm_csr_algorithms(
+            op=op, dtype=dtype, rhs_dtype=dtype, out_dtype=output_dtype, backend=_backend_name()
+        ):
+            pytest.skip("algorithm does not declare this type/op/backend combination")
+        prepared = module.prepare_spmm_csr_route(values, cols, ptr, (3, 4), op=op, alg=alg)
+        result = module.flagsparse_spmm_csr_run(
+            prepared, B, op_b=op_b, dense_layout=layout, out=out, out_dtype=output_dtype
+        )
+        assert result is out
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+        direct = module.flagsparse_spmm_csr(
+            values, cols, ptr, B, (3, 4), alg=alg, op=op,
+            op_b=op_b, dense_layout=layout, out_dtype=output_dtype,
+        )
+        torch.testing.assert_close(direct, result, rtol=rtol, atol=atol)
+        with pytest.raises(ValueError, match="conflicts"):
+            module.flagsparse_spmm_csr_run(
+                prepared, B, op_b=op_b, dense_layout=layout, out=out, out_dtype=dtype if wide else torch.float32
+            )
+        with pytest.raises(ValueError, match="overlap"):
+            module.flagsparse_spmm_csr_run(prepared, B, out=values, op_b=op_b)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))

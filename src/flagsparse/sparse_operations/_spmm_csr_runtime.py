@@ -123,10 +123,10 @@ def _classify(lengths, short, long):
 
 
 def run(prepared, B, *, algorithm, config, config_meta, timing=False,
-        diagnostics=False, dense_layout="row", out=None):
+        diagnostics=False, dense_layout="row", out=None, out_dtype=None):
     cfg = config
-    output_dtype = B.dtype
-    fp32_output = output_dtype == torch.float16 and algorithm in ("csr_split_nnz_reduce", "csr_adaptive_tile_split")
+    output_dtype = B.dtype if out_dtype is None else out_dtype
+    fp32_output = output_dtype in (torch.float16, torch.bfloat16) and algorithm in ("csr_split_nnz_reduce", "csr_adaptive_tile_split")
     buffer_dtype = torch.float32 if fp32_output else output_dtype
     phases = Phases(timing)
     m, n = prepared.n_rows, int(B.shape[1])
@@ -197,6 +197,8 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
                 out.copy_(C)
                 C = out
     meta = dict(config_meta, config=dict(cfg), algorithm=algorithm,
+                a_dtype=str(prepared.data.dtype), rhs_dtype=str(B.dtype),
+                output_dtype=str(output_dtype),
                 implementation_version=policy.IMPLEMENTATION_VERSION,
                 compute_dtype="float64" if acc == tl.float64 else "float32",
                 complex_component_dtype=("float64" if acc == tl.float64 else "float32") if complex_input else None,
@@ -214,8 +216,8 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
 def _split(prepared, A, B, C, rows, cfg, phases, stats, complex_input, acc, launch):
     n = B.shape[1]
     bn = cfg["block_n"]
-    partial_dtype = torch.float32 if B.dtype == torch.float16 else B.dtype
-    element_bytes = 4 if B.dtype == torch.float16 else B.element_size()
+    partial_dtype = torch.float32 if B.dtype in (torch.float16, torch.bfloat16) else B.dtype
+    element_bytes = 4 if B.dtype in (torch.float16, torch.bfloat16) else B.element_size()
     # Three equally sized numeric slabs bound X/Y plus allocation transition.
     wave, capacity = policy.workspace_geometry(n, element_bytes, cfg)
     with phases.measure("process_gpu_ms"):

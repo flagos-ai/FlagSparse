@@ -788,3 +788,61 @@ def test_spmv_csr_migrated_empty(alg, op, shape):
         pytest.skip(str(exc))
     assert result is out
     assert torch.equal(result.cpu(), torch.zeros_like(result.cpu()))
+
+
+from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
+
+
+@pytest.mark.parametrize("index_pair", [(torch.int32, torch.int64)] if _MIXED_QUICK_MODE else [
+    (torch.int32, torch.int32), (torch.int32, torch.int64),
+    (torch.int64, torch.int32), (torch.int64, torch.int64),
+], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("alg", [
+    "row_tile", "row_vector", "row_subgroup_stream",
+    "row_split_reduce", "row_adaptive_split",
+    "legacy_rowpar", "legacy_segbin", "legacy_bucket_vector",
+])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
+def test_spmv_csr_registered_wide_output(alg, dtype, op, wide, index_pair):
+    """Wide output must retain bits that a half-output intermediate would lose."""
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    try:
+        output_dtype = torch.float32 if wide else dtype
+        device = accelerator_device()
+        # Duplicate entries also exercise accumulation without coalescing.
+        ptr = torch.tensor([0, 3, 3, 5], dtype=index_pair[1], device=device)
+        cols = torch.tensor([0, 0, 1, 1, 2], dtype=index_pair[0], device=device)
+        values_cpu = torch.tensor([1, 0.00390625, -0.125, 0.5, 0.25], dtype=dtype)
+        values = values_cpu.to(device)
+        matrix = torch.zeros((3, 4), dtype=torch.float64)
+        matrix.index_put_(
+            (torch.tensor([0, 0, 0, 2, 2]), cols.cpu().long()),
+            values_cpu.double(), accumulate=True,
+        )
+        inner = 4 if op == "non" else 3
+        x = torch.ones(inner, dtype=dtype, device=device) * 1.0078125
+        expected = ((matrix if op == "non" else matrix.T) @ x.cpu().double()).to(output_dtype)
+        from flagsparse.sparse_operations._common import _backend_name
+        if alg not in spmv_mod.list_spmv_csr_algorithms(
+            op=op, dtype=dtype, rhs_dtype=dtype, out_dtype=output_dtype, backend=_backend_name()
+        ):
+            pytest.skip("algorithm does not declare this type/op/backend combination")
+        prepared = spmv_mod.prepare_spmv_csr(values, cols, ptr, (3, 4), op=op, alg=alg)
+        out = torch.full(expected.shape, float("nan"), dtype=output_dtype, device=device)
+        result = spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out, out_dtype=output_dtype)
+        assert result is out
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+        direct = flagsparse_spmv_csr(
+            values, cols, ptr, x, (3, 4), alg=alg, op=op, out_dtype=output_dtype
+        )
+        torch.testing.assert_close(direct, result, rtol=rtol, atol=atol)
+        with pytest.raises(ValueError, match="conflicts"):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out, out_dtype=dtype if wide else torch.float32)
+        with pytest.raises(ValueError, match="overlap"):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=values)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))

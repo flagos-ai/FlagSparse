@@ -774,6 +774,7 @@ class PreparedCsrSpmmRoute:
     """Matrix-level CSR SpMM route preparation shared by route algorithms."""
 
     __slots__ = (
+        "original_inputs",
         "data",
         "kernel_indices",
         "kernel_indptr",
@@ -1008,7 +1009,7 @@ def _run_spmm_csr_base_route(
 
 
 def _run_spmm_csr_base_accuracy_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", half_precision=False
 ):
     return _run_spmm_csr_base_route_impl(
         prepared,
@@ -1016,7 +1017,7 @@ def _run_spmm_csr_base_accuracy_route(
         timing=timing,
         diagnostics=diagnostics,
         dense_layout=dense_layout,
-        accuracy=True,
+        accuracy=not half_precision,
         route_name="csr_base_accuracy",
     )
 
@@ -2542,7 +2543,7 @@ def _run_spmm_csr_alg2_route(
 
 
 def _run_spmm_csr_alg2_accuracy_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", half_precision=False
 ):
     return _run_spmm_csr_alg2_accuracy_impl(
         prepared,
@@ -2551,12 +2552,13 @@ def _run_spmm_csr_alg2_accuracy_route(
         diagnostics=diagnostics,
         dense_layout=dense_layout,
         high_precision=False,
+        half_precision=half_precision,
         route_name="spmm_csr_alg2_accuracy",
     )
 
 
 def _run_spmm_csr_alg2_accuracy_hp_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", half_precision=False
 ):
     return _run_spmm_csr_alg2_accuracy_impl(
         prepared,
@@ -2564,7 +2566,8 @@ def _run_spmm_csr_alg2_accuracy_hp_route(
         timing=timing,
         diagnostics=diagnostics,
         dense_layout=dense_layout,
-        high_precision=True,
+        high_precision=not half_precision,
+        half_precision=half_precision,
         route_name="spmm_csr_alg2_accuracy_hp",
     )
 
@@ -2577,6 +2580,7 @@ def _run_spmm_csr_alg2_accuracy_impl(
     diagnostics=False,
     dense_layout="row",
     high_precision=False,
+    half_precision=False,
     route_name="spmm_csr_alg2_accuracy",
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
@@ -2597,7 +2601,7 @@ def _run_spmm_csr_alg2_accuracy_impl(
     C = _spmm_csr_alg2_compute(
         plan,
         B,
-        accuracy=True,
+        accuracy=not half_precision,
         high_precision=high_precision,
         out=C_out,
         dense_layout=dense_layout,
@@ -2647,13 +2651,14 @@ def _run_spmm_csr_alg2_accuracy_impl(
 
 def _run_spmm_csr_extension(prepared, B, *, algorithm, config=None,
                             config_meta=None, timing=False, diagnostics=False,
-                            dense_layout="row", out=None):
+                            dense_layout="row", out=None, out_dtype=None):
     from . import _spmm_csr_runtime
 
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     return _spmm_csr_runtime.run(
         prepared, B, algorithm=algorithm, config=config, config_meta=config_meta,
         timing=timing, diagnostics=diagnostics, dense_layout=dense_layout, out=out,
+        out_dtype=out_dtype,
     )
 
 
@@ -2670,6 +2675,8 @@ SPMM_CSR_ALGORITHMS = {
         display_name="BaseAccuracy",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
+            torch.bfloat16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2706,6 +2713,8 @@ SPMM_CSR_ALGORITHMS = {
         display_name="Alg1",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
+            torch.bfloat16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2718,6 +2727,8 @@ SPMM_CSR_ALGORITHMS = {
         display_name="Alg2",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
+            torch.bfloat16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2730,6 +2741,8 @@ SPMM_CSR_ALGORITHMS = {
         display_name="Alg2Accuracy",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
+            torch.bfloat16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2742,6 +2755,8 @@ SPMM_CSR_ALGORITHMS = {
         display_name="Alg2AccuracyHP",
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(
+            torch.float16,
+            torch.bfloat16,
             torch.float32,
             torch.float64,
             torch.complex64,
@@ -2771,6 +2786,9 @@ def get_spmm_csr_algorithm_spec(alg):
     algorithm = SPMM_CSR_ALGORITHMS[name]
     return dict(name=name, ops=algorithm.supported_ops,
                 value_dtypes=tuple(str(dtype).removeprefix("torch.") for dtype in algorithm.supported_dtypes),
+                half_output_dtypes={str(dtype).removeprefix("torch."): (str(dtype).removeprefix("torch."), "float32")
+                                    for dtype in (torch.float16, torch.bfloat16)
+                                    if dtype in algorithm.supported_dtypes},
                 layouts=("row", "col"))
 
 
@@ -2792,10 +2810,24 @@ def resolve_spmm_csr_algorithm(alg, op, dtype):
     return algorithm
 
 
-def list_spmm_csr_algorithms(op=None, dtype=None, backend=None, layout=None):
+def list_spmm_csr_algorithms(op=None, dtype=None, backend=None, layout=None, *,
+                             rhs_dtype=None, out_dtype=None):
+    wide_output = False
+    if rhs_dtype is not None or out_dtype is not None:
+        if dtype is None:
+            raise ValueError("dtype is required for type-combination filtering")
+        try:
+            types = _mixed_spmx.resolve_registered_types(
+                dtype, dtype if rhs_dtype is None else rhs_dtype, out_dtype=out_dtype
+            )
+        except TypeError:
+            return ()
+        wide_output = types["output_dtype"] != dtype
     op_name = None if op is None else _spmm_op_to_name(op)
     names = []
     for name, algorithm in SPMM_CSR_ALGORITHMS.items():
+        if wide_output and name.startswith("alpha_alg1_tle_"):
+            continue
         spec = get_spmm_csr_algorithm_spec(name)
         if backend is not None and backend not in spec.get("backends", _csr_extension_config.BACKENDS):
             continue
@@ -2811,6 +2843,8 @@ def list_spmm_csr_algorithms(op=None, dtype=None, backend=None, layout=None):
 
 def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto", config=None):
     """Prepare matrix-level CSR SpMM metadata for the route-based run API."""
+    from .mixed_spmx import remember_registered_inputs
+    original_inputs = (data, indices, indptr)
     op_code = _normalize_spmm_op(op)
     op_name = _spmm_op_to_name(op_code)
     (
@@ -2861,7 +2895,7 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
             route, t_data, t_indices, t_indptr, t_shape, op_name
         )
         route.materialized_op = op_name
-    return route
+    return remember_registered_inputs(route, original_inputs)
 
 
 def flagsparse_spmm_csr_run(
@@ -2871,7 +2905,9 @@ def flagsparse_spmm_csr_run(
     alg=None,
     config=None,
     out=None,
+    out_dtype=None,
     op=None,
+    op_b=None,
     dense_layout="auto",
     return_time=False,
     return_meta=False,
@@ -2885,6 +2921,8 @@ def flagsparse_spmm_csr_run(
     reported separately by the route. Stage timing is only collected when
     ``timing=True``.
     """
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, B, out)
     if not isinstance(prepared, PreparedCsrSpmmRoute):
         raise TypeError("prepared must be a PreparedCsrSpmmRoute instance")
     op_name = prepared.op if op is None else _spmm_op_to_name(op)
@@ -2899,6 +2937,15 @@ def flagsparse_spmm_csr_run(
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
+    B = _mixed_spmx.apply_registered_op_b(B, op_b)
+    types = _mixed_spmx.resolve_registered_types(
+        prepared.data.dtype, B.dtype, out=out, out_dtype=out_dtype
+    )
+    output_dtype = types["output_dtype"]
+    if output_dtype != B.dtype and algorithm.name.startswith("alpha_alg1_tle_"):
+        raise NotImplementedError(
+            f"{algorithm.name} does not yet support {B.dtype} -> {output_dtype}"
+        )
     if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
@@ -2907,7 +2954,7 @@ def flagsparse_spmm_csr_run(
         raise TypeError("B dtype must match sparse matrix dtype")
 
     extension = algorithm.name in SPMM_CSR_NEW_ALGORITHMS
-    if extension and op_name != prepared.op:
+    if op_name != prepared.op:
         raise ValueError("op conflicts with prepared CSR route")
     expected_rows = prepared.n_rows if op_name == "non" else prepared.n_cols
     expected_inner = prepared.n_cols if op_name == "non" else prepared.n_rows
@@ -2916,8 +2963,8 @@ def flagsparse_spmm_csr_run(
     if out is not None:
         if not torch.is_tensor(out) or tuple(out.shape) != (expected_rows, B.shape[1]):
             raise ValueError("out has an incompatible shape")
-        if out.dtype != B.dtype or out.device != B.device:
-            raise ValueError("out dtype and device must match B")
+        if out.dtype != output_dtype or out.device != B.device:
+            raise ValueError("out dtype/device must match the requested result")
         if any(torch._C._overlaps(out, value) for value in
                (prepared.data, prepared.kernel_indices, prepared.kernel_indptr, B)):
             raise ValueError("out must not overlap an input")
@@ -2934,7 +2981,8 @@ def flagsparse_spmm_csr_run(
             algorithm.name, str(B.dtype).removeprefix("torch."), int(B.shape[1]),
             dense_layout, caps, overrides, op=op_name,
         )
-        route_kwargs.update(config=resolved_config, config_meta=config_meta, out=out)
+        route_kwargs.update(config=resolved_config, config_meta=config_meta, out=out,
+                            out_dtype=output_dtype)
     elif config is not None:
         raise ValueError("config is not supported by this legacy CSR algorithm")
 
@@ -2950,17 +2998,47 @@ def flagsparse_spmm_csr_run(
         op_name,
         timing=bool(timing),
     )
+    # Preserve the selected legacy algorithm while materializing its FP32 inputs
+    # inside the measured run. Never store a half result before a wide output.
+    runtime_B = B
+    half_legacy = not extension and prepared.data.dtype in (torch.float16, torch.bfloat16)
+    conversion_events = None
+    if timing and half_legacy:
+        conversion_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
+        conversion_events[0].record()
+    if half_legacy:
+        from copy import copy
+
+        runtime_prepared = copy(runtime_prepared)
+        runtime_prepared.data = runtime_prepared.data.float()
+        runtime_B = B.resolve_conj().float()
+        if algorithm.name in ("csr_base_accuracy", "spmm_csr_alg2_accuracy", "spmm_csr_alg2_accuracy_hp"):
+            route_kwargs["half_precision"] = True
+    if conversion_events is not None:
+        conversion_events[1].record()
     C, route_meta = algorithm.run(
         runtime_prepared,
-        B,
+        runtime_B,
         timing=bool(timing),
         diagnostics=bool(diagnostics),
         dense_layout=dense_layout,
         **route_kwargs,
     )
+    output_events = None
+    if timing:
+        output_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
+        output_events[0].record()
+    if half_legacy:
+        C = C.to(output_dtype)
     if out is not None and C is not out:
         out.copy_(C)
         C = out
+    if output_events is not None:
+        output_events[1].record()
+        output_events[1].synchronize()
+        route_meta["compute_ms"] = float(route_meta.get("compute_ms") or 0.0) + output_events[0].elapsed_time(output_events[1])
+    if conversion_events is not None:
+        route_meta["process_gpu_ms"] = float(route_meta.get("process_gpu_ms") or 0.0) + conversion_events[0].elapsed_time(conversion_events[1])
     if end is not None:
         end.record()
         _ACCEL.synchronize()
@@ -2983,6 +3061,10 @@ def flagsparse_spmm_csr_run(
             "alg": algorithm.name,
             "display_name": algorithm.display_name,
             "op": op_name,
+            "a_dtype": str(prepared.data.dtype),
+            "rhs_dtype": str(B.dtype),
+            "output_dtype": str(output_dtype),
+            "conversion_mode": "materialize" if half_legacy else route_meta.get("conversion_mode", "native"),
             "operator_ms": operator_ms,
             "gpu_ms": gpu_ms,
             "process_cpu_ms": process_cpu_ms,
@@ -2991,6 +3073,8 @@ def flagsparse_spmm_csr_run(
             "c_stride": route_meta.get("c_stride"),
             "output_layout": route_meta.get("output_layout"),
         }
+        if half_legacy:
+            meta["compute_dtype"] = "torch.float32"
         if extension:
             meta.update({key: value for key, value in route_meta.items()
                          if key not in ("process_gpu_ms", "compute_ms")})
@@ -4534,7 +4618,8 @@ def flagsparse_spmm_csr(
     out_dtype (or out.dtype): float16 / bfloat16 -> float32 and int8 -> int32 /
     float32 run in ``mixed_spmx``.
     """
-    B = _apply_spmm_op_b(B, op_b)
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, B, out, (data, indices, indptr))
     if alg is not None or prepared is not None or config is not None:
         if any(value is not None for value in (block_n, block_nnz, max_segments)):
             raise ValueError("legacy launch parameters cannot be combined with a registered route")
@@ -4550,13 +4635,12 @@ def flagsparse_spmm_csr(
             op_code = _normalize_spmm_op(prepared.op)
         if shape is not None and tuple(shape) != prepared.shape:
             raise ValueError("shape conflicts with prepared CSR")
-        if out_dtype is not None and out_dtype != prepared.data.dtype:
-            raise TypeError("explicit CSR algorithms require out_dtype to match sparse data")
         return flagsparse_spmm_csr_run(
             prepared, B, alg=alg, config=config, op=_spmm_op_to_name(op_code),
-            dense_layout=dense_layout, out=out, timing=timing,
+            dense_layout=dense_layout, out=out, out_dtype=out_dtype, op_b=op_b, timing=timing,
             return_time=return_time, return_meta=return_meta,
         )
+    B = _apply_spmm_op_b(B, op_b)
     if torch.is_tensor(data) and _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype):
         C = _mixed_spmx.spmm_csr_mixed(
             data, indices, indptr, B, shape, op=op, transpose=transpose,

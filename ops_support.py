@@ -309,11 +309,11 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
         *(
             ApiSpec(
                 operator, f"flagsparse_{operator}_{fmt.lower()}", f"{operator}_{fmt.lower()}",
-                fmt, name, values=("float16", "float32", "float64", "complex64", "complex128"),
+                fmt, name, values=("float16", "bfloat16", "float32", "float64", "complex64", "complex128"),
                 indices=DEFAULT_INDEX_DTYPES,
                 ops=(modules["_spmx_column_config"].get("CSC_ALGORITHMS")[name]
                      if fmt == "CSC" else ("non", "trans", "conj")),
-                notes="explicit native extension; main preparation contract; hardware validation pending",
+                notes="explicit native extension; half/bfloat16: FP32 compute, same-type or FP32 output; main preparation contract; hardware validation pending",
             )
             for operator, fmt, source, constant in (
                 ("spmm", "CSR", "_spmm_csr_config", "NEW_ALGORITHMS"),

@@ -330,3 +330,160 @@ def test_scatter_policy_validator_rejects_unknown_policy():
             1,
             index_fallback_policy="invalid",
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("wide", [False, True])
+def test_registered_half_type_resolution(dtype, wide):
+    from types import SimpleNamespace
+    from flagsparse.sparse_operations.mixed_spmx import resolve_registered_types
+
+    output_dtype = torch.float32 if wide else dtype
+    out = SimpleNamespace(dtype=output_dtype)
+    result = resolve_registered_types(dtype, dtype, out=out, out_dtype=output_dtype)
+    assert result == dict(a_dtype=dtype, rhs_dtype=dtype, compute_dtype=torch.float32,
+                          output_dtype=output_dtype)
+    with pytest.raises(ValueError, match="conflicts"):
+        resolve_registered_types(dtype, dtype, out=out,
+                                 out_dtype=dtype if wide else torch.float32)
+    with pytest.raises(TypeError, match="matching"):
+        resolve_registered_types(dtype, torch.float32, out_dtype=output_dtype)
+    with pytest.raises(TypeError, match="unsupported"):
+        resolve_registered_types(dtype, dtype, out_dtype=torch.float64)
+
+
+@pytest.mark.parametrize("operator,algorithm,op", [
+    ("spmv_csr", "legacy_rowpar", "non"),
+    ("spmv_csr", "legacy_segbin", "trans"),
+    ("spmv_csr", "row_subgroup_stream", "conj"),
+    ("spmv_coo", "coo_segmented_stream_atomic", "non"),
+    ("spmv_csc", "csc_col_vector", "trans"),
+    ("spmm_csr", "csr_row_panel", "conj"),
+    ("spmm_csr", "csr_base_accuracy", "trans"),
+    ("spmm_csr", "spmm_csr_alg2_accuracy_hp", "non"),
+    ("spmm_coo", "spmm_coo_alg1", "trans"),
+    ("spmm_coo", "coo_segmented_stream_panel_atomic", "non"),
+    ("spmm_csc", "csc_col_kparallel", "trans"),
+    ("spmm_csc", "spmm_csc_base", "conj"),
+    ("spmv_csc", "spmv_csc_base", "non"),
+])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_registered_half_algorithm_query(operator, algorithm, op, dtype):
+    import importlib
+
+    module = importlib.import_module(f"flagsparse.sparse_operations.{operator}")
+    query = getattr(module, f"list_{operator}_algorithms")
+    assert algorithm in query(op=op, dtype=dtype, rhs_dtype=dtype, out_dtype=torch.float32)
+    with pytest.raises(ValueError, match="dtype is required"):
+        query(rhs_dtype=dtype, out_dtype=torch.float32)
+
+
+def test_generic_baseline_binds_only_requested_symbols():
+    from types import SimpleNamespace
+    from tests.cusparse_generic_baseline import _GenericLibrary, _SIGNATURES
+
+    class Function:
+        def __call__(self, *args):
+            return 0
+
+    create = Function()
+    spmv = Function()
+    library = _GenericLibrary(SimpleNamespace(cusparseCreate=create, cusparseSpMV=spmv))
+    assert library.cusparseCreate is create
+    assert library.cusparseSpMV is spmv
+    assert spmv.argtypes == _SIGNATURES["cusparseSpMV"]
+    with pytest.raises(NotImplementedError, match="cusparseCreateSlicedEll"):
+        library.cusparseCreateSlicedEll
+    # Missing SELL does not invalidate already bound generic multiplication.
+    assert library.cusparseSpMV is spmv
+
+
+@pytest.mark.parametrize("storage", ["float16", "bfloat16"])
+def test_registered_type_combo_cli_contract(storage):
+    import argparse
+    from tests.benchmark_utils import add_type_combo_arguments, parse_type_combos
+
+    value = f"{storage}:{storage}:{storage},{storage}:{storage}:float32"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dtype", default="float32")
+    parser.add_argument("--dense-cols", type=int, default=32)
+    add_type_combo_arguments(parser, spmm=True)
+    args = parser.parse_args(["--type-combos", value, "--op-b", "all", "--dense-cols", "1,7,33"])
+    assert args.dtype == "float32"  # implicit defaults must not conflict
+    assert args.dense_cols == "1,7,33"
+    assert parse_type_combos(args.type_combos, ["--type-combos", value]) == (
+        (storage, storage, storage), (storage, storage, "float32")
+    )
+    for token in ("--dtype=float16", "--dtypes=bfloat16"):
+        with pytest.raises(ValueError, match="conflicts"):
+            parse_type_combos(value, [token])
+    with pytest.raises(ValueError, match="matching inputs"):
+        parse_type_combos("float16:bfloat16:float32", [])
+
+
+def test_registered_original_alias_survives_preparation():
+    from types import SimpleNamespace
+    from flagsparse.sparse_operations.mixed_spmx import (
+        remember_registered_inputs, validate_registered_output_alias,
+    )
+
+    values = torch.ones(4, dtype=torch.float16)
+    prepared = remember_registered_inputs(SimpleNamespace(data=values.float()), (values,))
+    with pytest.raises(ValueError, match="original input"):
+        validate_registered_output_alias(prepared, torch.ones(4), values[::2])
+    validate_registered_output_alias(prepared, torch.ones(4), torch.empty(4))
+
+
+def test_generic_plan_close_is_idempotent():
+    from tests.cusparse_generic_baseline import _Plan
+
+    released = []
+    plan = _Plan(lambda: None, (), [(released.append, "descriptor")])
+    plan.close()
+    plan.close()
+    assert released == ["descriptor"]
+
+
+def test_hipsparse_partial_descriptor_failure_releases_resources(monkeypatch):
+    import ctypes
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from tests import cusparse_generic_baseline as baseline
+
+    released = []
+
+    class Function:
+        def __init__(self, name):
+            self.name = name
+
+        def __call__(self, *args):
+            if self.name == "hipsparseCreateDnVec":
+                return 3  # invalid value is an interface fault, not unsupported
+            if self.name.startswith("hipsparseCreate"):
+                ctypes.cast(args[0], ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(17)
+            elif self.name == "hipsparseGetVersion":
+                ctypes.cast(args[1], ctypes.POINTER(ctypes.c_int))[0] = 301000
+            elif self.name.startswith("hipsparseDestroy"):
+                released.append(self.name)
+            return 0
+
+    library = SimpleNamespace(**{name: Function(name) for name in (
+        "hipsparseCreate", "hipsparseDestroy", "hipsparseSetStream", "hipsparseGetVersion",
+        "hipsparseCreateCsr", "hipsparseDestroySpMat", "hipsparseCreateDnVec", "hipsparseDestroyDnVec",
+    )})
+    monkeypatch.setattr(baseline.ctypes, "CDLL", lambda name: library)
+    monkeypatch.setattr(baseline.ctypes.util, "find_library", lambda name: name)
+    monkeypatch.setattr(torch.version, "hip", "6.1")
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=23))
+
+    def tensor(dtype):
+        return SimpleNamespace(dtype=dtype, device=torch.device("cuda:0"), ndim=1,
+                               is_contiguous=lambda: True, numel=lambda: 1,
+                               stride=lambda axis: 1, data_ptr=lambda: 19)
+
+    a, index, ptr = tensor(torch.float16), tensor(torch.int32), tensor(torch.int32)
+    with pytest.raises(RuntimeError, match="CreateDnVec.*status 3"):
+        baseline.prepare_spmv("csr", (a, index, ptr), (1, 1), tensor(torch.float16),
+                              tensor(torch.float32), "non", torch.float32, backend="rocm")
+    assert released == ["hipsparseDestroySpMat", "hipsparseDestroy"]

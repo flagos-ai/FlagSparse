@@ -26,6 +26,8 @@ import triton.language as tl
 _SPMV_CSC_CUDA = _backend_name() == "cuda"
 
 SUPPORTED_SPMV_CSC_VALUE_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
     torch.float32,
     torch.float64,
     torch.complex64,
@@ -86,6 +88,7 @@ class PreparedCscSpmv:
     """Prepared CSC metadata for repeated SpMV calls."""
 
     __slots__ = (
+        "original_inputs",
         "data",
         "kernel_indices",
         "kernel_indptr",
@@ -392,10 +395,12 @@ def prepare_spmv_csc(
     index_fallback_policy="auto",
     *, alg=None, config=None,
 ):
+    from .mixed_spmx import remember_registered_inputs
+    original_inputs = (data, indices, indptr)
     if alg not in (None, "auto", "base", "spmv_csc_base"):
-        return _prepare_csc_registered(data, indices, indptr, shape, op,
+        return remember_registered_inputs(_prepare_csc_registered(data, indices, indptr, shape, op,
             True if transpose else None, alg, config, index_fallback_policy, "spmv",
-            {"block_nnz": block_nnz, "max_segments": max_segments})
+            {"block_nnz": block_nnz, "max_segments": max_segments}), original_inputs)
     if config is not None:
         raise ValueError("config requires an explicit CSC extension algorithm")
     index_fallback_policy = _normalize_spmv_csc_index_fallback_policy(
@@ -466,6 +471,7 @@ def prepare_spmv_csc(
     csr_delegate = None
     if (
         _SPMV_CSC_CUDA
+        and data.dtype not in (torch.float16, torch.bfloat16)
         and _spmv_csc_op_transposes(op_code)
         and int(data.numel()) > 0
     ):
@@ -488,7 +494,7 @@ def prepare_spmv_csc(
             )
         except Exception:
             csr_delegate = None
-    return PreparedCscSpmv(
+    return remember_registered_inputs(PreparedCscSpmv(
         data=data,
         kernel_indices=indices,
         kernel_indptr=indptr,
@@ -505,7 +511,7 @@ def prepare_spmv_csc(
         index_fallback_policy=index_fallback_policy,
         launch_backend=launch_backend,
         device_warp_size=device_warp_size,
-    )
+    ), original_inputs)
 
 
 def _validate_spmv_csc_x(x, prepared, op_code):
@@ -790,9 +796,12 @@ def _run_spmv_csc_prepared_with_fallback(prepared, x, op_code):
     try:
         return _triton_spmv_csc_kernel(prepared, x, op_code)
     except RuntimeError as exc:
+        from ._spmv_csr_config import is_index_compatibility_error
+
         if (
             prepared.index_fallback_policy != "auto"
             or not _spmv_csc_uses_int64_indices(prepared)
+            or not is_index_compatibility_error(exc)
         ):
             raise
         fallback_prepared = _spmv_csc_prepared_with_int32_indices(prepared, exc)
@@ -906,6 +915,25 @@ def flagsparse_spmv_csc(
     kernels, whose op='non' path atomically adds in the value dtype -- fp16 atomics
     are not available on every backend. See ``_spmv_csc_via_mixed``.
     """
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, x, out, (data, indices, indptr))
+    input_dtype = prepared.data.dtype if prepared is not None else getattr(data, "dtype", None)
+    if input_dtype in (torch.float16, torch.bfloat16) and (
+        prepared is not None and not isinstance(prepared, PreparedCscRoute)
+        or alg in ("base", "spmv_csc_base")
+    ):
+        if op is not None and transpose is not None and bool(transpose) != _spmv_csc_op_transposes(_normalize_spmv_csc_op(op)):
+            raise ValueError("transpose conflicts with op")
+        requested_op = op if op is not None else ("trans" if transpose else "non") if transpose is not None else None
+        if prepared is None:
+            prepared = prepare_spmv_csc(data, indices, indptr, shape,
+                block_nnz=block_nnz, max_segments=max_segments, op=requested_op,
+                index_fallback_policy=index_fallback_policy)
+        elif shape is not None and tuple(shape) != prepared.shape:
+            raise ValueError("shape conflicts with prepared CSC")
+        return flagsparse_spmv_csc_run(prepared, x, alg="spmv_csc_base", config=config,
+            op=requested_op, out=out, out_dtype=out_dtype, return_time=return_time,
+            return_meta=return_meta, timing=timing)
     if alg not in (None, "auto", "base", "spmv_csc_base") or isinstance(prepared, PreparedCscRoute):
         if prepared is None:
             prepared = _prepare_csc_registered(data, indices, indptr, shape, op, transpose,
@@ -913,13 +941,11 @@ def flagsparse_spmv_csc(
                 {"block_nnz": block_nnz, "max_segments": max_segments})
         elif shape is not None and tuple(shape) != prepared.shape:
             raise ValueError("shape conflicts with prepared CSC")
-        if out_dtype is not None and out_dtype != prepared.data.dtype:
-            raise TypeError("explicit CSC algorithms require matching out_dtype")
         if op is not None and transpose is not None and bool(transpose) != _spmv_csc_op_transposes(_normalize_spmv_csc_op(op)):
             raise ValueError("transpose conflicts with op")
         requested_op = op if op is not None else ("trans" if transpose else "non") if transpose is not None else None
         return flagsparse_spmv_csc_run(prepared, x, alg=alg, config=config, op=requested_op,
-            out=out, return_time=return_time, return_meta=return_meta, timing=timing)
+            out=out, out_dtype=out_dtype, return_time=return_time, return_meta=return_meta, timing=timing)
     if config is not None:
         raise ValueError("config requires an explicit CSC extension algorithm")
     op_explicit = op is not None
@@ -1361,8 +1387,11 @@ def _csc_spec(alg, kind):
     if alg not in (base, *names):
         raise ValueError(f"unknown {kind} CSC algorithm {alg!r}")
     return dict(name=alg, ops=CSC_ALGORITHMS.get(alg, ("non", "trans", "conj")),
-                value_dtypes=(torch.float16, *SUPPORTED_SPMV_CSC_VALUE_DTYPES), backends=BACKENDS,
-                layouts=("row", "col", "strided"), implementation_version=2,
+                value_dtypes=SUPPORTED_SPMV_CSC_VALUE_DTYPES,
+                backends=BACKENDS,
+                layouts=("row", "col", "strided"), implementation_version=3,
+                half_output_dtypes={dtype: (dtype, torch.float32)
+                                    for dtype in (torch.float16, torch.bfloat16)},
                 compute_dtype="native_component", validation="unverified")
 
 
@@ -1394,16 +1423,24 @@ def get_spmv_csc_algorithm_spec(alg):
     return _csc_spec(alg, "spmv")
 
 
-def list_spmv_csc_algorithms(op=None, dtype=None, backend=None):
+def list_spmv_csc_algorithms(op=None, dtype=None, backend=None, *, rhs_dtype=None, out_dtype=None):
+    if rhs_dtype is not None or out_dtype is not None:
+        if dtype is None:
+            raise ValueError("dtype is required for type-combination filtering")
+        try:
+            _mixed_spmx.resolve_registered_types(
+                dtype, dtype if rhs_dtype is None else rhs_dtype, out_dtype=out_dtype)
+        except TypeError:
+            return ()
     names = ("spmv_csc_base", *SPMV_CSC_NEW_ALGORITHMS)
     return tuple(name for name in names if
                  (op is None or _spmv_csc_op_to_name(op) in _csc_spec(name, "spmv")["ops"]) and
-                 (dtype is None or dtype in (torch.float16, *SUPPORTED_SPMV_CSC_VALUE_DTYPES)) and
+                 (dtype is None or dtype in _csc_spec(name, "spmv")["value_dtypes"]) and
                  (backend is None or backend in _csc_spec(name, "spmv")["backends"]))
 
 
 def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=None,
-                        return_time=False, return_meta=False, timing=False):
+                        out_dtype=None, return_time=False, return_meta=False, timing=False):
     from contextlib import nullcontext
     from ._spmm_csr_runtime import backend_caps, Phases
     from ._spmx_column_config import resolve_csc_config, CSC_ALGORITHMS
@@ -1424,8 +1461,11 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
         raise ValueError("dense operand shape/dtype/device mismatch")
     out_rows = prepared.n_rows if prepared.op == "non" else prepared.n_cols
     out_shape = (out_rows,) if vector else (out_rows, dense.shape[1])
+    output_dtype = _mixed_spmx.resolve_registered_types(
+        data.dtype, dense.dtype, out=out, out_dtype=out_dtype
+    )["output_dtype"]
     if out is not None:
-        if out.shape != out_shape or out.dtype != data.dtype or out.device != data.device:
+        if out.shape != out_shape or out.dtype != output_dtype or out.device != data.device:
             raise ValueError("out shape/dtype/device mismatch")
         if any(torch._C._overlaps(out, value) for value in (data, indices, ptr, dense)):
             raise ValueError("out overlaps an input")
@@ -1446,12 +1486,12 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
             a = data.resolve_conj().contiguous()
             i, p = indices.contiguous(), ptr.contiguous()
             b = dense.resolve_conj()
-            if data.dtype == torch.float16:
+            if data.dtype in (torch.float16, torch.bfloat16):
                 a, b = a.float(), b.float()
         stats = {}
         def compute(ii, pp):
             if selected == "csc_col_split_reduce":
-                return _run_csc_split(a, ii, pp, b, prepared.shape, prepared.op, cfg, phases, stats, data.dtype)
+                return _run_csc_split(a, ii, pp, b, prepared.shape, prepared.op, cfg, phases, stats, output_dtype)
             if selected in CSC_ALGORITHMS:
                 return _launch_csc_columns(a, ii, pp, b, prepared.shape, prepared.op, selected, cfg)
             raise ValueError("legacy CSC routes require the original prepared interface")
@@ -1467,11 +1507,12 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
                 fallback_reason = str(exc)
                 result = compute(i, p)
         with phases.measure("compute_ms"):
-            result = result.to(data.dtype)
+            result = result.to(output_dtype)
             if out is not None:
                 out.copy_(result)
                 result = out
         meta = dict(info, alg=selected, alg_requested=alg or prepared.alg, alg_resolved=selected,
+                    a_dtype=str(data.dtype), rhs_dtype=str(dense.dtype), output_dtype=str(output_dtype),
                     config=cfg, op=prepared.op, implementation_version=2, timing_contract_version=2,
                     compute_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
                     input_indices_dtype=str(indices.dtype), input_indptr_dtype=str(ptr.dtype),
@@ -1505,13 +1546,55 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
 
 
 def flagsparse_spmv_csc_run(prepared, x, *, alg=None, config=None, op=None, out=None,
-                            return_time=False, return_meta=False, timing=False):
+                            out_dtype=None, return_time=False, return_meta=False, timing=False):
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, x, out)
     if isinstance(prepared, PreparedCscRoute):
         if prepared.kind != "spmv":
             raise TypeError("prepared must describe CSC SpMV")
         return _run_csc_registered(prepared, x, alg=alg, config=config, op=op, out=out,
-                                  return_time=return_time, return_meta=return_meta, timing=timing)
+                                  out_dtype=out_dtype, return_time=return_time, return_meta=return_meta, timing=timing)
     if alg not in (None, "auto", "spmv_csc_base") or config is not None:
         raise ValueError("prepare with alg before switching a legacy CSC prepared route")
+    if prepared.data.dtype in (torch.float16, torch.bfloat16):
+        from copy import copy
+        from .spmv_coo import _coo_measure_run
+        from ._spmm_csr_runtime import output_has_internal_overlap
+
+        code = prepared.op if op is None else _normalize_spmv_csc_op(op)
+        if code != prepared.op:
+            raise ValueError("op conflicts with prepared CSC")
+        output_dtype = _mixed_spmx.resolve_registered_types(
+            prepared.data.dtype, x.dtype, out=out, out_dtype=out_dtype
+        )["output_dtype"]
+        rows = prepared.n_cols if _spmv_csc_op_transposes(code) else prepared.n_rows
+        if out is not None:
+            if out.shape != (rows,) or out.dtype != output_dtype or out.device != prepared.data.device:
+                raise ValueError("out shape/dtype/device mismatch")
+            if any(torch._C._overlaps(out, value) for value in
+                   (prepared.data, prepared.kernel_indices, prepared.kernel_indptr, x)):
+                raise ValueError("out overlaps an input")
+            if output_has_internal_overlap(out):
+                raise ValueError("out must have non-overlapping storage")
+        vector = _validate_spmv_csc_x(x, prepared, code)
+
+        def execute(phases):
+            with phases.measure("process_gpu_ms"):
+                execution = copy(prepared)
+                execution.data = prepared.data.float()
+                operand = vector.float()
+            with phases.measure("compute_ms"):
+                result = _run_spmv_csc_prepared_with_fallback(execution, operand, code).to(output_dtype)
+                if out is not None:
+                    out.copy_(result)
+                    result = out
+            return result, dict(alg="spmv_csc_base", alg_resolved="spmv_csc_base",
+                a_dtype=str(prepared.data.dtype), rhs_dtype=str(x.dtype),
+                compute_dtype="torch.float32", output_dtype=str(output_dtype),
+                conversion_mode="materialize", op=_spmv_csc_op_to_name(code),
+                execution_path="torch_npu" if _is_ascend_runtime() else "native_csc",
+                process_cpu_ms=0.0)
+
+        return _coo_measure_run(execute, return_time, return_meta, timing)
     return flagsparse_spmv_csc(prepared=prepared, x=x, op=op, out=out,
-                               return_time=return_time, return_meta=return_meta)
+                               out_dtype=out_dtype, return_time=return_time, return_meta=return_meta)

@@ -769,7 +769,11 @@ def main():
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--alg", default=None, help="Explicit algorithm or all/compare; omit for existing delivery")
     parser.add_argument("--config", default=None, help="JSON configuration for one explicit algorithm")
+    from benchmark_utils import add_type_combo_arguments, run_type_combo_benchmark
+    add_type_combo_arguments(parser)
     args = parser.parse_args()
+    if run_type_combo_benchmark("spmv_csc", args, parser):
+        return
     try:
         value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
         index_dtypes = _parse_csv_tokens(
@@ -821,9 +825,10 @@ def main():
         )
         import q4_variant_bench
 
-        q4_variant_bench.run_and_append(
-            "spmv_csc", paths, args.csv_csc, args.warmup, args.iters
-        )
+        if not any(token.split("=", 1)[0] == "--alg" for token in sys.argv[1:]):
+            q4_variant_bench.run_and_append(
+                "spmv_csc", paths, args.csv_csc, args.warmup, args.iters
+            )
         return
     if not paths:
         print("No .mtx files. Use --synthetic or --csv-csc with inputs.")

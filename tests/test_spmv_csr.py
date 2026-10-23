@@ -162,7 +162,11 @@ def synthetic_cases(torch, dtype, device):
 
 def main(argv=None):
     p = parser()
+    from benchmark_utils import add_type_combo_arguments, run_type_combo_benchmark
+    add_type_combo_arguments(p)
     args = p.parse_args(argv)
+    if run_type_combo_benchmark("spmv_csr", args, p, argv):
+        return
     args.alg = args.alg.strip()
     if args.alg == "all":
         args.alg = "compare"
@@ -466,9 +470,10 @@ def main(argv=None):
             csv_file.close()
     import q4_variant_bench
 
-    q4_variant_bench.run_and_append(
-        "spmv_csr", [str(path) for path in paths], args.csv_csr, args.warmup, args.iters
-    )
+    if not any(token.split("=", 1)[0] == "--alg" for token in (sys.argv[1:] if argv is None else argv)):
+        q4_variant_bench.run_and_append(
+            "spmv_csr", [str(path) for path in paths], args.csv_csr, args.warmup, args.iters
+        )
     # Row-level results live in the `status` column, as in every other benchmark
     # script. The exit code stays 0: the runner treats a non-zero exit as a failed
     # phase and the delivery rows inherit that, so one FAIL matrix in one dtype

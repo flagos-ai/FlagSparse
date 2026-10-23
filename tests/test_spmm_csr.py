@@ -728,7 +728,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="AlphaSparse-style CSR SpMM route benchmark."
     )
-    parser.add_argument("input", nargs="+", help=".mtx file(s) or directories")
+    parser.add_argument("input", nargs="*", help=".mtx file(s) or directories")
     parser.add_argument(
         "--alg", default="auto", help="auto, all, or comma-separated algorithms"
     )
@@ -772,7 +772,11 @@ def main():
     parser.add_argument(
         "--diagnose", action="store_true", help="Write separate diagnose metadata CSV"
     )
+    from benchmark_utils import add_type_combo_arguments, run_type_combo_benchmark
+    add_type_combo_arguments(parser, spmm=True)
     args = parser.parse_args()
+    if run_type_combo_benchmark("spmm_csr", args, parser):
+        return
 
     if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")

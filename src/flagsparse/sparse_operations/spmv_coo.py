@@ -34,6 +34,8 @@ import triton
 import triton.language as tl
 
 SUPPORTED_SPMV_COO_VALUE_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
     torch.float32,
     torch.float64,
     torch.complex64,
@@ -95,6 +97,7 @@ class PreparedCoo:
     """Prepared COO structure metadata that can serve non/trans/conj at runtime."""
 
     __slots__ = (
+        "original_inputs",
         "data_non",
         "row_non",
         "col_non",
@@ -597,6 +600,8 @@ def prepare_spmv_coo(
     *, alg=None, config=None,
 ):
     """Cache sorted COO + row-run ``seg_starts`` when ``sort_by_row``. No ``indptr``."""
+    from .mixed_spmx import remember_registered_inputs
+    original_inputs = (data, row, col)
     if alg is not None:
         selected = "coo_rowrun" if alg == "auto" else alg
         spec = get_spmv_coo_algorithm_spec(selected)
@@ -612,8 +617,8 @@ def prepare_spmv_coo(
         if row.device != data.device or col.device != data.device:
             raise ValueError("COO inputs must share a device")
         _prepare_coo_tensors(data, row, col, shape, False, value_dtypes=spec["supported_dtypes"])
-        return PreparedCooRoute(data, row, col, shape, code, alg, config,
-                               _normalize_spmv_coo_index_fallback_policy(index_fallback_policy))
+        return remember_registered_inputs(PreparedCooRoute(data, row, col, shape, code, alg, config,
+                               _normalize_spmv_coo_index_fallback_policy(index_fallback_policy)), original_inputs)
     if config is not None:
         raise ValueError("config requires an explicit alg")
     sort_by_row = True if sort_by_row is None else bool(sort_by_row)
@@ -641,7 +646,7 @@ def prepare_spmv_coo(
         row_trans = col_non
         col_trans = row_non
         seg_trans = None
-    return PreparedCoo(
+    return remember_registered_inputs(PreparedCoo(
         data_non,
         row_non,
         col_non,
@@ -655,7 +660,7 @@ def prepare_spmv_coo(
         transpose=transpose,
         op=op_code,
         index_fallback_policy=index_fallback_policy,
-    )
+    ), original_inputs)
 
 
 def _prepare_spmv_coo_launch_from_raw(
@@ -1054,6 +1059,8 @@ def flagsparse_spmv_coo(
     float16 / bfloat16 / int8 matrices and widened outputs (``out_dtype`` or
     ``out.dtype``: half -> float32, int8 -> int32 / float32) run in ``mixed_spmx``.
     """
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, x, out, (data, row, col))
     if alg is not None or config is not None or isinstance(prepared, PreparedCooRoute):
         if block_size is not None or num_warps is not None or block_inner != 128:
             raise ValueError("use config for registered COO launch parameters")
@@ -1070,11 +1077,9 @@ def flagsparse_spmv_coo(
             selected = "coo_rowrun" if selected == "auto" else selected
             if bool(sort_by_row) != (selected in ("coo_rowrun", "coo_rowrun_subgroup")):
                 raise ValueError("sort_by_row conflicts with the selected algorithm")
-        if out_dtype is not None and out_dtype != prepared.data.dtype:
-            raise TypeError("registered COO algorithms require matching out_dtype")
         requested_op = op if op is not None else ("trans" if transpose else "non") if transpose is not None else None
         return flagsparse_spmv_coo_run(prepared, x, alg=alg, config=config, op=requested_op,
-            out=out, return_time=return_time, return_meta=return_meta, timing=timing)
+            out=out, out_dtype=out_dtype, return_time=return_time, return_meta=return_meta, timing=timing)
     if return_meta or timing:
         raise ValueError("legacy COO diagnostics use the existing benchmark interface; select alg for registered diagnostics")
     if (
@@ -1137,6 +1142,18 @@ def flagsparse_spmv_coo(
         elif not op_explicit and transpose is not None:
             op_code = _normalize_spmv_coo_op(None, transpose=transpose_flag)
     launch = _resolve_spmv_coo_launch(prepared, op_code)
+    output_dtype = _mixed_spmx.resolve_registered_types(
+        launch.data.dtype, x.dtype, out=out, out_dtype=out_dtype
+    )["output_dtype"]
+    if out is not None:
+        if out.shape != (launch.n_rows,) or out.dtype != output_dtype or out.device != launch.data.device:
+            raise ValueError("out shape/dtype/device mismatch")
+        if any(torch._C._overlaps(out, value) for value in
+               (prepared.data_non, prepared.data_trans, prepared.row_non, prepared.col_non, x)):
+            raise ValueError("out overlaps an input")
+        from ._spmm_csr_runtime import output_has_internal_overlap
+        if output_has_internal_overlap(out):
+            raise ValueError("out must have non-overlapping storage")
     x = _validate_x_coo(x, launch)
     if num_warps is not None and num_warps not in (1, 2, 4, 8, 16, 32):
         raise ValueError("num_warps must be a power of 2 in [1, 32]")
@@ -1146,6 +1163,12 @@ def flagsparse_spmv_coo(
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
+    if launch.data.dtype in (torch.float16, torch.bfloat16):
+        from copy import copy
+
+        launch = copy(launch)
+        launch.data = launch.data.float()
+        x = x.float()
     if _is_ascend_runtime():
         y = _ascend_spmv_coo_index_add(launch, x)
     else:
@@ -1165,15 +1188,14 @@ def flagsparse_spmv_coo(
             num_warps=num_warps,
             block_inner=block_inner,
         )
+    y = y.to(output_dtype)
+    if out is not None:
+        out.copy_(y)
+        y = out
     elapsed_ms = None
     if return_time:
         _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    if out is not None:
-        if out.shape != y.shape or out.dtype != y.dtype:
-            raise ValueError("out shape/dtype must match result")
-        out.copy_(y)
-        y = out
     if return_time:
         return y, elapsed_ms
     return y
@@ -1439,15 +1461,25 @@ def get_spmv_coo_algorithm_spec(alg):
     if alg not in SPMV_COO_ALGORITHMS:
         raise ValueError(f"unknown COO SpMV algorithm {alg!r}")
     return dict(name=alg, supported_ops=("non", "trans", "conj"),
-                supported_dtypes=(torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128),
-                implementation_version=2, timing_contract_version=2,
+                supported_dtypes=(torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128),
+                half_output_dtypes={dtype: (dtype, torch.float32)
+                                    for dtype in (torch.float16, torch.bfloat16)},
+                implementation_version=3, timing_contract_version=2,
                 requires_sort=alg not in _COO_ATOMIC_ALGORITHMS)
 
 
-def list_spmv_coo_algorithms(op=None, dtype=None, backend=None):
+def list_spmv_coo_algorithms(op=None, dtype=None, backend=None, *, rhs_dtype=None, out_dtype=None):
+    if rhs_dtype is not None or out_dtype is not None:
+        if dtype is None:
+            raise ValueError("dtype is required for type-combination filtering")
+        try:
+            _mixed_spmx.resolve_registered_types(
+                dtype, dtype if rhs_dtype is None else rhs_dtype, out_dtype=out_dtype)
+        except TypeError:
+            return ()
     if op is not None:
         _normalize_spmv_coo_op(op)
-    if dtype is not None and dtype not in (torch.float16, *SUPPORTED_SPMV_COO_VALUE_DTYPES):
+    if dtype is not None and dtype not in (torch.float16, torch.bfloat16, *SUPPORTED_SPMV_COO_VALUE_DTYPES):
         return ()
     # Runtime capabilities are resolved against the actual device at run time.
     if backend is not None and backend not in tuple(spec.name for spec in _common_mod.backend_specs()):
@@ -1480,13 +1512,16 @@ def _coo_measure_run(execute, return_time, return_meta, timing):
 
 
 def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
-                            out=None, return_time=False, return_meta=False, timing=False):
+                            out=None, out_dtype=None, return_time=False, return_meta=False, timing=False):
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, x, out)
     if not isinstance(prepared, PreparedCooRoute):
         if alg is not None or config is not None:
             raise ValueError("prepare with alg before switching a legacy COO prepared route")
         if return_meta or timing:
             raise ValueError("legacy COO prepared diagnostics use the existing benchmark interface")
-        return flagsparse_spmv_coo(prepared=prepared, x=x, op=op, out=out, return_time=return_time)
+        return flagsparse_spmv_coo(prepared=prepared, x=x, op=op, out=out,
+                                   out_dtype=out_dtype, return_time=return_time)
     if op is not None and _spmv_coo_op_to_name(op) != prepared.op:
         raise ValueError("op conflicts with prepared COO")
     requested = prepared.alg if alg is None else alg
@@ -1502,8 +1537,11 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
         raise TypeError("x must be a tensor")
     if x.ndim != 1 or x.numel() != shape[1] or x.dtype != data.dtype or x.device != data.device:
         raise ValueError("x shape/dtype/device does not match COO operation")
+    output_dtype = _mixed_spmx.resolve_registered_types(
+        data.dtype, x.dtype, out=out, out_dtype=out_dtype
+    )["output_dtype"]
     if out is not None:
-        if out.shape != (shape[0],) or out.dtype != data.dtype or out.device != data.device:
+        if out.shape != (shape[0],) or out.dtype != output_dtype or out.device != data.device:
             raise ValueError("out shape/dtype/device does not match COO operation")
         if any(torch._C._overlaps(out, t) for t in (data, row, col, x)):
             raise ValueError("out overlaps an input")
@@ -1521,7 +1559,7 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
         with phases.measure("process_gpu_ms"):
             a, r, c = a.resolve_conj().resolve_neg().contiguous(), r.contiguous(), c.contiguous()
             vector = x.resolve_conj().resolve_neg()
-            if data.dtype == torch.float16:
+            if data.dtype in (torch.float16, torch.bfloat16):
                 a, vector = a.float(), x.float()
             if selected not in _COO_ATOMIC_ALGORITHMS:
                 a, r, c, starts = _coo_sorted_runs(a, r, c)
@@ -1549,12 +1587,13 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
                 view = _PreparedCooLaunch(a, r, c, shape, starts, 0,
                                          index_fallback_policy=prepared.index_fallback_policy)
                 y = _run_spmv_coo_prepared_with_fallback(view, vector, 256, 4, 128)
-            y = y.to(data.dtype)
+            y = y.to(output_dtype)
             if out is not None:
                 out.copy_(y)
                 y = out
         return y, dict(info, alg=selected, alg_requested=requested, alg_resolved=selected,
-                       op=prepared.op, compute_dtype=str(torch.float32 if data.dtype == torch.float16 else data.dtype),
+                       a_dtype=str(data.dtype), rhs_dtype=str(x.dtype), output_dtype=str(output_dtype),
+                       op=prepared.op, compute_dtype=str(torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype),
                        component_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
                        backend=_backend_name(),
                        input_indices=(str(row.dtype), str(col.dtype)),

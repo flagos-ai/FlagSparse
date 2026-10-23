@@ -3,12 +3,16 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 3
+IMPLEMENTATION_VERSION = 4
 NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream")
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend")
 VALUE_DTYPES = ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")
+
+
+class BackendCapabilityUnavailable(NotImplementedError):
+    """Known missing/unknown device capability, distinct from an implementation fault."""
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,10 @@ def algorithm_spec(alg):
         "capability_requirements": ("int64", "reduction") if new else (),
         "compute_dtype": "input_dependent",
         "compute_dtype_by_input": {dt: compute_dtype(name, dt) for dt in VALUE_DTYPES},
+        "half_output_dtypes": {
+            dt: (dt, "float32")
+            for dt in ("float16", "bfloat16")
+        },
     }
 
 
@@ -119,7 +127,7 @@ def validate_support(alg, op, dtype, indices_dtype, indptr_dtype, caps):
         and caps.subgroup_width in (32, 64)
         and caps.max_threads_per_block > 0
     ):
-        raise NotImplementedError(
+        raise BackendCapabilityUnavailable(
             f"CSR SpMV {alg}: unverified capabilities for {caps.backend}/{caps.arch}"
         )
     if (
@@ -127,7 +135,7 @@ def validate_support(alg, op, dtype, indices_dtype, indptr_dtype, caps):
         and compute_dtype(alg, dtype) in ("float64", "complex128")
         and not caps.fp64
     ):
-        raise NotImplementedError(
+        raise BackendCapabilityUnavailable(
             f"CSR SpMV {alg}: FP64 capability required for {dtype}"
         )
 
@@ -243,7 +251,7 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
         or caps.subgroup_width not in (32, 64)
         or not (caps.int64 and caps.reduction and caps.max_threads_per_block > 0)
     ):
-        raise NotImplementedError(
+        raise BackendCapabilityUnavailable(
             f"no verified CSR SpMV profile for {caps.backend}/{caps.arch}"
         )
     candidates = []
@@ -271,7 +279,7 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
         available = caps.max_threads_per_block // caps.subgroup_width
         warps = max((w for w in (1, 2, 4, 8) if w <= available), default=0)
         if not warps:
-            raise NotImplementedError(f"no legal launch profile: {rejections}")
+            raise BackendCapabilityUnavailable(f"no legal launch profile: {rejections}")
         for section in ("row_tile", "row_vector", "row_subgroup_stream", "row_split_reduce", "process"):
             resolved[section]["num_warps"] = min(resolved[section]["num_warps"], warps)
         resolved["row_split_reduce"]["reduce_num_warps"] = min(4, warps)

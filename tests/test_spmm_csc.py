@@ -739,7 +739,11 @@ def main():
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--fail-fast", action="store_true")
+    from benchmark_utils import add_type_combo_arguments, run_type_combo_benchmark
+    add_type_combo_arguments(parser, spmm=True)
     args = parser.parse_args()
+    if run_type_combo_benchmark("spmm_csc", args, parser):
+        return
 
     if not ACCEL.is_available():
         raise RuntimeError("A CUDA/ROCm PyTorch device is required for native CSC SpMM benchmark")
@@ -867,13 +871,14 @@ def main():
     failures = sum(1 for row in rows if row.get("status") in ("FAIL", "ERROR"))
     import q4_variant_bench
 
-    q4_variant_bench.run_and_append(
-        "spmm_csc",
-        [path for _name, path, _shape, _cols in cases if path is not None],
-        args.csv_csc,
-        args.warmup,
-        args.iters,
-    )
+    if not any(token.split("=", 1)[0] == "--alg" for token in sys.argv[1:]):
+        q4_variant_bench.run_and_append(
+            "spmm_csc",
+            [path for _name, path, _shape, _cols in cases if path is not None],
+            args.csv_csc,
+            args.warmup,
+            args.iters,
+        )
     if failures:
         raise SystemExit(1)
 

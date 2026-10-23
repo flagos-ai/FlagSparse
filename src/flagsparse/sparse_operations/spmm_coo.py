@@ -754,6 +754,7 @@ class PreparedCooSpmmRoute:
     """Matrix-level COO SpMM route preparation shared by registered algorithms."""
 
     __slots__ = (
+        "original_inputs",
         "data",
         "row",
         "col",
@@ -1972,12 +1973,19 @@ def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, *, wide=T
 
 
 def _run_spmm_coo_rowrun_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", out_dtype=None
 ):
+    result_dtype = prepared.output_dtype if out_dtype is None else out_dtype
     dense_layout = _normalize_dense_layout(dense_layout)
     use_gather = (prepared.gather_ptr is not None and torch.is_tensor(B)
                   and B.ndim == 2 and int(B.shape[1]) == 32)
+    conversion_events = None
+    if timing:
+        conversion_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
+        conversion_events[0].record()
     B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, wide=not use_gather)
+    if conversion_events is not None:
+        conversion_events[1].record()
     launch = _resolve_spmm_coo_launch_config(
         int(B.shape[1]), prepared.nnz, device=prepared.data.device
     )
@@ -1988,7 +1996,7 @@ def _run_spmm_coo_rowrun_route(
         start.record()
     if use_gather:
         from . import _spmm_row_gather
-        C = _empty_dense_layout((prepared.n_rows, int(B.shape[1])), prepared.output_dtype,
+        C = _empty_dense_layout((prepared.n_rows, int(B.shape[1])), result_dtype,
                                 prepared.data.device, dense_layout)
         C = _spmm_row_gather.compute(prepared.data, prepared.col, prepared.gather_ptr, B, C)
     else:
@@ -2001,7 +2009,7 @@ def _run_spmm_coo_rowrun_route(
             int(B.shape[1]),
             block_n=launch["block_n"],
             block_nnz=launch["block_nnz"],
-            output_dtype=prepared.output_dtype,
+            output_dtype=result_dtype,
             dense_layout=dense_layout,
             seg_starts=prepared.seg_starts,
             num_warps=launch["num_warps"],
@@ -2055,14 +2063,24 @@ def _run_spmm_coo_rowrun_route(
                 block_n=32, block_nnz=lanes, batch_rows=batch, num_warps=4,
                 grid_m=triton.cdiv(prepared.n_rows, batch), grid_n=1,
                 compute_dtype="complex64")
+    if conversion_events is not None:
+        conversion_events[1].synchronize()
+        meta["process_gpu_ms"] = float(meta.get("process_gpu_ms") or 0.0) + conversion_events[0].elapsed_time(conversion_events[1])
     return C, meta
 
 
 def _run_spmm_coo_atomic_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", out_dtype=None
 ):
+    result_dtype = prepared.output_dtype if out_dtype is None else out_dtype
     dense_layout = _normalize_dense_layout(dense_layout)
+    conversion_events = None
+    if timing:
+        conversion_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
+        conversion_events[0].record()
     B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout)
+    if conversion_events is not None:
+        conversion_events[1].record()
     launch = _resolve_spmm_coo_launch_config(
         int(B.shape[1]), prepared.nnz, device=prepared.data.device
     )
@@ -2080,7 +2098,7 @@ def _run_spmm_coo_atomic_route(
         int(B.shape[1]),
         block_n=launch["block_n"],
         block_nnz=launch["block_nnz"],
-        output_dtype=prepared.output_dtype,
+        output_dtype=result_dtype,
         dense_layout=dense_layout,
     )
     if timing:
@@ -2120,6 +2138,9 @@ def _run_spmm_coo_atomic_route(
             "c_stride": tuple(int(v) for v in C.stride()),
             "output_layout": _dense_layout_name(C),
         }
+    if conversion_events is not None:
+        conversion_events[1].synchronize()
+        meta["process_gpu_ms"] = float(meta.get("process_gpu_ms") or 0.0) + conversion_events[0].elapsed_time(conversion_events[1])
     return C, meta
 
 
@@ -2147,12 +2168,19 @@ def _spmm_coo_alg1_build_bucket_descriptors(segs_flat, counts, offsets):
 
 
 def _run_spmm_coo_alg1_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", out_dtype=None
 ):
-    if prepared.output_dtype not in (torch.float32, torch.float64):
-        raise TypeError("spmm_coo_alg1 only supports float32 and float64")
+    result_dtype = prepared.output_dtype if out_dtype is None else out_dtype
+    if prepared.output_dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise TypeError("spmm_coo_alg1 requires a real floating-point dtype")
     dense_layout = _normalize_dense_layout(dense_layout)
+    conversion_events = None
+    if timing:
+        conversion_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
+        conversion_events[0].record()
     B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout)
+    if conversion_events is not None:
+        conversion_events[1].record()
     n_dense_cols = int(B.shape[1])
     device = prepared.data.device
     if _use_spmm_coo_ascend_dispatch():
@@ -2163,7 +2191,7 @@ def _run_spmm_coo_alg1_route(
             B,
             prepared.n_rows,
             n_dense_cols,
-            output_dtype=prepared.output_dtype,
+            output_dtype=result_dtype,
             dense_layout=dense_layout,
         )
         meta = {
@@ -2224,6 +2252,11 @@ def _run_spmm_coo_alg1_route(
         segs_flat, counts, offsets
     )
 
+    compute_ms = None
+    if timing:
+        compute_start = _ACCEL.Event(enable_timing=True)
+        compute_end = _ACCEL.Event(enable_timing=True)
+        compute_start.record()
     C_compute = _zeros_dense_layout(
         (prepared.n_rows, n_dense_cols), prepared.compute_dtype, device, dense_layout
     )
@@ -2231,11 +2264,6 @@ def _run_spmm_coo_alg1_route(
         n_dense_cols, prepared.nnz, device=prepared.data.device
     )
     acc_dtype = tl.float64 if prepared.compute_dtype == torch.float64 else tl.float32
-    compute_ms = None
-    if timing:
-        compute_start = _ACCEL.Event(enable_timing=True)
-        compute_end = _ACCEL.Event(enable_timing=True)
-        compute_start.record()
     for bucket in buckets:
         n_bucket = int(bucket["count"])
         if n_bucket <= 0:
@@ -2260,16 +2288,12 @@ def _run_spmm_coo_alg1_route(
             BLOCK_NNZ=block_nnz,
             ACC_DTYPE=acc_dtype,
         )
-    if timing:
-        compute_end.record()
-        _ACCEL.synchronize()
-        compute_ms = compute_start.elapsed_time(compute_end)
-    if prepared.compute_dtype != prepared.output_dtype:
-        C = C_compute.to(prepared.output_dtype)
+    if prepared.compute_dtype != result_dtype:
+        C = C_compute.to(result_dtype)
         if dense_layout == "col":
             C_out = _empty_dense_layout(
                 (prepared.n_rows, n_dense_cols),
-                prepared.output_dtype,
+                result_dtype,
                 device,
                 dense_layout,
             )
@@ -2277,6 +2301,10 @@ def _run_spmm_coo_alg1_route(
             C = C_out
     else:
         C = C_compute
+    if timing:
+        compute_end.record()
+        _ACCEL.synchronize()
+        compute_ms = compute_start.elapsed_time(compute_end)
     counts_cpu = [int(bucket["count"]) for bucket in buckets]
     meta = {
         "alg": "spmm_coo_alg1",
@@ -2312,6 +2340,9 @@ def _run_spmm_coo_alg1_route(
             "c_stride": tuple(int(v) for v in C.stride()),
             "output_layout": _dense_layout_name(C),
         }
+    if conversion_events is not None:
+        conversion_events[1].synchronize()
+        meta["process_gpu_ms"] = float(meta.get("process_gpu_ms") or 0.0) + conversion_events[0].elapsed_time(conversion_events[1])
     return C, meta
 
 
@@ -2334,7 +2365,7 @@ SPMM_COO_ALGORITHMS = {
         name="spmm_coo_alg1",
         display_name="COOAlg1",
         supported_ops=tuple(SPMM_COO_OP_NAMES.values()),
-        supported_dtypes=(torch.float32, torch.float64),
+        supported_dtypes=(torch.float16, torch.bfloat16, torch.float32, torch.float64),
         run=_run_spmm_coo_alg1_route,
     ),
 }
@@ -2354,7 +2385,8 @@ class _PreparedCooSpmmExtension(_coo_native.PreparedCooRoute):
 
 def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
                             dense_layout="auto", out=None, return_time=False,
-                            return_meta=False, timing=False, diagnostics=False):
+                            return_meta=False, timing=False, diagnostics=False,
+                            out_dtype=None):
     if op is not None and _spmm_coo_op_to_name(op) != prepared.op:
         raise ValueError("op conflicts with prepared COO")
     selected = prepared.alg if alg is None else _normalize_spmm_coo_alg(alg)
@@ -2367,8 +2399,11 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
     if B.dtype != prepared.data.dtype or B.device != prepared.data.device:
         raise ValueError("B dtype/device does not match sparse data")
     dense_layout = _normalize_dense_layout(dense_layout)
+    output_dtype = _mixed_spmx.resolve_registered_types(
+        prepared.data.dtype, B.dtype, out=out, out_dtype=out_dtype
+    )["output_dtype"]
     if out is not None:
-        if out.shape != (shape[0], B.shape[1]) or out.dtype != B.dtype or out.device != B.device:
+        if out.shape != (shape[0], B.shape[1]) or out.dtype != output_dtype or out.device != B.device:
             raise ValueError("out shape/dtype/device mismatch")
         if any(torch._C._overlaps(out, t) for t in (prepared.data, prepared.row, prepared.col, B)):
             raise ValueError("out overlaps an input")
@@ -2376,7 +2411,7 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
         if output_has_internal_overlap(out):
             raise ValueError("out must have non-overlapping storage")
     # Preserve the migrated algorithm's policy independently of main's legacy tuning.
-    compute_dtype = {torch.float16: torch.float32, torch.float32: torch.float64,
+    compute_dtype = {torch.float16: torch.float32, torch.bfloat16: torch.float32, torch.float32: torch.float64,
                      torch.complex64: torch.complex128}.get(B.dtype, B.dtype)
     overrides = config if config is not None else (prepared.config if selected == prepared.alg else {})
     cfg, info = _coo_native._resolve_coo_config(selected, compute_dtype, B.device, overrides, B.shape[1])
@@ -2394,11 +2429,12 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
         with phases.measure("compute_ms"):
             C = _coo_native._launch_coo_extension(a, r, c, starts, bc, shape,
                 selected, cfg, prepared.op == "conj", compute_dtype=compute_dtype)
-            C = _materialize_dense_layout(C.to(B.dtype), dense_layout)
+            C = _materialize_dense_layout(C.to(output_dtype), dense_layout)
             if out is not None:
                 out.copy_(C)
                 C = out
         return C, dict(info, alg=selected, alg_requested=alg or prepared.alg,
+                       a_dtype=str(prepared.data.dtype), rhs_dtype=str(B.dtype), output_dtype=str(output_dtype),
                        alg_resolved=selected, op=prepared.op, compute_dtype=str(compute_dtype),
                        conversion_mode=cfg.get("conversion_mode", "materialize"),
                        dense_layout=dense_layout, b_stride=tuple(B.stride()), c_stride=tuple(C.stride()),
@@ -2411,7 +2447,7 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
 for _name in SPMM_COO_NEW_ALGORITHMS:
     SPMM_COO_ALGORITHMS[_name] = SpmmCooAlgorithm(
         name=_name, display_name=_name, supported_ops=("non", "trans", "conj"),
-        supported_dtypes=(torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=(torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128),
         run=_run_spmm_coo_extension,
     )
 
@@ -2423,6 +2459,9 @@ def get_spmm_coo_algorithm_spec(alg):
     spec = SPMM_COO_ALGORITHMS[name]
     return dict(name=name, supported_ops=spec.supported_ops,
                 supported_dtypes=spec.supported_dtypes, layouts=("row", "col"),
+                half_output_dtypes={dtype: (dtype, torch.float32)
+                                    for dtype in (torch.float16, torch.bfloat16)
+                                    if dtype in spec.supported_dtypes},
                 requires_sort=name not in _coo_native._COO_ATOMIC_ALGORITHMS)
 
 
@@ -2444,7 +2483,15 @@ def resolve_spmm_coo_algorithm(alg, op, dtype):
     return algorithm
 
 
-def list_spmm_coo_algorithms(op=None, dtype=None, backend=None, layout=None):
+def list_spmm_coo_algorithms(op=None, dtype=None, backend=None, layout=None, *, rhs_dtype=None, out_dtype=None):
+    if rhs_dtype is not None or out_dtype is not None:
+        if dtype is None:
+            raise ValueError("dtype is required for type-combination filtering")
+        try:
+            _mixed_spmx.resolve_registered_types(
+                dtype, dtype if rhs_dtype is None else rhs_dtype, out_dtype=out_dtype)
+        except TypeError:
+            return ()
     if backend is not None and backend not in {spec.name for spec in _common_mod.backend_specs()}:
         return ()
     if layout is not None and layout not in ("row", "col", "strided"):
@@ -2462,11 +2509,13 @@ def list_spmm_coo_algorithms(op=None, dtype=None, backend=None, layout=None):
 
 def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto", config=None):
     """Prepare matrix-level canonical COO metadata for registered SpMM algorithms."""
+    from .mixed_spmx import remember_registered_inputs
+    original_inputs = (data, row, col)
     name = _normalize_spmm_coo_alg(alg)
     if name in SPMM_COO_NEW_ALGORITHMS:
         _prepare_spmm_coo_matrix(data, row, col, shape, validate_only=True)
         resolve_spmm_coo_algorithm(name, op, data.dtype)
-        return _PreparedCooSpmmExtension(data, row, col, shape, op, name, config)
+        return remember_registered_inputs(_PreparedCooSpmmExtension(data, row, col, shape, op, name, config), original_inputs)
     if config is not None:
         raise ValueError("config requires an explicit COO extension algorithm")
     op_code = _normalize_spmm_coo_op(op)
@@ -2502,7 +2551,7 @@ def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto", confi
     resolved_alg = _normalize_spmm_coo_alg(alg)
     if resolved_alg != "auto":
         resolve_spmm_coo_algorithm(resolved_alg, op_name, output_dtype)
-    return PreparedCooSpmmRoute(
+    return remember_registered_inputs(PreparedCooSpmmRoute(
         canonical_data,
         canonical_row,
         canonical_col,
@@ -2513,7 +2562,7 @@ def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto", confi
         compute_dtype,
         op_name,
         resolved_alg,
-    )
+    ), original_inputs)
 
 
 def _select_spmm_coo_auto_alg(prepared):
@@ -2547,6 +2596,8 @@ def flagsparse_spmm_coo_run(
     config=None,
     op=None,
     out=None,
+    out_dtype=None,
+    op_b=None,
     dense_layout="auto",
     return_time=False,
     return_meta=False,
@@ -2554,18 +2605,34 @@ def flagsparse_spmm_coo_run(
     diagnostics=False,
 ):
     """Run a registered COO SpMM algorithm with CSR-style timing metadata."""
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, B, out)
+    B = _mixed_spmx.apply_registered_op_b(B, op_b)
     if isinstance(prepared, _PreparedCooSpmmExtension):
         return _run_spmm_coo_extension(prepared, B, alg=alg, config=config, op=op,
-            out=out, dense_layout=dense_layout, return_time=return_time,
+            out=out, out_dtype=out_dtype, dense_layout=dense_layout, return_time=return_time,
             return_meta=return_meta, timing=timing, diagnostics=diagnostics)
-    if config is not None or out is not None:
-        raise ValueError("legacy COO run retains its existing configuration/output contract")
+    if not isinstance(prepared, PreparedCooSpmmRoute):
+        raise TypeError("prepared must be a PreparedCooSpmmRoute instance")
+    if not torch.is_tensor(B) or B.ndim != 2:
+        raise ValueError("B must be a 2D tensor")
+    output_dtype = _mixed_spmx.resolve_registered_types(
+        prepared.output_dtype, B.dtype, out=out, out_dtype=out_dtype
+    )["output_dtype"]
+    if config is not None:
+        raise ValueError("legacy COO run retains its existing configuration contract")
+    if out is not None:
+        if out.shape != (prepared.n_rows, B.shape[1]) or out.dtype != output_dtype or out.device != B.device:
+            raise ValueError("out shape/dtype/device mismatch")
+        if any(torch._C._overlaps(out, tensor) for tensor in (prepared.data, prepared.row, prepared.col, B)):
+            raise ValueError("out overlaps an input")
+        from ._spmm_csr_runtime import output_has_internal_overlap
+        if output_has_internal_overlap(out):
+            raise ValueError("out must have non-overlapping storage")
     if op is not None and _spmm_coo_op_to_name(op) != prepared.op:
         raise ValueError("op conflicts with prepared COO")
     if _normalize_spmm_coo_alg(alg) in SPMM_COO_NEW_ALGORITHMS:
         raise ValueError("prepare with alg before selecting an extension; canonical COO cannot recover duplicates")
-    if not isinstance(prepared, PreparedCooSpmmRoute):
-        raise TypeError("prepared must be a PreparedCooSpmmRoute instance")
     alg_name = prepared.alg if alg is None else _normalize_spmm_coo_alg(alg)
     if alg_name == "auto":
         # Resolved here rather than in resolve_spmm_coo_algorithm(), which only sees
@@ -2600,7 +2667,19 @@ def flagsparse_spmm_coo_run(
         timing=bool(timing),
         diagnostics=bool(diagnostics),
         dense_layout=dense_layout,
+        out_dtype=output_dtype,
     )
+    output_events = None
+    if timing and out is not None:
+        output_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
+        output_events[0].record()
+    if out is not None:
+        out.copy_(C)
+        C = out
+    if output_events is not None:
+        output_events[1].record()
+        output_events[1].synchronize()
+        route_meta["compute_ms"] = float(route_meta.get("compute_ms") or 0.0) + output_events[0].elapsed_time(output_events[1])
     if end is not None:
         end.record()
         _ACCEL.synchronize()
@@ -2615,13 +2694,18 @@ def flagsparse_spmm_coo_run(
             "alg": algorithm.name,
             "display_name": algorithm.display_name,
             "op": prepared.op,
+            "implementation_path": route_meta.get("alg", algorithm.name),
+            "a_dtype": str(prepared.output_dtype),
+            "rhs_dtype": str(B.dtype),
+            "compute_dtype": str(prepared.compute_dtype),
+            "output_dtype": str(output_dtype),
             "operator_ms": operator_ms,
             "gpu_ms": gpu_ms,
             "process_cpu_ms": process_cpu_ms,
             "dense_layout": route_meta.get("dense_layout", dense_layout),
             "b_stride": route_meta.get("b_stride"),
-            "c_stride": route_meta.get("c_stride"),
-            "output_layout": route_meta.get("output_layout"),
+            "c_stride": tuple(C.stride()),
+            "output_layout": _dense_layout_name(C),
         }
         if timing:
             meta["process_gpu_ms"] = route_meta.get("process_gpu_ms")
@@ -2876,6 +2960,7 @@ def flagsparse_spmm_coo(
     dense_layout="auto",
     *,
     out_dtype=None,
+    op_b=None,
     alg=None,
     config=None,
     prepared=None,
@@ -2886,9 +2971,12 @@ def flagsparse_spmm_coo(
     op: 0/'non' for A @ B, 1/'trans' for A.T @ B,
     2/'conj' for A.conj().T @ B.
     out_dtype (or out.dtype): int8 -> int32 (default) or float32; float16/
-    bfloat16 -> same type or float32. Both run in ``mixed_spmx`` -- see
-    flagsparse_spmm_csr's identical out_dtype for the CSR counterpart.
+    bfloat16 -> same type or float32. Explicit algorithms retain their own
+    implementation; the default mixed route remains available for old calls.
     """
+    from .mixed_spmx import validate_registered_output_alias
+    validate_registered_output_alias(prepared, B, out, (data, row, col))
+    B = _mixed_spmx.apply_registered_op_b(B, op_b)
     if alg is not None or prepared is not None or config is not None:
         if block_n is not None or block_nnz is not None:
             raise ValueError("use config for registered COO launch parameters")
@@ -2900,12 +2988,9 @@ def flagsparse_spmm_coo(
                 op=_spmm_coo_op_to_name(code), alg="auto" if alg is None else alg, config=config)
         if isinstance(prepared, _PreparedCooSpmmExtension) and shape is not None and tuple(shape) != prepared.shape:
             raise ValueError("shape conflicts with prepared COO")
-        dtype = getattr(prepared, "output_dtype", prepared.data.dtype)
-        if out_dtype is not None and out_dtype != dtype:
-            raise TypeError("explicit COO algorithms require matching out_dtype")
         requested_op = None if op is None and transpose is None else _spmm_coo_op_to_name(code)
         return flagsparse_spmm_coo_run(prepared, B, alg=alg, config=config, op=requested_op,
-            out=out, dense_layout=dense_layout, return_time=return_time,
+            out=out, out_dtype=out_dtype, dense_layout=dense_layout, return_time=return_time,
             return_meta=return_meta, timing=timing)
     if torch.is_tensor(data) and _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype):
         if transpose or (op is not None and str(op).strip().lower() not in ("0", "n", "non", "non_trans")):

@@ -1297,7 +1297,11 @@ def main():
     )
     parser.add_argument("--alg", default=None, help="Explicit algorithm or all/compare; omit for existing delivery")
     parser.add_argument("--config", default=None, help="JSON configuration for one explicit algorithm")
+    from benchmark_utils import add_type_combo_arguments, run_type_combo_benchmark
+    add_type_combo_arguments(parser)
     args = parser.parse_args()
+    if run_type_combo_benchmark("spmv_coo", args, parser):
+        return
     value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(
         args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes"
@@ -1348,9 +1352,10 @@ def main():
         )
         import q4_variant_bench
 
-        q4_variant_bench.run_and_append(
-            "spmv_coo", paths, args.csv_coo, args.warmup, args.iters
-        )
+        if not any(token.split("=", 1)[0] == "--alg" for token in sys.argv[1:]):
+            q4_variant_bench.run_and_append(
+                "spmv_coo", paths, args.csv_coo, args.warmup, args.iters
+            )
         return
 
     if args.csv_tocsr:

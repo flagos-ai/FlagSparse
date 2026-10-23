@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native cuSPARSE baselines for the benchmark scripts.
+"""Native Generic API baselines for the benchmark scripts.
+
+Explicit CSR/COO/CSC type-combination benchmarks select ``backend="cuda"``
+or ``backend="rocm"`` for direct cuSPARSE or hipSPARSE calls. Legacy callers
+that omit backend retain their original cuSPARSE-only behavior.
 
 SpVV, Axpby and SELL SpMV for the q4 operators, plus CSR/COO/CSC SpMV, CSR/COO SpMM
 and CSR SDDMM for the q4 *variants* of existing operators: the mixed-precision and
@@ -87,6 +91,29 @@ _SIGNATURES = {
 }
 
 
+class _GenericLibrary:
+    """Bind each generic API entry point only when its operation needs it.
+
+    For example, an installation without SELL must still be usable for CSR
+    SpMV. Missing operation symbols are distinct from a missing shared library.
+    """
+
+    def __init__(self, library):
+        self.library = library
+
+    def __getattr__(self, name):
+        if name not in _SIGNATURES:
+            raise AttributeError(name)
+        try:
+            function = getattr(self.library, name)
+        except AttributeError as exc:
+            raise NotImplementedError(f"cuSPARSE library does not provide {name}") from exc
+        function.argtypes = _SIGNATURES[name]
+        function.restype = _I
+        setattr(self, name, function)
+        return function
+
+
 def _lib():
     global _LIB, _LIB_ERROR
     if _LIB is not None:
@@ -96,13 +123,14 @@ def _lib():
     names = [ctypes.util.find_library("cusparse"), "libcusparse.so.12", "libcusparse.so"]
     for name in filter(None, names):
         try:
-            lib = ctypes.CDLL(name)
-            for fn, args in _SIGNATURES.items():
-                getattr(lib, fn).argtypes = args
-                getattr(lib, fn).restype = _I
+            lib = _GenericLibrary(ctypes.CDLL(name))
+            # Validate the common handle/stream contract without requiring
+            # unrelated sparse formats or operations to be installed.
+            lib.cusparseCreate
+            lib.cusparseSetStream
             _LIB = lib
             return lib
-        except (OSError, AttributeError) as exc:
+        except (OSError, NotImplementedError) as exc:
             _LIB_ERROR = f"cannot load cuSPARSE generic API from {name}: {exc}"
     raise RuntimeError(_LIB_ERROR or "libcusparse not found")
 
@@ -173,9 +201,9 @@ class _Plan:
         return self._run()
 
     def close(self):
-        for fn, handle in self._destroy:
+        release, self._destroy = self._destroy, []
+        for fn, handle in release:
             fn(handle)
-        self._destroy = []
 
 
 def _spvec(values, indices, size):
@@ -335,8 +363,152 @@ def _dnmat(t):
     return h
 
 
-def prepare_spmv(fmt, arrays, shape, x, y, op, compute_dtype):
+# Independently checked against ROCm 6.1 hipsparse.h and HIP library_types.h.
+# Keep HIP's enum table explicit even where its values agree with CUDA.
+_HIP_TYPES = {
+    torch.float16: 2, torch.bfloat16: 14, torch.float32: 0,
+    torch.float64: 1, torch.complex64: 4, torch.complex128: 5,
+}
+_HIP_OP = {"non": 0, "trans": 1, "conj": 2}
+_HIP_INDEX = {torch.int32: 2, torch.int64: 3}
+_HIP_ORDER = {"col": 1, "row": 2}
+
+
+def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
+                                compute_dtype, backend, matrix):
+    """Explicit native baseline, with a device-local handle owned by this plan.
+
+    Unlike the historical q4 entry points, this path supports either vendor and
+    cleans up partially constructed plans. No input conversion is performed.
+    """
+    if backend not in ("cuda", "rocm"):
+        raise NotImplementedError(f"direct sparse C API is unavailable on {backend}")
+    hip = backend == "rocm"
+    if hip != bool(getattr(torch.version, "hip", None)) or rhs.device.type != "cuda":
+        raise NotImplementedError(f"{backend} baseline requires a matching CUDA/HIP device")
+    if fmt not in ("csr", "coo", "csc"):
+        raise ValueError(f"unsupported native baseline format: {fmt}")
+    prefix = "hipsparse" if hip else "cusparse"
+    names = ([ctypes.util.find_library("hipsparse"), "libhipsparse.so", "hipsparse.dll"]
+             if hip else [ctypes.util.find_library("cusparse"), "libcusparse.so.12", "libcusparse.so"])
+    library = None
+    errors = []
+    for name in filter(None, names):
+        try:
+            library = ctypes.CDLL(name)
+            break
+        except OSError as exc:
+            errors.append(str(exc))
+    if library is None:
+        raise NotImplementedError(f"{prefix} library unavailable: {'; '.join(errors)}")
+
+    def function(suffix, signature=None):
+        try:
+            fn = getattr(library, prefix + suffix)
+        except AttributeError as exc:
+            raise NotImplementedError(f"{prefix} lacks {prefix + suffix}") from exc
+        fn.argtypes = signature if signature is not None else _SIGNATURES["cusparse" + suffix]
+        fn.restype = _I
+        return fn
+
+    def check(status, operation):
+        if status == 10:  # HIPSPARSE/CUSPARSE_STATUS_NOT_SUPPORTED
+            raise NotImplementedError(f"{prefix}{operation}: native combination not supported (status 10)")
+        if status:
+            raise RuntimeError(f"{prefix}{operation} failed (status {status}, {fmt}, "
+                               f"{arrays[0].dtype}/{rhs.dtype}/{out.dtype}, {op_a}/{op_b})")
+
+    types = _HIP_TYPES if hip else _CUDA_TYPES
+    operations = _HIP_OP if hip else _OP
+    index_types = _HIP_INDEX if hip else {torch.int32: _INDEX_32I, torch.int64: _INDEX_64I}
+    orders = _HIP_ORDER if hip else {"col": _ORDER_COL, "row": _ORDER_ROW}
+    if any(t.device != rhs.device for t in (*arrays, out)):
+        raise ValueError("native baseline arrays and output must be on the RHS device")
+    if any(t.ndim != 1 or not t.is_contiguous() for t in arrays):
+        raise ValueError("native sparse descriptors require contiguous one-dimensional arrays")
+    if any(t.dtype not in types for t in (arrays[0], rhs, out)) or compute_dtype not in types:
+        raise NotImplementedError(f"{prefix}: unsupported descriptor dtype")
+    destroy = []
+
+    def create(suffix, destroy_suffix, *args):
+        handle = _P()
+        # Resolve destruction first so missing symbols cannot leak a descriptor.
+        release = function(destroy_suffix, [_P])
+        check(function(suffix)(ctypes.byref(handle), *args), suffix)
+        destroy.append((release, handle))
+        return handle
+
+    def dense(t):
+        if not matrix:
+            if t.ndim != 1 or t.stride(0) != 1:
+                raise ValueError("native DnVec requires a contiguous vector")
+            return create("CreateDnVec", "DestroyDnVec", t.numel(), _P(t.data_ptr()), types[t.dtype])
+        if t.stride(1) == 1:
+            order, ld = orders["row"], max(1, t.stride(0))
+        elif t.stride(0) == 1:
+            order, ld = orders["col"], max(1, t.stride(1))
+        else:
+            raise ValueError("native DnMat requires row/column-major storage")
+        return create("CreateDnMat", "DestroyDnMat", *t.shape, ld, _P(t.data_ptr()), types[t.dtype], order)
+
+    try:
+        with torch.cuda.device(rhs.device):
+            handle = create("Create", "Destroy")
+            set_stream = function("SetStream")
+            check(set_stream(handle, _P(torch.cuda.current_stream(rhs.device).cuda_stream)), "SetStream")
+            version = _I()
+            check(function("GetVersion", [_P, ctypes.POINTER(_I)])(handle, ctypes.byref(version)), "GetVersion")
+            values, first, second = arrays
+            if first.dtype not in index_types or second.dtype not in index_types:
+                raise ValueError("native sparse baseline requires int32/int64 indices")
+            if fmt == "coo":
+                if first.dtype != second.dtype:
+                    raise NotImplementedError("native COO descriptor requires equal index dtypes")
+                sparse = create("CreateCoo", "DestroySpMat", *shape, values.numel(),
+                                _P(first.data_ptr()), _P(second.data_ptr()), _P(values.data_ptr()),
+                                index_types[first.dtype], 0, types[values.dtype])
+            else:
+                sparse = create("Create" + fmt.capitalize(), "DestroySpMat", *shape, values.numel(),
+                                _P(second.data_ptr()), _P(first.data_ptr()), _P(values.data_ptr()),
+                                index_types[second.dtype], index_types[first.dtype], 0, types[values.dtype])
+            rhs_d, out_d = dense(rhs), dense(out)
+            one, zero = _scalar(1, compute_dtype), _scalar(0, compute_dtype)
+            operation = "SpMM" if matrix else "SpMV"
+            arguments = (handle, operations[op_a])
+            if matrix:
+                arguments += (operations[op_b],)
+            arguments += (ctypes.byref(one), sparse, rhs_d, ctypes.byref(zero), out_d, types[compute_dtype], 0)
+            size = ctypes.c_size_t()
+            execute = function(operation)
+            check(function(operation + "_bufferSize")(*arguments, ctypes.byref(size)), operation + "_bufferSize")
+            workspace = torch.empty(max(1, size.value), dtype=torch.uint8, device=rhs.device)
+            preprocessed = False
+            if hip and matrix and hasattr(library, "hipsparseSpMM_preprocess"):
+                preprocess = function("SpMM_preprocess", _SIGNATURES["cusparseSpMM"])
+                check(preprocess(*arguments, _P(workspace.data_ptr())), "SpMM_preprocess")
+                preprocessed = True
+
+        def run():
+            with torch.cuda.device(rhs.device):
+                check(set_stream(handle, _P(torch.cuda.current_stream(rhs.device).cuda_stream)), "SetStream")
+                check(execute(*arguments, _P(workspace.data_ptr())), operation)
+            return out
+
+        plan = _Plan(run, (library, arrays, rhs, out, one, zero, workspace), list(reversed(destroy)))
+        plan.metadata = dict(vendor_backend=prefix, vendor_version=version.value,
+                             vendor_alg="default", vendor_preprocessed=preprocessed,
+                             compute_dtype=str(compute_dtype))
+        return plan
+    except BaseException:
+        for release, descriptor in reversed(destroy):
+            release(descriptor)
+        raise
+
+
+def prepare_spmv(fmt, arrays, shape, x, y, op, compute_dtype, *, backend=None):
     """y = op(A) @ x; x / y dtypes may differ from A's (mixed precision)."""
+    if backend is not None:
+        return _prepare_registered_generic(fmt, arrays, shape, x, y, op, "non", compute_dtype, backend, False)
     lib, handle = _lib(), _handle()
     values = arrays[0]
     m = _spmat(fmt, arrays, shape, values.dtype)
@@ -367,8 +539,10 @@ def prepare_spmv(fmt, arrays, shape, x, y, op, compute_dtype):
     return _Plan(run, (arrays, x, y, work, one, zero), destroy)
 
 
-def prepare_spmm(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype):
+def prepare_spmm(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, *, backend=None):
     """C = op(A) @ op(B); B / C may be row- or column-major views."""
+    if backend is not None:
+        return _prepare_registered_generic(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, backend, True)
     lib, handle = _lib(), _handle()
     values = arrays[0]
     m = _spmat(fmt, arrays, shape, values.dtype)

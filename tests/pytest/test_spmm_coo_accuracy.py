@@ -276,44 +276,52 @@ def test_spmm_coo_migrated_routes(alg, op, dtype, index_dtype, layout):
 
 @pytest.mark.spmm_coo
 @pytest.mark.parametrize("blocks,reduce", [(1, "segment"), (2, "segment"), (4, "segment"), (8, "segment"), (2, "none")])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64])
+@pytest.mark.parametrize("dtype,output_dtype", [(torch.float32, torch.float32), (torch.complex64, torch.complex64), (torch.float16, torch.float16), (torch.float16, torch.float32), (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32)])
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize("n", [1, 7])
-def test_spmm_coo_stream_carry_boundaries(blocks, reduce, dtype, op, n):
-    import importlib
-
-    module = importlib.import_module("flagsparse.sparse_operations.spmm_coo")
-    device = accelerator_device()
-    count = 521
-    # A long adjacent run crosses both block and program boundaries; remaining
-    # coordinates revisit the same output non-contiguously, including a tail.
-    rows = torch.cat((torch.zeros(401, dtype=torch.int64), torch.arange(120) % 5))
-    cols = torch.arange(count) % 7
-    data = (torch.arange(count, dtype=torch.float64) % 9 - 4) / 16
-    if dtype.is_complex:
-        data = torch.complex(data, data.flip(0) / 2)
-    data = data.to(dtype)
-    shape = (5, 7)
-    golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
-    matrix = torch.zeros(shape, dtype=golden_dtype)
-    matrix.index_put_((rows, cols), data.to(golden_dtype), accumulate=True)
-    matrix = matrix if op == "non" else matrix.T.conj() if op == "conj" else matrix.T
-    operand = torch.ones((matrix.shape[1], n), dtype=golden_dtype)
-    operand = operand.to(dtype)
-    expected = (matrix @ operand.to(golden_dtype)).to(dtype)
-    cfg = dict(block_nnz=32, blocks_per_program=blocks, local_reduce=reduce)
+def test_spmm_coo_stream_carry_boundaries(blocks, reduce, dtype, output_dtype, op, n):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     try:
+        import importlib
+
+        module = importlib.import_module("flagsparse.sparse_operations.spmm_coo")
+        device = accelerator_device()
+        count = 521
+        # A long adjacent run crosses both block and program boundaries; remaining
+        # coordinates revisit the same output non-contiguously, including a tail.
+        rows = torch.cat((torch.zeros(401, dtype=torch.int64), torch.arange(120) % 5))
+        cols = torch.arange(count) % 7
+        data = (torch.arange(count, dtype=torch.float64) % 9 - 4) / 16
+        if dtype.is_complex:
+            data = torch.complex(data, data.flip(0) / 2)
+        data = data.to(dtype)
+        shape = (5, 7)
+        golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
+        matrix = torch.zeros(shape, dtype=golden_dtype)
+        matrix.index_put_((rows, cols), data.to(golden_dtype), accumulate=True)
+        matrix = matrix if op == "non" else matrix.T.conj() if op == "conj" else matrix.T
+        operand = torch.ones((matrix.shape[1], n), dtype=golden_dtype)
+        operand = operand.to(dtype)
+        expected = (matrix @ operand.to(golden_dtype)).to(output_dtype)
+        cfg = dict(block_nnz=32, blocks_per_program=blocks, local_reduce=reduce)
+        from flagsparse.sparse_operations._common import _backend_name
+        if 'coo_segmented_stream_panel_atomic' not in module.list_spmm_coo_algorithms(
+            op=op, dtype=dtype, rhs_dtype=dtype, out_dtype=output_dtype, backend=_backend_name()
+        ):
+            pytest.skip("algorithm does not declare this type/op/backend combination")
         for mode in ("materialize", "load"):
             cfg["conversion_mode"] = mode
             prepared = module.prepare_spmm_coo_route(data.to(device), rows.to(device), cols.to(device), shape,
                 op=op, alg="coo_segmented_stream_panel_atomic", config=cfg)
-            actual, meta = module.flagsparse_spmm_coo_run(prepared, operand.to(device), return_meta=True, timing=True)
-            rtol, atol = close_tolerances(dtype)
+            actual, meta = module.flagsparse_spmm_coo_run(prepared, operand.to(device), out_dtype=output_dtype, return_meta=True, timing=True)
+            rtol, atol = close_tolerances(output_dtype)
             torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
             assert meta["operator_ms"] == meta["gpu_ms"]
             assert meta["conversion_mode"] == mode
-            assert meta["compute_dtype"] == str(torch.complex128 if dtype.is_complex else torch.float64)
-    except NotImplementedError as exc:
+            expected_compute = (torch.float32 if dtype in (torch.float16, torch.bfloat16)
+                                else torch.complex128 if dtype.is_complex else torch.float64)
+            assert meta["compute_dtype"] == str(expected_compute)
+    except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
 
 
@@ -340,3 +348,94 @@ def test_spmm_coo_migrated_empty(alg, op, shape):
         pytest.skip(str(exc))
     assert result is out
     assert torch.equal(result.cpu(), torch.zeros_like(result.cpu()))
+
+
+from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
+
+
+@pytest.mark.parametrize("index_pair", [(torch.int32, torch.int64)] if _MIXED_QUICK_MODE else [
+    (torch.int32, torch.int32), (torch.int32, torch.int64),
+    (torch.int64, torch.int32), (torch.int64, torch.int64),
+], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
+@pytest.mark.spmm_coo
+@pytest.mark.parametrize("alg,op", [
+    ('coo_segmented_panel_atomic', 'non'),
+    ('coo_segmented_panel_atomic', 'trans'),
+    ('coo_segmented_panel_atomic', 'conj'),
+    ('coo_rowrun_panel', 'non'),
+    ('coo_rowrun_panel', 'trans'),
+    ('coo_rowrun_panel', 'conj'),
+    ('coo_segmented_stream_panel_atomic', 'non'),
+    ('coo_segmented_stream_panel_atomic', 'trans'),
+    ('coo_segmented_stream_panel_atomic', 'conj'),
+    ('coo_rowrun', 'non'),
+    ('coo_rowrun', 'trans'),
+    ('coo_rowrun', 'conj'),
+    ('coo_atomic', 'non'),
+    ('coo_atomic', 'trans'),
+    ('coo_atomic', 'conj'),
+    ('spmm_coo_alg1', 'non'),
+    ('spmm_coo_alg1', 'trans'),
+    ('spmm_coo_alg1', 'conj'),
+])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["f16", "bf16"])
+@pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
+@pytest.mark.parametrize("op_b", ["non", "trans", "conj"])
+@pytest.mark.parametrize("layout", ["row", "col"])
+def test_spmm_coo_registered_half_combinations(alg, op, dtype, wide, op_b, layout, index_pair):
+    """Exercise the selected kernel, including a result not exactly representable in half."""
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    try:
+        import importlib
+
+        module = importlib.import_module("flagsparse.sparse_operations.spmm_coo")
+        device = accelerator_device()
+        values = torch.tensor([1, 0.00390625, -0.125, 0.5], dtype=dtype, device=device)
+        first = torch.tensor([0, 0, 0, 2], dtype=index_pair[0], device=device)
+        second = torch.tensor([0, 0, 1, 2], dtype=index_pair[1], device=device)
+        matrix = torch.zeros((3, 4), dtype=torch.float64)
+        matrix.index_put_(
+            (torch.tensor([0, 0, 0, 2]), torch.tensor([0, 0, 1, 2])),
+            values.cpu().double(), accumulate=True,
+        )
+        n = 7 if _MIXED_QUICK_MODE else 33
+        inner = 4 if op == "non" else 3
+        effective = torch.full((inner, n), 1.0078125, dtype=dtype, device=device)
+        if layout == "col":
+            effective = effective.T.contiguous().T
+        operand = effective if op_b == "non" else effective.T
+        extra = {"op_b": op_b, "dense_layout": layout}
+        output_dtype = torch.float32 if wide else dtype
+        expected = ((matrix if op == "non" else matrix.T) @ effective.cpu().double()).to(output_dtype)
+        backing = torch.full((*expected.shape[:-1], expected.shape[-1] * 2),
+                             float("nan"), dtype=output_dtype, device=device)
+        out = backing[..., ::2]
+        originals = [tensor.clone() for tensor in (values, first, second, operand)]
+        from flagsparse.sparse_operations._common import _backend_name
+        if alg not in module.list_spmm_coo_algorithms(
+            op=op, dtype=dtype, rhs_dtype=dtype, out_dtype=output_dtype, backend=_backend_name()
+        ):
+            pytest.skip("algorithm does not declare this type/op/backend combination")
+        prepared = module.prepare_spmm_coo_route(values, first, second, (3, 4), op=op, alg=alg)
+        result = module.flagsparse_spmm_coo_run(
+            prepared, operand, out=out, out_dtype=output_dtype, **extra
+        )
+        assert result is out
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+        direct = module.flagsparse_spmm_coo(
+            values, first, second, operand, (3, 4), alg=alg, op=op,
+            out_dtype=output_dtype, **extra,
+        )
+        torch.testing.assert_close(direct, result, rtol=rtol, atol=atol)
+        for actual, original in zip((values, first, second, operand), originals):
+            torch.testing.assert_close(actual, original, rtol=0, atol=0)
+        conflicting = dtype if wide else torch.float32
+        with pytest.raises(ValueError, match="conflicts"):
+            module.flagsparse_spmm_coo_run(
+                prepared, operand, out=out, out_dtype=conflicting, **extra
+            )
+        with pytest.raises(ValueError, match="overlap"):
+            module.flagsparse_spmm_coo_run(prepared, operand, out=values, op_b=op_b)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
