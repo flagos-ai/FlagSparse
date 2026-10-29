@@ -1056,7 +1056,9 @@ def _csc_product(A, B, pos, dense_pos, mask, COMPLEX: tl.constexpr, FP64: tl.con
         if CONJ:
             ai = -ai
         return ar * br - ai * bi, ar * bi + ai * br
-    return tl.load(A + pos, mask, 0).to(dtype) * tl.load(B + dense_pos, mask, 0).to(dtype), tl.full(pos.shape, 0, dtype)
+    else:
+        product = tl.load(A + pos, mask, 0).to(dtype) * tl.load(B + dense_pos, mask, 0).to(dtype)
+        return product, tl.full(product.shape, 0, dtype)
 
 
 @triton.jit

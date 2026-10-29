@@ -221,7 +221,7 @@ def test_spmv_csc_int64_auto_fallback_to_int32(monkeypatch):
     def fail_int64_once(prepared, x_in, op_code):
         if prepared.kernel_indices.dtype == torch.int64 and not state["forced_once"]:
             state["forced_once"] = True
-            raise RuntimeError("forced int64 launch failure")
+            raise RuntimeError("unsupported int64 kernel indices (injected)")
         return original(prepared, x_in, op_code)
 
     monkeypatch.setattr(spmv_csc_mod, "_triton_spmv_csc_kernel", fail_int64_once)

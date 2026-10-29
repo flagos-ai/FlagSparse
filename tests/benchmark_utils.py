@@ -50,6 +50,7 @@ def add_type_combo_arguments(parser, *, spmm=False):
         ("--config", dict(default=None)),
         ("--fail-fast", dict(action="store_true")),
         ("--synthetic", dict(action="store_true")),
+        ("--vendor-timeout", dict(type=float, default=180.0)),
     ):
         if option not in parser._option_string_actions:
             parser.add_argument(option, **kwargs)
@@ -142,8 +143,8 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
         indices = selection(option("index_dtypes", "index_dtype", default="int32"), ("int32", "int64"))
         pointers = selection(args.indptr_dtypes, ("int32", "int64")) if args.indptr_dtypes else None
         ns = tuple(int(n) for n in str(getattr(args, "dense_cols", 1)).split(","))
-        if any(n < 0 for n in ns) or args.warmup < 0 or args.iters < 1:
-            raise ValueError("require N >= 0, warmup >= 0 and iters >= 1")
+        if any(n < 0 for n in ns) or args.warmup < 0 or args.iters < 1 or args.vendor_timeout <= 0:
+            raise ValueError("require N >= 0, warmup >= 0, iters >= 1 and vendor-timeout > 0")
         config = json.loads(args.config) if isinstance(args.config, str) else args.config
         requested = getattr(args, "alg", None) or "auto"
         if config is not None and (requested in ("auto", "compare", "all") or "," in requested):
@@ -171,7 +172,8 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
               "alg", "alg_requested", "alg_resolved", "backend", "m", "n", "nnz", "status", "reason", "max_error",
               "ms", "gpu_ms", "process_cpu_ms", "process_gpu_ms", "compute_ms",
               "vendor_ms", "vendor_backend", "vendor_version", "vendor_alg", "vendor_preprocessed", "vendor_status",
-              "vendor_reason", "vendor_max_error", "speedup_vs_vendor", "metadata", "timed", "sample_rule"]
+              "vendor_reason", "vendor_max_error", "vendor_exit_code", "vendor_stdout", "vendor_stderr",
+              "vendor_output_nonfinite", "source_nonfinite", "source_max_abs", "input_nonfinite", "rhs_nonfinite", "reference_nonfinite", "output_nonfinite", "speedup_vs_vendor", "metadata", "timed", "sample_rule"]
     stream = open(csv_path, "w", newline="", encoding="utf-8") if csv_path else None
     writer = csv.DictWriter(stream, fields, extrasaction="ignore") if stream else None
     if writer:
@@ -181,6 +183,8 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     print("ms=process_cpu_ms+gpu_ms; median +/-10% mean; phase diagnostics measured separately.")
     print(f"{'Matrix':24} {'A/RHS/Out':23} {'A/B':9} {'Lay/N':9} {'Algorithm':32} {'ms':>9} {'CPU':>8} {'ProcGPU':>8} {'Compute':>8} {'Vendor':>9} {'V/Alg':>8} Status")
     reported_vendor_reasons = set()
+    vendor_log_dir = Path(str(csv_path) + ".vendor_logs") if csv_path else Path("vendor_logs") / operator
+    vendor_case = 0
 
     def emit(row):
         if writer:
@@ -200,11 +204,18 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
         reason = row.get("vendor_reason")
         if reason and reason not in reported_vendor_reasons:
             print(f"Vendor {row.get('vendor_status', 'SKIP')}: {reason}")
+            if row.get("vendor_status") == "ERROR" and row.get("vendor_stderr"):
+                print(f"Vendor log: {row['vendor_stderr']}")
+                log = Path(row["vendor_stderr"])
+                if log.exists():
+                    print(log.read_text(encoding="utf-8", errors="replace")[-8000:])
             reported_vendor_reasons.add(reason)
 
     def accuracy(result, golden, dtype):
         actual = result.detach().cpu()
         reference = torch.as_tensor(golden).to(dtype)
+        if not bool(torch.isfinite(actual).all() and torch.isfinite(reference).all()):
+            return "FAIL", None
         error = float((actual.double() - reference.double()).abs().max()) if actual.numel() else 0.0
         rtol, atol = close_tolerances(dtype)
         return ("PASS" if torch.allclose(actual, reference, rtol=rtol, atol=atol) else "FAIL"), error
@@ -222,7 +233,10 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                 second = torch.tensor(host.col if fmt == "coo" else host.indptr, dtype=torch.int64)
                 shape = host.shape
             else:
-                a, first, second, shape = getattr(mtx_fast, "load_" + fmt)(source, dtype=dtype, device="cpu")
+                a, first, second, shape = getattr(mtx_fast, "load_" + fmt)(source, dtype=torch.float64, device="cpu")
+            source_nonfinite = int((~torch.isfinite(a)).sum())
+            source_max_abs = float(a.abs().max()) if a.numel() else 0.0
+            a = a.to(dtype)
             import scipy.sparse as sparse
             values = a.double().numpy()
             host = (sparse.coo_matrix((values, (first.numpy(), second.numpy())), shape=shape)
@@ -248,13 +262,24 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                 for index, ptr in ((i, p) for i in indices for p in (pointers or (i,))):
                     arrays = (a.to(device), first.to(device=device, dtype=getattr(torch, index)),
                               second.to(device=device, dtype=getattr(torch, ptr)))
+                    vendor_results = {}
+                    vendor_case += 1
                     for alg in selected:
                         row = dict(matrix=str(source or "synthetic"), dtype=combo[0], type_combo=":".join(combo), a_dtype=combo[0],
                                    rhs_dtype=combo[1], compute_dtype="float32", output_dtype=combo[2], op=op,
                                    op_a=op, op_b=op_b, layout=layout, dense_cols=ncols, index_dtype=index,
                                    indptr_dtype=ptr, alg=alg, alg_requested=alg, backend=backend, m=shape[0], n=shape[1], nnz=a.numel(),
-                                   timed="prepared_run", sample_rule="median +/-10% mean", status="ERROR")
+                                   timed="prepared_run", sample_rule="median +/-10% mean", status="ERROR",
+                                   source_nonfinite=source_nonfinite, source_max_abs=source_max_abs)
                         try:
+                            if operator == "spmv_csr" and alg != "auto":
+                                spec = module.get_spmv_csr_algorithm_spec(alg)
+                                if index not in spec["index_dtypes"]:
+                                    if requested in ("all", "compare"):
+                                        row.update(status="SKIP", reason=f"{alg} requires column indices in {spec['index_dtypes']}")
+                                        emit(row)
+                                        continue
+                                    raise ValueError(f"{alg} does not support column indices {index}")
                             prepared = prepare(*arrays, shape, op=op, alg=alg, config=config)
                             kwargs = dict(out_dtype=output_dtype, return_time=True, return_meta=True)
                             if matrix:
@@ -273,6 +298,12 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                             row.update(gpu_ms=filtered_avg_ms(gpu), process_cpu_ms=filtered_avg_ms(cpu))
                             row["ms"] = row["gpu_ms"] + row["process_cpu_ms"]
                             row["status"], row["max_error"] = accuracy(result, golden, output_dtype)
+                            row.update(input_nonfinite=int((~torch.isfinite(a)).sum()),
+                                       rhs_nonfinite=int((~torch.isfinite(effective)).sum()),
+                                       reference_nonfinite=int((~torch.isfinite(torch.as_tensor(golden).to(output_dtype))).sum()),
+                                       output_nonfinite=int((~torch.isfinite(result)).sum()))
+                            if any(row[key] for key in ("input_nonfinite", "rhs_nonfinite", "reference_nonfinite", "output_nonfinite")):
+                                row.update(status="FAIL", reason="non-finite input/reference/output; see finite-count columns")
                             if args.timing:
                                 _, _, diagnostics = run(prepared, rhs, timing=True, **kwargs)
                                 row.update({key: diagnostics.get(key) for key in ("process_gpu_ms", "compute_ms")})
@@ -281,28 +312,34 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                             row["vendor_status"] = "SKIP"
                             row["vendor_reason"] = "disabled"
                             if not (getattr(args, "no_vendor", False) or getattr(args, "no_cusparse", False)):
-                                plan = None
-                                try:
-                                    target = torch.empty_like(result)
-                                    plan = (vendor.prepare_spmm(fmt, arrays, shape, rhs, target, op, op_b, torch.float32, backend=backend)
-                                            if matrix else vendor.prepare_spmv(fmt, arrays, shape, rhs, target, op, torch.float32, backend=backend))
-                                    from tests.utils import cuda_event_benchmark_filtered
-                                    plan.run()
-                                    actual, vendor_ms = cuda_event_benchmark_filtered(plan.run, args.warmup, args.iters)
-                                    row.update({key: value for key, value in plan.metadata.items() if key.startswith("vendor_")},
-                                               vendor_ms=vendor_ms, vendor_reason="")
-                                    row["vendor_status"], row["vendor_max_error"] = accuracy(actual, golden, output_dtype)
-                                    row["speedup_vs_vendor"] = vendor_ms / row["ms"] if row["ms"] > 0 else None
-                                except NotImplementedError as exc:
-                                    row["vendor_reason"] = str(exc)
-                                except Exception as exc:
-                                    row.update(vendor_status="ERROR", vendor_reason=str(exc))
-                                    traceback.print_exc()
+                                vendor_log_dir.mkdir(parents=True, exist_ok=True)
+                                checkpoint = vendor_log_dir / f"case_{vendor_case:06d}_{alg}.flagsparse.json"
+                                checkpoint.write_text(json.dumps(dict(row, vendor_status="PENDING", vendor_reason="worker not completed"), default=str), encoding="utf-8")
+                                # Reuse this condition's measured baseline across algorithms,
+                                # never a prepared plan or device allocation across processes.
+                                output_stride = tuple(result.stride())
+                                vendor_result = vendor_results.get(output_stride)
+                                if vendor_result is None:
+                                    rtol, atol = close_tolerances(output_dtype)
+                                    payload = dict(fmt=fmt, arrays=tuple(t.detach().cpu() for t in arrays),
+                                                   shape=shape, rhs=rhs.detach().cpu(),
+                                                   output_shape=tuple(result.shape), output_stride=output_stride, output_dtype=output_dtype,
+                                                   op_a=op, op_b=op_b, backend=backend, matrix=matrix,
+                                                   golden=torch.as_tensor(golden), rtol=rtol, atol=atol,
+                                                   warmup=args.warmup, iters=args.iters,
+                                                   device_index=rhs.device.index or 0)
+                                    vendor_result = vendor.benchmark_isolated(
+                                        payload, log_prefix=vendor_log_dir / f"case_{vendor_case:06d}_layout_{len(vendor_results)}",
+                                        timeout=args.vendor_timeout)
+                                    vendor_results[output_stride] = vendor_result
+                                row.update({key: value for key, value in vendor_result.items()
+                                            if key.startswith("vendor_")})
+                                if row.get("vendor_ms") is not None and row["ms"] > 0:
+                                    row["speedup_vs_vendor"] = row["vendor_ms"] / row["ms"]
+                                if row["vendor_status"] == "ERROR":
                                     if args.fail_fast:
-                                        raise
-                                finally:
-                                    if plan is not None:
-                                        plan.close()
+                                        emit(row)
+                                        raise SystemExit("vendor execution failed (--fail-fast)")
                         except BackendCapabilityUnavailable as exc:
                             row.update(status="SKIP", reason=str(exc))
                         except Exception as exc:

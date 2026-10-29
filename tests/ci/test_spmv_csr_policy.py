@@ -506,3 +506,16 @@ def test_migrated_policies_validate_capabilities_and_workspace():
         column.resolve_coo_config("coo_segmented_stream_atomic", "float32", caps, {"blocks_per_program": 3})
     with unittest.TestCase().assertRaises(ValueError):
         column.resolve_csc_config("csc_col_vector", "float32", 1, caps, {"num_warps": 3}, op="trans")
+
+
+def test_split_config_does_not_require_adaptive_threshold_order():
+    csr, _ = _extension_policies()
+    csr.set_known_backends(("rocm",))
+    caps = csr.BackendCaps("rocm", "hip", "gfx936", 64, 1024, (1, 2, 4, 8),
+                           True, True, True, True, True, True, True)
+    cfg, _ = csr.resolve_config("csr_split_nnz_reduce", "float16", 7, "row", caps,
+                                {"segment_nnz": 8, "reduce_block_size": 2, "workspace_bytes": 256})
+    assert cfg["segment_nnz"] == 8
+    with unittest.TestCase().assertRaises(ValueError):
+        csr.resolve_config("csr_adaptive_tile_split", "float16", 7, "row", caps,
+                           {"segment_nnz": 8})

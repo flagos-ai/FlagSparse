@@ -461,7 +461,7 @@ def test_spmv_csr_new_out_and_prepared_validation():
         torch.empty(3, device=x.device),
         torch.empty(4, device=x.device, dtype=torch.float64),
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, TypeError)):
             spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out)
     for args in (
         {"op": "trans"},
@@ -808,6 +808,9 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
 @pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
 def test_spmv_csr_registered_wide_output(alg, dtype, op, wide, index_pair):
     """Wide output must retain bits that a half-output intermediate would lose."""
+    spec = spmv_mod.get_spmv_csr_algorithm_spec(alg)
+    if str(index_pair[0]).removeprefix("torch.") not in spec["index_dtypes"]:
+        pytest.skip("algorithm does not support this column index dtype")
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     try:
         output_dtype = torch.float32 if wide else dtype

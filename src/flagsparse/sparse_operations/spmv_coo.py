@@ -480,8 +480,9 @@ def _spmv_coo_atomic_f64(
 
 @triton.jit
 def _spmv_coo_run_add(row_a, val_a, row_b, val_b):
-    same = row_a == row_b
-    return row_b, val_b + tl.where(same, val_a, 0.0)
+    # The flags represent segment starts, not row IDs. Propagating a start
+    # makes this operation associative even for unsorted runs such as 0,1,0.
+    return row_a | row_b, tl.where(row_b, val_b, val_a + val_b)
 
 
 @triton.jit
@@ -508,8 +509,10 @@ def _spmv_coo_atomic_runs_real(
     col = tl.load(col_ptr + offs, valid, 0)
     value = tl.load(data_ptr + offs, valid, 0.0).to(ACC)
     vector = tl.load(x_ptr + col, valid, 0.0).to(ACC)
+    previous = tl.load(row_ptr + offs - 1, valid & (lane > 0), -1)
+    head = (lane == 0) | (row != previous) | ~valid
     _, run_sum = tl.associative_scan(
-        (row, value * vector), axis=0, combine_fn=_spmv_coo_run_add
+        (head, value * vector), axis=0, combine_fn=_spmv_coo_run_add
     )
     next_row = tl.load(row_ptr + offs + 1, valid & (offs + 1 < nnz), -1)
     boundary = valid & ((row != next_row) | (lane == BLOCK - 1))

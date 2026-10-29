@@ -464,3 +464,48 @@ runner 原默认交付汇总仍按默认交付投影，不代表显式扫描的�
 尤其检查 BF16、直接厂商接口、宽输出抵消样本、stream 和分层归约。
 保留既有容差和 FAIL 记录，不承诺所有厂商版本支持全部组合。
 INT8、异类型输入、TLE、其他格式及性能消融仍属于后续阶段。
+
+### 实测问题修复与逐算子确认（2026-10-29）
+
+2026-10-27 的 quick/normal 性能结果只覆盖首个矩阵，不能作为全矩阵性能验收。
+本次修复不改变默认算法、容差、prepare 边界或低精度计算策略：
+
+- 显式类型组合 baseline 在现有 Generic helper 的独立子进程运行，传输 CPU 数据，
+  不共享 GPU 指针。进程启动、数据传输及描述符准备不计入事件耗时。
+  相同矩阵/类型/op/布局/索引/输出 stride 的厂商结果在算法间复用；不复用执行计划。
+- 记录厂商退出码、超时及独立 stdout/stderr。`--vendor-timeout` 默认 180 秒。
+  普通失败、原生 abort 或段错误作为 vendor ERROR 返回，默认继续算法扫描；
+  `--fail-fast` 仍明确终止。库/组合不支持仍为 SKIP，不伪造厂商成绩。
+- CSV 旁的 `.vendor_logs/` 保存 worker 日志和调用厂商前的 FlagSparse JSON 快照。
+  快照标为 PENDING，不是额外的完成结果行；用于异常中断后的恢复和定位。
+- CSV 增加原值最大绝对值及原值、转换后输入、RHS、参考和输出的非有限值计数。
+  非有限结果保持 FAIL 和有效时间，不缩放矩阵、不扩大容差；误差不可定义时留空。
+- COO 实数 segmented scan 改用段首标志的结合式归约，避免无序重复行错误合并。
+  CSC 复数乘积 helper 使用互斥编译分支及一致返回形状。
+- CSR compare 根据声明过滤非法列索引组合；半精度 pytest 同步能力筛选。
+  独立 split 不再要求无关的 adaptive 阈值顺序，adaptive 仍检查此约束。
+  CSC fallback 测试注入明确索引不支持错误，保留普通运行错误不得回退的测试。
+
+进程隔离不保证能恢复驱动级设备重置；若设备整体失效，应停止该节点任务并恢复设备。
+本次只做 AST/diff 和源码审查，没有执行算子、pytest、功能导入或离线编译。
+厂商的具体类型支持及已出现的 VMFault 根因仍需在节点通过独立日志确认。
+
+先在计算节点只确认 SpMV CSR，使用有限值合成矩阵：
+
+```bash
+COMBOS='float16:float16:float16,float16:float16:float32,bfloat16:bfloat16:bfloat16,bfloat16:bfloat16:float32'
+python tests/test_spmv_csr.py --synthetic --alg compare \
+  --type-combos "$COMBOS" --ops non --index-dtypes int32 \
+  --warmup 1 --iters 3 --timing --csv-csr spmv_csr_mixed_check.csv
+```
+
+先检查每算法的 status、vendor_status/vendor_reason、非有限值计数与 worker 日志。
+厂商 SKIP/ERROR 不应把 FlagSparse PASS 改成 FAIL/ERROR。确认 non 后再改 `--ops all`，
+随后扩大合法索引范围和真实矩阵。准确性回归仍使用原 runner：
+
+```bash
+python run_flagsparse_pytest.py --ops spmv_csr --phase accuracy --mode quick \
+  --results-dir pytest_results_spmv_csr_mixed_check
+```
+
+通过后再依次确认其他五个算子，不立即重复完整六算子大扫描。

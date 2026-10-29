@@ -573,6 +573,100 @@ def prepare_spmm(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, *, backend
     return _Plan(run, (arrays, B, C, work, one, zero), destroy)
 
 
+def benchmark_isolated(payload, *, log_prefix, timeout=180):
+    """CPU-only request transport; native failures stay in a fresh process.
+
+    Startup, transfers and descriptor preparation are outside event timing.
+    The caller owns persistent stdout/stderr paths for each tested condition.
+    """
+    import json
+    from pathlib import Path
+    import subprocess
+    import sys
+    import tempfile
+
+    prefix = Path(log_prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    logs = dict(vendor_stdout=str(prefix) + ".stdout.log",
+                vendor_stderr=str(prefix) + ".stderr.log")
+    with tempfile.TemporaryDirectory(prefix="flagsparse_vendor_") as directory:
+        request, response = Path(directory) / "request.pt", Path(directory) / "response.json"
+        torch.save(payload, request)
+        command = [sys.executable, str(Path(__file__).resolve()),
+                   "--isolated-benchmark", str(request), str(response)]
+        try:
+            with open(logs["vendor_stdout"], "w", encoding="utf-8") as stdout, open(logs["vendor_stderr"], "w", encoding="utf-8") as stderr:
+                child = subprocess.run(command, stdout=stdout, stderr=stderr,
+                                       timeout=timeout, check=False)
+        except subprocess.TimeoutExpired:
+            return dict(logs, vendor_status="ERROR", vendor_exit_code="timeout",
+                        vendor_reason=f"vendor worker timed out after {timeout}s")
+        except OSError as exc:
+            return dict(logs, vendor_status="ERROR", vendor_exit_code="launch_error",
+                        vendor_reason=f"cannot start vendor worker: {exc}")
+        if child.returncode or not response.exists():
+            return dict(logs, vendor_status="ERROR", vendor_exit_code=child.returncode,
+                        vendor_reason=f"vendor worker exited {child.returncode}; no usable result; see worker logs")
+        try:
+            result = json.loads(response.read_text(encoding="utf-8"))
+            if result.get("vendor_status") not in ("PASS", "FAIL", "SKIP", "ERROR"):
+                raise ValueError("missing vendor status")
+        except (ValueError, OSError, AttributeError) as exc:
+            return dict(logs, vendor_status="ERROR", vendor_exit_code=child.returncode,
+                        vendor_reason=f"invalid vendor worker response: {exc}")
+        return dict(result, **logs, vendor_exit_code=child.returncode)
+
+
+def _isolated_benchmark_worker(request, response):
+    import json
+    from pathlib import Path
+    import traceback
+    from utils import cuda_event_benchmark_filtered
+
+    # Only load the private request written by the parent invocation.
+    payload = torch.load(request, map_location="cpu", weights_only=False)
+    plan = None
+    result = {}
+    try:
+        torch.cuda.set_device(payload["device_index"])
+        device = torch.device("cuda", payload["device_index"])
+        arrays = tuple(t.to(device) for t in payload["arrays"])
+        rhs = payload["rhs"].to(device)
+        out = torch.empty_strided(payload["output_shape"], payload["output_stride"],
+                                  dtype=payload["output_dtype"], device=device)
+        print(f"vendor prepare: {payload['fmt']} {arrays[0].dtype}/{rhs.dtype}/{out.dtype} "
+              f"{payload['op_a']}/{payload['op_b']} shape={payload['shape']} rhs_stride={rhs.stride()}", flush=True)
+        if payload["matrix"]:
+            plan = prepare_spmm(payload["fmt"], arrays, payload["shape"], rhs, out,
+                                payload["op_a"], payload["op_b"], torch.float32, backend=payload["backend"])
+        else:
+            plan = prepare_spmv(payload["fmt"], arrays, payload["shape"], rhs, out,
+                                payload["op_a"], torch.float32, backend=payload["backend"])
+        print(f"vendor first run: {plan.metadata}", flush=True)
+        plan.run()
+        torch.cuda.synchronize(device)
+        print("vendor timing", flush=True)
+        actual, elapsed = cuda_event_benchmark_filtered(plan.run, payload["warmup"], payload["iters"])
+        actual = actual.cpu()
+        golden = payload["golden"].to(payload["output_dtype"])
+        finite = bool(torch.isfinite(actual).all() and torch.isfinite(golden).all())
+        error = float((actual.double() - golden.double()).abs().max()) if actual.numel() and finite else (0.0 if not actual.numel() else None)
+        passed = finite and torch.allclose(actual, golden, rtol=payload["rtol"], atol=payload["atol"])
+        result = dict(plan.metadata, vendor_status="PASS" if passed else "FAIL",
+                      vendor_ms=elapsed, vendor_max_error=error,
+                      vendor_reason="" if finite else "non-finite output or reference",
+                      vendor_output_nonfinite=int((~torch.isfinite(actual)).sum()))
+    except NotImplementedError as exc:
+        result = dict(vendor_status="SKIP", vendor_reason=str(exc))
+    except Exception as exc:
+        traceback.print_exc()
+        result = dict(vendor_status="ERROR", vendor_reason=str(exc))
+    finally:
+        if plan is not None:
+            plan.close()
+    Path(response).write_text(json.dumps(result), encoding="utf-8")
+
+
 def prepare_sddmm(arrays, shape, A, B, out_values, op_a, op_b, compute_dtype):
     """out_values = op(A) @ op(B) sampled on the CSR pattern ``arrays`` (values unused)."""
     lib, handle = _lib(), _handle()
@@ -594,3 +688,10 @@ def prepare_sddmm(arrays, shape, A, B, out_values, op_a, op_b, compute_dtype):
 
     destroy = [(lib.cusparseDestroySpMat, m), (lib.cusparseDestroyDnMat, a_d), (lib.cusparseDestroyDnMat, b_d)]
     return _Plan(run, (pattern, A, B, work, one, zero), destroy)
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 4 or sys.argv[1] != "--isolated-benchmark":
+        raise SystemExit("internal usage: --isolated-benchmark REQUEST RESPONSE")
+    _isolated_benchmark_worker(sys.argv[2], sys.argv[3])

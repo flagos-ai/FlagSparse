@@ -115,7 +115,7 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
             try:
                 if set(profile) - set(cfg):
                     raise ValueError(f"profile has fields not used by {algorithm}: {sorted(set(profile) - set(cfg))}")
-                validate_config(candidate, caps)
+                validate_config(candidate, caps, algorithm=algorithm)
             except ValueError as exc:
                 rejections.append(str(exc))
             else:
@@ -127,12 +127,12 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
     cfg.update(supplied)
     if "segment_nnz" in supplied and "split_row_threshold" not in supplied:
         cfg["split_row_threshold"] = cfg["segment_nnz"] * (4 if n >= 128 else 2)
-    validate_config(cfg, caps)
+    validate_config(cfg, caps, algorithm=algorithm)
     return cfg, dict(config_source="explicit" if supplied else source,
                      config_rejections=rejections, backend_caps=asdict(caps))
 
 
-def validate_config(cfg, caps):
+def validate_config(cfg, caps, *, algorithm="csr_adaptive_tile_split"):
     fields = CONFIG_FIELDS | ({"panel_accumulators"} if "panel_accumulators" in cfg else set())
     if set(cfg) != fields:
         raise ValueError(f"invalid configuration fields: {sorted(set(cfg) ^ CONFIG_FIELDS)}")
@@ -152,7 +152,7 @@ def validate_config(cfg, caps):
         raise ValueError("initial CSR SpMM profiles support num_stages=1 only")
     if cfg.get("panel_accumulators", 2) not in (1, 2, 4):
         raise ValueError("panel_accumulators must be 1, 2 or 4")
-    if cfg["short_row_threshold"] >= cfg["split_row_threshold"]:
+    if algorithm == "csr_adaptive_tile_split" and cfg["short_row_threshold"] >= cfg["split_row_threshold"]:
         raise ValueError("short_row_threshold must be less than split_row_threshold")
     if cfg["workspace_bytes"] < 48:
         raise ValueError("workspace_bytes must hold at least three complex128 elements")

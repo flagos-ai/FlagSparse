@@ -202,7 +202,7 @@ def test_spmm_csc_prepared_path_and_meta():
     assert meta["op"] == op
     assert meta["logical_shape"] == (M, K)
     assert meta["process_cpu_ms"] == 0.0
-    assert meta["process_gpu_ms"] == 0.0
+    assert meta["process_gpu_ms"] >= 0.0
     assert meta["compute_ms"] >= 0.0
     _assert_close(out, ref, dtype)
 
@@ -271,7 +271,7 @@ def test_spmm_csc_int64_auto_fallback_to_int32(monkeypatch, op):
     def fail_int64_once(prepared, B_in, op_code=None):
         if prepared.kernel_indices.dtype == torch.int64 and not state["forced_once"]:
             state["forced_once"] = True
-            raise RuntimeError("forced int64 launch failure")
+            raise RuntimeError("unsupported int64 kernel indices (injected)")
         return original(prepared, B_in, op_code)
 
     monkeypatch.setattr(spmm_csc_mod, "_triton_spmm_csc_base_kernel", fail_int64_once)

@@ -487,3 +487,35 @@ def test_hipsparse_partial_descriptor_failure_releases_resources(monkeypatch):
         baseline.prepare_spmv("csr", (a, index, ptr), (1, 1), tensor(torch.float16),
                               tensor(torch.float32), "non", torch.float32, backend="rocm")
     assert released == ["hipsparseDestroySpMat", "hipsparseDestroy"]
+
+
+@pytest.mark.parametrize("outcome", ["abort", "timeout", "unsupported", "pass", "malformed"])
+def test_vendor_worker_result_isolation(monkeypatch, tmp_path, outcome):
+    import json
+    import subprocess
+    from pathlib import Path
+    from types import SimpleNamespace
+    from tests import cusparse_generic_baseline as baseline
+
+    def fake_run(command, **kwargs):
+        assert command[2] == "--isolated-benchmark"
+        assert kwargs["check"] is False
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        if outcome == "abort":
+            return SimpleNamespace(returncode=-6)
+        response = {"vendor_status": "SKIP", "vendor_reason": "not supported"}
+        if outcome == "pass":
+            response = {"vendor_status": "PASS", "vendor_ms": 0.25}
+        Path(command[4]).write_text("invalid json" if outcome == "malformed" else json.dumps(response))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = baseline.benchmark_isolated({}, log_prefix=tmp_path / "case")
+    expected = {"abort": "ERROR", "timeout": "ERROR", "malformed": "ERROR", "unsupported": "SKIP", "pass": "PASS"}
+    assert result["vendor_status"] == expected[outcome]
+    assert Path(result["vendor_stderr"]).exists()
+    if outcome == "abort":
+        assert result["vendor_exit_code"] == -6
+    if outcome != "pass":
+        assert "vendor_ms" not in result
