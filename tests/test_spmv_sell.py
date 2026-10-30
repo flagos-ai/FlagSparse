@@ -38,6 +38,7 @@ _REORDER``.
 import argparse
 import csv
 import glob
+import gc
 import os
 import sys
 from pathlib import Path
@@ -54,9 +55,11 @@ from benchmark_utils import accelerator_device  # noqa: E402
 from mtx_fast import read_scipy_csr  # noqa: E402
 
 import cusparse_generic_baseline as cusparse_baseline  # noqa: E402
+import ascend_sparse_baseline as cann_baseline
 import flagsparse as fs  # noqa: E402
 from flagsparse.sparse_operations._common import (  # noqa: E402
     _benchmark_cuda_op,
+    _is_ascend_runtime,
     _is_rocm_runtime,
 )
 from flagsparse.sparse_operations._spmv_csr_benchmark import (  # noqa: E402
@@ -94,6 +97,8 @@ FIELDS = [
     "slice_size",
     "sell_values",
     "timed",
+    "execution_path",
+    "implementation",
     "layout",
     "sell_sigma",
     "sell_c",
@@ -117,7 +122,8 @@ FIELDS = [
     "pytorch_reason",
     "status",
     "error",
-]
+# Only where they get filled -- see the same note in tests/test_spmm_csc.py.
+] + (cann_baseline.PERF_FIELDS if _is_ascend_runtime() else [])
 
 
 def _name(dtype):
@@ -218,6 +224,8 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
     prepared_route = os.environ.get("FLAGSPARSE_SELL_PREPARED", "").strip().lower()
     if prepared_route in ("1", "true", "yes"):
         prepared_route = "auto"
+    if _is_ascend_runtime() and prepared_route in ("", "0"):
+        prepared_route = "auto"
     row["timed"] = "prepared" if prepared_route not in ("", "0") else "call"
 
     if row["timed"] == "prepared":
@@ -249,6 +257,18 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
                 values, sell_cols, offsets, x, out, m, slice_size
             )
         ours = _rocm_graph_replay(ours, out)
+    elif _is_ascend_runtime():
+        prepared = fs.prepare_spmv_sell(
+            values,
+            sell_cols,
+            offsets,
+            (m, k),
+            slice_size=slice_size,
+            out_dtype=out_arg,
+        )
+
+        def ours():
+            return fs.flagsparse_spmv_sell(prepared=prepared, x=x, out=out)
     else:
         def ours():
             return fs.flagsparse_spmv_sell(
@@ -263,6 +283,29 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
         )
     row["triton_max_error"] = _error(first, ref)
     _, row["triton_ms"] = _benchmark_cuda_op(ours, warmup, iters)
+    if _is_ascend_runtime():
+        row.update(plan.ascend_meta if row["timed"] == "prepared" else prepared.ascend_meta)
+        cann_baseline.mark_row(row)
+        native_plan = None
+        try:
+            native_out = torch.empty(m, dtype=odt, device=dev)
+            native_plan = cann_baseline.prepare_spmv("csr", (data, cols_d, ptr_d), (m, k), x, native_out)
+            native_plan.run()
+            error = _error(native_out, ref)
+            if not _passes(odt, error):
+                raise ValueError(f"CANN result failed CPU golden validation: {error}")
+            _, elapsed_ms = _benchmark_cuda_op(native_plan.run, warmup, iters)
+            native_plan.run()
+            post_error = _error(native_out, ref)
+            if not _passes(odt, post_error):
+                raise ValueError(f"CANN result failed post-timing CPU golden validation: {post_error}")
+            error = max(error, post_error)
+            cann_baseline.record_result(row, native_plan, elapsed_ms, error, row["triton_ms"])
+        except Exception as exc:
+            row.update(cann_status="FAIL", cann_reason=f"{type(exc).__name__}: {exc}")
+        finally:
+            if native_plan is not None:
+                native_plan.close()
 
     try:
         compute = torch.float32 if vdt in (torch.float16, torch.bfloat16, torch.int8) else vdt
@@ -340,9 +383,14 @@ def main(argv=None):
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             rows.append(row)
+            if _is_ascend_runtime():
+                torch._dynamo.reset()
+                gc.collect()
+                torch.npu.empty_cache()
             print(
                 f"  {row['value_dtype']:>9s}->{row['out_dtype']:<9s} {row['status']:5s} "
-                f"ours={row.get('triton_ms')} cusparse={row.get('cusparse_ms')} torch={row.get('pytorch_ms')}",
+                f"ours={row.get('triton_ms')} vendor={row.get('vendor_name', 'cuSPARSE')} "
+                f"vendor_ms={row.get('cann_ms', row.get('cusparse_ms'))} torch={row.get('pytorch_ms')}",
                 flush=True,
             )
     os.makedirs(os.path.dirname(os.path.abspath(args.csv)) or ".", exist_ok=True)

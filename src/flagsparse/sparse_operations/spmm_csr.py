@@ -15,18 +15,24 @@
 """CSR SpMM kernels, helpers, and benchmark entry points."""
 
 import ctypes
+import functools
+import inspect
 import math
+import warnings
 
 from . import _common as _common_mod
 from ._common import *
 from . import mixed_spmx as _mixed_spmx
+from ._ascend_fp64_spmm import prepare_fp64_spmm as _prepare_ascend_fp64_spmm
+from ._ascend_fp64_spmm import run_fp64_spmm as _run_ascend_fp64_spmm
+from ._ascend_fp64_spmm import run_fp64_spmm_once as _run_ascend_fp64_spmm_once
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
 
 
-def _ascend_csr_row_ids(indptr, n_rows):
+def _ascend_csr_row_ids(indptr, n_rows, *, cache=True):
     """Per-nonzero row index for the Ascend/XPU fallbacks (repeat_interleave, not Triton)."""
-    return _csr_row_ids_torch(indptr, n_rows)
+    return _csr_row_ids_torch(indptr, n_rows, cache=cache)
 
 
 HipPointer = _common_mod.HipPointer
@@ -783,6 +789,10 @@ class PreparedCsrSpmmRoute:
         "alg",
         "materialized_op",
         "materialized_route",
+        "ascend_row_ids",
+        "ascend_col_ids",
+        "ascend_runner",
+        "ascend_fp64_plan",
     )
 
     def __init__(
@@ -813,6 +823,18 @@ class PreparedCsrSpmmRoute:
         # Filled in by prepare_spmm_csr_route for trans/conj; see the note there.
         self.materialized_op = None
         self.materialized_route = None
+        self.ascend_fp64_plan = None
+        if _is_ascend_runtime():
+            self.ascend_row_ids = _ascend_csr_row_ids(self.kernel_indptr, self.n_rows, cache=False)
+            self.ascend_col_ids = self.kernel_indices.to(torch.int64).contiguous()
+            self.ascend_runner = None
+            self.ascend_fp64_plan = _prepare_ascend_fp64_spmm(
+                data, self.ascend_row_ids, self.ascend_col_ids, self.shape
+            )
+        else:
+            self.ascend_row_ids = None
+            self.ascend_col_ids = None
+            self.ascend_runner = None
 
 
 def _normalize_spmm_csr_alg(alg):
@@ -836,6 +858,44 @@ def _normalize_spmm_csr_alg(alg):
     if token == "auto":
         return "auto"
     return token
+
+
+@functools.lru_cache(maxsize=None)
+def _route_takes_out(run):
+    """Whether a route function accepts ``out=``.
+
+    Only the routes that can write through to a caller's buffer declare it, so
+    the ones that cannot are never handed an argument they would silently drop;
+    the public entry copies into ``out`` for those instead.
+    """
+    return "out" in inspect.signature(run).parameters
+
+
+def _validate_spmm_out(prepared, B, out, dense_layout):
+    """Check a caller-supplied SpMM output buffer before any route touches it.
+
+    Rejecting a mismatched buffer here keeps the failure at the public boundary:
+    a wrong dtype or shape handed to the Ascend native route would otherwise be
+    declined by its own guard, fall back to an internal allocation, and silently
+    return a different tensor than the caller asked to be filled.
+    """
+    if not torch.is_tensor(out):
+        raise TypeError("out must be a torch.Tensor")
+    expected = (int(prepared.n_rows), int(B.shape[1]))
+    if tuple(out.shape) != expected:
+        raise ValueError(f"out must have shape {expected}, got {tuple(out.shape)}")
+    # COO's prepared route names the result dtype explicitly (it supports mixed
+    # i8->i32 and f16->f32 outputs); CSR's result follows its values.
+    expected_dtype = getattr(prepared, "output_dtype", None) or prepared.data.dtype
+    if out.dtype != expected_dtype:
+        raise ValueError(f"out.dtype must be {expected_dtype}, got {out.dtype}")
+    if out.device != B.device:
+        raise ValueError("out must be on the same device as B")
+    if dense_layout == "col":
+        if out.stride(0) != 1:
+            raise ValueError("dense_layout='col' needs a column-major out")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous for dense_layout='row'")
 
 
 def _normalize_dense_layout(layout):
@@ -985,7 +1045,7 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
 
 
 def _run_spmm_csr_base_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", out=None
 ):
     return _run_spmm_csr_base_route_impl(
         prepared,
@@ -995,6 +1055,7 @@ def _run_spmm_csr_base_route(
         dense_layout=dense_layout,
         accuracy=False,
         route_name="csr_base",
+        out=out,
     )
 
 
@@ -1021,10 +1082,161 @@ def _run_spmm_csr_base_route_impl(
     dense_layout="row",
     accuracy=False,
     route_name="csr_base",
+    out=None,
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
-    B = _materialize_dense_layout(B, dense_layout)
+    if not _is_ascend_runtime():
+        B = _materialize_dense_layout(B, dense_layout)
+    if _is_ascend_runtime():
+        native = _run_ascend_fp64_spmm(
+            prepared, B, dense_layout, timing=timing, out=out
+        )
+        if native is not None:
+            return native
+        C_out = _empty_dense_layout(
+            (prepared.n_rows, int(B.shape[1])),
+            prepared.data.dtype,
+            prepared.data.device,
+            dense_layout,
+        )
+        if timing:
+            _ACCEL.synchronize()
+            t0 = time.perf_counter()
+        if _is_ascend_runtime() and prepared.ascend_runner is None:
+            ascend_data = prepared.data
+            ascend_row_ids = prepared.ascend_row_ids
+            ascend_col_ids = prepared.ascend_col_ids
+            ascend_n_rows = prepared.n_rows
+
+            def ascend_spmm(dense):
+                result = torch.zeros(
+                    ascend_n_rows,
+                    dense.shape[1],
+                    dtype=ascend_data.dtype,
+                    device=dense.device,
+                )
+                if ascend_data.is_complex():
+                    values = torch.view_as_real(ascend_data)
+                    dense_values = torch.view_as_real(dense).index_select(
+                        0, ascend_col_ids
+                    )
+                    products = torch.stack(
+                        (
+                            values[:, 0, None] * dense_values[..., 0]
+                            - values[:, 1, None] * dense_values[..., 1],
+                            values[:, 0, None] * dense_values[..., 1]
+                            + values[:, 1, None] * dense_values[..., 0],
+                        ),
+                        dim=-1,
+                    )
+                    result = torch.zeros(
+                        ascend_n_rows,
+                        dense.shape[1],
+                        2,
+                        dtype=dense_values.dtype,
+                        device=dense.device,
+                    )
+                    result = _ascend_index_add(
+                        result, 0, ascend_row_ids, products
+                    )
+                    return torch.view_as_complex(result)
+                else:
+                    products = ascend_data[:, None] * dense.index_select(
+                        0, ascend_col_ids
+                    )
+                    result = _ascend_index_add(
+                        result, 0, ascend_row_ids, products
+                    )
+                return result
+
+            try:
+                prepared.ascend_runner = _ascend_compile(
+                    ascend_spmm
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"CSR SpMM Ascend graph compile failed; using eager fallback: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                prepared.ascend_runner = False
+        if _is_ascend_runtime() and prepared.ascend_runner:
+            try:
+                C_out = _ascend_owned_output(prepared.ascend_runner(B))
+            except Exception as exc:
+                warnings.warn(
+                    f"CSR SpMM Ascend graph replay failed; using eager fallback: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                prepared.ascend_runner = False
+                C_out.zero_()
+                if prepared.data.is_complex():
+                    values = torch.view_as_real(prepared.data)
+                    dense_values = torch.view_as_real(B).index_select(
+                        0, prepared.ascend_col_ids
+                    )
+                    products = torch.stack(
+                        (
+                            values[:, 0, None] * dense_values[..., 0]
+                            - values[:, 1, None] * dense_values[..., 1],
+                            values[:, 0, None] * dense_values[..., 1]
+                            + values[:, 1, None] * dense_values[..., 0],
+                        ),
+                        dim=-1,
+                    )
+                    torch.view_as_real(C_out).index_add_(
+                        0, prepared.ascend_row_ids, products
+                    )
+                else:
+                    products = prepared.data[:, None] * B.index_select(
+                        0, prepared.ascend_col_ids
+                    )
+                    C_out = _ascend_index_add(
+                        C_out, 0, prepared.ascend_row_ids, products
+                    )
+        else:
+            C_out.zero_()
+            if prepared.data.is_complex():
+                values = torch.view_as_real(prepared.data)
+                dense_values = torch.view_as_real(B).index_select(
+                    0, prepared.ascend_col_ids
+                )
+                products = torch.stack(
+                    (
+                        values[:, 0, None] * dense_values[..., 0]
+                        - values[:, 1, None] * dense_values[..., 1],
+                        values[:, 0, None] * dense_values[..., 1]
+                        + values[:, 1, None] * dense_values[..., 0],
+                    ),
+                    dim=-1,
+                )
+                torch.view_as_real(C_out).index_add_(
+                    0, prepared.ascend_row_ids, products
+                )
+            else:
+                products = prepared.data[:, None] * B.index_select(
+                    0, prepared.ascend_col_ids
+                )
+                C_out = _ascend_index_add(
+                    C_out, 0, prepared.ascend_row_ids, products
+                )
+        if timing:
+            _ACCEL.synchronize()
+            compute_ms = (time.perf_counter() - t0) * 1000.0
+        else:
+            compute_ms = None
+        return C_out, {
+            **_ascend_execution_meta(prepared),
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0 if timing else None,
+            "compute_ms": compute_ms,
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C_out.stride()),
+            "output_layout": _dense_layout_name(C_out),
+        }
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
         prepared.data.dtype,
@@ -2800,7 +3012,10 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
         op=op_name,
         alg=resolved_alg,
     )
-    if op_name != "non" and (_backend_name() == "cuda" or _is_iluvatar_runtime()):
+    if op_name != "non" and (
+        _backend_name() == "cuda" or _is_iluvatar_runtime()
+        or _is_ascend_runtime()
+    ):
         # Materialise A.T (A.conj().T for conj) here instead of on every run. The
         # transpose is a sort + bincount + cumsum over nnz; caching it matches the
         # vendor benchmark's one-time materialization on CUDA and Iluvatar. A
@@ -2830,8 +3045,14 @@ def flagsparse_spmm_csr_run(
     return_meta=False,
     timing=False,
     diagnostics=False,
+    out=None,
 ):
     """Run a registered CSR SpMM route.
+
+    ``out``, when given, receives the result and is returned -- see
+    ``flagsparse_spmm_coo_run`` for why the Ascend native FP64 route needs the
+    caller to own that buffer. Routes that cannot write through to it allocate
+    and copy, so the semantics hold either way.
 
     The default operator timing follows the AlphaSparse-style benchmark policy:
     ``gpu_ms`` is a CUDA event around the route run, while process CPU time is
@@ -2922,13 +3143,21 @@ def flagsparse_spmm_csr_run(
         op_name,
         timing=bool(timing),
     )
-    C, route_meta = algorithm.run(
-        runtime_prepared,
-        B,
+    if out is not None:
+        _validate_spmm_out(runtime_prepared, B, out, dense_layout)
+    run_kwargs = dict(
         timing=bool(timing),
         diagnostics=bool(diagnostics),
         dense_layout=dense_layout,
     )
+    if out is not None and _route_takes_out(algorithm.run):
+        run_kwargs["out"] = out
+    C, route_meta = algorithm.run(runtime_prepared, B, **run_kwargs)
+    if out is not None and C is not out:
+        # The route allocated its own output: honour `out` anyway rather than
+        # returning a different tensor, at the cost of one copy.
+        out.copy_(C)
+        C = out
     if end is not None:
         end.record()
         _ACCEL.synchronize()
@@ -2951,6 +3180,7 @@ def flagsparse_spmm_csr_run(
             "alg": algorithm.name,
             "display_name": algorithm.display_name,
             "op": op_name,
+            **(_ascend_execution_meta(runtime_prepared) if _is_ascend_runtime() else {}),
             "operator_ms": operator_ms,
             "gpu_ms": gpu_ms,
             "process_cpu_ms": process_cpu_ms,
@@ -2959,6 +3189,9 @@ def flagsparse_spmm_csr_run(
             "c_stride": route_meta.get("c_stride"),
             "output_layout": route_meta.get("output_layout"),
         }
+        for key in ("execution_path", "implementation"):
+            if key in route_meta:
+                meta[key] = route_meta[key]
         if timing:
             meta["process_gpu_ms"] = process_gpu_ms
             meta["compute_ms"] = route_meta.get("compute_ms")
@@ -4554,15 +4787,22 @@ def flagsparse_spmm_csr(
         if ascend_timed:
             _ACCEL.synchronize()
         t0 = time.perf_counter()
-        if transposed:
-            out_mat = torch.zeros((n_cols, B.shape[1]), device=data.device, dtype=data.dtype)
-            # op(A) = A^H needs the values conjugated too, not just row/col swapped.
-            vals = data.conj() if op_code == SPMM_OP_CONJ_TRANS else data
-            _index_add_values(out_mat, 0, cols, vals[:, None] * _gather_values(B, row_ids))
-        else:
-            out_mat = torch.zeros((n_rows, B.shape[1]), device=data.device, dtype=data.dtype)
-            _index_add_values(out_mat, 0, row_ids, data[:, None] * _gather_values(B, cols))
-        if out is not None:
+        native_rows, native_cols = (cols, row_ids) if transposed else (row_ids, cols)
+        native_shape = (n_cols, n_rows) if transposed else (n_rows, n_cols)
+        out_mat = _run_ascend_fp64_spmm_once(
+            data, native_rows, native_cols, B, native_shape,
+            sort_rows=transposed, out=out,
+        )
+        used_native_fp64 = out_mat is not None
+        if out_mat is None:
+            if transposed:
+                out_mat = torch.zeros((n_cols, B.shape[1]), device=data.device, dtype=data.dtype)
+                vals = data.conj() if op_code == SPMM_OP_CONJ_TRANS else data
+                _index_add_values(out_mat, 0, cols, vals[:, None] * _gather_values(B, row_ids))
+            else:
+                out_mat = torch.zeros((n_rows, B.shape[1]), device=data.device, dtype=data.dtype)
+                _index_add_values(out_mat, 0, row_ids, data[:, None] * _gather_values(B, cols))
+        if out is not None and out_mat is not out:
             out.copy_(out_mat)
             out_mat = out
         if ascend_timed:
@@ -4577,6 +4817,8 @@ def flagsparse_spmm_csr(
                 "op_total_ms": elapsed,
                 "op": _spmm_op_to_name(op_code),
             }
+            if used_native_fp64:
+                meta.update(execution_path="native", implementation="cann_sparse_tensor_dense_matmul_fp64")
             return (out_mat, elapsed, meta) if return_time else (out_mat, meta)
         return (out_mat, elapsed) if return_time else out_mat
 

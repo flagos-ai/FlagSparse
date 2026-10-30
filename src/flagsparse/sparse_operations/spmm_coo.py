@@ -16,14 +16,20 @@
 
 import os
 import ctypes
+import warnings
 from dataclasses import dataclass
 
 from . import _common as _common_mod
 from ._common import *
 from . import mixed_spmx as _mixed_spmx
+from ._ascend_fp64_spmm import prepare_fp64_spmm as _prepare_ascend_fp64_spmm
+from ._ascend_fp64_spmm import run_fp64_spmm as _run_ascend_fp64_spmm
+from ._ascend_fp64_spmm import run_fp64_spmm_once as _run_ascend_fp64_spmm_once
 from .spmm_csr import (
     SUPPORTED_SPMM_VALUE_DTYPES,
+    _route_takes_out,
     _select_spmm_alg1_warp_and_factor,
+    _validate_spmm_out,
     _spmm_coo_reference_tolerance,
     _spmm_relative_threshold,
     _spmm_validation_metrics,
@@ -769,6 +775,8 @@ class PreparedCooSpmmRoute:
         "alg",
         "gather_ptr",
         "full_row_ptr",
+        "ascend_runner",
+        "ascend_fp64_plan",
     )
 
     def __init__(
@@ -802,6 +810,11 @@ class PreparedCooSpmmRoute:
         self.alg = str(alg)
         self.gather_ptr = None
         self.full_row_ptr = None
+        self.ascend_runner = None
+        self.ascend_fp64_plan = (
+            _prepare_ascend_fp64_spmm(data, row, col, self.shape)
+            if _is_ascend_runtime() else None
+        )
         if _is_iluvatar_runtime() and self.alg in ("auto", "coo_rowrun"):
             # The BI-V rowrun route writes every output row, including empty ones,
             # so its prepared calls can allocate C without a separate zero fill.
@@ -1839,9 +1852,17 @@ def _spmm_coo_ascend_scatter(
     cols64 = col.to(torch.int64)
     # contrib[p] = A.values[p] * B[col[p]], summed into C[row[p]]. conj (for
     # op=conj_trans) is already folded into `data` by _materialize_spmm_coo_op.
-    contrib = data.unsqueeze(1) * _gather_values(B, cols64)
-    acc = torch.zeros((n_rows, n_dense_cols), dtype=contrib.dtype, device=data.device)
-    _index_add_values(acc, 0, rows64, contrib)
+    if data.is_complex():
+        contrib = _ascend_complex_products(data, B, cols64)
+        acc = torch.zeros(
+            (n_rows, n_dense_cols, 2), dtype=contrib.dtype, device=data.device
+        )
+        acc = _ascend_index_add(acc, 0, rows64, contrib)
+        acc = torch.view_as_complex(acc)
+    else:
+        contrib = data.unsqueeze(1) * B.index_select(0, cols64)
+        acc = torch.zeros((n_rows, n_dense_cols), dtype=contrib.dtype, device=data.device)
+        acc = _ascend_index_add(acc, 0, rows64, contrib)
     acc = acc.to(dtype)
 
     if out is not None:
@@ -2025,7 +2046,7 @@ def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, *, wide=T
 
 
 def _run_spmm_coo_rowrun_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", out=None
 ):
     dense_layout = _normalize_dense_layout(dense_layout)
     use_gather = (prepared.gather_ptr is not None and torch.is_tensor(B)
@@ -2038,6 +2059,91 @@ def _run_spmm_coo_rowrun_route(
     B = _validate_spmm_coo_route_runtime_inputs(
         prepared, B, dense_layout, wide=not (use_gather or use_biv_half)
     )
+    if _is_ascend_runtime():
+        native = _run_ascend_fp64_spmm(
+            prepared, B, dense_layout, timing=timing, out=out
+        )
+        if native is not None:
+            result, meta = native
+            return result, {"alg": "coo_ascend_fp64_native", "op": prepared.op, **meta}
+        if prepared.ascend_runner is None:
+            ascend_data = prepared.data
+            ascend_row = prepared.row
+            ascend_col = prepared.col
+            ascend_n_rows = prepared.n_rows
+            ascend_output_dtype = prepared.output_dtype
+
+            def ascend_spmm(dense):
+                result = torch.zeros(
+                    ascend_n_rows,
+                    dense.shape[1],
+                    dtype=ascend_data.dtype,
+                    device=dense.device,
+                )
+                if ascend_data.is_complex():
+                    products = _ascend_complex_products(
+                        ascend_data, dense, ascend_col
+                    )
+                    result_pair = torch.zeros(
+                        ascend_n_rows,
+                        dense.shape[1],
+                        2,
+                        dtype=products.dtype,
+                        device=dense.device,
+                    )
+                    result_pair = _ascend_index_add(
+                        result_pair, 0, ascend_row, products
+                    )
+                    return torch.view_as_complex(result_pair)
+                products = ascend_data[:, None] * dense.index_select(0, ascend_col)
+                result = _ascend_index_add(result, 0, ascend_row, products)
+                return result.to(ascend_output_dtype)
+
+            try:
+                prepared.ascend_runner = _ascend_compile(
+                    ascend_spmm
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"COO SpMM Ascend graph compile failed; using eager fallback: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                prepared.ascend_runner = False
+        try:
+            C = _ascend_owned_output(prepared.ascend_runner(B)) if prepared.ascend_runner else None
+        except Exception as exc:
+            warnings.warn(
+                f"COO SpMM Ascend graph replay failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.ascend_runner = False
+            C = None
+        if C is None:
+            C = _spmm_coo_ascend_scatter(
+                prepared.data,
+                prepared.row,
+                prepared.col,
+                B,
+                prepared.n_rows,
+                int(B.shape[1]),
+                output_dtype=prepared.output_dtype,
+                dense_layout=dense_layout,
+            )
+        return C, {
+            "alg": "coo_ascend_scatter",
+            **_ascend_execution_meta(prepared),
+            "display_name": "COOAscendScatter",
+            "op": prepared.op,
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0 if timing else None,
+            "compute_ms": None,
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C.stride()),
+            "output_layout": _dense_layout_name(C),
+        }
     launch = _resolve_spmm_coo_launch_config(
         int(B.shape[1]), prepared.nnz, device=prepared.data.device
     )
@@ -2543,8 +2649,19 @@ def flagsparse_spmm_coo_run(
     return_meta=False,
     timing=False,
     diagnostics=False,
+    out=None,
 ):
-    """Run a registered COO SpMM algorithm with CSR-style timing metadata."""
+    """Run a registered COO SpMM algorithm with CSR-style timing metadata.
+
+    ``out``, when given, receives the result and is returned. It lets a caller
+    reuse one output buffer across calls, which prepare_spmv_sell's prepared run
+    has always allowed and this one did not. On the Ascend native FP64 route the
+    operator writes straight through, so the buffer's address stays fixed -- that
+    route's run time depends on where its B and C land, and a benchmark can only
+    hold both sides at one address by owning C. Other routes still allocate and
+    then copy into ``out``, so the semantics hold everywhere even where the copy
+    is not avoided.
+    """
     if not isinstance(prepared, PreparedCooSpmmRoute):
         raise TypeError("prepared must be a PreparedCooSpmmRoute instance")
     alg_name = prepared.alg if alg is None else _normalize_spmm_coo_alg(alg)
@@ -2575,13 +2692,21 @@ def flagsparse_spmm_coo_run(
     if start is not None:
         _ACCEL.synchronize()
         start.record()
-    C, route_meta = algorithm.run(
-        prepared,
-        B,
+    if out is not None:
+        _validate_spmm_out(prepared, B, out, dense_layout)
+    run_kwargs = dict(
         timing=bool(timing),
         diagnostics=bool(diagnostics),
         dense_layout=dense_layout,
     )
+    if out is not None and _route_takes_out(algorithm.run):
+        run_kwargs["out"] = out
+    C, route_meta = algorithm.run(prepared, B, **run_kwargs)
+    if out is not None and C is not out:
+        # The route allocated its own output: honour `out` anyway rather than
+        # returning a different tensor, at the cost of one copy.
+        out.copy_(C)
+        C = out
     if end is not None:
         end.record()
         _ACCEL.synchronize()
@@ -2596,6 +2721,7 @@ def flagsparse_spmm_coo_run(
             "alg": algorithm.name,
             "display_name": algorithm.display_name,
             "op": prepared.op,
+            **(_ascend_execution_meta(prepared) if _is_ascend_runtime() else {}),
             "operator_ms": operator_ms,
             "gpu_ms": gpu_ms,
             "process_cpu_ms": process_cpu_ms,
@@ -2604,6 +2730,9 @@ def flagsparse_spmm_coo_run(
             "c_stride": route_meta.get("c_stride"),
             "output_layout": route_meta.get("output_layout"),
         }
+        for key in ("execution_path", "implementation"):
+            if key in route_meta:
+                meta[key] = route_meta[key]
         if timing:
             meta["process_gpu_ms"] = route_meta.get("process_gpu_ms")
             meta["compute_ms"] = route_meta.get("compute_ms")
@@ -2750,17 +2879,23 @@ def _run_spmm_coo_route(
         if do_timing:
             _ACCEL.synchronize()
             compute_start = time.perf_counter()
-        C = _spmm_coo_ascend_scatter(
-            data_compute,
-            native_row,
-            native_col,
-            B_compute,
-            n_rows,
-            n_dense_cols,
-            output_dtype=native_data.dtype,
-            out=out,
-            dense_layout=dense_layout,
+        C = _run_ascend_fp64_spmm_once(
+            data_compute, native_row, native_col, B_compute, shape,
+            out=out, dense_layout=dense_layout,
         )
+        used_native_fp64 = C is not None
+        if C is None:
+            C = _spmm_coo_ascend_scatter(
+                data_compute,
+                native_row,
+                native_col,
+                B_compute,
+                n_rows,
+                n_dense_cols,
+                output_dtype=native_data.dtype,
+                out=out,
+                dense_layout=dense_layout,
+            )
         if do_timing:
             _ACCEL.synchronize()
             compute_ms = (time.perf_counter() - compute_start) * 1000.0
@@ -2776,6 +2911,8 @@ def _run_spmm_coo_route(
                 "dense_layout": dense_layout,
                 "output_layout": _dense_layout_name(C),
             }
+            if used_native_fp64:
+                meta.update(execution_path="native", implementation="cann_sparse_tensor_dense_matmul_fp64")
             return (C, op_total_ms, meta) if return_time else (C, meta)
         return (C, op_total_ms) if return_time else C
 

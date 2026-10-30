@@ -26,6 +26,8 @@ Timing matches the scripts' own rows: where the operator has a prepare step
 once outside the timed window, as cuSPARSE's descriptor setup does; the mixed
 precision / int8 paths have no prepare step and are timed as one call. The row's
 ``timed`` column says which.
+Ascend CSR, COO and CSC variants use their prepared paths; CSC also prepares
+reusable RHS dtype conversion outside the timed computation.
 
 Per row: FlagSparse, native cuSPARSE with the same type combination (CUDA only;
 ``tests/cusparse_generic_baseline.py``), and PyTorch on the same matrix. Accuracy
@@ -33,6 +35,7 @@ is checked against a CPU float64 / complex128 SciPy product; int outputs exactly
 """
 
 import csv
+import gc
 import glob
 import os
 from dataclasses import dataclass
@@ -42,10 +45,13 @@ import scipy.sparse as sp
 import torch
 
 import cusparse_generic_baseline as cusparse_baseline
+import ascend_sparse_baseline as cann_baseline
 import flagsparse as fs
 from benchmark_utils import accelerator_device
 from flagsparse.sparse_operations import mixed_spmx
+from flagsparse.sparse_operations import sddmm_csr
 from flagsparse.sparse_operations._common import (
+    _ascend_execution_meta,
     _benchmark_cuda_op,
     _gather_values,
     _is_ascend_runtime,
@@ -345,28 +351,49 @@ class _Matrix:
 _VENDOR_MAX_ERROR = 1e-2
 
 
-def _vendor(row, build):
-    reason = cusparse_baseline.skip_reason()
+def _vendor(row, build, baseline=cusparse_baseline):
+    reason = baseline.skip_reason()
+    plan = None
     if reason is None:
         try:
             plan, check = build()
             plan.run()
             err = check()
             row["vendor_max_error"] = err
-            if err <= _VENDOR_MAX_ERROR:
+            valid = (_passes(getattr(torch, row["out_dtype"]), err) if baseline is cann_baseline
+                     else err <= _VENDOR_MAX_ERROR)
+            if valid:
+                if baseline is cann_baseline:
+                    plan.check = check
                 return plan, None
             plan.close()
-            reason = f"cuSPARSE result off by {err:.3g} (relative); baseline not used"
+            reason = f"{getattr(baseline, 'NAME', 'cuSPARSE')} result off by {err:.3g} (relative); baseline not used"
         except Exception as exc:
+            if baseline is cann_baseline and plan is not None:
+                plan.close()
             reason = f"{type(exc).__name__}: {exc}"
+    if baseline is cann_baseline:
+        row.update(cann_status="FAIL", cann_reason=reason)
     row["vendor_reason"] = reason
     return None, reason
 
 
 def _time_vendor(row, plan, warmup, iters):
     if plan is not None:
-        _, row["vendor_ms"] = _benchmark_cuda_op(plan.run, warmup, iters)
-        plan.close()
+        try:
+            _, elapsed_ms = _benchmark_cuda_op(plan.run, warmup, iters)
+            if row.get("baseline_kind") == "cann":
+                plan.run()
+                post_error = plan.check()
+                if _passes(getattr(torch, row["out_dtype"]), post_error):
+                    error = max(row["vendor_max_error"], post_error)
+                    cann_baseline.record_result(row, plan, elapsed_ms, error, row["ours_ms"])
+                else:
+                    row.update(cann_status="FAIL", cann_reason=f"CANN post-timing CPU golden validation failed: {post_error}")
+            else:
+                row["vendor_ms"] = elapsed_ms
+        finally:
+            plan.close()
 
 
 def _time_pytorch(row, build, warmup, iters, reference):
@@ -448,20 +475,44 @@ def _spmv(v, mat, gen, warmup, iters, row):
                 ours = lambda: fs.flagsparse_spmv_csr(  # noqa: E731
                     prepared=prepared, x=x, out=target
                 )
+            elif _is_ascend_runtime():
+                if mixed:
+                    prepared = mixed_spmx.prepare_spmv_csr_mixed(
+                        vals, mat.cols, mat.ptr, x.dtype, mat.shape,
+                        out_dtype=v.out,
+                    )
+                else:
+                    prepared = fs.prepare_spmv_csr(
+                        vals, mat.cols, mat.ptr, mat.shape, op=v.op_a
+                    )
+                row["timed"] = "prepared"
+                ours = lambda: fs.flagsparse_spmv_csr(  # noqa: E731
+                    prepared=prepared, x=x
+                )
             else:
                 if mixed and not _is_ascend_runtime():
                     # The vendor writes a preallocated y; so does the prepared path below.
                     kw["out"] = torch.empty(y_len, dtype=v.out, device=mat.dev)
                 ours = lambda: fs.flagsparse_spmv_csr(vals, mat.cols, mat.ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
         elif v.fmt == "coo":
-            if v.op_a == "non" and not _is_ascend_runtime():
-                prepared = fs.prepare_spmv_coo(vals, mat.rows, mat.cols, mat.shape)
-                row["timed"] = "prepared"
-                ours = lambda: fs.flagsparse_spmv_coo(prepared=prepared, x=x, **kw)  # noqa: E731
-            else:
-                ours = lambda: fs.flagsparse_spmv_coo(vals, mat.rows, mat.cols, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
+            prepared = fs.prepare_spmv_coo(
+                vals, mat.rows, mat.cols, mat.shape, op=v.op_a
+            )
+            row["timed"] = "prepared"
+            ours = lambda: fs.flagsparse_spmv_coo(  # noqa: E731
+                prepared=prepared, x=x, **kw
+            )
         else:
-            ours = lambda: fs.flagsparse_spmv_csc(csc_vals, mat.csc_rows, mat.csc_ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
+            if _is_ascend_runtime():
+                prepared = fs.prepare_spmv_csc(
+                    csc_vals, mat.csc_rows, mat.csc_ptr, mat.shape, op=v.op_a, x=x
+                )
+                row["timed"] = "prepared"
+                ours = lambda: fs.flagsparse_spmv_csc(  # noqa: E731
+                    prepared=prepared, x=x, **kw
+                )
+            else:
+                ours = lambda: fs.flagsparse_spmv_csc(csc_vals, mat.csc_rows, mat.csc_ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
     else:
         row["timed"] = "prepared"
         if v.fmt == "csr":
@@ -561,24 +612,53 @@ def _spmm(v, mat, gen, warmup, iters, row):
         return _spmm_bell(v, mat, vals, vals_cpu, B, ref, warmup, iters, row)
     kw = {} if v.out == default_out else {"out_dtype": v.out}
     if v.fmt == "csc":
-        row["timed"] = "call"
         csc_vals, csc_rows, csc_ptr = mat.arrays("csc", vals)
-        ours = lambda: fs.flagsparse_spmm_csc(
-            csc_vals, csc_rows, csc_ptr, _op_t(B, v.op_b), mat.shape, op=v.op_a, **kw
-        )
+        if _is_ascend_runtime() and v.value == torch.float16:
+            row["timed"] = "prepared"
+            prepared = mixed_spmx.prepare_spmm_csc_mixed(
+                csc_vals, csc_rows, csc_ptr, mat.shape, out_dtype=v.out
+            )
+            B_eff = _op_t(B, v.op_b).to(prepared.acc_dtype)
+            ours = lambda: mixed_spmx.spmm_csc_mixed_prepared(prepared, B_eff)
+        elif _is_ascend_runtime():
+            row["timed"] = "prepared"
+            prepared = fs.prepare_spmm_csc_route(
+                csc_vals, csc_rows, csc_ptr, mat.shape, op=v.op_a
+            )
+            B_eff = _op_t(B, v.op_b)
+            ours = lambda: fs.flagsparse_spmm_csc_run(prepared, B_eff)
+        else:
+            row["timed"] = "call"
+            ours = lambda: fs.flagsparse_spmm_csc(
+                csc_vals, csc_rows, csc_ptr, _op_t(B, v.op_b), mat.shape, op=v.op_a, **kw
+            )
     elif (
         v.fmt in ("csr", "coo")
         and (
             mixed_spmx.spmm_needs_mixed(v.value, None, kw.get("out_dtype"))
-            or (_is_ascend_runtime() and v.fmt == "csr")
         )
     ):
-        row["timed"] = "call"
-        if v.fmt == "csr":
+        if _is_ascend_runtime() and v.fmt == "csr":
+            row["timed"] = "prepared"
+            prepared = mixed_spmx.prepare_spmm_csr_mixed(
+                vals, mat.cols, mat.ptr, mat.shape, out_dtype=v.out
+            )
+            B_eff = _op_t(B, v.op_b).to(prepared.acc_dtype)
+            ours = lambda: mixed_spmx.spmm_csr_mixed_prepared(prepared, B_eff)
+        elif _is_ascend_runtime() and v.fmt == "coo":
+            row["timed"] = "prepared"
+            prepared = mixed_spmx.prepare_spmm_coo_mixed(
+                vals, mat.rows, mat.cols, mat.shape, out_dtype=v.out
+            )
+            B_eff = _op_t(B, v.op_b).to(prepared.acc_dtype)
+            ours = lambda: mixed_spmx.spmm_coo_mixed_prepared(prepared, B_eff)
+        elif v.fmt == "csr":
+            row["timed"] = "call"
             ours = lambda: fs.flagsparse_spmm_csr(  # noqa: E731
                 vals, mat.cols, mat.ptr, B, mat.shape, op=v.op_a, op_b=v.op_b, **kw
             )
         else:
+            row["timed"] = "call"
             ours = lambda: fs.flagsparse_spmm_coo(  # noqa: E731
                 vals,
                 mat.rows,
@@ -586,7 +666,7 @@ def _spmm(v, mat, gen, warmup, iters, row):
                 B,
                 mat.shape,
                 op=v.op_a,
-                dense_layout=v.layout,
+                **({"dense_layout": v.layout} if _is_ascend_runtime() else {}),
                 **kw,
             )
     else:
@@ -594,26 +674,39 @@ def _spmm(v, mat, gen, warmup, iters, row):
         B_eff = _op_t(B, v.op_b)  # op(B) as a strided view; the run reads its strides
         if v.fmt == "csr":
             prepared = fs.prepare_spmm_csr_route(vals, mat.cols, mat.ptr, mat.shape, op=v.op_a)
-            ours = lambda: fs.flagsparse_spmm_csr_run(prepared, B_eff, alg="auto")  # noqa: E731
+            ours = lambda: fs.flagsparse_spmm_csr_run(  # noqa: E731
+                prepared, B_eff, alg="auto", **({"dense_layout": v.layout} if _is_ascend_runtime() else {})
+            )
         else:
             prepared = fs.prepare_spmm_coo_route(vals, mat.rows, mat.cols, mat.shape, op=v.op_a)
-            ours = lambda: fs.flagsparse_spmm_coo_run(prepared, B_eff, alg="auto")  # noqa: E731
+            ours = lambda: fs.flagsparse_spmm_coo_run(  # noqa: E731
+                prepared, B_eff, alg="auto", **({"dense_layout": v.layout} if _is_ascend_runtime() else {})
+            )
     first = ours()
     first = first[0] if isinstance(first, tuple) else first
     row["max_error"] = _error(first, ref)
     row["out_dtype"] = _name(first.dtype)
     _, row["ours_ms"] = _benchmark_cuda_op(ours, warmup, iters)
 
+    if _is_ascend_runtime():
+        row.update(_ascend_execution_meta(
+            prepared, "runner" if hasattr(prepared, "runner") else "ascend_runner"
+        ))
+
+    baseline = cann_baseline if _is_ascend_runtime() and v.fmt in ("coo", "csr", "csc") else cusparse_baseline
+    if baseline is cann_baseline:
+        cann_baseline.mark_row(row)
+
     def build_vendor():
         C = torch.empty(m_eff, DENSE_COLS, dtype=v.out, device=mat.dev)
-        if v.layout == "col":
+        if v.layout == "col" and baseline is not cann_baseline:
             C = _col_major(C)
-        plan = cusparse_baseline.prepare_spmm(
+        plan = baseline.prepare_spmm(
             v.fmt, mat.arrays(v.fmt, vals), mat.shape, B, C, v.op_a, v.op_b, _compute_dtype(v)
         )
         return plan, lambda: _error(C, ref)
 
-    plan, _ = _vendor(row, build_vendor)
+    plan, _ = _vendor(row, build_vendor, baseline)
     _time_vendor(row, plan, warmup, iters)
 
     def build_torch():
@@ -697,6 +790,20 @@ def _sddmm_ref(mat, a_eff, b_eff):
     return out
 
 
+def _ascend_complex_sddmm_reference(indices, indptr, x, y):
+    row_ids = torch.repeat_interleave(
+        torch.arange(indptr.numel() - 1, dtype=torch.int64, device=indices.device),
+        indptr[1:] - indptr[:-1],
+    )
+    if row_ids.numel() == 0:
+        return torch.empty(0, dtype=x.dtype, device=x.device)
+    left = torch.view_as_real(x.resolve_conj()).index_select(0, row_ids)
+    right = torch.view_as_real(y.resolve_conj()).index_select(0, indices.to(torch.int64))
+    real = (left[..., 0] * right[..., 0] - left[..., 1] * right[..., 1]).sum(dim=1)
+    imag = (left[..., 0] * right[..., 1] + left[..., 1] * right[..., 0]).sum(dim=1)
+    return torch.view_as_complex(torch.stack((real, imag), dim=-1))
+
+
 def _sddmm(v, mat, gen, warmup, iters, row):
     m, n = mat.shape
     kd = DENSE_COLS
@@ -710,18 +817,14 @@ def _sddmm(v, mat, gen, warmup, iters, row):
         A, B = _col_major(A), _col_major(B)
 
     if _is_ascend_runtime():
-        # The public Ascend SDDMM fallback is intentionally raw-input based;
-        # preparing here would compile its Triton row-id helper first.
-        row["timed"] = "call"
+        row["timed"] = "prepared"
+        prepared = fs.prepare_sddmm_csr(mat.cols, mat.ptr, mat.shape, k_hint=kd)
 
         def ours():
             return fs.flagsparse_sddmm_csr(
-                None,
-                mat.cols,
-                mat.ptr,
+                prepared=prepared,
                 x=A,
                 y=B,
-                shape=mat.shape,
                 op_a=v.op_a,
                 op_b=v.op_b,
                 dense_layout=v.layout,
@@ -757,8 +860,39 @@ def _sddmm(v, mat, gen, warmup, iters, row):
             mat.ptr.long(), mat.cols.long(), torch.zeros(mat.csr.nnz, dtype=compute, device=mat.dev), mat.shape
         )
         row["pytorch_compute_dtype"] = _name(compute)
+        # Transposed once here, outside the timed callable, so op='trans' and
+        # layout='col' are judged on the kernel rather than on a transpose --
+        # exactly as the sampled_addmm path below has always done.
         a_op, b_op = _op_t(A, v.op_a).to(compute), _op_t(B, v.op_b).to(compute)
-        return lambda: torch.sparse.sampled_addmm(pattern, a_op, b_op, beta=0.0)
+        sampled = lambda: torch.sparse.sampled_addmm(pattern, a_op, b_op, beta=0.0)
+        try:
+            sampled()
+        except Exception as exc:
+            # torch_npu registers no aten::sparse_sampled_addmm, so on Ascend
+            # every op/layout variant of this operator used to carry no PyTorch
+            # baseline at all and fell through to the scaled-H800 tier while the
+            # plain non/non/row rows kept a PyTorch one -- the same kernel then
+            # read 6.5x or 0.15x depending only on which tier its row landed in.
+            # Fall back to the gather/multiply/sum formulation that the
+            # sddmm_csr script already times for those rows, so all five
+            # variants share one denominator. pytorch_formulation records which
+            # formulation produced the number.
+            row["pytorch_formulation"] = "gather/multiply/sum"
+            row["pytorch_sampled_addmm_reason"] = f"{type(exc).__name__}: {exc}"
+            indices = mat.cols
+            indptr = mat.ptr.to(torch.int64)
+            # _sddmm_reference indexes y by COLUMN id, so it wants (n, K).
+            y_rows = b_op.t().contiguous()
+            if _is_ascend_runtime() and compute.is_complex:
+                row["pytorch_complex_strategy"] = "real_planes"
+                return lambda: _ascend_complex_sddmm_reference(
+                    indices, indptr, a_op, y_rows
+                )
+            return lambda: sddmm_csr._sddmm_reference(
+                indices, indptr, a_op, y_rows, None, 1.0, 0.0
+            )
+        row["pytorch_formulation"] = "sampled_addmm"
+        return sampled
 
     _time_pytorch(row, build_torch, warmup, iters, ref)
     if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
@@ -848,6 +982,8 @@ def run_variants(
                 "n_cols": mat.shape[1],
                 "nnz": mat.csr.nnz,
             }
+            if _is_ascend_runtime():
+                row.update(execution_path="eager", implementation="torch_npu")
             try:
                 out_dtype = _KINDS[v.kind](v, mat, gen, warmup, iters, row)
                 row["status"] = "PASS" if _passes(out_dtype, row["max_error"]) else "FAIL"
@@ -861,8 +997,13 @@ def run_variants(
             rows.append(row)
             log(
                 f"[q4] {row['matrix']} {v.name}: {row['status']} ours={row.get('ours_ms')} "
-                f"vendor={row.get('vendor_ms')} torch={row.get('pytorch_ms')} {row.get('error') or ''}"
+                f"vendor={row.get('vendor_name', 'cuSPARSE')} vendor_ms={row.get('cann_ms', row.get('vendor_ms'))} "
+                f"torch={row.get('pytorch_ms')} {row.get('error') or ''}"
             )
+            if _is_ascend_runtime():
+                torch._dynamo.reset()
+                gc.collect()
+                torch.npu.empty_cache()
     return rows
 
 

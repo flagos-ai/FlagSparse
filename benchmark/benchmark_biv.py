@@ -6,8 +6,12 @@ from __future__ import annotations
 import os
 import sys
 from datetime import date
+from pathlib import Path
 
-from run_flagsparse_pytest import main
+# The shared runner lives at the repository root, one level up.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from run_flagsparse_pytest import main  # noqa: E402
 
 
 def run() -> int:
