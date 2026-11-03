@@ -17,6 +17,8 @@ import json
 import os
 from pathlib import Path
 
+import itertools
+
 import pytest
 import torch
 
@@ -303,7 +305,7 @@ NEW_ALGORITHMS = spmv_mod.SPMV_CSR_NEW_ALGORITHMS
 # The new CSR routes have launch profiles only for CUDA and ROCm.  Keep their
 # coverage on those backends, but do not collect them as skipped XPU tests.
 TESTED_ALGORITHMS = spmv_mod.list_spmv_csr_algorithms(
-    backend=spmv_mod._backend_name()
+    backend=spmv_mod._backend_name(), dtype=torch.float32
 )
 TESTED_NEW_ALGORITHMS = tuple(
     alg for alg in NEW_ALGORITHMS if alg in TESTED_ALGORITHMS
@@ -711,6 +713,44 @@ def test_spmv_csr_complex_cancellation(alg, dtype, op):
 
 
 # Explicit migrated algorithms share this operator's marker, golden and tolerance.
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("wide", [False, True])
+@pytest.mark.parametrize("lengths", [[], [0, 0, 0], [0, 1, 7, 8, 9, 0, 513, 2, 0]])
+def test_spmv_csr_nnz_tiles_batched_boundaries(dtype, wide, lengths):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    if "csr_nnz_tile_reduce" not in spmv_mod.list_spmv_csr_algorithms(dtype=dtype, backend=common._backend_name()):
+        pytest.skip("NNZ tile capability is unavailable on this backend")
+    output_dtype = torch.float32 if wide else dtype
+    device = accelerator_device()
+    ptr_cpu = torch.tensor([0] + list(itertools.accumulate(lengths)), dtype=torch.int64)
+    count = int(ptr_cpu[-1])
+    cols_cpu = (torch.arange(count) * 13) % 37
+    values_cpu = torch.where(torch.arange(count) % 3 == 0, -0.125, 0.25).to(dtype)
+    values, cols, ptr = values_cpu.to(device), cols_cpu.to(device), ptr_cpu.to(device)
+    x = torch.full((37,), 0.5, dtype=dtype, device=device)
+    cfg = dict(block_nnz=8, reduce_block_size=4, workspace_bytes=512)
+    try:
+        prepared = spmv_mod.prepare_spmv_csr(values, cols, ptr, (len(lengths), 37),
+                                            alg="csr_nnz_tile_reduce", config=cfg)
+        backing = torch.full((2 * len(lengths),), float("nan"), dtype=output_dtype, device=device)
+        out = backing[::2]
+        for _ in range(2):
+            values.mul_(0.5)
+            out.fill_(float("nan"))
+            result, meta = spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out, return_meta=True)
+            expected = torch.zeros(len(lengths), dtype=torch.float64)
+            owners = torch.repeat_interleave(torch.arange(len(lengths)), torch.tensor(lengths, dtype=torch.int64))
+            expected.index_add_(0, owners, values.cpu().double() * 0.5)
+            assert result is out
+            rtol, atol = close_tolerances(output_dtype)
+            torch.testing.assert_close(result.cpu(), expected.to(output_dtype), rtol=rtol, atol=atol)
+            assert meta["workspace_peak_bytes"] <= cfg["workspace_bytes"]
+            assert meta["plan_builds"] == 1
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+
 _MIGRATED_ROUTES = (('row_subgroup_stream', 'non'), ('row_subgroup_stream', 'trans'), ('row_subgroup_stream', 'conj'))
 
 
@@ -800,6 +840,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
 @pytest.mark.spmv_csr
 @pytest.mark.parametrize("alg", [
     "row_tile", "row_vector", "row_subgroup_stream",
+    "csr_nnz_tile_reduce",
     "row_split_reduce", "row_adaptive_split",
     "legacy_rowpar", "legacy_segbin", "legacy_bucket_vector",
 ])

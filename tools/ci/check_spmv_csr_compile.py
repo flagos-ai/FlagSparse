@@ -45,6 +45,12 @@ def main():
         compile(ast.Module(body=definitions, type_ignores=[]), str(path), "exec"),
         module.__dict__,
     )
+    nnz_path = path.with_name("_spmv_csr_nnz.py")
+    nnz_tree = ast.parse(nnz_path.read_text(encoding="utf-8"))
+    nnz_definitions = [node for node in nnz_tree.body
+                       if isinstance(node, ast.FunctionDef) and node.decorator_list
+                       and node.name != "_nnz_kernel" and node.name != "_segmented_add"]
+    exec(compile(ast.Module(body=nnz_definitions, type_ignores=[]), str(nnz_path), "exec"), module.__dict__)
     width = args.subgroup_width or (32 if args.backend == "cuda" else 64)
     target = GPUTarget(
         args.backend, int(args.arch) if args.backend == "cuda" else args.arch, width
@@ -77,6 +83,22 @@ def main():
         print(f"compiled {name} {pointers} {constants}", flush=True)
 
     # Complex pointers expose native real components, never a Triton complex type.
+    for value, index, panel, wide in itertools.product(("fp16", "bf16"), ("i32", "i64"), (1, 16), (False, True)):
+        output = "fp32" if wide else value
+        check("_mixed_nnz_panel",
+              dict(A="*" + value, I="*" + index, P="*" + index, B="*" + value,
+                   C="*fp32", Partial="*fp32", Owners="*i64", Out="*" + output),
+              ("M", "NNZ", "FIRST_TILE", "ROW_FIRST", "ROW_END", "COL_FIRST", "WIDTH",
+               "BS0", "BS1", "CS0", "CS1", "OS0", "OS1"), dict(TILE=128 if panel == 1 else 32, PANEL=panel))
+        check("_mixed_nnz_output", dict(C="*fp32", P="*" + index, Out="*" + output),
+              ("ROW_FIRST", "ROW_END", "COLUMN", "WIDTH", "OS0", "OS1"),
+              dict(TILE=128 if panel == 1 else 32, PANEL=panel))
+        check("_mixed_boundary_reduce", dict(Input="*fp32", Output="*fp32", Starts="*i64", Ends="*i64"),
+              (), dict(WIDTH=panel, BLOCK=256))
+        check("_mixed_boundary_finish", dict(Input="*fp32", Rows="*i64", C="*fp32"),
+              ("ROW_FIRST",), dict(WIDTH=panel))
+    check("_compact_boundaries", dict(Owners="*i64", Offsets="*i64", Selected="*i64", Rows="*i64"),
+          ("COUNT",), dict(BLOCK=256))
     value_modes = (
         ("fp16", False, tl.float32),
         ("bf16", False, tl.float32),

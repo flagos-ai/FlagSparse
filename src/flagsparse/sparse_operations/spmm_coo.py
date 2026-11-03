@@ -2428,9 +2428,11 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
                 a, r, c, starts = _coo_native._coo_sorted_runs(a, r, c)
         with phases.measure("compute_ms"):
             C = _coo_native._launch_coo_extension(a, r, c, starts, bc, shape,
-                selected, cfg, prepared.op == "conj", compute_dtype=compute_dtype)
-            C = _materialize_dense_layout(C.to(output_dtype), dense_layout)
-            if out is not None:
+                selected, cfg, prepared.op == "conj", compute_dtype=compute_dtype,
+                out=out if out is not None and out.dtype == compute_dtype else None)
+            if C is not out:
+                C = _materialize_dense_layout(C.to(output_dtype), dense_layout)
+            if out is not None and C is not out:
                 out.copy_(C)
                 C = out
         return C, dict(info, alg=selected, alg_requested=alg or prepared.alg,

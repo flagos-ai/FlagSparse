@@ -19,11 +19,11 @@ from ._spmv_csr_config import BackendCapabilityUnavailable
 
 NEW_ALGORITHMS = (
     "csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce",
-    "csr_adaptive_tile_split", "csr_row_panel",
+    "csr_adaptive_tile_split", "csr_row_panel", "csr_nnz_panel_reduce",
 )
 BACKENDS = ()
 DTYPES = ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")
-IMPLEMENTATION_VERSION = 3
+IMPLEMENTATION_VERSION = 4
 CONFIG_FIELDS = frozenset((
     "tile_rows", "tile_k", "tile_n", "block_k", "block_n", "panels",
     "segment_nnz", "reduce_block_size", "num_warps", "num_stages",
@@ -54,11 +54,13 @@ class BackendCaps:
 def algorithm_spec(name):
     if name not in NEW_ALGORITHMS:
         raise ValueError(f"unknown new CSR SpMM algorithm {name!r}")
-    return dict(name=name, ops=("non", "trans", "conj"), value_dtypes=DTYPES,
+    return dict(name=name, ops=("non", "trans", "conj"), value_dtypes=("float16", "bfloat16") if name == "csr_nnz_panel_reduce" else DTYPES,
                 half_output_dtypes={dt: (dt, "float32") for dt in ("float16", "bfloat16")},
                 layouts=("row", "col", "strided"), backends=BACKENDS,
                 index_dtypes=("int32", "int64"), execution_column_dtype="int32",
                 compute_dtype="native_component", implementation_version=IMPLEMENTATION_VERSION,
+                config_candidates=({"tile_n": (16, 32, 64), "panel_accumulators": (1, 2, 4)}
+                                   if name == "csr_row_panel" else {"tile_n" if name == "csr_row_tile" else "block_n": (16, 32, 64)}),
                 transpose_strategy="main_route_preparation", validation="unverified")
 
 
@@ -70,7 +72,7 @@ def capability_reason(caps, dtype, *, op="non", algorithm="csr_row_tile"):
     required = ["int64", "reduction"]
     if dtype in ("float64", "complex128"):
         required.append("fp64")
-    if op != "non" or algorithm in ("csr_split_nnz_reduce", "csr_adaptive_tile_split"):
+    if op != "non" or algorithm in ("csr_split_nnz_reduce", "csr_adaptive_tile_split", "csr_nnz_panel_reduce"):
         required.extend(("stable_sort", "scan"))
     for key in required:
         if getattr(caps, key) is not True:
@@ -82,7 +84,7 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
     algorithm_spec(algorithm)
     if overrides is not None and not isinstance(overrides, dict):
         raise TypeError("config must be a dictionary")
-    if dtype not in DTYPES:
+    if dtype not in algorithm_spec(algorithm)["value_dtypes"]:
         raise TypeError(f"{algorithm} does not support {dtype}")
     reason = capability_reason(caps, dtype, op=op, algorithm=algorithm)
     if reason:
@@ -98,6 +100,8 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
         cfg.update(tile_rows=4 if dtype == "complex128" else 8,
                    tile_n=min(panel_n, 1 << (max(1, n) - 1).bit_length()),
                    num_warps=2, panel_accumulators=2)
+    if algorithm == "csr_nnz_panel_reduce":
+        cfg.update(block_k=32, block_n=16)
     source = "conservative"
     rejections = []
     if cfg["num_warps"] not in caps.legal_num_warps:
@@ -156,6 +160,11 @@ def validate_config(cfg, caps, *, algorithm="csr_adaptive_tile_split"):
         raise ValueError("short_row_threshold must be less than split_row_threshold")
     if cfg["workspace_bytes"] < 48:
         raise ValueError("workspace_bytes must hold at least three complex128 elements")
+    if algorithm == "csr_nnz_panel_reduce":
+        if cfg["workspace_bytes"] < 36 * cfg["block_n"]:
+            raise ValueError("workspace_bytes cannot hold one row and one NNZ panel tile")
+        if cfg["block_k"] > 4096 or cfg["block_n"] > 256:
+            raise ValueError("NNZ panel tile exceeds supported bounds")
 
 
 def workspace_geometry(n, element_bytes, cfg):

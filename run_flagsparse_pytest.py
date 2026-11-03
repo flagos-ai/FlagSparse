@@ -1760,6 +1760,14 @@ def write_phase_result(
 def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # The CUDA sbatch wrapper defines an allocation-local namespace. Preserve
+    # physical ordinals/UUIDs supplied by Slurm instead of replacing them by 0.
+    allocation = os.environ.get("FLAGSPARSE_SLURM_CUDA_VISIBLE_DEVICES")
+    if allocation is not None:
+        devices = [item.strip() for item in allocation.split(",") if item.strip()]
+        if not 0 <= gpu_id < len(devices):
+            raise ValueError(f"GPU index {gpu_id} is outside the Slurm allocation {devices}")
+        env["CUDA_VISIBLE_DEVICES"] = devices[gpu_id]
     # Batch schedulers can leave these variables pointing at a cleaned-up job
     # scratch directory. Triton's ROCm compiler delegates assembly to clang,
     # which then fails before a kernel is built. Keep valid user directories,
@@ -1787,6 +1795,8 @@ def _subprocess_device_id(gpu_id: int) -> int:
     ASCEND_RT_VISIBLE_DEVICES, and XPU's torch_xmlir shim reads
     CUDA_VISIBLE_DEVICES. Every other backend keeps the id it was given.
     """
+    if "FLAGSPARSE_SLURM_CUDA_VISIBLE_DEVICES" in os.environ:
+        return 0
     backend = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
     return 0 if backend in ("ascend", "xpu") else gpu_id
 

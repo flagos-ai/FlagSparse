@@ -136,6 +136,26 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
     counts = {"tile_rows": 0, "kparallel_rows": 0, "split_rows": 0, "panel_rows": 0}
     stats = dict(segment_count=0, reduction_levels=0, workspace_peak_bytes=0,
                  descriptor_peak_bytes_estimate=0, segment_batches=0)
+    if algorithm == "csr_nnz_panel_reduce":
+        from ._spmv_csr_nnz import run_mixed
+
+        with phases.measure("compute_ms"):
+            B = B.resolve_conj().resolve_neg()
+            C = out if out is not None else (
+                torch.empty_strided((m, n), (1, max(m, 1)), device=B.device, dtype=output_dtype)
+                if dense_layout == "col" else torch.empty((m, n), device=B.device, dtype=output_dtype))
+        nnz_config = dict(block_nnz=cfg["block_k"], block_n=cfg["block_n"],
+                          num_warps=cfg["num_warps"], reduce_block_size=cfg["reduce_block_size"],
+                          workspace_bytes=cfg["workspace_bytes"])
+        stats = run_mixed(prepared, B, C, nnz_config, phases)
+        meta = dict(config_meta, config=dict(cfg), algorithm=algorithm,
+                    implementation_version=policy.IMPLEMENTATION_VERSION,
+                    compute_dtype="float32", output_dtype=str(output_dtype),
+                    a_dtype=str(prepared.data.dtype), rhs_dtype=str(B.dtype),
+                    process_cpu_ms=0.0, validation="unverified", b_stride=tuple(B.stride()),
+                    c_stride=tuple(C.stride()), **stats)
+        meta.update(phases.results())
+        return C, meta
     with phases.measure("compute_ms"):
         # Resolving lazy views is numerical input handling and remains inside run.
         A = prepared.data.resolve_conj().resolve_neg().contiguous()

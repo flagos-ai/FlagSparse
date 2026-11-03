@@ -1,0 +1,2 @@
+# Slurm rejects CRLF batch scripts, including after checkout on Windows.
+*.sbatch text eol=lf

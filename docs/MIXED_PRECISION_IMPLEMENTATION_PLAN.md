@@ -1,5 +1,89 @@
 # SpMV/SpMM 混合精度补齐与优化实施计划
 
+## 2026-11-03：四组合优化及 NNZ 均衡源码交付
+
+优化前基线：`zyq_sparse` / `c76e20dd7857d0950f4d856d492d74c5e11f12ee`。
+本节记录源码实现；CUDA/DCU 编译、准确性与性能均待计算节点验证。
+不以此前 small synthetic 数据宣称 30 矩阵提速。
+
+- 新增 `csr_nnz_tile_reduce`（SpMV）及 `csr_nnz_panel_reduce`（SpMM），
+  仅声明 FP16/BF16 同类型输入、FP32 计算、同类型或 FP32 输出。
+  原 API、prepare/run 与 compare 由注册表接入，不切换默认算法。
+- 原生 CSR 固定 NNZ tile，GPU upper-bound 定位行；完整行直接写输出，
+  跨 tile 行输出独占边界记录，经 GPU 前缀压紧、分层归约和顺序跨批归并。
+  不使用浮点 atomic，不建立跨调用 owner-map/cache。
+- workspace 默认 256 MiB，包含 FP32 行组累加器及部分和/归约同时存活缓冲；
+  按面板、行组、tile 分批。`workspace_peak_bytes` 是保守数值空间上界，
+  描述符另计估计上界；不包含最终用户输出、输入及 PyTorch allocator 保留空间。
+  计数读回和设备等待在完整 run 内，CPU 算法处理时间不额外计入这些等待。
+- SpMV 显式配置使用平坦字段 `block_nnz/num_warps/num_stages/reduce_block_size/workspace_bytes`。
+  SpMM 复用 `block_k` 表示 NNZ tile 长度、`block_n` 表示输出面板宽度，其他字段沿用现有配置。
+  两者默认分别为 128 和 32×16、4 warps、1 stage、256 路归约。
+- CSC 直接路径改为加载时 FP32 转换；归约可直接写合法 out，non 散射仍使用 FP32 缓冲。
+  CSC split 保留原物化转换及 FP32 缓冲，避免改变既有归约策略。
+- COO SpMV 新算法去除半精度输入全量 FP32 副本；COO SpMM 的 compute-dtype out
+  可直接充当累加输出，保留 materialize/load 显式消融。
+- 原四组合宽输出测试增加新注册名称，增加空行、跨 tile、多层归约、512 字节
+  workspace、面板尾部、strided out、重复调用测试。原离线编译检查增加新 JIT，
+  本地不执行该检查。默认 runner 和公开函数名不变，无新增 Python 文件。
+
+### 计算节点验收命令
+
+在库根目录执行；CUDA/DCU 使用相同命令。先准确性，再真实矩阵。
+
+```bash
+python run_flagsparse_pytest.py \
+  --ops spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc \
+  --phase accuracy --mode quick --results-dir mixed_nnz_accuracy_quick
+
+python run_flagsparse_pytest.py \
+  --ops spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc \
+  --phase accuracy --mode normal --results-dir mixed_nnz_accuracy_normal
+
+COMBOS=float16:float16:float16,float16:float16:float32,bfloat16:bfloat16:bfloat16,bfloat16:bfloat16:float32
+MATRIX_DIR=../../matrix
+mkdir -p mixed_nnz_results
+for kind in spmv spmm; do
+  for fmt in csr coo csc; do
+    extra=()
+    if [ "$kind" = spmm ]; then extra=(--op-b non --layout row); fi
+    python "tests/test_${kind}_${fmt}.py" "$MATRIX_DIR" \
+      --type-combos "$COMBOS" --alg compare --ops non \
+      --index-dtypes int32 --indptr-dtypes int32 \
+      "${extra[@]}" --no-vendor --warmup 10 --iters 50 --timing \
+      "--csv-${fmt}" "mixed_nnz_results/${kind}_${fmt}.csv"
+  done
+done
+```
+
+SpMM 未指定 dense-cols 时为 N=32。厂商验收在支持组合的 CUDA/新版 HIP 环境
+删除 `--no-vendor`，记录 vendor 状态/版本；旧 DTK 不可用不阻断 FlagSparse。
+全覆盖将 `--ops non` 换为 `--ops all`；SpMM extra 换为
+`(--op-b non,trans,conj --layout all --dense-cols 1,8,16,32,64,128,256)`，
+索引改成 `int32,int64`。建议分批运行并保存独立 CSV。
+
+仅测试新算法及强制分批的示例：
+
+```bash
+python tests/test_spmv_csr.py --synthetic --type-combos "$COMBOS" \
+  --alg csr_nnz_tile_reduce --ops all \
+  --config '{"block_nnz":8,"reduce_block_size":4,"workspace_bytes":512}' \
+  --no-vendor --warmup 1 --iters 3 --timing --csv-csr mixed_nnz_results/spmv_smoke.csv
+
+python tests/test_spmm_csr.py --synthetic --type-combos "$COMBOS" \
+  --alg csr_nnz_panel_reduce --ops all --op-b non,trans,conj --layout all \
+  --config '{"block_k":8,"block_n":4,"reduce_block_size":4,"workspace_bytes":512}' \
+  --no-vendor --warmup 1 --iters 3 --timing --csv-csr mixed_nnz_results/spmm_smoke.csv
+```
+
+消融通过相同显式算法分别传 `--config`，不能与 compare 共用配置：
+CSR panel 使用 `tile_n=16/32/64`、`panel_accumulators=1/2/4`；
+COO stream panel 使用 `conversion_mode=load/materialize`、
+`blocks_per_program=1/2/4/8`、`local_reduce=segment/none`，每次只改变一项。
+每次结果记录四元组、op、布局、N、索引、算法及配置；精度 FAIL 保留有效耗时。
+性能统计分别比较同算法优化前后与旧/新最佳，不把无 baseline 的自身改进称为厂商加速比。
+
+
 日期：2026-10-20  
 目标库：FlagSparse-main，`zyq_sparse` 分支  
 状态：规划文档；本文不代表功能已实现、已编译或已通过实机验证。

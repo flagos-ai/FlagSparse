@@ -2772,7 +2772,7 @@ for _algorithm_name in SPMM_CSR_NEW_ALGORITHMS:
     SPMM_CSR_ALGORITHMS[_algorithm_name] = SpmmCsrAlgorithm(
         name=_algorithm_name, display_name=_algorithm_name,
         supported_ops=tuple(SPMM_OP_NAMES.values()),
-        supported_dtypes=tuple(getattr(torch, name) for name in _csr_extension_config.DTYPES),
+        supported_dtypes=tuple(getattr(torch, name) for name in _csr_extension_config.algorithm_spec(_algorithm_name)["value_dtypes"]),
         run=partial(_run_spmm_csr_extension, algorithm=_algorithm_name),
     )
 

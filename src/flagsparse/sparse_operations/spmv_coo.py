@@ -1405,10 +1405,11 @@ def _coo_sorted_runs(data, row, col):
     return data, row, col, starts
 
 
-def _launch_coo_extension(data, row, col, starts, B, shape, alg, cfg, conj=False, compute_dtype=None):
+def _launch_coo_extension(data, row, col, starts, B, shape, alg, cfg, conj=False, compute_dtype=None, out=None):
     # B is always a 2D view; SpMV uses a singleton output panel.
     compute_dtype = data.dtype if compute_dtype is None else compute_dtype
-    C = torch.zeros((shape[0], B.shape[1]), device=data.device, dtype=compute_dtype)
+    C = out if out is not None else torch.empty((shape[0], B.shape[1]), device=data.device, dtype=compute_dtype)
+    C.zero_()
     if not data.numel() or not C.numel():
         return C
     complex_ = data.is_complex()
@@ -1562,7 +1563,7 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
         with phases.measure("process_gpu_ms"):
             a, r, c = a.resolve_conj().resolve_neg().contiguous(), r.contiguous(), c.contiguous()
             vector = x.resolve_conj().resolve_neg()
-            if data.dtype in (torch.float16, torch.bfloat16):
+            if selected not in _COO_NEW_ALGORITHMS and data.dtype in (torch.float16, torch.bfloat16):
                 a, vector = a.float(), x.float()
             if selected not in _COO_ATOMIC_ALGORITHMS:
                 a, r, c, starts = _coo_sorted_runs(a, r, c)
@@ -1571,7 +1572,9 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
             if selected in _COO_NEW_ALGORITHMS:
                 def launch(rr, cc, ss):
                     return _launch_coo_extension(a, rr, cc, ss, vector[:, None], shape,
-                                                 selected, cfg, prepared.op == "conj")[:, 0]
+                                                 selected, cfg, prepared.op == "conj",
+                                                 compute_dtype=torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype,
+                                                 out=out[:, None] if out is not None and out.dtype == (torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype) and out.is_contiguous() else None)[:, 0]
                 try:
                     y = launch(r, c, starts)
                 except Exception as exc:
@@ -1592,7 +1595,8 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
                 y = _run_spmv_coo_prepared_with_fallback(view, vector, 256, 4, 128)
             y = y.to(output_dtype)
             if out is not None:
-                out.copy_(y)
+                if y.data_ptr() != out.data_ptr() or y.stride() != out.stride():
+                    out.copy_(y)
                 y = out
         return y, dict(info, alg=selected, alg_requested=requested, alg_resolved=selected,
                        a_dtype=str(data.dtype), rhs_dtype=str(x.dtype), output_dtype=str(output_dtype),
@@ -1601,7 +1605,7 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
                        backend=_backend_name(),
                        input_indices=(str(row.dtype), str(col.dtype)),
                        execution_indices=(str(r.dtype), str(c.dtype)), fallback_reason=reason,
-                       transpose_strategy="index_roles", implementation_version=2,
+                       transpose_strategy="index_roles", implementation_version=3,
                        blocks_per_program=cfg.get("blocks_per_program", 1),
                        timing_contract_version=2)
     return _coo_measure_run(execute, return_time, return_meta, timing)

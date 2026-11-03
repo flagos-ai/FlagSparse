@@ -40,7 +40,7 @@ kernels = load_module("_csr_interpreter_kernels", "_spmv_csr_kernels.py")
 policy = load_module("_csr_interpreter_policy", "_spmv_csr_config.py")
 
 
-@pytest.mark.parametrize("alg", policy.NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg", [a for a in policy.NEW_ALGORITHMS if a != "csr_nnz_tile_reduce"])
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -149,7 +149,7 @@ def test_interpreted_multilevel_reduction(alg, width):
     assert plans[0]["starts"].data_ptr() != plans[1]["starts"].data_ptr()
 
 
-@pytest.mark.parametrize("alg", policy.NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg", [a for a in policy.NEW_ALGORITHMS if a != "csr_nnz_tile_reduce"])
 def test_interpreted_public_api_and_fallback(alg, monkeypatch):
     """Run real public orchestration on CPU tensors; only device/events are mocked."""
     import importlib
@@ -215,7 +215,7 @@ def test_interpreted_public_api_and_fallback(alg, monkeypatch):
     assert meta["config"] == prepared.config
 
 
-@pytest.mark.parametrize("alg", policy.NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg", [a for a in policy.NEW_ALGORITHMS if a != "csr_nnz_tile_reduce"])
 @pytest.mark.parametrize("m", [0, 7])
 def test_interpreted_zero_columns(alg, m):
     prepared = SimpleNamespace(

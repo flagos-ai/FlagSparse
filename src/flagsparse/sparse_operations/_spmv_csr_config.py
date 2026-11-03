@@ -3,8 +3,8 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 4
-NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream")
+IMPLEMENTATION_VERSION = 5
+NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream", "csr_nnz_tile_reduce")
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend")
@@ -69,7 +69,7 @@ def algorithm_spec(alg):
         "name": name,
         "implementation_version": IMPLEMENTATION_VERSION,
         "ops": ("non", "trans", "conj"),
-        "value_dtypes": VALUE_DTYPES,
+        "value_dtypes": ("float16", "bfloat16") if name == "csr_nnz_tile_reduce" else VALUE_DTYPES,
         "index_dtypes": (
             ("int32",) if name == "legacy_bucket_vector" else ("int32", "int64")
         ),
@@ -79,7 +79,7 @@ def algorithm_spec(alg):
         "runtime_process_ops": (
             ("non", "trans", "conj")
             if name
-            in ("row_split_reduce", "row_adaptive_split", "legacy_bucket_vector")
+            in ("row_split_reduce", "row_adaptive_split", "legacy_bucket_vector", "csr_nnz_tile_reduce")
             else ("trans", "conj")
         ),
         "transpose_strategy": "per_run_csr_rebuild",
@@ -91,6 +91,9 @@ def algorithm_spec(alg):
             dt: (dt, "float32")
             for dt in ("float16", "bfloat16")
         },
+        "config_candidates": ({"lanes_per_row": (2, 4, 8, 16, 32, 64),
+                               "row_tiles_per_program": (1, 2, 4, 8)}
+                              if name == "row_subgroup_stream" else {}),
     }
 
 
@@ -238,6 +241,26 @@ def _validate_config(resolved, caps):
 
 
 def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_nnz=0):
+    if config is not None and not isinstance(config, dict):
+        raise TypeError("CSR SpMV config must be a dictionary")
+    if alg == "csr_nnz_tile_reduce":
+        if caps.backend not in ("cuda", "rocm") or not (caps.int64 and caps.reduction and caps.subgroup_width in (32, 64)):
+            raise BackendCapabilityUnavailable("NNZ tiles require verified CUDA/ROCm scan and index capabilities")
+        resolved = dict(block_nnz=128, num_warps=4, num_stages=1,
+                        reduce_block_size=256, workspace_bytes=256 * 1024 * 1024)
+        _merge(resolved, config or {})
+        for key in ("block_nnz", "reduce_block_size", "num_warps"):
+            value = resolved[key]
+            if value <= 0 or value & (value - 1):
+                raise ValueError(f"{key} must be a positive power of two")
+        if not 2 <= resolved["reduce_block_size"] <= 256 or resolved["block_nnz"] > 4096:
+            raise ValueError("NNZ tile/reduction block exceeds supported limits")
+        if resolved["num_warps"] not in (1, 2, 4, 8) or resolved["num_warps"] * caps.subgroup_width > caps.max_threads_per_block:
+            raise ValueError("illegal NNZ tile launch")
+        if resolved["num_stages"] != 1 or resolved["workspace_bytes"] < 36:
+            raise ValueError("NNZ tiles require stage=1 and at least 36 workspace bytes")
+        source = "explicit" if config else "conservative-nnz-v1"
+        return (resolved, source, []) if return_rejections else (resolved, source)
     if config is not None and not isinstance(config, dict):
         raise TypeError("CSR SpMV config must be a dictionary")
     if alg not in NEW_ALGORITHMS:

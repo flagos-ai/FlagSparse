@@ -22,6 +22,18 @@ spec.loader.exec_module(policy)
 
 
 class ConfigPolicy(unittest.TestCase):
+    def test_mixed_nnz_type_and_workspace_contract(self):
+        caps = policy.BackendCaps("rocm", "gfx936", "hip", 64, 1024, True, True, True)
+        spec = policy.algorithm_spec("csr_nnz_tile_reduce")
+        self.assertEqual(spec["value_dtypes"], ("float16", "bfloat16"))
+        cfg, _ = policy.resolve_config("csr_nnz_tile_reduce", caps)
+        self.assertEqual(cfg["block_nnz"], 128)
+        for override in ({"block_nnz": 3}, {"workspace_bytes": 35}, {"num_stages": 2}):
+            with self.assertRaises(ValueError):
+                policy.resolve_config("csr_nnz_tile_reduce", caps, override)
+        with self.assertRaises(NotImplementedError):
+            policy.validate_support("csr_nnz_tile_reduce", "non", "float32", "int32", "int32", caps)
+
     def setUp(self):
         self.cuda = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True)
         self.hip = policy.BackendCaps(
@@ -29,8 +41,12 @@ class ConfigPolicy(unittest.TestCase):
         )
 
     def test_registry_support(self):
-        self.assertEqual(len(policy.list_algorithms()), 8)
+        self.assertEqual(len(policy.list_algorithms()), 9)
         for alg in policy.NEW_ALGORITHMS:
+            if alg == "csr_nnz_tile_reduce":
+                self.assertNotIn(alg, policy.list_algorithms(dtype="float32"))
+                self.assertIn(alg, policy.list_algorithms(dtype="bfloat16", backend="rocm"))
+                continue
             self.assertIn(alg, policy.list_algorithms("non", "torch.float32", "rocm"))
             self.assertIn(alg, policy.list_algorithms("trans", "float32", "cuda"))
             self.assertIn(alg, policy.list_algorithms("non", "complex64", "cuda"))
@@ -44,13 +60,15 @@ class ConfigPolicy(unittest.TestCase):
     def test_all_dtype_ops_and_precision_requirements(self):
         no_fp64 = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, False, True, True)
         for alg in policy.ALGORITHMS:
-            for dtype in policy.VALUE_DTYPES:
+            for dtype in policy.algorithm_spec(alg)["value_dtypes"]:
                 for op in ("non", "trans", "conj"):
                     policy.validate_support(alg, op, dtype, "int32", "int64", self.cuda)
             spec = policy.algorithm_spec(alg)
             self.assertEqual(spec["compute_dtype_by_input"]["complex64"], "complex64")
             self.assertEqual(spec["compute_dtype_by_input"]["float16"], "float32")
         for alg in policy.NEW_ALGORITHMS:
+            if alg == "csr_nnz_tile_reduce":
+                continue
             policy.resolve_config(alg, no_fp64)
             for dtype in ("float16", "bfloat16", "complex64"):
                 policy.validate_support(alg, "conj", dtype, "int64", "int32", no_fp64)
@@ -424,7 +442,7 @@ class IntegrationPolicy(unittest.TestCase):
         rows = ops_support.build_rows(SOURCE)
         for alg in policy.NEW_ALGORITHMS:
             cases = [row for row in rows if row["route"] == alg]
-            self.assertEqual(len(cases), 36)
+            self.assertEqual(len(cases), 12 if alg == "csr_nnz_tile_reduce" else 36)
             self.assertEqual({row["op"] for row in cases}, {"non", "trans", "conj"})
             self.assertEqual({row["status"] for row in cases}, {"UNVERIFIED"})
 
@@ -488,7 +506,7 @@ def test_migrated_policies_validate_capabilities_and_workspace():
     caps = csr.BackendCaps("rocm", "hip", "gfx936", 64, 1024, (1, 2, 4, 8),
                            True, True, True, True, True, True, True)
     for alg in csr.NEW_ALGORITHMS:
-        cfg, info = csr.resolve_config(alg, "complex128", 33, "col", caps)
+        cfg, info = csr.resolve_config(alg, "float16" if alg == "csr_nnz_panel_reduce" else "complex128", 33, "col", caps)
         assert info["backend_caps"]["backend"] == "rocm"
         assert cfg["workspace_bytes"] == 256 * 1024 * 1024
         assert csr.algorithm_spec(alg)["validation"] == "unverified"

@@ -1323,13 +1323,15 @@ def _run_csc_split(data, indices, ptr, dense, shape, op, cfg, phases, stats, out
     return result[:, 0] if vector else result
 
 
-def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg):
+def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg, *, out=None, out_dtype=None):
     """Shared native CSC launch; all strides are in logical (possibly complex) elements."""
     vector = dense.ndim == 1
     n = 1 if vector else dense.shape[1]
     rows = shape[0] if op == "non" else shape[1]
     output_shape = (rows,) if vector else (rows, n)
-    result = torch.empty(output_shape, dtype=data.dtype, device=data.device)
+    output_dtype = data.dtype if out_dtype is None else out_dtype
+    buffer_dtype = torch.float32 if op == "non" and data.dtype in (torch.float16, torch.bfloat16) else output_dtype
+    result = out if out is not None and out.dtype == buffer_dtype else torch.empty(output_shape, dtype=buffer_dtype, device=data.device)
     if op == "non":
         result.zero_()
     if not rows or not n or not shape[1]:
@@ -1488,14 +1490,15 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
             a = data.resolve_conj().contiguous()
             i, p = indices.contiguous(), ptr.contiguous()
             b = dense.resolve_conj()
-            if data.dtype in (torch.float16, torch.bfloat16):
+            if selected == "csc_col_split_reduce" and data.dtype in (torch.float16, torch.bfloat16):
                 a, b = a.float(), b.float()
         stats = {}
         def compute(ii, pp):
             if selected == "csc_col_split_reduce":
                 return _run_csc_split(a, ii, pp, b, prepared.shape, prepared.op, cfg, phases, stats, output_dtype)
             if selected in CSC_ALGORITHMS:
-                return _launch_csc_columns(a, ii, pp, b, prepared.shape, prepared.op, selected, cfg)
+                return _launch_csc_columns(a, ii, pp, b, prepared.shape, prepared.op, selected, cfg,
+                                           out=out, out_dtype=output_dtype)
             raise ValueError("legacy CSC routes require the original prepared interface")
         with (nullcontext() if selected == "csc_col_split_reduce" else phases.measure("compute_ms")):
             try:
@@ -1510,12 +1513,13 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
                 result = compute(i, p)
         with phases.measure("compute_ms"):
             result = result.to(output_dtype)
-            if out is not None:
+            if out is not None and result is not out:
                 out.copy_(result)
                 result = out
         meta = dict(info, alg=selected, alg_requested=alg or prepared.alg, alg_resolved=selected,
                     a_dtype=str(data.dtype), rhs_dtype=str(dense.dtype), output_dtype=str(output_dtype),
-                    config=cfg, op=prepared.op, implementation_version=2, timing_contract_version=2,
+                    config=cfg, op=prepared.op, implementation_version=3, timing_contract_version=2,
+                    conversion_mode="materialize" if selected == "csc_col_split_reduce" else "load",
                     compute_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
                     input_indices_dtype=str(indices.dtype), input_indptr_dtype=str(ptr.dtype),
                     execution_indices_dtype=str(i.dtype), execution_indptr_dtype=str(p.dtype),

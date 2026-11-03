@@ -785,11 +785,24 @@ def test_child_device_matches_the_visible_device_mask(
     # torch_npu ignores CUDA_VISIBLE_DEVICES, so Ascend children landed on NPU 0
     # whatever --gpus said; masked children then see their one card as device 0.
     monkeypatch.setenv("FLAGSPARSE_BACKEND", backend)
+    monkeypatch.delenv("FLAGSPARSE_SLURM_CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
     env = runner._base_env(ROOT, 6)
     assert env["CUDA_VISIBLE_DEVICES"] == "6"
     assert env.get("ASCEND_RT_VISIBLE_DEVICES") == ascend_mask
     assert runner._subprocess_device_id(6) == child_device
+
+
+@pytest.mark.parametrize("allocation", ["3,5", "GPU-first,GPU-second"])
+def test_slurm_cuda_allocation_is_preserved(monkeypatch, allocation):
+    monkeypatch.setenv("FLAGSPARSE_BACKEND", "cuda")
+    monkeypatch.setenv("FLAGSPARSE_SLURM_CUDA_VISIBLE_DEVICES", allocation)
+    for index, device in enumerate(allocation.split(",")):
+        assert runner._base_env(ROOT, index)["CUDA_VISIBLE_DEVICES"] == device
+        assert runner._subprocess_device_id(index) == 0
+    for index in (-1, 2):
+        with pytest.raises(ValueError, match="Slurm allocation"):
+            runner._base_env(ROOT, index)
 
 
 def test_delivery_projection_keeps_a_timeout_distinct_from_not_run():

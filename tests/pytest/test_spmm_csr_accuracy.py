@@ -23,6 +23,7 @@ from flagsparse import (
 from flagsparse.sparse_operations import _common as common
 from tests import reference_utils
 
+
 from tests.pytest.param_shapes import (
     MNK_SHAPES,
     SPMM_FLOAT_DTYPES,
@@ -41,6 +42,41 @@ from tests.pytest.accuracy_utils import (
 pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 
 _SYNTHETIC_VALUE_SCALE = 0.125
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("wide", [False, True])
+@pytest.mark.parametrize("n", [0, 1, 7, 33])
+def test_spmm_csr_nnz_panels_bounded_workspace(dtype, wide, n):
+    import importlib
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+    device = accelerator_device()
+    lengths = torch.tensor([0, 1, 7, 8, 9, 0, 513, 2, 0], dtype=torch.int64)
+    ptr_cpu = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    count = int(ptr_cpu[-1])
+    cols_cpu = (torch.arange(count) * 13) % 37
+    values = torch.full((count,), 0.125, dtype=dtype, device=device)
+    cols, ptr = cols_cpu.to(device), ptr_cpu.to(device)
+    B = torch.full((n, 37), 0.5, dtype=dtype, device=device).T
+    output_dtype = torch.float32 if wide else dtype
+    out = torch.full((9, 2 * n), float("nan"), dtype=output_dtype, device=device)[:, ::2]
+    cfg = dict(block_k=8, block_n=4, reduce_block_size=4, workspace_bytes=512)
+    try:
+        prepared = module.prepare_spmm_csr_route(values, cols, ptr, (9, 37), alg="csr_nnz_panel_reduce", config=cfg)
+        for _ in range(2):
+            out.fill_(float("nan"))
+            result, meta = module.flagsparse_spmm_csr_run(prepared, B, out=out, return_meta=True)
+            expected = (lengths.double()[:, None] * 0.0625).expand(9, n).to(output_dtype)
+            assert result is out
+            rtol, atol = close_tolerances(output_dtype)
+            torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+            assert meta["workspace_peak_bytes"] <= cfg["workspace_bytes"]
+            assert meta["plan_builds"] == 1
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+
 
 
 def _random_csr_mk(M, K, dtype, device, value_scale=_SYNTHETIC_VALUE_SCALE):
@@ -441,6 +477,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
 @pytest.mark.spmm_csr
 @pytest.mark.parametrize("alg", [
     "csr_row_tile", "csr_row_kparallel", "csr_row_panel",
+    "csr_nnz_panel_reduce",
     "csr_split_nnz_reduce", "csr_adaptive_tile_split",
     "csr_base", "csr_base_accuracy", "spmm_csr_alg1", "spmm_csr_alg2",
     "spmm_csr_alg2_accuracy", "spmm_csr_alg2_accuracy_hp",

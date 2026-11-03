@@ -309,7 +309,7 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
         *(
             ApiSpec(
                 operator, f"flagsparse_{operator}_{fmt.lower()}", f"{operator}_{fmt.lower()}",
-                fmt, name, values=("float16", "bfloat16", "float32", "float64", "complex64", "complex128"),
+                fmt, name, values=(("float16", "bfloat16") if name == "csr_nnz_panel_reduce" else ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")),
                 indices=DEFAULT_INDEX_DTYPES,
                 ops=(modules["_spmx_column_config"].get("CSC_ALGORITHMS")[name]
                      if fmt == "CSC" else ("non", "trans", "conj")),
@@ -362,6 +362,7 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
                 "CSR",
                 algorithm,
                 value_const="SPMV_CSR_NEW_VALUE_DTYPES",
+                values=("float16", "bfloat16") if algorithm == "csr_nnz_tile_reduce" else None,
                 index_const="SUPPORTED_INDEX_DTYPES",
                 ops=spmv_ops,
                 notes="CUDA/ROCm; input-dependent accumulation; per-run CSR transpose; hardware validation pending",

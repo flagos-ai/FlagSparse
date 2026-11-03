@@ -34,6 +34,7 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "row_split_reduce",
     "row_adaptive_split",
     "row_subgroup_stream",
+    "csr_nnz_tile_reduce",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1654,8 +1655,10 @@ def _spmv_check_output(out, prepared, x, output_dtype=None):
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
-    if not out.is_contiguous():
+    if not out.is_contiguous() and prepared.alg != "csr_nnz_tile_reduce":
         raise ValueError("out must be contiguous")
+    if prepared.alg == "csr_nnz_tile_reduce" and out.numel() > 1 and out.stride(0) <= 0:
+        raise ValueError("out must have non-overlapping positive strides")
     if out.is_conj() or out.is_neg():
         raise ValueError("out must not be a lazy conjugate or negative view")
     if out.numel():
@@ -1773,6 +1776,23 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
     else:
         execution, plan, buckets = prepared, None, None
         process_ms = 0.0 if timing else None
+
+    if alg == "csr_nnz_tile_reduce":
+        from ._spmv_csr_nnz import run_mixed
+        from ._spmm_csr_runtime import Phases
+
+        phases = Phases(timing)
+        with phases.measure("compute_ms"):
+            vector = x.resolve_conj().contiguous()
+            y = out if out is not None else torch.empty(
+                execution.n_rows, dtype=execution.data.dtype, device=x.device)
+        stats = run_mixed(execution, vector[:, None], y[:, None], execution.config, phases)
+        measured = phases.results()
+        if timing:
+            measured["process_gpu_ms"] += process_ms or 0.0
+        return y, dict(process_cpu_ms=0.0, **measured, **stats,
+                       execution_indices_dtype=str(execution.kernel_indices.dtype).removeprefix("torch."),
+                       execution_indptr_dtype=str(execution.kernel_indptr.dtype).removeprefix("torch."))
 
     def compute():
         vector = x.resolve_conj().contiguous()
@@ -1947,6 +1967,10 @@ def flagsparse_spmv_csr_run(
             meta.update(
                 process_gpu_ms=phases["process_gpu_ms"], compute_ms=phases["compute_ms"]
             )
+        if actual.alg == "csr_nnz_tile_reduce":
+            for key in ("boundary_record_count", "reduction_levels", "tile_batches",
+                        "workspace_peak_bytes", "descriptor_peak_bytes", "nnz_tile_count", "plan_builds"):
+                meta[key] = phases[key]
         if _is_rocm_runtime() and actual.rocm_nnz_plan is not None:
             meta.update(
                 execution_kernel="rocm_nnz_balanced",
