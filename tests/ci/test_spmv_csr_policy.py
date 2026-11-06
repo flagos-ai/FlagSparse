@@ -13,6 +13,20 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "src/flagsparse/sparse_operations"
+
+
+def test_fixed_nnz_plan_has_no_dynamic_boundary_compaction():
+    tree = ast.parse((SOURCE / "_spmv_csr_nnz.py").read_text(encoding="utf-8"))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "_run_mixed_fixed")
+    calls = {n.func.attr for n in ast.walk(function)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert not calls & {"item", "cumsum", "unique_consecutive", "repeat_interleave", "nonzero"}
+    # The only host structural read is the existing per-row-wave CSR boundary.
+    assert sum(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "tolist" for n in ast.walk(function)) == 1
+
+
 spec = importlib.util.spec_from_file_location(
     "_csr_policy_test_config", SOURCE / "_spmv_csr_config.py"
 )
@@ -28,6 +42,12 @@ class ConfigPolicy(unittest.TestCase):
         self.assertEqual(spec["value_dtypes"], ("float16", "bfloat16"))
         cfg, _ = policy.resolve_config("csr_nnz_tile_reduce", caps)
         self.assertEqual(cfg["block_nnz"], 128)
+        self.assertEqual(cfg["plan_mode"], "compact")
+        fixed, _ = policy.resolve_config("csr_nnz_tile_reduce", caps, {"plan_mode": "fixed"})
+        self.assertEqual(fixed["plan_mode"], "fixed")
+        for override in ({"plan_mode": "other"}, {"plan_mode": "fixed", "reduce_block_size": 2}):
+            with self.assertRaises(ValueError):
+                policy.resolve_config("csr_nnz_tile_reduce", caps, override)
         for override in ({"block_nnz": 3}, {"workspace_bytes": 35}, {"num_stages": 2}):
             with self.assertRaises(ValueError):
                 policy.resolve_config("csr_nnz_tile_reduce", caps, override)
@@ -505,6 +525,23 @@ def test_migrated_policies_validate_capabilities_and_workspace():
     csr, column = _extension_policies()
     caps = csr.BackendCaps("rocm", "hip", "gfx936", 64, 1024, (1, 2, 4, 8),
                            True, True, True, True, True, True, True)
+    for load in (1, 4, 8):
+        cfg, _ = csr.resolve_config("csr_row_panel", "float16", 33, "row", caps,
+                                    {"panel_load_nnz": load})
+        assert cfg["panel_load_nnz"] == load
+    for mode in ("compact", "fixed"):
+        cfg, _ = csr.resolve_config("csr_nnz_panel_reduce", "bfloat16", 33, "col", caps,
+                                    {"plan_mode": mode})
+        assert cfg["plan_mode"] == mode
+    for algorithm, override in (
+        ("csr_row_panel", {"panel_load_nnz": 2}),
+        ("csr_row_tile", {"panel_load_nnz": 4}),
+        ("csr_row_panel", {"plan_mode": "fixed"}),
+        ("csr_nnz_panel_reduce", {"plan_mode": "bad"}),
+        ("csr_nnz_panel_reduce", {"plan_mode": "fixed", "reduce_block_size": 2}),
+    ):
+        with unittest.TestCase().assertRaises(ValueError):
+            csr.resolve_config(algorithm, "float16", 33, "row", caps, override)
     for alg in csr.NEW_ALGORITHMS:
         cfg, info = csr.resolve_config(alg, "float16" if alg == "csr_nnz_panel_reduce" else "complex128", 33, "col", caps)
         assert info["backend_caps"]["backend"] == "rocm"

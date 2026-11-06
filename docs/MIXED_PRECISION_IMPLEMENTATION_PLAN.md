@@ -593,3 +593,90 @@ python run_flagsparse_pytest.py --ops spmv_csr --phase accuracy --mode quick \
 ```
 
 通过后再依次确认其他五个算子，不立即重复完整六算子大扫描。
+
+## Mixed 第二轮：panel 成块加载与 NNZ fixed 计划（2026-11-06）
+
+基线：`5f35de149d7fce4f3f6d6817ea2a23fc20850d25`，分支 `zyq_sparse`。
+开始时已有的 `tools/run_cuda_tests.sbatch`、`docs/CUDA_SBATCH.md` 修改保留。
+优化前数据：工作目录 `test_mixed_data/11.06data/pytest_results_mixed_all_vendor`；
+prepared_run、median ±10% mean，三个SpMV各30矩阵，SpMM CSR仅6矩阵，不能视为六算子完整基线。
+
+### 新配置及边界
+
+| 算法 | 配置 | 默认 | 实现 |
+|---|---|---|---|
+| csr_row_panel | panel_load_nnz=1/4/8 | 1 | `[R,K]`成块加载value/index，逐位置广播到面板，不保留三维累加器 |
+| csr_nnz_tile_reduce / csr_nnz_panel_reduce | plan_mode=compact/fixed | compact | fixed首尾槽位、局部行定位和固定容量归并树 |
+| row_subgroup_stream | 原lane、行块数配置 | 不变 | 已直接半精度加载、FP32累加和最终out写回，本轮增加配置回归 |
+| COO stream | 原blocks_per_program/local_reduce；SpMM另有conversion_mode | 不变 | 已支持合法FP32 out直接atomic，本轮增加NaN/strided out身份回归 |
+
+四种组合：FP16/FP16、BF16/BF16输入，FP32计算，输出同输入或FP32。不新增API/算法名、不切默认。
+成块加载不保证机器码访存向量化，需实机检查加载事务、寄存器和spill。
+fixed每次run重建，当前tile批次行界在最多四个输出面板间复用；单行tile广播owner，多行tile局部二分。
+固定首尾槽保留有序owner，未用数值槽写零。跨界记录按块分段归约，完整行写FP32累加器，跨块首尾递归归并。
+不使用浮点atomic、动态边界压紧或有效计数读回。fixed的reduce_block_size为4至256的二次幂；2不能保证容量收缩。
+数值workspace默认256MiB，包含行波次/面板累加和归并双缓冲；描述符单独统计。小空间分批，最终才转半精度输出。
+必要的行波次指针读回仍在run中。boundary_slot_capacity为峰值容量，不冒充有效记录数。
+完整计时保持ms=process_cpu_ms+gpu_ms；诊断另测。初始化、计划、归并和转换均在原run边界内。
+
+### 原测试入口及消融
+
+在已配置CUDA容器/虚拟环境或HIP计算节点执行，当前开发环境不运行：
+
+```bash
+python run_flagsparse_pytest.py \
+  --ops spmv_csr,spmm_csr,spmv_coo,spmm_coo \
+  --phase accuracy --mode quick --results-dir pytest_results_mixed_p2_accuracy
+# quick后将mode改为normal，并更换results-dir。
+```
+
+原mixed用例增加fixed及panel加载配置，覆盖四种类型、操作、布局、合法索引和宽输出。
+NNZ专用测试覆盖compact/fixed、小workspace、多层归并、空矩阵、长行及strided out。
+COO carry用例保留块数1/2/4/8和segment/none，增加NaN预填strided out；策略测试覆盖非法配置与配置隔离。
+源码接通不等于硬件验证，CUDA/ROCm编译、精度及性能均待计算节点验收。
+
+全算法基线仍使用默认配置：
+
+```bash
+MATRIX_DIR=~/run/matrix
+: "${MATRIX_DIR:?set MATRIX_DIR}"
+test -d "$MATRIX_DIR" || exit 1
+python run_flagsparse_pytest.py \
+  --ops spmv_csr,spmm_csr,spmv_coo,spmm_coo \
+  --phase performance --mode quick --benchmark-input "$MATRIX_DIR" \
+  --benchmark-warmup 10 --benchmark-iters 50 \
+  --benchmark-args "--type-combos float16:float16:float32,bfloat16:bfloat16:float32 --alg compare --ops non --index-dtypes int32 --indptr-dtypes int32 --timing" \
+  --op-benchmark-args "spmm_csr=--op-b non --layout row --dense-cols 32" \
+  --op-benchmark-args "spmm_coo=--op-b non --layout row --dense-cols 32" \
+  --results-dir pytest_results_mixed_p2_compare
+```
+
+新配置用单算法显式消融，不将专用config传给compare：
+
+```bash
+for mode in compact fixed; do
+  python tests/test_spmv_csr.py "$MATRIX_DIR" \
+    --type-combos float16:float16:float32,bfloat16:bfloat16:float32 \
+    --alg csr_nnz_tile_reduce --config "{\"plan_mode\":\"$mode\"}" \
+    --ops non --index-dtypes int32 --indptr-dtypes int32 \
+    --warmup 10 --iters 50 --timing --csv-csr "spmv_nnz_$mode.csv"
+  python tests/test_spmm_csr.py "$MATRIX_DIR" \
+    --type-combos float16:float16:float32,bfloat16:bfloat16:float32 \
+    --alg csr_nnz_panel_reduce --config "{\"plan_mode\":\"$mode\"}" \
+    --ops non --op-b non --layout row --dense-cols 32 \
+    --index-dtypes int32 --indptr-dtypes int32 \
+    --warmup 10 --iters 50 --timing --csv-csr "spmm_nnz_$mode.csv"
+done
+for load in 1 4 8; do
+  python tests/test_spmm_csr.py "$MATRIX_DIR" \
+    --type-combos float16:float16:float32,bfloat16:bfloat16:float32 \
+    --alg csr_row_panel --config "{\"panel_load_nnz\":$load}" \
+    --ops non --op-b non --layout row --dense-cols 32 \
+    --index-dtypes int32 --indptr-dtypes int32 \
+    --warmup 10 --iters 50 --timing --csv-csr "spmm_panel_load$load.csv"
+done
+```
+
+厂商默认开启；当前HIP明确不支持时可加`--no-vendor`，FlagSparse继续，结果仅称自身改进。
+后续补同类型输出、全部op/opB、两种布局及N=8/128。固定其余因素后分别消融面板加载块、宽度、累加器、subgroup行块/lane、COO块数/归约/转换。
+CUDA/ROCm分别记录软件版本、覆盖、精度和profiler；保留FAIL，报告单算法及逐矩阵最佳的算术/几何平均和回退。

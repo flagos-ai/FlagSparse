@@ -718,7 +718,9 @@ def test_spmv_csr_complex_cancellation(alg, dtype, op):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("wide", [False, True])
 @pytest.mark.parametrize("lengths", [[], [0, 0, 0], [0, 1, 7, 8, 9, 0, 513, 2, 0]])
-def test_spmv_csr_nnz_tiles_batched_boundaries(dtype, wide, lengths):
+@pytest.mark.parametrize("plan_mode", ["compact", "fixed"])
+@pytest.mark.parametrize("workspace", [512, 16384])
+def test_spmv_csr_nnz_tiles_batched_boundaries(plan_mode, workspace, dtype, wide, lengths):
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     if "csr_nnz_tile_reduce" not in spmv_mod.list_spmv_csr_algorithms(dtype=dtype, backend=common._backend_name()):
         pytest.skip("NNZ tile capability is unavailable on this backend")
@@ -730,7 +732,7 @@ def test_spmv_csr_nnz_tiles_batched_boundaries(dtype, wide, lengths):
     values_cpu = torch.where(torch.arange(count) % 3 == 0, -0.125, 0.25).to(dtype)
     values, cols, ptr = values_cpu.to(device), cols_cpu.to(device), ptr_cpu.to(device)
     x = torch.full((37,), 0.5, dtype=dtype, device=device)
-    cfg = dict(block_nnz=8, reduce_block_size=4, workspace_bytes=512)
+    cfg = dict(block_nnz=8, reduce_block_size=4, workspace_bytes=workspace, plan_mode=plan_mode)
     try:
         prepared = spmv_mod.prepare_spmv_csr(values, cols, ptr, (len(lengths), 37),
                                             alg="csr_nnz_tile_reduce", config=cfg)
@@ -748,6 +750,10 @@ def test_spmv_csr_nnz_tiles_batched_boundaries(dtype, wide, lengths):
             torch.testing.assert_close(result.cpu(), expected.to(output_dtype), rtol=rtol, atol=atol)
             assert meta["workspace_peak_bytes"] <= cfg["workspace_bytes"]
             assert meta["plan_builds"] == 1
+            assert meta["plan_mode"] == plan_mode
+            if plan_mode == "fixed":
+                assert "boundary_record_count" not in meta
+                assert meta["boundary_slot_capacity"] >= 0
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
 
@@ -838,16 +844,19 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
     (torch.int64, torch.int32), (torch.int64, torch.int64),
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", [
+@pytest.mark.parametrize("alg,config", [(name, None) for name in [
     "row_tile", "row_vector", "row_subgroup_stream",
     "csr_nnz_tile_reduce",
     "row_split_reduce", "row_adaptive_split",
     "legacy_rowpar", "legacy_segbin", "legacy_bucket_vector",
+]] + [
+    pytest.param("csr_nnz_tile_reduce", {"plan_mode": "fixed"}, id="nnz-fixed"),
+    pytest.param("row_subgroup_stream", {"row_subgroup_stream": {"row_tiles_per_program": 1, "lanes_per_row": 2}}, id="subgroup-small"),
 ])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
-def test_spmv_csr_registered_wide_output(alg, dtype, op, wide, index_pair):
+def test_spmv_csr_registered_wide_output(alg, config, dtype, op, wide, index_pair):
     """Wide output must retain bits that a half-output intermediate would lose."""
     spec = spmv_mod.get_spmv_csr_algorithm_spec(alg)
     if str(index_pair[0]).removeprefix("torch.") not in spec["index_dtypes"]:
@@ -874,14 +883,14 @@ def test_spmv_csr_registered_wide_output(alg, dtype, op, wide, index_pair):
             op=op, dtype=dtype, rhs_dtype=dtype, out_dtype=output_dtype, backend=_backend_name()
         ):
             pytest.skip("algorithm does not declare this type/op/backend combination")
-        prepared = spmv_mod.prepare_spmv_csr(values, cols, ptr, (3, 4), op=op, alg=alg)
+        prepared = spmv_mod.prepare_spmv_csr(values, cols, ptr, (3, 4), op=op, alg=alg, config=config)
         out = torch.full(expected.shape, float("nan"), dtype=output_dtype, device=device)
         result = spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out, out_dtype=output_dtype)
         assert result is out
         rtol, atol = close_tolerances(output_dtype)
         torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
         direct = flagsparse_spmv_csr(
-            values, cols, ptr, x, (3, 4), alg=alg, op=op, out_dtype=output_dtype
+            values, cols, ptr, x, (3, 4), alg=alg, config=config, op=op, out_dtype=output_dtype
         )
         torch.testing.assert_close(direct, result, rtol=rtol, atol=atol)
         with pytest.raises(ValueError, match="conflicts"):

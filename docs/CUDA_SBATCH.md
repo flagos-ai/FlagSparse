@@ -11,6 +11,8 @@
 
 默认镜像是 `$HOME/run/images/flagtree.sif`。无需先执行交互式 `env1.sh`，也无需在登录节点激活 venv。
 venv 应已基于镜像 Python 创建，且已具备测试依赖；脚本不创建或修复 venv。
+venv 校验比较目录身份，允许 `/data/home/...` 和 `/data/run01/...` 等软链接别名；
+不要求激活脚本内保存的路径字符串与物理路径完全相同。
 Slurm 的 `CUDA_VISIBLE_DEVICES` 显式传入 cleanenv 容器，不固定为 GPU 0。
 包装脚本同时设置专用分配标记，runner 的 `--gpus` 此时表示**分配列表中的序号**：
 默认 0 使用分配的第一张卡；申请两张卡后 `--gpus 0,1` 使用两张卡。
@@ -210,7 +212,8 @@ sbatch /data/path/FlagSparse-main/tools/run_cuda_tests.sbatch \
   --ops spmm_csr --phase accuracy --mode quick
 ```
 
-- 从其他目录提交必须设置 `--repo`（或 `FLAGSPARSE_REPO`），因为 Slurm 会复制脚本，无法从脚本自身位置推断源库。
+- 库目录选择顺序：`--repo`、`FLAGSPARSE_REPO`、当前目录（含 runner 时）、`SLURM_SUBMIT_DIR`。交互式 job 中先 cd 进库再用 bash 启动即可；旧脚本可显式传 `--repo "$PWD"`，避免申请 job 时的提交目录覆盖当前目录。
+- 从其他目录提交且该目录不含库时，应设置 `--repo`（或 `FLAGSPARSE_REPO`），因为 Slurm 会复制脚本，无法从脚本自身位置推断源库。
 - Slurm 输出：提交目录下 `flagsparse-JOBID.out/.err`，可用 sbatch `--output/--error` 覆盖。
 - 作业日志与可复现命令：库内 `slurm_results/JOBID/launch.txt`、`test.log`。
 - 默认 runner 结果：`slurm_results/JOBID/results/`；显式 `--results-dir` 优先。

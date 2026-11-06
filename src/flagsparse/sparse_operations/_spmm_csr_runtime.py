@@ -146,7 +146,7 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
                 if dense_layout == "col" else torch.empty((m, n), device=B.device, dtype=output_dtype))
         nnz_config = dict(block_nnz=cfg["block_k"], block_n=cfg["block_n"],
                           num_warps=cfg["num_warps"], reduce_block_size=cfg["reduce_block_size"],
-                          workspace_bytes=cfg["workspace_bytes"])
+                          workspace_bytes=cfg["workspace_bytes"], plan_mode=cfg["plan_mode"])
         stats = run_mixed(prepared, B, C, nnz_config, phases)
         meta = dict(config_meta, config=dict(cfg), algorithm=algorithm,
                     implementation_version=policy.IMPLEMENTATION_VERSION,
@@ -187,6 +187,7 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
                     _view(A), prepared.kernel_indices, prepared.kernel_indptr, _view(B), _view(C),
                     m, n, B.stride(0), B.stride(1), C.stride(0), C.stride(1),
                     cfg["tile_rows"], cfg["tile_n"], cfg["panel_accumulators"], complex_input, acc,
+                    LOAD_NNZ=cfg["panel_load_nnz"],
                     **launch)
             counts["panel_rows"] = m
         elif algorithm == "csr_row_tile":

@@ -385,7 +385,9 @@ def test_spmv_coo_stream_carry_boundaries(blocks, reduce, dtype, output_dtype, o
             pytest.skip("algorithm does not declare this type/op/backend combination")
         prepared = module.prepare_spmv_coo(data.to(device), rows.to(device), cols.to(device), shape,
             op=op, alg="coo_segmented_stream_atomic", config=cfg)
-        actual, meta = module.flagsparse_spmv_coo_run(prepared, operand.to(device), out_dtype=output_dtype, return_meta=True, timing=True)
+        out = torch.full((expected.shape[0] * 2,), float("nan"), dtype=output_dtype, device=device)[::2]
+        actual, meta = module.flagsparse_spmv_coo_run(prepared, operand.to(device), out=out, out_dtype=output_dtype, return_meta=True, timing=True)
+        assert actual is out
         rtol, atol = close_tolerances(output_dtype)
         torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
         assert meta["operator_ms"] == meta["gpu_ms"]

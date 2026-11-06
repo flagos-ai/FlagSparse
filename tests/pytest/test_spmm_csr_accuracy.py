@@ -47,8 +47,52 @@ _SYNTHETIC_VALUE_SCALE = 0.125
 @pytest.mark.spmm_csr
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("wide", [False, True])
+@pytest.mark.parametrize("load,accumulators", [(1, 2), (4, 1), (4, 2), (8, 4)])
+@pytest.mark.parametrize("n", [7, 33])
+def test_spmm_csr_panel_sparse_load_tails(dtype, wide, load, accumulators, n):
+    import importlib
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+    device = accelerator_device()
+    lengths = torch.tensor([0, 1, 3, 4, 7, 8, 9, 17, 0], dtype=torch.int64)
+    ptr_cpu = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    count = int(ptr_cpu[-1])
+    cols_cpu = (torch.arange(count) * 13) % 19
+    values_cpu = ((torch.arange(count) % 5 - 2).double() / 16).to(dtype)
+    values = values_cpu.to(device)
+    matrix = torch.zeros((9, 19), dtype=torch.float64)
+    matrix.index_put_((torch.repeat_interleave(torch.arange(9), lengths), cols_cpu),
+                      values_cpu.double(), accumulate=True)
+    rhs_cpu = ((torch.arange(19 * n).reshape(19, n) % 7 - 3).double() / 8).to(dtype)
+    rhs = rhs_cpu.to(device).T.contiguous().T
+    output_dtype = torch.float32 if wide else dtype
+    out = torch.full((9, 2 * n), float("nan"), dtype=output_dtype, device=device)[:, ::2]
+    config = dict(panel_load_nnz=load, panel_accumulators=accumulators,
+                  tile_rows=4, tile_n=16)
+    try:
+        prepared = module.prepare_spmm_csr_route(
+            values, cols_cpu.to(device), ptr_cpu.to(device), (9, 19),
+            alg="csr_row_panel", config=config)
+        actual, meta = module.flagsparse_spmm_csr_run(prepared, rhs, out=out, return_meta=True)
+        assert actual is out
+        assert meta["config"]["panel_load_nnz"] == load
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(actual.cpu(), (matrix @ rhs_cpu.double()).to(output_dtype),
+                                   rtol=rtol, atol=atol)
+        torch.testing.assert_close(values.cpu(), values_cpu, rtol=0, atol=0)
+        torch.testing.assert_close(rhs.cpu(), rhs_cpu, rtol=0, atol=0)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("wide", [False, True])
 @pytest.mark.parametrize("n", [0, 1, 7, 33])
-def test_spmm_csr_nnz_panels_bounded_workspace(dtype, wide, n):
+@pytest.mark.parametrize("plan_mode", ["compact", "fixed"])
+@pytest.mark.parametrize("workspace", [512, 16384])
+def test_spmm_csr_nnz_panels_bounded_workspace(plan_mode, workspace, dtype, wide, n):
     import importlib
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
@@ -62,7 +106,7 @@ def test_spmm_csr_nnz_panels_bounded_workspace(dtype, wide, n):
     B = torch.full((n, 37), 0.5, dtype=dtype, device=device).T
     output_dtype = torch.float32 if wide else dtype
     out = torch.full((9, 2 * n), float("nan"), dtype=output_dtype, device=device)[:, ::2]
-    cfg = dict(block_k=8, block_n=4, reduce_block_size=4, workspace_bytes=512)
+    cfg = dict(block_k=8, block_n=4, reduce_block_size=4, workspace_bytes=workspace, plan_mode=plan_mode)
     try:
         prepared = module.prepare_spmm_csr_route(values, cols, ptr, (9, 37), alg="csr_nnz_panel_reduce", config=cfg)
         for _ in range(2):
@@ -74,6 +118,10 @@ def test_spmm_csr_nnz_panels_bounded_workspace(dtype, wide, n):
             torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
             assert meta["workspace_peak_bytes"] <= cfg["workspace_bytes"]
             assert meta["plan_builds"] == 1
+            assert meta["plan_mode"] == plan_mode
+            if plan_mode == "fixed":
+                assert "boundary_record_count" not in meta
+                assert meta["boundary_slot_capacity"] >= 0
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
 
@@ -475,19 +523,23 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
     (torch.int64, torch.int32), (torch.int64, torch.int64),
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmm_csr
-@pytest.mark.parametrize("alg", [
+@pytest.mark.parametrize("alg,config", [(name, None) for name in [
     "csr_row_tile", "csr_row_kparallel", "csr_row_panel",
     "csr_nnz_panel_reduce",
     "csr_split_nnz_reduce", "csr_adaptive_tile_split",
     "csr_base", "csr_base_accuracy", "spmm_csr_alg1", "spmm_csr_alg2",
     "spmm_csr_alg2_accuracy", "spmm_csr_alg2_accuracy_hp",
+]] + [
+    pytest.param("csr_nnz_panel_reduce", {"plan_mode": "fixed"}, id="nnz-fixed"),
+    pytest.param("csr_row_panel", {"panel_load_nnz": 4}, id="panel-load4"),
+    pytest.param("csr_row_panel", {"panel_load_nnz": 8, "panel_accumulators": 4}, id="panel-load8-acc4"),
 ])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize("op_b", ["non", "trans", "conj"])
 @pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
 @pytest.mark.parametrize("layout", ["row", "col"])
-def test_spmm_csr_registered_wide_output(alg, dtype, op, op_b, wide, layout, index_pair):
+def test_spmm_csr_registered_wide_output(alg, config, dtype, op, op_b, wide, layout, index_pair):
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     try:
         import importlib
@@ -517,7 +569,7 @@ def test_spmm_csr_registered_wide_output(alg, dtype, op, op_b, wide, layout, ind
             op=op, dtype=dtype, rhs_dtype=dtype, out_dtype=output_dtype, backend=_backend_name()
         ):
             pytest.skip("algorithm does not declare this type/op/backend combination")
-        prepared = module.prepare_spmm_csr_route(values, cols, ptr, (3, 4), op=op, alg=alg)
+        prepared = module.prepare_spmm_csr_route(values, cols, ptr, (3, 4), op=op, alg=alg, config=config)
         result = module.flagsparse_spmm_csr_run(
             prepared, B, op_b=op_b, dense_layout=layout, out=out, out_dtype=output_dtype
         )
@@ -525,7 +577,7 @@ def test_spmm_csr_registered_wide_output(alg, dtype, op, op_b, wide, layout, ind
         rtol, atol = close_tolerances(output_dtype)
         torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
         direct = module.flagsparse_spmm_csr(
-            values, cols, ptr, B, (3, 4), alg=alg, op=op,
+            values, cols, ptr, B, (3, 4), alg=alg, config=config, op=op,
             op_b=op_b, dense_layout=layout, out_dtype=output_dtype,
         )
         torch.testing.assert_close(direct, result, rtol=rtol, atol=atol)

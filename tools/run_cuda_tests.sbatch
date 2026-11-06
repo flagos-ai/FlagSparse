@@ -17,7 +17,7 @@ usage() {
 sbatch [Slurm options] tools/run_cuda_tests.sbatch [wrapper options] -- [test arguments]
 
 Wrapper options:
-  --repo PATH       Repository (default: FLAGSPARSE_REPO or submission directory)
+  --repo PATH       Repository (default: FLAGSPARSE_REPO, current repo, submission directory)
   --image PATH      Image (default: $HOME/run/images/flagtree.sif)
   --venv PATH       Venv (default: /data/home/scwb320/run/gcx/vpy)
   --libcuda PATH    Triton libcuda directory (default: /usr/local/cuda/compat/lib.real)
@@ -31,7 +31,15 @@ HELP
 }
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
-repo=${FLAGSPARSE_REPO:-${SLURM_SUBMIT_DIR:-$PWD}}
+# Interactive allocations retain their original SLURM_SUBMIT_DIR even after cd.
+# Prefer a repository in the current directory when no explicit override exists.
+if [[ -n "${FLAGSPARSE_REPO:-}" ]]; then
+    repo=$FLAGSPARSE_REPO
+elif [[ -f "$PWD/run_flagsparse_pytest.py" ]]; then
+    repo=$PWD
+else
+    repo=${SLURM_SUBMIT_DIR:-$PWD}
+fi
 image=${FLAGSPARSE_IMAGE:-$HOME/run/images/flagtree.sif}
 venv=${FLAGSPARSE_VENV:-/data/home/scwb320/run/gcx/vpy}
 libcuda=${FLAGSPARSE_LIBCUDA:-/usr/local/cuda/compat/lib.real}
@@ -124,9 +132,16 @@ fi
 # Writable and isolated across jobs; compilation/warmup remain the runner's job.
 export TRITON_CACHE_DIR="$job_dir/triton_cache"
 mkdir -p "$TRITON_CACHE_DIR"
-[[ "$(command -v python)" == "$venv/bin/"* ]] || {
-    echo "ERROR: activated Python is not from $venv: $(command -v python)" >&2; exit 2;
-}
+python_command=$(command -v python)
+# activate can retain the original /data/home/... spelling while the host
+# resolved --venv through a symlink to /data/run01/.... Compare directories,
+# not path strings or the Python executable (venvs can share its symlink target).
+if [[ -z "${VIRTUAL_ENV:-}" || ! "$VIRTUAL_ENV" -ef "$venv" ||
+      ! "$(dirname "$python_command")" -ef "$venv/bin" ]]; then
+    printf 'ERROR: venv mismatch: requested=%s activated=%s Python=%s\n' \
+        "$venv" "${VIRTUAL_ENV-<unset>}" "$python_command" >&2
+    exit 2
+fi
 {
     printf 'Python=%s\nTRITON_LIBCUDA_PATH=%s\nCUDA_VISIBLE_DEVICES=%s\n' \
         "$(command -v python)" "$TRITON_LIBCUDA_PATH" "${CUDA_VISIBLE_DEVICES-<unset>}"

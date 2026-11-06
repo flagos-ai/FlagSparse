@@ -77,7 +77,7 @@ def row_panel_kernel(A, I, P, B, C, M, N,
                      B0: tl.constexpr, B1: tl.constexpr,
                      C0: tl.constexpr, C1: tl.constexpr,
                      R: tl.constexpr, BN: tl.constexpr, ACCUMULATORS: tl.constexpr,
-                     COMPLEX: tl.constexpr, ACC: tl.constexpr):
+                     COMPLEX: tl.constexpr, ACC: tl.constexpr, LOAD_NNZ: tl.constexpr = 1):
     rows = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
     ns = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN)
     valid = rows < M
@@ -92,22 +92,44 @@ def row_panel_kernel(A, I, P, B, C, M, N,
     i1 = tl.zeros((R, BN), ACC)
     i2 = tl.zeros((R, BN), ACC)
     i3 = tl.zeros((R, BN), ACC)
-    for base in range(0, longest, ACCUMULATORS):
-        for slot in tl.static_range(ACCUMULATORS):
-            pos = starts + base + slot
+    CHUNK: tl.constexpr = max(LOAD_NNZ, ACCUMULATORS)
+    for base in range(0, longest, CHUNK):
+        if LOAD_NNZ > 1:
+            offsets = starts[:, None] + base + tl.arange(0, CHUNK)[None, :]
+            active = valid[:, None] & (offsets < ends[:, None])
+            indices = tl.load(I + offsets, active, 0).to(tl.int64)
+            if COMPLEX:
+                values_r = tl.load(A + 2 * offsets, active, 0).to(ACC)
+                values_i = tl.load(A + 2 * offsets + 1, active, 0).to(ACC)
+            else:
+                values_r = tl.load(A + offsets, active, 0).to(ACC)
+        for k in tl.static_range(CHUNK):
+            slot: tl.constexpr = k % ACCUMULATORS
+            pos = starts + base + k
             mask = valid & (pos < ends)
-            cols = tl.load(I + pos, mask, 0).to(tl.int64)
+            if LOAD_NNZ > 1:
+                pick = tl.full((R, 1), k, tl.int32)
+                cols = tl.gather(indices, pick, 1).reshape((R,))
+                vr = tl.gather(values_r, pick, 1).reshape((R,))
+                if COMPLEX:
+                    vi = tl.gather(values_i, pick, 1).reshape((R,))
+            else:
+                cols = tl.load(I + pos, mask, 0).to(tl.int64)
             bo = cols[:, None] * B0 + ns[None, :] * B1
             bm = mask[:, None] & (ns[None, :] < N)
             if COMPLEX:
-                vr = tl.load(A + 2 * pos, mask, 0).to(ACC)
-                vi = tl.load(A + 2 * pos + 1, mask, 0).to(ACC)
+                if LOAD_NNZ == 1:
+                    vr = tl.load(A + 2 * pos, mask, 0).to(ACC)
+                    vi = tl.load(A + 2 * pos + 1, mask, 0).to(ACC)
                 br = tl.load(B + 2 * bo, bm, 0).to(ACC)
                 bi = tl.load(B + 2 * bo + 1, bm, 0).to(ACC)
                 real = vr[:, None] * br - vi[:, None] * bi
                 imag = vr[:, None] * bi + vi[:, None] * br
             else:
-                v = tl.load(A + pos, mask, 0).to(ACC)
+                if LOAD_NNZ > 1:
+                    v = vr
+                else:
+                    v = tl.load(A + pos, mask, 0).to(ACC)
                 real = v[:, None] * tl.load(B + bo, bm, 0).to(ACC)
                 imag = tl.zeros((R, BN), ACC)
             if slot == 0:

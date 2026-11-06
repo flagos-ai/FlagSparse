@@ -23,7 +23,7 @@ NEW_ALGORITHMS = (
 )
 BACKENDS = ()
 DTYPES = ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")
-IMPLEMENTATION_VERSION = 4
+IMPLEMENTATION_VERSION = 5
 CONFIG_FIELDS = frozenset((
     "tile_rows", "tile_k", "tile_n", "block_k", "block_n", "panels",
     "segment_nnz", "reduce_block_size", "num_warps", "num_stages",
@@ -59,8 +59,9 @@ def algorithm_spec(name):
                 layouts=("row", "col", "strided"), backends=BACKENDS,
                 index_dtypes=("int32", "int64"), execution_column_dtype="int32",
                 compute_dtype="native_component", implementation_version=IMPLEMENTATION_VERSION,
-                config_candidates=({"tile_n": (16, 32, 64), "panel_accumulators": (1, 2, 4)}
-                                   if name == "csr_row_panel" else {"tile_n" if name == "csr_row_tile" else "block_n": (16, 32, 64)}),
+                config_candidates=({"tile_n": (16, 32, 64), "panel_accumulators": (1, 2, 4), "panel_load_nnz": (1, 4, 8)}
+                                   if name == "csr_row_panel" else {"plan_mode": ("compact", "fixed")}
+                                   if name == "csr_nnz_panel_reduce" else {"tile_n" if name == "csr_row_tile" else "block_n": (16, 32, 64)}),
                 transpose_strategy="main_route_preparation", validation="unverified")
 
 
@@ -99,9 +100,9 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
         panel_n = 16 if dtype == "complex128" else 32
         cfg.update(tile_rows=4 if dtype == "complex128" else 8,
                    tile_n=min(panel_n, 1 << (max(1, n) - 1).bit_length()),
-                   num_warps=2, panel_accumulators=2)
+                   num_warps=2, panel_accumulators=2, panel_load_nnz=1)
     if algorithm == "csr_nnz_panel_reduce":
-        cfg.update(block_k=32, block_n=16)
+        cfg.update(block_k=32, block_n=16, plan_mode="compact")
     source = "conservative"
     rejections = []
     if cfg["num_warps"] not in caps.legal_num_warps:
@@ -137,10 +138,14 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
 
 
 def validate_config(cfg, caps, *, algorithm="csr_adaptive_tile_split"):
-    fields = CONFIG_FIELDS | ({"panel_accumulators"} if "panel_accumulators" in cfg else set())
+    fields = CONFIG_FIELDS | ({"panel_accumulators", "panel_load_nnz"} if algorithm == "csr_row_panel" else set()) | ({"plan_mode"} if algorithm == "csr_nnz_panel_reduce" else set())
     if set(cfg) != fields:
         raise ValueError(f"invalid configuration fields: {sorted(set(cfg) ^ CONFIG_FIELDS)}")
     for key, value in cfg.items():
+        if key == "plan_mode":
+            if value not in ("compact", "fixed"):
+                raise ValueError("plan_mode must be compact or fixed")
+            continue
         if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 2**63:
             raise ValueError(f"{key} must be a positive integer")
     for key in ("tile_rows", "tile_k", "tile_n", "block_k", "block_n", "panels", "reduce_block_size"):
@@ -154,6 +159,10 @@ def validate_config(cfg, caps, *, algorithm="csr_adaptive_tile_split"):
         raise ValueError("launch exceeds target thread limit")
     if cfg["num_stages"] != 1:
         raise ValueError("initial CSR SpMM profiles support num_stages=1 only")
+    if cfg.get("panel_load_nnz", 1) not in (1, 4, 8):
+        raise ValueError("panel_load_nnz must be 1, 4 or 8")
+    if cfg.get("plan_mode") == "fixed" and cfg["reduce_block_size"] < 4:
+        raise ValueError("fixed reduction requires reduce_block_size >= 4")
     if cfg.get("panel_accumulators", 2) not in (1, 2, 4):
         raise ValueError("panel_accumulators must be 1, 2 or 4")
     if algorithm == "csr_adaptive_tile_split" and cfg["short_row_threshold"] >= cfg["split_row_threshold"]:

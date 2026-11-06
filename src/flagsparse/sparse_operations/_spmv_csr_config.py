@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 5
+IMPLEMENTATION_VERSION = 6
 NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream", "csr_nnz_tile_reduce")
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
@@ -93,7 +93,8 @@ def algorithm_spec(alg):
         },
         "config_candidates": ({"lanes_per_row": (2, 4, 8, 16, 32, 64),
                                "row_tiles_per_program": (1, 2, 4, 8)}
-                              if name == "row_subgroup_stream" else {}),
+                              if name == "row_subgroup_stream" else {"plan_mode": ("compact", "fixed")}
+                              if name == "csr_nnz_tile_reduce" else {}),
     }
 
 
@@ -190,7 +191,10 @@ def _merge(base, overrides):
         if isinstance(base[key], dict):
             _merge(base[key], value)
         else:
-            if isinstance(value, bool) or not isinstance(value, int):
+            if key == "plan_mode":
+                if value not in ("compact", "fixed"):
+                    raise ValueError("plan_mode must be compact or fixed")
+            elif isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(f"config {key} must be an integer")
             base[key] = value
 
@@ -247,7 +251,7 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
         if caps.backend not in ("cuda", "rocm") or not (caps.int64 and caps.reduction and caps.subgroup_width in (32, 64)):
             raise BackendCapabilityUnavailable("NNZ tiles require verified CUDA/ROCm scan and index capabilities")
         resolved = dict(block_nnz=128, num_warps=4, num_stages=1,
-                        reduce_block_size=256, workspace_bytes=256 * 1024 * 1024)
+                        reduce_block_size=256, workspace_bytes=256 * 1024 * 1024, plan_mode="compact")
         _merge(resolved, config or {})
         for key in ("block_nnz", "reduce_block_size", "num_warps"):
             value = resolved[key]
@@ -259,6 +263,8 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
             raise ValueError("illegal NNZ tile launch")
         if resolved["num_stages"] != 1 or resolved["workspace_bytes"] < 36:
             raise ValueError("NNZ tiles require stage=1 and at least 36 workspace bytes")
+        if resolved["plan_mode"] == "fixed" and resolved["reduce_block_size"] < 4:
+            raise ValueError("fixed reduction requires reduce_block_size >= 4")
         source = "explicit" if config else "conservative-nnz-v1"
         return (resolved, source, []) if return_rejections else (resolved, source)
     if config is not None and not isinstance(config, dict):
