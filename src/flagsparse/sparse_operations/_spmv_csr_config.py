@@ -3,8 +3,8 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 6
-NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream", "csr_nnz_tile_reduce")
+IMPLEMENTATION_VERSION = 7
+NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream", "csr_nnz_tile_reduce", "csr_subgroup_pair_mixed")
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend")
@@ -69,7 +69,7 @@ def algorithm_spec(alg):
         "name": name,
         "implementation_version": IMPLEMENTATION_VERSION,
         "ops": ("non", "trans", "conj"),
-        "value_dtypes": ("float16", "bfloat16") if name == "csr_nnz_tile_reduce" else VALUE_DTYPES,
+        "value_dtypes": ("float16", "bfloat16") if name in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else VALUE_DTYPES,
         "index_dtypes": (
             ("int32",) if name == "legacy_bucket_vector" else ("int32", "int64")
         ),
@@ -91,7 +91,8 @@ def algorithm_spec(alg):
             dt: (dt, "float32")
             for dt in ("float16", "bfloat16")
         },
-        "config_candidates": ({"lanes_per_row": (2, 4, 8, 16, 32, 64),
+        "config_candidates": ({"prefetch_chunks": (1, 2), "lanes_per_row": (2, 4, 8, 16, 32, 64), "row_tiles_per_program": (1, 2, 4, 8)}
+                              if name == "csr_subgroup_pair_mixed" else {"lanes_per_row": (2, 4, 8, 16, 32, 64),
                                "row_tiles_per_program": (1, 2, 4, 8)}
                               if name == "row_subgroup_stream" else {"plan_mode": ("compact", "fixed")}
                               if name == "csr_nnz_tile_reduce" else {}),
@@ -229,6 +230,20 @@ def _validate_config(resolved, caps):
         raise ValueError("row_subgroup_stream lanes_per_row exceeds subgroup width")
     if stream["rows_per_program"] * stream["lanes_per_row"] > 65536:
         raise ValueError("row_subgroup_stream exceeds the supported tile size")
+    if "csr_subgroup_pair_mixed" in resolved:
+        pair = resolved["csr_subgroup_pair_mixed"]
+        if pair["prefetch_chunks"] not in (1, 2):
+            raise ValueError("prefetch_chunks must be 1 or 2")
+        if pair["loop_num_stages"] != 1 or pair["row_tiles_per_program"] not in (1, 2, 4, 8):
+            raise ValueError("mixed subgroup requires stage=1 and 1/2/4/8 row tiles")
+        for key, value in pair.items():
+            if type(value) is not int or value <= 0 or value & (value - 1):
+                raise ValueError(f"invalid mixed subgroup {key}")
+        if (pair["lanes_per_row"] > caps.subgroup_width or
+                pair["rows_per_program"] * pair["lanes_per_row"] > 65536 or
+                pair["num_warps"] not in (1, 2, 4, 8) or
+                pair["num_warps"] * caps.subgroup_width > caps.max_threads_per_block):
+            raise ValueError("mixed subgroup exceeds target launch/tile limits")
     split = resolved["row_split_reduce"]
     if split["reduce_block_size"] < 2:
         raise ValueError("reduce_block_size must be >= 2 to make reduction progress")
@@ -285,6 +300,8 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
         )
     candidates = []
     profile = ARCH_PROFILES.get((caps.backend, caps.arch))
+    if alg == "csr_subgroup_pair_mixed":
+        profile = {alg: profile[alg]} if profile and alg in profile else None
     if profile is not None:
         candidates.append((f"{caps.backend}:{caps.arch}", profile))
     candidates.append((f"{caps.backend}:conservative-v1", {}))
@@ -314,6 +331,11 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
         resolved["row_split_reduce"]["reduce_num_warps"] = min(4, warps)
         _validate_config(resolved, caps)
         source = f"{caps.backend}:resource-conservative-v1"
+    if alg == "csr_subgroup_pair_mixed":
+        if config is not None and set(config) - {alg}:
+            raise ValueError("mixed subgroup config must use its own algorithm section")
+        resolved[alg] = dict(resolved["row_subgroup_stream"], prefetch_chunks=2)
+        resolved[alg]["rows_per_program"] = resolved[alg]["num_warps"] * caps.subgroup_width // 8
     if alg == "row_subgroup_stream":
         stream = resolved[alg]
         lanes = next((v for bound, v in ((4, 2), (8, 4), (16, 8), (32, 16), (64, 32))
@@ -323,7 +345,7 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
     if config is not None:
         _merge(resolved, config)
         _validate_config(resolved, caps)
-        if alg == "row_subgroup_stream":
+        if alg in ("row_subgroup_stream", "csr_subgroup_pair_mixed"):
             override = config.get(alg, {})
             stream = resolved[alg]
             if "rows_per_program" not in override and any(k in override for k in ("lanes_per_row", "num_warps")):

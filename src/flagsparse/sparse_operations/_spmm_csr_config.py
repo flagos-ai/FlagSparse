@@ -19,11 +19,11 @@ from ._spmv_csr_config import BackendCapabilityUnavailable
 
 NEW_ALGORITHMS = (
     "csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce",
-    "csr_adaptive_tile_split", "csr_row_panel", "csr_nnz_panel_reduce",
+    "csr_adaptive_tile_split", "csr_row_panel", "csr_nnz_panel_reduce", "csr_panel_staged_mixed",
 )
 BACKENDS = ()
 DTYPES = ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")
-IMPLEMENTATION_VERSION = 5
+IMPLEMENTATION_VERSION = 6
 CONFIG_FIELDS = frozenset((
     "tile_rows", "tile_k", "tile_n", "block_k", "block_n", "panels",
     "segment_nnz", "reduce_block_size", "num_warps", "num_stages",
@@ -54,12 +54,14 @@ class BackendCaps:
 def algorithm_spec(name):
     if name not in NEW_ALGORITHMS:
         raise ValueError(f"unknown new CSR SpMM algorithm {name!r}")
-    return dict(name=name, ops=("non", "trans", "conj"), value_dtypes=("float16", "bfloat16") if name == "csr_nnz_panel_reduce" else DTYPES,
+    return dict(name=name, ops=("non", "trans", "conj"), value_dtypes=("float16", "bfloat16") if name in ("csr_nnz_panel_reduce", "csr_panel_staged_mixed") else DTYPES,
                 half_output_dtypes={dt: (dt, "float32") for dt in ("float16", "bfloat16")},
                 layouts=("row", "col", "strided"), backends=BACKENDS,
                 index_dtypes=("int32", "int64"), execution_column_dtype="int32",
-                compute_dtype="native_component", implementation_version=IMPLEMENTATION_VERSION,
-                config_candidates=({"tile_n": (16, 32, 64), "panel_accumulators": (1, 2, 4), "panel_load_nnz": (1, 4, 8)}
+                compute_dtype="float32" if name == "csr_panel_staged_mixed" else "native_component",
+                implementation_version=1 if name == "csr_panel_staged_mixed" else IMPLEMENTATION_VERSION,
+                config_candidates=({"panel_load_nnz": (1, 4, 8), "value_stage": ("storage", "compute"), "panel_accumulators": (1, 2, 4), "tile_n": (16, 32, 64)}
+                                   if name == "csr_panel_staged_mixed" else {"tile_n": (16, 32, 64), "panel_accumulators": (1, 2, 4), "panel_load_nnz": (1, 4, 8)}
                                    if name == "csr_row_panel" else {"plan_mode": ("compact", "fixed")}
                                    if name == "csr_nnz_panel_reduce" else {"tile_n" if name == "csr_row_tile" else "block_n": (16, 32, 64)}),
                 transpose_strategy="main_route_preparation", validation="unverified")
@@ -101,13 +103,17 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
         cfg.update(tile_rows=4 if dtype == "complex128" else 8,
                    tile_n=min(panel_n, 1 << (max(1, n) - 1).bit_length()),
                    num_warps=2, panel_accumulators=2, panel_load_nnz=1)
+    if algorithm == "csr_panel_staged_mixed":
+        cfg.update(tile_rows=4, tile_n=min(32, 1 << (max(1, n) - 1).bit_length()),
+                   num_warps=2, panel_accumulators=2, panel_load_nnz=4, value_stage="storage")
     if algorithm == "csr_nnz_panel_reduce":
         cfg.update(block_k=32, block_n=16, plan_mode="compact")
     source = "conservative"
     rejections = []
     if cfg["num_warps"] not in caps.legal_num_warps:
         rejections.append(f"default num_warps={cfg['num_warps']} is unsupported by target")
-        cfg["num_warps"] = min(caps.legal_num_warps)
+        cfg["num_warps"] = (max((w for w in caps.legal_num_warps if w <= cfg["num_warps"]), default=min(caps.legal_num_warps))
+                            if algorithm == "csr_panel_staged_mixed" else min(caps.legal_num_warps))
     for key, profiles in (
         (caps.backend, BACKEND_PROFILES),
         ((caps.backend, algorithm), BACKEND_PROFILES),
@@ -139,9 +145,15 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
 
 def validate_config(cfg, caps, *, algorithm="csr_adaptive_tile_split"):
     fields = CONFIG_FIELDS | ({"panel_accumulators", "panel_load_nnz"} if algorithm == "csr_row_panel" else set()) | ({"plan_mode"} if algorithm == "csr_nnz_panel_reduce" else set())
+    if algorithm == "csr_panel_staged_mixed":
+        fields |= {"panel_accumulators", "panel_load_nnz", "value_stage"}
     if set(cfg) != fields:
         raise ValueError(f"invalid configuration fields: {sorted(set(cfg) ^ CONFIG_FIELDS)}")
     for key, value in cfg.items():
+        if key == "value_stage":
+            if value not in ("storage", "compute"):
+                raise ValueError("value_stage must be storage or compute")
+            continue
         if key == "plan_mode":
             if value not in ("compact", "fixed"):
                 raise ValueError("plan_mode must be compact or fixed")
@@ -159,6 +171,8 @@ def validate_config(cfg, caps, *, algorithm="csr_adaptive_tile_split"):
         raise ValueError("launch exceeds target thread limit")
     if cfg["num_stages"] != 1:
         raise ValueError("initial CSR SpMM profiles support num_stages=1 only")
+    if algorithm == "csr_panel_staged_mixed" and cfg["tile_rows"] * cfg["tile_n"] * cfg["panel_accumulators"] > 16384:
+        raise ValueError("mixed panel accumulator tile exceeds supported bounds")
     if cfg.get("panel_load_nnz", 1) not in (1, 4, 8):
         raise ValueError("panel_load_nnz must be 1, 4 or 8")
     if cfg.get("plan_mode") == "fixed" and cfg["reduce_block_size"] < 4:

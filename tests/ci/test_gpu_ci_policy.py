@@ -93,3 +93,22 @@ def test_migrated_algorithms_use_existing_accuracy_files_and_markers():
         assert f"@pytest.mark.{op}" in source
         assert f"def test_{op}_migrated_routes" in source
         assert f"def test_{op}_migrated_empty" in source
+
+
+def test_independent_mixed_cases_use_existing_gpu_delivery_files():
+    candidates = {
+        "spmv_csr": "csr_subgroup_pair_mixed",
+        "spmm_csr": "csr_panel_staged_mixed",
+        "spmv_coo": "coo_stream_prefetch_mixed",
+        "spmm_coo": "coo_stream_panel_prefetch_mixed",
+        "spmv_csc": "csc_subgroup_pair_mixed",
+        "spmm_csc": "csc_panel_staged_mixed",
+    }
+    for op, name in candidates.items():
+        text = _read(PROJECT_ROOT / "tests" / "pytest" / f"test_{op}_accuracy.py")
+        assert name in text
+        assert f"@pytest.mark.{op}" in text
+        assert f"test_{op}_independent_mixed_boundaries" in text
+    benchmark = _read(PROJECT_ROOT / "tests" / "benchmark_utils.py")
+    assert '"compare"' in benchmark and "supported = query(" in benchmark
+    assert 'row["metadata"] = meta' in benchmark

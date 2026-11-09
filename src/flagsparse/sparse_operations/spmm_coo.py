@@ -2372,7 +2372,7 @@ SPMM_COO_ALGORITHMS = {
 
 
 SPMM_COO_NEW_ALGORITHMS = ("coo_segmented_panel_atomic", "coo_rowrun_panel",
-                           "coo_segmented_stream_panel_atomic")
+                           "coo_segmented_stream_panel_atomic", "coo_stream_panel_prefetch_mixed")
 
 
 class _PreparedCooSpmmExtension(_coo_native.PreparedCooRoute):
@@ -2414,7 +2414,7 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
     compute_dtype = {torch.float16: torch.float32, torch.bfloat16: torch.float32, torch.float32: torch.float64,
                      torch.complex64: torch.complex128}.get(B.dtype, B.dtype)
     overrides = config if config is not None else (prepared.config if selected == prepared.alg else {})
-    cfg, info = _coo_native._resolve_coo_config(selected, compute_dtype, B.device, overrides, B.shape[1])
+    cfg, info = _coo_native._resolve_coo_config(selected, B.dtype if selected in _coo_native._COO_MIXED_ALGORITHMS else compute_dtype, B.device, overrides, B.shape[1])
 
     def execute(phases):
         with phases.measure("process_gpu_ms"):
@@ -2422,7 +2422,10 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
             a = prepared.data.resolve_conj().resolve_neg().to(storage).contiguous()
             r, c = (prepared.row, prepared.col) if prepared.op == "non" else (prepared.col, prepared.row)
             r, c = r.to(torch.int32).contiguous(), c.to(torch.int32).contiguous()
-            bc = _materialize_dense_layout(B.resolve_conj().resolve_neg().to(storage), dense_layout)
+            if selected in _coo_native._COO_MIXED_ALGORITHMS and cfg["conversion_mode"] == "load":
+                bc = B.resolve_conj().resolve_neg()
+            else:
+                bc = _materialize_dense_layout(B.resolve_conj().resolve_neg().to(storage), dense_layout)
             starts = None
             if selected not in _coo_native._COO_ATOMIC_ALGORITHMS:
                 a, r, c, starts = _coo_native._coo_sorted_runs(a, r, c)
@@ -2439,6 +2442,10 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
                        a_dtype=str(prepared.data.dtype), rhs_dtype=str(B.dtype), output_dtype=str(output_dtype),
                        alg_resolved=selected, op=prepared.op, compute_dtype=str(compute_dtype),
                        conversion_mode=cfg.get("conversion_mode", "materialize"),
+                       prefetch_blocks=cfg.get("prefetch_blocks"),
+                       input_materialized=(a.data_ptr() != prepared.data.data_ptr() or bc.data_ptr() != B.data_ptr()),
+                       output_buffer="user_out" if out is not None and out.dtype == compute_dtype else "compute_buffer",
+                       implementation_version=4 if selected in _coo_native._COO_MIXED_ALGORITHMS else 3,
                        dense_layout=dense_layout, b_stride=tuple(B.stride()), c_stride=tuple(C.stride()),
                        input_indices=(str(prepared.row.dtype), str(prepared.col.dtype)),
                        execution_indices=(str(r.dtype), str(c.dtype)),
@@ -2449,7 +2456,8 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
 for _name in SPMM_COO_NEW_ALGORITHMS:
     SPMM_COO_ALGORITHMS[_name] = SpmmCooAlgorithm(
         name=_name, display_name=_name, supported_ops=("non", "trans", "conj"),
-        supported_dtypes=(torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128),
+        supported_dtypes=((torch.float16, torch.bfloat16) if _name in _coo_native._COO_MIXED_ALGORITHMS else
+                          (torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128)),
         run=_run_spmm_coo_extension,
     )
 

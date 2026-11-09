@@ -486,6 +486,13 @@ def compute(prepared, x, y, alg, config, plan=None):
     data, vector, output_view = view(prepared.data), view(x), view(y)
     args = (data, prepared.kernel_indices, prepared.kernel_indptr, vector, output_view)
     channels = 2 if complex_input else 1
+    if alg == "csr_subgroup_pair_mixed":
+        c = config[alg]
+        subgroup_pair_mixed_kernel[(triton.cdiv(m, c["rows_per_program"] * c["row_tiles_per_program"]),)](
+            *args, m, x.stride(0), y.stride(0), R=c["rows_per_program"], V=c["lanes_per_row"],
+            GROUPS=c["row_tiles_per_program"], CHUNKS=c["prefetch_chunks"],
+            num_warps=c["num_warps"], num_stages=1, enable_fp_fusion=False)
+        return y
     if alg == "row_subgroup_stream":
         c = config[alg]
         row_subgroup_stream_kernel[(triton.cdiv(m, c["rows_per_program"] * c["row_tiles_per_program"]),)](
@@ -634,3 +641,38 @@ def compute(prepared, x, y, alg, config, plan=None):
             num_warps=c["reduce_num_warps"],
         )
     return y
+
+
+@triton.jit
+def subgroup_pair_mixed_kernel(A, I, P, X, Y, M, XS, YS,
+         R: tl.constexpr, V: tl.constexpr, GROUPS: tl.constexpr,
+         CHUNKS: tl.constexpr):
+    """Native compressed-axis mixed reduction with independent accumulation chains."""
+    first = tl.program_id(0).to(tl.int64) * R * GROUPS
+    lane = tl.arange(0, V)
+    for group in range(GROUPS):
+        row = first + group * R + tl.arange(0, R)
+        valid = row < M
+        start = tl.load(P + row, valid, 0).to(tl.int64)
+        end = tl.load(P + row + 1, valid, 0).to(tl.int64)
+        acc0 = tl.zeros((R, V), tl.float32)
+        acc1 = tl.zeros((R, V), tl.float32)
+        steps = tl.max(tl.cdiv(end - start, V * CHUNKS), 0)
+        for step in range(steps):
+            p0 = start[:, None] + step * V * CHUNKS + lane[None, :]
+            m0 = valid[:, None] & (p0 < end[:, None])
+            c0 = tl.load(I + p0, m0, 0).to(tl.int64)
+            a0 = tl.load(A + p0, m0, 0)
+            x0 = tl.load(X + c0 * XS, m0, 0)
+            if CHUNKS == 2:
+                p1 = p0 + V
+                m1 = valid[:, None] & (p1 < end[:, None])
+                c1 = tl.load(I + p1, m1, 0).to(tl.int64)
+                a1 = tl.load(A + p1, m1, 0)
+                x1 = tl.load(X + c1 * XS, m1, 0)
+            acc0 += a0.to(tl.float32) * x0.to(tl.float32)
+            if CHUNKS == 2:
+                acc1 += a1.to(tl.float32) * x1.to(tl.float32)
+        if CHUNKS == 2:
+            acc0 += acc1
+        tl.store(Y + row * YS, tl.sum(acc0, 1), valid)

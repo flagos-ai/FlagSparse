@@ -362,7 +362,7 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
                 "CSR",
                 algorithm,
                 value_const="SPMV_CSR_NEW_VALUE_DTYPES",
-                values=("float16", "bfloat16") if algorithm == "csr_nnz_tile_reduce" else None,
+                values=("float16", "bfloat16") if algorithm in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else None,
                 index_const="SUPPORTED_INDEX_DTYPES",
                 ops=spmv_ops,
                 notes="CUDA/ROCm; input-dependent accumulation; per-run CSR transpose; hardware validation pending",
@@ -519,6 +519,18 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             ops=spmm_csc_ops,
             notes="spmm_csc_base uses native CSC arrays and supports non/trans/conj",
         ),
+        *(
+            ApiSpec(kind, "flagsparse_" + module, module, fmt, algorithm,
+                    values=("float16", "bfloat16"), indices=("int32", "int64"),
+                    ops=ops, notes="Independent mixed candidate; FP32 compute, same-type/FP32 output; hardware unverified")
+            for kind, module, fmt, algorithm, ops in (
+                ('spmm', 'spmm_csr', 'CSR', 'csr_panel_staged_mixed', ('non', 'trans', 'conj')),
+                ('spmv', 'spmv_coo', 'COO', 'coo_stream_prefetch_mixed', ('non', 'trans', 'conj')),
+                ('spmm', 'spmm_coo', 'COO', 'coo_stream_panel_prefetch_mixed', ('non', 'trans', 'conj')),
+                ('spmv', 'spmv_csc', 'CSC', 'csc_subgroup_pair_mixed', ('trans', 'conj')),
+                ('spmm', 'spmm_csc', 'CSC', 'csc_panel_staged_mixed', ('trans', 'conj')),
+            )
+        ),
         ApiSpec(
             "spgemm",
             "flagsparse_spgemm_csr",
@@ -637,6 +649,9 @@ def rows_for_spec(
     ):
         status = "UNVERIFIED"
         notes.append("new CSR SpMV route requires backend-specific hardware validation")
+
+    if spec.route in ('csr_subgroup_pair_mixed', 'csr_panel_staged_mixed', 'coo_stream_prefetch_mixed', 'coo_stream_panel_prefetch_mixed', 'csc_subgroup_pair_mixed', 'csc_panel_staged_mixed') and status == "SUPPORTED":
+        status = "UNVERIFIED"
 
     ops = spec.ops
     if ops is None:

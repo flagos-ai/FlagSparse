@@ -428,7 +428,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
     (torch.int64, torch.int32), (torch.int64, torch.int64),
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmv_coo
-@pytest.mark.parametrize("alg,op", [
+@pytest.mark.parametrize("alg,op", [('coo_stream_prefetch_mixed', 'non'), ('coo_stream_prefetch_mixed', 'trans'), ('coo_stream_prefetch_mixed', 'conj'),
     ('coo_segmented_atomic', 'non'),
     ('coo_segmented_atomic', 'trans'),
     ('coo_segmented_atomic', 'conj'),
@@ -521,3 +521,63 @@ def test_spmv_coo_legacy_prepared_wide_output(dtype, op, sort_by_row):
     assert result is out
     rtol, atol = close_tolerances(torch.float32)
     torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("config", [None, {'prefetch_blocks': 1, 'blocks_per_program': 1}, {'local_reduce': 'none', 'blocks_per_program': 4}], ids=lambda c: "default" if c is None else str(c))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
+@pytest.mark.parametrize("case", ["empty", "tails", "unordered", "zero_axis"])
+def test_spmv_coo_independent_mixed_boundaries(config, dtype, wide, case):
+    from importlib import import_module
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    module = import_module("flagsparse.sparse_operations.spmv_coo")
+    device = accelerator_device()
+    lengths = [0] * 13 if case == "empty" else [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 129, 257]
+    if case == "zero_axis":
+        lengths = []
+    axis = torch.repeat_interleave(torch.arange(len(lengths)), torch.tensor(lengths, dtype=torch.int64))
+    other = (torch.arange(axis.numel()) * 7) % 19
+    vals = ((torch.arange(axis.numel()) % 7 - 3).float() / 16).to(dtype)
+    rows, cols = (axis, other)
+    shape = (len(lengths), 19)
+    if case == "unordered":
+        # Reverse within each compressed object; COO additionally disperses owners.
+        order = torch.arange(axis.numel() - 1, -1, -1)
+        # COO does not require sorted owners.
+        rows, cols, vals = rows[order], cols[order], vals[order]
+    matrix = torch.zeros(shape, dtype=torch.float64)
+    matrix.index_put_((rows.long(), cols.long()), vals.double(), accumulate=True)
+    values = vals.to(device)
+    first, second = rows.to(device=device, dtype=torch.int32), cols.to(device=device, dtype=torch.int64)
+    op = "non"
+    effective = matrix.T if op == "trans" else matrix
+    output_dtype = torch.float32 if wide else dtype
+    rhs = ((torch.arange(effective.shape[1]) % 5 - 2).float() / 8).to(dtype)
+    operand = torch.empty(rhs.numel() * 2, dtype=dtype, device=device)[::2]
+    operand.copy_(rhs.to(device))
+    expected = (effective @ rhs.double()).to(output_dtype)
+    backing = torch.full((*expected.shape[:-1], expected.shape[-1] * 2), float("nan"), dtype=output_dtype, device=device)
+    out = backing[..., ::2]
+    originals = [v.clone() for v in (values, first, second, operand)]
+    try:
+        prepared = module.prepare_spmv_coo(values, first, second, shape, op=op, alg="coo_stream_prefetch_mixed", config=config)
+        result, meta = module.flagsparse_spmv_coo_run(prepared, operand, out=out, out_dtype=output_dtype, return_meta=True)
+        assert result is out
+        if config is None and case == "tails":
+            measured, elapsed, diagnostic = module.flagsparse_spmv_coo_run(
+                prepared, operand, out=out, out_dtype=output_dtype,
+                return_meta=True, return_time=True, timing=True)
+            assert measured is out
+            assert elapsed == pytest.approx(diagnostic["gpu_ms"] + diagnostic.get("process_cpu_ms", 0.0))
+            assert diagnostic["compute_ms"] >= 0
+            assert diagnostic["process_gpu_ms"] >= 0
+            with pytest.raises(ValueError, match="op|prepared"):
+                module.flagsparse_spmv_coo_run(prepared, operand, op="non" if op == "trans" else "trans")
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+        for actual, original in zip((values, first, second, operand), originals):
+            torch.testing.assert_close(actual, original, rtol=0, atol=0)
+        assert meta.get("alg_resolved", meta.get("algorithm")) == "coo_stream_prefetch_mixed"
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))

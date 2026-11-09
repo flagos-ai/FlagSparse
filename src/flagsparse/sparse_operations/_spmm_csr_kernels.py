@@ -104,7 +104,6 @@ def row_panel_kernel(A, I, P, B, C, M, N,
             else:
                 values_r = tl.load(A + offsets, active, 0).to(ACC)
         for k in tl.static_range(CHUNK):
-            slot: tl.constexpr = k % ACCUMULATORS
             pos = starts + base + k
             mask = valid & (pos < ends)
             if LOAD_NNZ > 1:
@@ -132,13 +131,15 @@ def row_panel_kernel(A, I, P, B, C, M, N,
                     v = tl.load(A + pos, mask, 0).to(ACC)
                 real = v[:, None] * tl.load(B + bo, bm, 0).to(ACC)
                 imag = tl.zeros((R, BN), ACC)
-            if slot == 0:
+            # Evaluate the static loop expression directly: annotating a local
+            # constexpr here redefines it on each unrolled iteration.
+            if k % ACCUMULATORS == 0:
                 r0 += real
                 i0 += imag
-            elif slot == 1:
+            elif k % ACCUMULATORS == 1:
                 r1 += real
                 i1 += imag
-            elif slot == 2:
+            elif k % ACCUMULATORS == 2:
                 r2 += real
                 i2 += imag
             else:
@@ -203,3 +204,53 @@ def finish_kernel(X, C, Rows, Offsets, Counts, N, COL_START,
     else:
         re = tl.load(X + xo, mask, 0) + tl.load(C + co, mask, 0)
         tl.store(C + co, re, mask)
+
+
+@triton.jit
+def panel_staged_mixed_kernel(A, I, P, B, C, M, N,
+         B0: tl.constexpr, B1: tl.constexpr, C0: tl.constexpr, C1: tl.constexpr,
+         R: tl.constexpr, BN: tl.constexpr, LOAD: tl.constexpr,
+         ACCS: tl.constexpr, COMPUTE_STAGE: tl.constexpr):
+    """Mixed panel: staged storage loads, FP32 accumulation, one final store."""
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
+    col = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN)
+    valid = row < M
+    start = tl.load(P + row, valid, 0).to(tl.int64)
+    end = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    longest = tl.max(end - start, 0)
+    a0 = tl.zeros((R, BN), tl.float32)
+    a1 = tl.zeros((R, BN), tl.float32)
+    a2 = tl.zeros((R, BN), tl.float32)
+    a3 = tl.zeros((R, BN), tl.float32)
+    # LOAD and ACCS are powers of two, so max is their least common multiple.
+    U: tl.constexpr = max(LOAD, ACCS)
+    for base in range(0, longest, U):
+        for group in tl.static_range(U // LOAD):
+            pos = start[:, None] + base + group * LOAD + tl.arange(0, LOAD)[None, :]
+            mask = valid[:, None] & (pos < end[:, None])
+            indices = tl.load(I + pos, mask, 0)
+            values = tl.load(A + pos, mask, 0)
+            if COMPUTE_STAGE:
+                values = values.to(tl.float32)
+            for k in tl.static_range(LOAD):
+                pick = tl.full((R, 1), k, tl.int32)
+                idx = tl.gather(indices, pick, 1).reshape((R,)).to(tl.int64)
+                value = tl.gather(values, pick, 1).reshape((R,)).to(tl.float32)
+                active = valid & (start + base + group * LOAD + k < end)
+                rhs = tl.load(B + idx[:, None] * B0 + col[None, :] * B1,
+                              active[:, None] & (col[None, :] < N), 0).to(tl.float32)
+                product = value[:, None] * rhs
+                if (group * LOAD + k) % ACCS == 0:
+                    a0 += product
+                elif (group * LOAD + k) % ACCS == 1:
+                    a1 += product
+                elif (group * LOAD + k) % ACCS == 2:
+                    a2 += product
+                else:
+                    a3 += product
+    if ACCS >= 2:
+        a0 += a1
+    if ACCS == 4:
+        a0 += a2 + a3
+    tl.store(C + row[:, None] * C0 + col[None, :] * C1, a0,
+             valid[:, None] & (col[None, :] < N))

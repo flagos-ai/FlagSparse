@@ -18,11 +18,34 @@ from . import _spmm_csr_config as _csr_policy
 
 DTYPES = _csr_policy.DTYPES
 # COO shares backend capability contracts; kernels remain in the COO modules.
+COO_MIXED_ALGORITHMS = ("coo_stream_prefetch_mixed", "coo_stream_panel_prefetch_mixed")
 COO_ALGORITHMS = ("coo_segmented_atomic", "coo_rowrun_subgroup",
                   "coo_segmented_panel_atomic", "coo_rowrun_panel",
-                  "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic")
+                  "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic", *COO_MIXED_ALGORITHMS)
 COO_ARCH_PROFILES = {}
 COO_BACKEND_PROFILES = {name: {} for name in _csr_policy.BACKENDS}
+
+
+
+def _validate_mixed_coo_config(cfg, caps, fields):
+    if set(cfg) != fields:
+        raise ValueError("unsupported mixed COO configuration fields")
+    for key, value in cfg.items():
+        if key == "local_reduce":
+            if value not in ("segment", "none"):
+                raise ValueError("local_reduce must be segment or none")
+        elif key == "conversion_mode":
+            if value not in ("load", "materialize"):
+                raise ValueError("conversion_mode must be load or materialize")
+        elif type(value) is not int or value <= 0 or value & (value - 1):
+            raise ValueError(f"{key} must be a positive power of two")
+    if cfg["prefetch_blocks"] not in (1, 2) or cfg["blocks_per_program"] not in (1, 2, 4, 8) or cfg["blocks_per_program"] % cfg["prefetch_blocks"]:
+        raise ValueError("prefetch_blocks must divide blocks_per_program")
+    if (cfg["num_warps"] not in caps.legal_num_warps or cfg["num_stages"] != 1 or
+            cfg["num_warps"] * caps.subgroup_width > caps.max_threads_per_block):
+        raise ValueError("illegal mixed COO launch")
+    if cfg["block_nnz"] > 1024 or cfg.get("block_n", 1) > 64:
+        raise ValueError("mixed COO prefetch tile exceeds supported bounds")
 
 
 def resolve_coo_config(alg, dtype, caps, config=None, n=1):
@@ -33,7 +56,9 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
     if caps.backend not in _csr_policy.BACKENDS or not caps.legal_num_warps or not caps.subgroup_width or caps.int64 is not True:
         raise _csr_policy.BackendCapabilityUnavailable(f"COO launch/index capabilities unknown: {caps}")
     atomic = alg in ("coo_segmented_atomic", "coo_segmented_panel_atomic",
-                     "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic")
+                     "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic", *COO_MIXED_ALGORITHMS)
+    if alg in COO_MIXED_ALGORITHMS and dtype not in ("float16", "bfloat16"):
+        raise TypeError(f"{alg} requires float16/bfloat16 inputs")
     overrides = dict(config or {})
     cfg = dict(num_warps=4 if atomic else 2, num_stages=1)
     if atomic:
@@ -49,6 +74,11 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
         cfg["blocks_per_program"] = 2
     if alg in ("coo_segmented_panel_atomic", "coo_segmented_stream_panel_atomic"):
         cfg["conversion_mode"] = "load" if alg == "coo_segmented_stream_panel_atomic" else "materialize"
+    if alg in COO_MIXED_ALGORITHMS:
+        cfg.update(block_nnz=128 if alg == "coo_stream_prefetch_mixed" else 32,
+                   blocks_per_program=2, prefetch_blocks=2)
+        if alg == "coo_stream_panel_prefetch_mixed":
+            cfg.update(block_n=min(16, 1 << (max(1, n) - 1).bit_length()), conversion_mode="load")
     unknown = set(overrides) - set(cfg)
     if unknown:
         raise ValueError(f"unsupported {alg} configuration fields: {sorted(unknown)}")
@@ -59,7 +89,20 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
     arch_profile = COO_ARCH_PROFILES.get((caps.backend, caps.arch), {}).get(alg, {})
     rejected = []
     accepted_keys = set()
+    mixed_source = "conservative"
     for source, candidate in (("backend", profile), ("architecture", arch_profile)):
+        if alg in COO_MIXED_ALGORITHMS:
+            merged = dict(cfg, **candidate)
+            try:
+                _validate_mixed_coo_config(merged, caps, set(cfg))
+            except ValueError as exc:
+                rejected.append(f"{source}: {exc}")
+            else:
+                cfg = merged
+                if candidate:
+                    mixed_source = source
+                accepted_keys.update(candidate)
+            continue
         for key, value in candidate.items():
             valid = key in cfg and (
                 value in ("segment", "none") if key == "local_reduce" else
@@ -74,7 +117,10 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
                 accepted_keys.add(key)
             else:
                 rejected.append(f"{source}: illegal {key}={value!r}")
+    mixed_fields = set(cfg)
     cfg.update(overrides)
+    if alg in COO_MIXED_ALGORITHMS:
+        _validate_mixed_coo_config(cfg, caps, mixed_fields)
     for key, value in cfg.items():
         if key == "conversion_mode":
             if value not in ("load", "materialize"):
@@ -84,6 +130,11 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
                 raise ValueError("local_reduce must be segment or none")
         elif type(value) is not int or value <= 0 or value & (value - 1):
             raise ValueError(f"{key} must be a positive power of two")
+    if alg in COO_MIXED_ALGORITHMS:
+        if cfg["prefetch_blocks"] not in (1, 2) or cfg["blocks_per_program"] % cfg["prefetch_blocks"]:
+            raise ValueError("prefetch_blocks must be 1/2 and divide blocks_per_program")
+        if cfg["block_nnz"] > 1024 or cfg.get("block_n", 1) > 64:
+            raise ValueError("mixed COO prefetch tile exceeds supported bounds")
     if cfg.get("blocks_per_program", 1) not in (1, 2, 4, 8):
         raise ValueError("blocks_per_program must be 1, 2, 4 or 8")
     if (cfg["num_warps"] not in caps.legal_num_warps or cfg["num_stages"] != 1
@@ -105,12 +156,15 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
     elif caps.stable_sort is not True or caps.reduction is not True:
         raise _csr_policy.BackendCapabilityUnavailable("COO stable sort/reduction capability unknown")
     return cfg, dict(backend=caps.backend, target=caps.target, arch=caps.arch,
-                     config_source="explicit" if overrides else ("architecture" if arch_profile else "backend" if profile else "conservative"),
+                     config_source="explicit" if overrides else (mixed_source if alg in COO_MIXED_ALGORITHMS else "architecture" if arch_profile else "backend" if profile else "conservative"),
                      validation="unverified", config=cfg, rejected_profiles=rejected, implementation_version=2,
                      timing_contract_version=2)
 
 
+CSC_MIXED_ALGORITHMS = ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed")
 CSC_ALGORITHMS = {
+    "csc_subgroup_pair_mixed": ("trans", "conj"),
+    "csc_panel_staged_mixed": ("trans", "conj"),
     "csc_col_vector": ("trans", "conj"),
     "csc_col_kparallel": ("trans", "conj"),
     "csc_col_split_reduce": ("trans", "conj"),
@@ -131,6 +185,8 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
         raise ValueError(f"unknown CSC algorithm {algorithm!r}")
     if op not in CSC_ALGORITHMS[algorithm]:
         raise ValueError(f"{algorithm} does not support op={op}")
+    if algorithm in CSC_MIXED_ALGORITHMS and dtype not in ("float16", "bfloat16"):
+        raise TypeError(f"{algorithm} requires float16/bfloat16 inputs")
     if dtype not in DTYPES:
         raise TypeError(f"unsupported CSC dtype {dtype}")
     if caps.backend not in _csr_policy.BACKENDS or not caps.legal_num_warps or not caps.subgroup_width:
@@ -166,11 +222,23 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
         cfg.update(columns_per_program=4, block_n=min(bn, 1 << (max(1, n)-1).bit_length()), panel_accumulators=2)
     else:
         cfg.update(columns_per_program=2, block_nnz=16, block_n=min(bn, 1 << (max(1, n)-1).bit_length()))
+    if algorithm == "csc_subgroup_pair_mixed":
+        cfg = dict(num_warps=warps, num_stages=1, lanes_per_column=8,
+                   columns_per_program=warps * caps.subgroup_width // 8,
+                   column_tiles_per_program=4, prefetch_chunks=2)
+    elif algorithm == "csc_panel_staged_mixed":
+        cfg = dict(num_warps=warps, num_stages=1, columns_per_program=4,
+                   block_n=min(16, 1 << (max(1, n)-1).bit_length()),
+                   panel_load_nnz=4, panel_accumulators=2, value_stage="storage")
     allowed = set(cfg)
     def validate(candidate):
         if set(candidate) != allowed:
             raise ValueError(f"unsupported CSC config fields: {sorted(set(candidate)-allowed)}")
         for key, value in candidate.items():
+            if key == "value_stage":
+                if value not in ("storage", "compute"):
+                    raise ValueError("value_stage must be storage or compute")
+                continue
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{key} must be a positive integer")
             if key not in ("num_stages", "workspace_bytes") and value & (value-1):
@@ -185,7 +253,14 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
             raise ValueError("launch exceeds max_threads_per_block")
         if candidate.get("lanes_per_column", 1) > caps.subgroup_width:
             raise ValueError("lanes_per_column exceeds subgroup width")
-        if candidate.get("panel_accumulators", 1) not in (1, 2):
+        if algorithm in CSC_MIXED_ALGORITHMS:
+            if candidate.get("panel_load_nnz", 1) not in (1, 4, 8) or candidate.get("prefetch_chunks", 1) not in (1, 2):
+                raise ValueError("invalid mixed loading configuration")
+            if candidate.get("column_tiles_per_program", 1) not in (1, 2, 4, 8):
+                raise ValueError("column_tiles_per_program must be 1/2/4/8")
+            if candidate["columns_per_program"] * candidate.get("block_n", candidate.get("lanes_per_column", 1)) > 4096:
+                raise ValueError("mixed CSC tile exceeds supported bounds")
+        if candidate.get("panel_accumulators", 1) not in ((1, 2, 4) if algorithm == "csc_panel_staged_mixed" else (1, 2)):
             raise ValueError("panel_accumulators must be 1 or 2")
     source, rejected = "conservative", []
     for key, table in ((caps.backend, CSC_BACKEND_PROFILES), ((caps.backend, algorithm), CSC_BACKEND_PROFILES),
@@ -200,9 +275,13 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
                 cfg, source = candidate, str(key)
     explicit = dict(overrides or {})
     for key, value in explicit.items():
+        if key == "value_stage" and key in allowed:
+            if value not in ("storage", "compute"):
+                raise ValueError("value_stage must be storage or compute")
+            continue
         if key not in allowed or isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"invalid CSC configuration {key}={value!r}")
-    if algorithm == "csc_col_subgroup" and "columns_per_program" not in explicit:
+    if algorithm in ("csc_col_subgroup", "csc_subgroup_pair_mixed") and "columns_per_program" not in explicit:
         cfg["columns_per_program"] = explicit.get("num_warps", cfg["num_warps"]) * caps.subgroup_width // explicit.get("lanes_per_column", cfg["lanes_per_column"])
     cfg.update(explicit)
     validate(cfg)

@@ -23,7 +23,7 @@ import triton.language as tl
 
 from . import _common as common
 from . import _spmm_csr_config as policy
-from ._spmm_csr_kernels import finish_kernel, reduce_kernel, row_panel_kernel, rows_kernel
+from ._spmm_csr_kernels import panel_staged_mixed_kernel, finish_kernel, reduce_kernel, row_panel_kernel, rows_kernel
 
 
 def output_has_internal_overlap(out):
@@ -181,7 +181,14 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
                 r, bk, bn, row_ids is not None, False, complex_input, acc, **launch)
 
     if m and n:
-        if algorithm == "csr_row_panel":
+        if algorithm == "csr_panel_staged_mixed":
+            with phases.measure("compute_ms"):
+                panel_staged_mixed_kernel[(triton.cdiv(m, cfg["tile_rows"]), triton.cdiv(n, cfg["tile_n"]))](
+                    A, prepared.kernel_indices, prepared.kernel_indptr, B, C,
+                    m, n, *B.stride(), *C.stride(), cfg["tile_rows"], cfg["tile_n"],
+                    cfg["panel_load_nnz"], cfg["panel_accumulators"], cfg["value_stage"] == "compute", **launch)
+            counts["panel_rows"] = m
+        elif algorithm == "csr_row_panel":
             with phases.measure("compute_ms"):
                 row_panel_kernel[(triton.cdiv(m, cfg["tile_rows"]), triton.cdiv(n, cfg["tile_n"]))](
                     _view(A), prepared.kernel_indices, prepared.kernel_indptr, _view(B), _view(C),
@@ -226,6 +233,10 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
                 validation="unverified", process_cpu_ms=0.0,
                 dense_layout=dense_layout, b_stride=tuple(B.stride()), c_stride=tuple(C.stride()),
                 output_layout=("row" if C.is_contiguous() else "col" if C.T.is_contiguous() else "strided"), **counts, **stats)
+    if algorithm == "csr_panel_staged_mixed":
+        meta.update(implementation_version=1, panel_load_nnz=cfg["panel_load_nnz"],
+                    value_stage=cfg["value_stage"], execution_path="native_csr_staged_panel",
+                    output_buffer="user_out" if out is not None else "direct_output")
     meta.update(phases.results())
     if diagnostics:
         meta["diagnostics"] = {**counts, **stats, "config": dict(cfg),

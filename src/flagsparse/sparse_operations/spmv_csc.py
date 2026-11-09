@@ -1340,6 +1340,20 @@ def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg, *, ou
     a = torch.view_as_real(data) if complex_values else data
     b = torch.view_as_real(dense) if complex_values else dense
     y = torch.view_as_real(result) if complex_values else result
+    if alg == "csc_subgroup_pair_mixed":
+        _csc_subgroup_pair_mixed_kernel[(triton.cdiv(shape[1], cfg["columns_per_program"] * cfg["column_tiles_per_program"]),)](
+            a, indices, indptr, b, y, shape[1], dense.stride(0), result.stride(0),
+            R=cfg["columns_per_program"], V=cfg["lanes_per_column"],
+            GROUPS=cfg["column_tiles_per_program"], CHUNKS=cfg["prefetch_chunks"],
+            num_warps=cfg["num_warps"], num_stages=1)
+        return result
+    if alg == "csc_panel_staged_mixed":
+        _csc_panel_staged_mixed_kernel[(triton.cdiv(shape[1], cfg["columns_per_program"]), triton.cdiv(n, cfg["block_n"]))](
+            a, indices, indptr, b, y, shape[1], n, *dense.stride(), *result.stride(),
+            R=cfg["columns_per_program"], BN=cfg["block_n"], LOAD=cfg["panel_load_nnz"],
+            ACCS=cfg["panel_accumulators"], COMPUTE_STAGE=cfg["value_stage"] == "compute",
+            num_warps=cfg["num_warps"], num_stages=1)
+        return result
     if alg in ("csc_col_vector", "csc_col_kparallel"):
         _csc_vector_kernel[(shape[1], triton.cdiv(n, cfg["block_n"]))](
             a, indices, indptr, b, y, indices, indices, indices, shape[1], n,
@@ -1366,7 +1380,7 @@ def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg, *, ou
 
 
 SPMV_CSC_NEW_ALGORITHMS = ("csc_col_subgroup", "csc_col_tile_atomic",
-                           "csc_col_vector", "csc_col_split_reduce")
+                           "csc_col_vector", "csc_col_split_reduce", "csc_subgroup_pair_mixed")
 
 
 class PreparedCscRoute:
@@ -1385,15 +1399,15 @@ def _csc_spec(alg, kind):
     from ._spmx_column_config import CSC_ALGORITHMS
     from ._spmm_csr_config import BACKENDS
     base = "spmv_csc_base" if kind == "spmv" else "spmm_csc_base"
-    names = (("csc_col_subgroup", "csc_col_tile_atomic", "csc_col_vector", "csc_col_split_reduce")
+    names = (("csc_col_subgroup", "csc_col_tile_atomic", "csc_col_vector", "csc_col_split_reduce", "csc_subgroup_pair_mixed")
              if kind == "spmv" else
-             ("csc_col_panel", "csc_col_tile_panel_atomic", "csc_col_kparallel", "csc_col_split_reduce"))
+             ("csc_col_panel", "csc_col_tile_panel_atomic", "csc_col_kparallel", "csc_col_split_reduce", "csc_panel_staged_mixed"))
     if alg not in (base, *names):
         raise ValueError(f"unknown {kind} CSC algorithm {alg!r}")
     return dict(name=alg, ops=CSC_ALGORITHMS.get(alg, ("non", "trans", "conj")),
-                value_dtypes=SUPPORTED_SPMV_CSC_VALUE_DTYPES,
+                value_dtypes=((torch.float16, torch.bfloat16) if alg in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else SUPPORTED_SPMV_CSC_VALUE_DTYPES),
                 backends=BACKENDS,
-                layouts=("row", "col", "strided"), implementation_version=3,
+                layouts=("row", "col", "strided"), implementation_version=4 if alg in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else 3,
                 half_output_dtypes={dtype: (dtype, torch.float32)
                                     for dtype in (torch.float16, torch.bfloat16)},
                 compute_dtype="native_component", validation="unverified")
@@ -1490,6 +1504,9 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
             a = data.resolve_conj().contiguous()
             i, p = indices.contiguous(), ptr.contiguous()
             b = dense.resolve_conj()
+            if selected in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed"):
+                a = data.resolve_conj().resolve_neg().contiguous()
+                b = dense.resolve_conj().resolve_neg()
             if selected == "csc_col_split_reduce" and data.dtype in (torch.float16, torch.bfloat16):
                 a, b = a.float(), b.float()
         stats = {}
@@ -1518,7 +1535,7 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
                 result = out
         meta = dict(info, alg=selected, alg_requested=alg or prepared.alg, alg_resolved=selected,
                     a_dtype=str(data.dtype), rhs_dtype=str(dense.dtype), output_dtype=str(output_dtype),
-                    config=cfg, op=prepared.op, implementation_version=3, timing_contract_version=2,
+                    config=cfg, op=prepared.op, implementation_version=4 if selected in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else 3, timing_contract_version=2,
                     conversion_mode="materialize" if selected == "csc_col_split_reduce" else "load",
                     compute_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
                     input_indices_dtype=str(indices.dtype), input_indptr_dtype=str(ptr.dtype),
@@ -1604,3 +1621,88 @@ def flagsparse_spmv_csc_run(prepared, x, *, alg=None, config=None, op=None, out=
         return _coo_measure_run(execute, return_time, return_meta, timing)
     return flagsparse_spmv_csc(prepared=prepared, x=x, op=op, out=out,
                                out_dtype=out_dtype, return_time=return_time, return_meta=return_meta)
+
+
+@triton.jit
+def _csc_subgroup_pair_mixed_kernel(A, I, P, X, Y, M, XS, YS,
+         R: tl.constexpr, V: tl.constexpr, GROUPS: tl.constexpr,
+         CHUNKS: tl.constexpr):
+    """Native compressed-axis mixed reduction with independent accumulation chains."""
+    first = tl.program_id(0).to(tl.int64) * R * GROUPS
+    lane = tl.arange(0, V)
+    for group in range(GROUPS):
+        row = first + group * R + tl.arange(0, R)
+        valid = row < M
+        start = tl.load(P + row, valid, 0).to(tl.int64)
+        end = tl.load(P + row + 1, valid, 0).to(tl.int64)
+        acc0 = tl.zeros((R, V), tl.float32)
+        acc1 = tl.zeros((R, V), tl.float32)
+        steps = tl.max(tl.cdiv(end - start, V * CHUNKS), 0)
+        for step in range(steps):
+            p0 = start[:, None] + step * V * CHUNKS + lane[None, :]
+            m0 = valid[:, None] & (p0 < end[:, None])
+            c0 = tl.load(I + p0, m0, 0).to(tl.int64)
+            a0 = tl.load(A + p0, m0, 0)
+            x0 = tl.load(X + c0 * XS, m0, 0)
+            if CHUNKS == 2:
+                p1 = p0 + V
+                m1 = valid[:, None] & (p1 < end[:, None])
+                c1 = tl.load(I + p1, m1, 0).to(tl.int64)
+                a1 = tl.load(A + p1, m1, 0)
+                x1 = tl.load(X + c1 * XS, m1, 0)
+            acc0 += a0.to(tl.float32) * x0.to(tl.float32)
+            if CHUNKS == 2:
+                acc1 += a1.to(tl.float32) * x1.to(tl.float32)
+        if CHUNKS == 2:
+            acc0 += acc1
+        tl.store(Y + row * YS, tl.sum(acc0, 1), valid)
+
+
+@triton.jit
+def _csc_panel_staged_mixed_kernel(A, I, P, B, C, M, N,
+         B0: tl.constexpr, B1: tl.constexpr, C0: tl.constexpr, C1: tl.constexpr,
+         R: tl.constexpr, BN: tl.constexpr, LOAD: tl.constexpr,
+         ACCS: tl.constexpr, COMPUTE_STAGE: tl.constexpr):
+    """Mixed panel: staged storage loads, FP32 accumulation, one final store."""
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
+    col = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN)
+    valid = row < M
+    start = tl.load(P + row, valid, 0).to(tl.int64)
+    end = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    longest = tl.max(end - start, 0)
+    a0 = tl.zeros((R, BN), tl.float32)
+    a1 = tl.zeros((R, BN), tl.float32)
+    a2 = tl.zeros((R, BN), tl.float32)
+    a3 = tl.zeros((R, BN), tl.float32)
+    # LOAD and ACCS are powers of two, so max is their least common multiple.
+    U: tl.constexpr = max(LOAD, ACCS)
+    for base in range(0, longest, U):
+        for group in tl.static_range(U // LOAD):
+            pos = start[:, None] + base + group * LOAD + tl.arange(0, LOAD)[None, :]
+            mask = valid[:, None] & (pos < end[:, None])
+            indices = tl.load(I + pos, mask, 0)
+            values = tl.load(A + pos, mask, 0)
+            if COMPUTE_STAGE:
+                values = values.to(tl.float32)
+            for k in tl.static_range(LOAD):
+                pick = tl.full((R, 1), k, tl.int32)
+                idx = tl.gather(indices, pick, 1).reshape((R,)).to(tl.int64)
+                value = tl.gather(values, pick, 1).reshape((R,)).to(tl.float32)
+                active = valid & (start + base + group * LOAD + k < end)
+                rhs = tl.load(B + idx[:, None] * B0 + col[None, :] * B1,
+                              active[:, None] & (col[None, :] < N), 0).to(tl.float32)
+                product = value[:, None] * rhs
+                if (group * LOAD + k) % ACCS == 0:
+                    a0 += product
+                elif (group * LOAD + k) % ACCS == 1:
+                    a1 += product
+                elif (group * LOAD + k) % ACCS == 2:
+                    a2 += product
+                else:
+                    a3 += product
+    if ACCS >= 2:
+        a0 += a1
+    if ACCS == 4:
+        a0 += a2 + a3
+    tl.store(C + row[:, None] * C0 + col[None, :] * C1, a0,
+             valid[:, None] & (col[None, :] < N))

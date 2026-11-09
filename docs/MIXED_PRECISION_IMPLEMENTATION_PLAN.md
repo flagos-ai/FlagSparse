@@ -680,3 +680,482 @@ done
 厂商默认开启；当前HIP明确不支持时可加`--no-vendor`，FlagSparse继续，结果仅称自身改进。
 后续补同类型输出、全部op/opB、两种布局及N=8/128。固定其余因素后分别消融面板加载块、宽度、累加器、subgroup行块/lane、COO块数/归约/转换。
 CUDA/ROCm分别记录软件版本、覆盖、精度和profiler；保留FAIL，报告单算法及逐矩阵最佳的算术/几何平均和回退。
+
+### 2026-11-09 实机回归修复
+
+11.09测试暴露两处本轮实现问题：
+
+- csr_row_panel：static_range中重复注解slot为tl.constexpr，导致load1/4/8全部编译失败。现直接在分支使用k % ACCUMULATORS，保留原累加器分配和数值策略。
+- SpMV NNZ：公共元数据硬编码compact的boundary_record_count，fixed报KeyError，compact又遗漏plan_mode。现按实际plan_mode返回boundary_record_count或boundary_slot_capacity，不将容量冒充有效计数。
+
+SpMV实现版本升为7、SpMM升为6。默认配置、计时公式、容差及workspace策略不变。
+原pytest增加compact/fixed、四种类型组合、return_time/return_meta/timing八种组合回归，检查输出身份、精度、计时公式及统计字段。
+已有panel加载尾部和宽输出用例继续覆盖默认load1与load4/8；CI策略用例增加static_range内constexpr重复注解的静态检查。
+本地仅AST和diff检查，未执行pytest、内核编译或算子。实机验证状态仍为待验证。
+
+已在计算节点时，先使用原容器脚本定向验证：
+
+```bash
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+  --ops spmv_csr,spmm_csr --phase accuracy --mode quick \
+  --pytest-args '-k "nnz_tiles_batched_boundaries or nnz_return_contract or nnz_panels_bounded_workspace or panel_sparse_load_tails or registered_wide_output"' \
+  --results-dir pytest_results_mixed_p2_fix_accuracy
+```
+
+定向通过后使用同一入口去掉--pytest-args做完整quick回归，再执行前文compact/fixed与panel1/4/8性能对照，写入新的结果目录。
+FP16真实矩阵输入溢出、neos3/net150等数值FAIL需继续保留；本修复不通过放宽容差掩盖它们。
+
+
+## Independent mixed candidates: source baseline (2026-11-09)
+
+Base commit: `cbbac89a607cb3af8d292eafb9e567e0875131c0`, branch `zyq_sparse`. Existing unstaged repairs are retained. No runtime validation performed. Existing computational function SHA256 snapshots (AST source, excludes decorators) follow for static regression review.
+
+<details><summary>Pre-change function hashes</summary>
+
+```json
+{
+  "_spmv_csr_kernels.py": {
+    "uses_native_rocm_fp32_accumulation": "d95608efbde99bddbd2f6f2ffbd9d33c2da5c4fbd1fb91f755611d83ee7edc6e",
+    "_product": "efbadca5fc4d8ecba88a5bb3d036c3b993ad6d642b696436a8dd586cbc819fa9",
+    "_store_result": "2bcffbc131448dcb923811f762f5e80f47175527203991d3aed5775e76f4bca3",
+    "row_tile_kernel": "d3d0ac8aa0c3964ec21f361eae58a6c78bf9fbe680a57d426fddd8ad1a342ef9",
+    "row_subgroup_stream_kernel": "6a83be100afc3d79ec67066e4ac7fe0ea9d3e857c05cfb176082bc5f60ec0d62",
+    "row_tile_real_kernel": "bfc65589119dd76d6036502935520ac98f0abc28d6c584c6bd3e4b7a59529323",
+    "row_vector_kernel": "c1f132155b2bd90ade944bcb8f2f7a633461f81c58455d62b8f21145523a8bcb",
+    "bucket_rows_kernel": "ddea690075cd7d49fe8788fbd22f526b39748e9faba78b1fa0067a0ac7cc43f4",
+    "classify_kernel": "b3a56f08eab148067e4f5c34a3a6cc8cbb5cd2c361f6c90d77d16f744d8d2197",
+    "compact_rows_kernel": "8f0d3577261bee0de52a268521378480fd4d263d8c3262fc3fc023e636ae9b4f",
+    "_owner": "b3f8870337cc682a646be428611c458853589927d293b6631d0e96bf726bbacc",
+    "descriptors_kernel": "2dd67b991433bfa8f5c8944c1f0671aa9865b612740a3c945582f73d60d26eb5",
+    "segment_kernel": "f63194457e83bd6462cd7b37feffa4e262c000d665b1da23b90f126cf330b7fa",
+    "reduce_level_kernel": "6ee168ec7160ac3096f472642261b29a3ca16e186e5a77bc0af7e0fa48f2b667",
+    "finish_kernel": "4954cdc541f7dbfbfc9b5990592335db8471cae78f6c8dbdd7b1d902f2bee2d1",
+    "build_plan": "c0411159c957fb688bb7e27e934b23882e993aa829eba7f7251fa8d6e3fdaeb1",
+    "compute": "13d35aecbf81ffe17f756d78ba28104904af288537d1d5820e260e95e8b7c9a1"
+  },
+  "_spmm_csr_kernels.py": {
+    "rows_kernel": "90043703907034d4204caed6c0fd40a62635bd7d863db4a740000e24197ec918",
+    "row_panel_kernel": "e7d2b40c447ccdf6e5e73a6ca9e33577f1cbb1e804ec5c147f36eceac86ef7a1",
+    "reduce_kernel": "2ac8db6916b3f54a1e6e1c64c9d2d6a62c0c823662aa0f330cae4e0ad2a2e474",
+    "finish_kernel": "2adf8385f9358a9005a644eb53e1957c3c81a8c8d1024ed0c096e47262783bab"
+  },
+  "spmv_coo.py": {
+    "_spmv_coo_dtype_error_message": "124cc7d5c6db7fe2a15bf14ebf23c9cfbca444d0a317882fb2e2e1ff8734011d",
+    "_normalize_spmv_coo_op": "41d0becbd081e51fd364bb2774ff51b4e0bc679452a9ea97a45d5d634519adab",
+    "_spmv_coo_op_to_name": "a431a400ce09498c1a727f0a7bfb418eae9700ce728d8eb4fe1aac7228c5bf7e",
+    "_spmv_coo_op_transposes": "89d6bf23e833f6da1586eab11d4629b7bc1d06657daa0f5a8df2c85a488a9d5a",
+    "_normalize_spmv_coo_index_fallback_policy": "b5acf334972a7c390ae26df34a2d5bab0f7f5c22ccc1ed64752679dfc47d76da",
+    "_spmv_coo_seg_f32": "bb0e43bb2fea63c7deb77533a624f80bed08ecce786da534ef83efa0f1e89161",
+    "_spmv_coo_seg_f64": "81eea03ecd960acbbda24442f824f7209ff24da91c5c224c03566c935ee60952",
+    "_spmv_coo_seg_complex": "0123fdc539b222a1d66cc6f1d2b3de0d026a389493b49437cc2cd9e950c9cc99",
+    "_spmv_coo_atomic_f32": "757630bf4db990afbe1cc4b4e8771a8130307b6df30a12c1cc1c6a205be802cb",
+    "_spmv_coo_atomic_complex": "ca8f5f33255e7d0224af3361e43448bd9651acba04cc03efa46cc8278890f662",
+    "_spmv_coo_atomic_f64": "b0e5e8691be8981bd45e53c23a680b5c584a0e6cc0d3beedc86791f6d4a13a40",
+    "_spmv_coo_run_add": "77d300f95942fd73d2047cf108bbfe174495ce3aeda738e8954341e1876d2c4e",
+    "_spmv_coo_atomic_runs_real": "b583eb71c1da12efa45d7d3411e93141bc2a17d344e4a36c4aea0252f72f201c",
+    "_sort_coo_lex_inplace": "8b35931cb8fb4bb9607a28626dcef48980dcf121123989dbb88e2a8edb9b7afb",
+    "_seg_starts_from_sorted_rows": "43b9c9fe60ede56e713719da3a3f6511487a3240e10f76c799846b3a3cb88285",
+    "_prepare_coo_tensors": "8975485d865a865aee958a95862cce30be59040473da3310d3cfc52697cac48e",
+    "prepare_spmv_coo": "cff7dc70d266a7aac04e6c02d3868e309174370766a9f167a2fc0cf7d9e8030d",
+    "_prepare_spmv_coo_launch_from_raw": "7824d343a4c20f74961c598b49fc47eb3474cf6dc9de9e4ffb4ec6c02cdfd432",
+    "_resolve_spmv_coo_launch": "fc9109d9c5cb1bf4b88868ddaec4c7f6a83caeae97c152984ba45b1cc2b994dc",
+    "_validate_x_coo": "604694b30b6f394906f3682ef8003aa11c61b8dc77d85a7092d2efcf140ae6f9",
+    "_triton_spmv_coo_kernel": "755a031ba2f1c3b77d737e742b00428c65120f2acf665395ed8d5fbe54d2861b",
+    "_spmv_coo_uses_int64_indices": "c57272fcc84227c01eeb8bb1d6dc06b6b2ebb5c696abb9928dbdeb54eb8e9353",
+    "_spmv_coo_int32_fallback_blocker": "53b8dc4cc566c2ad88b3802bd3524232b4c4a8b66c04d6c788c7c6cb154ff8c7",
+    "_spmv_coo_prepared_with_int32_indices": "2048bb05e6c18d483daf65c0a24a8b911ec004e1588e72439a2a39d5f78971ed",
+    "_run_spmv_coo_prepared_with_fallback": "da0f5c320504f7adfdb75a05f78943c0b892bffefcdc166fb8849bea7fbe4811",
+    "_ascend_spmv_coo_index_add": "39f94975703190d860e14790f0d4d5ce8c30c85a45b14f1b0f34413e6336c4af",
+    "_cached_rocm_coo_launch": "4340f4de1e8012fa1e31d3f3e37b43ddde71b2674728a32313771c08848f0f5c",
+    "_resolve_spmv_coo_kernel_launch": "1a0f8c6b62a871965c35717d89f6224629dd8815b4e726195530aec01188990b",
+    "flagsparse_spmv_coo": "9a2fa7eca59a58ffd348b881b9518b5313ae6326bf373cd90830c08ced941b7c",
+    "_coo_scan_pair": "44e95e764e35925dfbc92d00e58873042b452cadd10b4efaa93bdf7290a56a0a",
+    "_coo_product": "56e3d3b9d744a64981ad2510c84491f57badf3bebdd288a0bccc598e65810a43",
+    "_coo_segmented_panel_kernel": "761a9b0e51a75072b7453158f89c49fd5ac148a61a8cfd68231d460ce65cf0c3",
+    "_coo_stream_panel_kernel": "9b834f0c9643d1b62a90d789b81b9985f1b6187a70cba0ee14eff962dc81aa95",
+    "_coo_rowrun_group_kernel": "ceaf1d44350efa81e4006d17558c73dc136257010cf95d471610b8422a3ca298",
+    "_resolve_coo_config": "7abf42fba66866b510e93ead37a66607fa002c772e735d21704de8a882337585",
+    "_coo_sorted_runs": "8d29af726c9e25ce8d4681b62a905f4674111eb00d3c52ca442b13683aa265ee",
+    "_launch_coo_extension": "379ffb96cd48c3f6347ff8038dc9721cd6da5bb69d09f005bb17c1df787d1066",
+    "get_spmv_coo_algorithm_spec": "c3bf0d5448a022d5a208a5cae1e55145f5177ca39c4017e26ba9407bff881d00",
+    "list_spmv_coo_algorithms": "38b5dea5501bdbadb7a42746634635a909d94f7b8d68487c42bd8b2858a5dbc9",
+    "_coo_measure_run": "fe4209b6efeb3005b296297badff4a025da997f674c35d2f8a63fecc72823106",
+    "flagsparse_spmv_coo_run": "375f08289a612cf4a94645af665e263817c3f8cb6072a119939f052631513db3",
+    "_coo_index_compatibility_error": "6ca1156cb605fc51f1c148a2ffdc9df8982919b2dfa305b9cc2543bd67572e97"
+  },
+  "spmv_csc.py": {
+    "_spmv_csc_dtype_error_message": "7ef3fbcb65f21475c6eb94cf9d87a7d102b182daf36415c5881e0af0045719a3",
+    "_normalize_spmv_csc_op": "fa09cafb139a5b569dea6ef882f00128142546c2a14c1fad33c75959a1e71c34",
+    "_spmv_csc_op_to_name": "a606e0795fee9a7a07aff4c69d2f345045a5738e92fef2bd23e6361cbab8c13c",
+    "_spmv_csc_op_transposes": "7ceb9ba527ac250b3eff93ff2195a335697d34b491901ec30ea6b3887ea47784",
+    "_normalize_spmv_csc_index_fallback_policy": "f2f31cc1928a5996371c89da0933c701f19d22d7634306d19412d4cda61dcc99",
+    "_spmv_csc_non_real_kernel": "ed7b4e43cfbe77a632926fb9143f84708f7907e102e1dcba2e9e8b3cce504eea",
+    "_spmv_csc_non_complex_kernel": "3edfc4bae8a32ce65c867e40dc9fcff0bf04cc3c4a76d1eb1bdc93542e9fd307",
+    "_spmv_csc_trans_real_kernel": "dab40cfccb2dbe872e34613e9d9e87c2e89d8fa625629759beafa7b94ce667de",
+    "_spmv_csc_trans_complex_kernel": "408b9d8ccd48d008d185c37da79f0facf06b2f745a6e5e0a15d543fc17e5c1b9",
+    "_prepare_spmv_csc_matrix": "9caf1232e0c047e24fac8afdbbcb26ec7897dcc597b6be5b289b07542db0ece9",
+    "prepare_spmv_csc": "f9762ec3c8e86758069cac50bf636a814e7a68ef618ed2e1ba1276aaed8cffa4",
+    "_validate_spmv_csc_x": "c1c195421627b8bcca42434f5df180d483e583be008e088613376ef649a4513d",
+    "_spmv_csc_non_real_nnzpar_kernel": "e5d8889688a2746abea781689cddfcdec0a69130f007dc8838f8589596dcb933",
+    "_spmv_csc_non_complex_nnzpar_kernel": "31662456933c1801ec8c7a10fc11d61744ed7bcb12f7b6528e48f712e4644a21",
+    "_ascend_spmv_csc_torch": "deb371db6c6579f6e140a2ce5ec94e431727015d24c8838b2aa1a43cf84a04d5",
+    "_triton_spmv_csc_kernel": "7b59531ea543405a118079eff30051f761acabb16682a3b50fdab331e3384403",
+    "_spmv_csc_uses_int64_indices": "b4c11fa3f13fc165355854f9e774ae96353332bad95d4d92c54f012118981f6e",
+    "_spmv_csc_int32_fallback_blocker": "1424b4bfe6bfafd9c611a2dee39b78100c4e20ff3d58acf340c5d22385bcad33",
+    "_spmv_csc_prepared_with_int32_indices": "290f9a58198b9a7cab7d815d8116c5c7a21b4420ec8ccb5c3dea0d8edcfd9ce4",
+    "_run_spmv_csc_prepared_with_fallback": "336c7613b237eae63f5c8ad49d174049a5ed476990633516f826091ea58b696e",
+    "_spmv_csc_via_mixed": "c22d028687aff70b14fddfa97c9637fdd1c11d296a21198d592da9ac773fc6b8",
+    "flagsparse_spmv_csc": "b2d09c97badb6e1d367eb3651969bd02268509954a6db3b7c39a3c3d3dacf99e",
+    "_csc_product": "eadecc05328451470c7d3bfeb4d3f72d726fd7ca6d59f1ac71317e17d5e70cb8",
+    "_csc_columns_reduce_kernel": "068c8c14dd3ab1e75b3719f7aea2742995d8b0dbf61c6b13cda47c8f3f030ec0",
+    "_csc_columns_atomic_kernel": "a38a0330a32dee0c2d33124afda9e3ffb2974447865ddaf04c065acbd4c8d1ed",
+    "_csc_vector_kernel": "9bb0c089c0e01cbf4635e8c055700c89524b542d8450053542a8d587e7788085",
+    "_csc_split_store_kernel": "4d3927a0f1fe79e8aa57a9ff76851c191af976a7873398e00700e17dd545457a",
+    "_run_csc_split": "337cccd9e9b4910a449566d332aca4dccfd6288150c5fb482e4073f51656c7f1",
+    "_launch_csc_columns": "6d47e56e60011bb1f91e002a0b21883be96fd5e29da868274a536f714b83f064",
+    "_csc_spec": "823a5c5029faa38db7c2f4b405fff695e150098b9b37a9d5f3468e8971031353",
+    "_prepare_csc_registered": "588a4ef0fabc61f3736c6885fbd06312c07070011ae0e6cc9c60f280d10cb7b2",
+    "get_spmv_csc_algorithm_spec": "80d47a88c121d65e58f7c8cff3d4b51b12a857365e87690af892b12a6773cf40",
+    "list_spmv_csc_algorithms": "99784f7100dfbc7ff28e8966023db5430defa7daaed877b79d81ba7889a6ac2a",
+    "_run_csc_registered": "0810bda220a5b0481efc9208d134629693b37402477705a2fa1e874220ac666c",
+    "flagsparse_spmv_csc_run": "48f849a466d314d173aa964892dc82501f81e9f3809ff1d612ae628b2c2c5286"
+  }
+}
+```
+</details>
+
+
+## 六个独立 mixed 候选：实现与验收（2026-11-10）
+
+本次保留旧计算 kernel、默认配置、默认路由及 NNZ compact/fixed。新增名称只声明
+FP16/BF16 同类型输入、FP32 计算、同类型或 FP32 输出；不是旧算法别名。
+源码和静态检查不代表 CUDA/ROCm 编译、正确性或性能已通过。
+
+| 算子 | 新名称 | 旧对照 | opA |
+|---|---|---|---|
+| SpMV CSR | `csr_subgroup_pair_mixed` | `row_subgroup_stream` | non/trans/conj |
+| SpMM CSR | `csr_panel_staged_mixed` | `csr_row_panel` | non/trans/conj |
+| SpMV COO | `coo_stream_prefetch_mixed` | `coo_segmented_stream_atomic` | non/trans/conj |
+| SpMM COO | `coo_stream_panel_prefetch_mixed` | `coo_segmented_stream_panel_atomic` | non/trans/conj |
+| SpMV CSC | `csc_subgroup_pair_mixed` | `csc_col_subgroup` | trans/conj |
+| SpMM CSC | `csc_panel_staged_mixed` | `csc_col_panel` | trans/conj |
+
+SpMM 保留三种 opB 和原布局契约。CSC non 不使用这些新名称，不构造 CSR 委托。
+公共 API、两级导出、六个 benchmark 和统一 runner 沿用原入口；compare 从注册表枚举。
+专用配置只能配合一个显式算法，不能传给 compare。静态支持表的新增行标为 UNVERIFIED。
+
+### 实现差异与可证伪假设
+
+- Pair：每轮两个连续 V 宽子块，先加载两组稀疏及 dense 值，再分别 FP32 累加；
+  结束合并双链并归约。`prefetch_chunks=1` 是单链消融。对象组顺序执行，不同时保留全部组的累加器。
+  索引集合互斥且完整；额外寄存器与尾部工作可能使短行变慢，不能预先宣称异步流水。
+- Staged panel：L=1/4/8，A=1/2/4，超块 U=max(L,A)=lcm(L,A)。固定 A 时加载 L 不改变
+  每项的累加器归属。`value_stage=storage` 抽取后提升，`compute` 整个小块先提升。
+  保持 A 个 [R,BN] FP32 累加器；不引入 [R,BK,BN] 累加器。
+  tl.gather 的布局转换和寄存器占用必须实测，半精度存储不等于寄存器自动减半。
+- COO prefetch：一次预取 1/2 个块的坐标、value、dense 输入，再逐块 scan/carry。
+  carry 仅跨相邻同 owner 边界合并；不排序，不合并非连续同 owner。none 特化不含 scan/carry。
+  SpMM load 模式按有效 B stride 直读，materialize 在 run 内转换作为消融。
+- 所有中间累加、atomic 和 carry 为 FP32；窄输出最后转换一次。FP32 out 可以直接累加，
+  但旧 COO 已有该机制，不把它重复算作新收益。
+
+Pair 起点 V=8、2 warps、4 顺序对象组、2 子块；CSR 使用嵌套配置
+`{"csr_subgroup_pair_mixed":{"prefetch_chunks":2,"lanes_per_row":8,"row_tiles_per_program":4}}`。
+CSC 使用平铺配置，字段为 lanes_per_column、columns_per_program、column_tiles_per_program、prefetch_chunks。
+
+Panel 起点 CSR R=4/BN=32，CSC R=4/BN=16，L=4/A=2，2 warps。
+字段 panel_load_nnz、panel_accumulators、value_stage；CSR 使用 tile_rows/tile_n，CSC 使用 columns_per_program/block_n。
+COO 起点 SpMV T=128，SpMM T=32/BN=16，blocks_per_program=2、prefetch_blocks=2，4 warps。
+所有 stage=1；显式非法配置报错，未知能力不冒充已支持。
+
+### 计算节点命令
+
+以下均在已经分配的 CUDA 计算节点、仓库根目录执行。脚本负责容器和虚拟环境。
+登录节点提交时用 `sbatch --partition=gpu_a800 tools/run_cuda_tests.sbatch --repo "$PWD" -- ...`；
+bash 本身不申请计算节点。ROCm 使用其已有环境直接执行同一 runner 参数，不使用 CUDA 容器包装。
+
+先运行原六算子 quick 准确性（包含新算法的全类型/op 测试及专门边界）：
+
+```bash
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+--ops spmv_csr,spmm_csr,spmv_coo,spmm_coo,spmv_csc,spmm_csc \
+--phase accuracy --mode quick \
+--results-dir pytest_results_mixed_independent_accuracy
+```
+
+normal 准确性使用相同命令，将 mode 改为 normal，另设 results-dir。
+快速定位新增覆盖可额外传：
+`--pytest-args '-k "independent_mixed_boundaries or registered_half_combinations or registered_wide_output"'`。
+
+真实矩阵四组合比较，SpMM 默认 N=32；CSC 必须包含 trans/conj 才有新候选：
+
+```bash
+MATRIX_DIR="$HOME/run/matrix"
+test -d "$MATRIX_DIR" || exit 1
+COMBOS='float16:float16:float16,float16:float16:float32,bfloat16:bfloat16:bfloat16,bfloat16:bfloat16:float32'
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+--ops spmv_csr,spmm_csr,spmv_coo,spmm_coo,spmv_csc,spmm_csc \
+--phase performance --mode quick --benchmark-input "$MATRIX_DIR" \
+--benchmark-warmup 10 --benchmark-iters 50 \
+--benchmark-args "--type-combos $COMBOS --alg compare --ops all --index-dtypes int32 --indptr-dtypes int32 --timing" \
+--op-benchmark-args "spmm_csr=--op-b non --layout row" \
+--op-benchmark-args "spmm_coo=--op-b non --layout row" \
+--op-benchmark-args "spmm_csc=--op-b non --layout row" \
+--results-dir pytest_results_mixed_independent_compare
+```
+
+上述命令保留 vendor。厂商不支持时记录原因，FlagSparse 继续。当前不支持组合的 DTK
+可显式在 benchmark-args 加 --no-vendor；自身收益不能称为厂商加速比。
+扩展布局/opB时对 SpMM 透传 `--op-b all --layout all --dense-cols 8,32,128`。
+
+单算法消融示例（各组合单独记录；修改 L 后分别写入不同 CSV）：
+
+```bash
+bash tools/run_cuda_tests.sbatch --repo "$PWD" --entry tests/test_spmm_csr.py -- \
+"$MATRIX_DIR" --type-combos float16:float16:float32,bfloat16:bfloat16:float32 \
+--alg csr_panel_staged_mixed \
+--config '{"tile_rows":4,"tile_n":32,"panel_accumulators":2,"panel_load_nnz":4,"value_stage":"storage"}' \
+--ops non --op-b non --layout row --dense-cols 32 \
+--index-dtypes int32 --indptr-dtypes int32 --warmup 10 --iters 50 --timing \
+--csv-csr mixed_staged_L4_storage.csv
+```
+
+消融依次固定其他参数比较：L=1/4/8及value_stage；pair子块1/2再V/G；
+COO预取1/2，再segment/none，再SpMM load/materialize。blocks_per_program必须能被prefetch_blocks整除。
+不同时改变多个因素后将收益归给一个因素。
+
+### 统计和验证边界
+
+保留 main prepare/run 边界，ms=process_cpu_ms+gpu_ms，完整采样与分段诊断分开，
+沿用中位数±10%过滤。CSV保留实际配置/stride/算法及准确性状态，FAIL的有效性能不剔除。
+固定类型四元组、opA/opB、layout、N、索引和平台，报告各算法、旧最佳、新最佳、胜出比例、
+算术/几何平均及逐矩阵回退。未覆盖矩阵不能与旧完整30矩阵结果混称同批收益。
+
+本地只检查AST、diff及旧kernel源码摘要，不执行上述命令或导入算子。
+计算节点需要额外核对寄存器、spill、布局转换、加载事务、atomic及kernel数量；
+只有完整调用实测有收益，才能推荐新配置，默认路由仍不切换。
+
+
+## Optional mixed benchmark work metrics (2026-11-10)
+
+The existing generic performance framework primarily reports latency and speedup.
+The six existing CSR/COO/CSC SpMV/SpMM scripts now accept `--perf-metrics` through
+`tests/benchmark_utils.py`, with pure metric helpers in `tests/utils.py`.
+This opt-in switch currently requires `--type-combos`; requesting it on a legacy
+branch fails explicitly instead of silently omitting metrics. No new entry point,
+algorithm, kernel, default route or vendor policy is introduced by this switch.
+The original runner forwards it in `--benchmark-args`.
+
+### Definitions and interpretation
+
+`ms = process_cpu_ms + gpu_ms` remains the denominator. Prepare is excluded in
+this registered mixed benchmark; required per-run work remains inside the run.
+Diagnostics are separate and are never substituted for the complete run.
+
+Let Z be stored NNZ (including duplicates and explicit zeros), W be 1 for SpMV
+or effective output-column count N for SpMM, and O be the output row count after
+opA. Model `spmx_logical_access_v1` uses:
+
+- Useful FLOPs = `2 * Z * W` (one real multiply and add per contribution).
+- CSR sparse bytes = `Z * (sizeof(A) + sizeof(index)) + (M+1) * sizeof(indptr)`.
+- CSC sparse bytes uses `(K+1)` pointers for original shape M by K.
+- COO sparse bytes = `Z * (sizeof(A) + sizeof(row) + sizeof(col))`.
+- RHS gather bytes = `Z * W * sizeof(RHS)`.
+- Output write bytes = `O * W * sizeof(output)`.
+- Logical bytes = sparse bytes + RHS gather bytes + output write bytes.
+- `useful_gflops = useful_flops / (ms * 1e6)`; `logical_gbs` uses the same divisor.
+- `gnnz_s = Z / (ms * 1e6)`, regardless of W; arithmetic intensity is useful
+  FLOPs / logical bytes. Zero-sized output reports zero work; invalid/nonpositive
+  time yields missing rates with a reason.
+
+These are decimal giga-units. The logical model uses original input storage and
+index widths, and is identical for different algorithms under the same condition.
+It is **not measured DRAM/HBM traffic, a compulsory-traffic lower bound, or peak
+bandwidth utilization**. It excludes cache reuse, repeated panel loads, padding,
+atomic read/modify/write, temporary buffers, transpose/plan traffic and conversions.
+SpMM may reuse B substantially, so a high logical GB/s can exceed physical bandwidth
+without indicating a measurement error. Do not label this field effective hardware
+bandwidth. Useful GFLOP/s likewise excludes extra executed arithmetic and padding.
+For fixed inputs these rates rescale latency; they alone do not identify a bottleneck.
+
+Optional CSV fields include the byte components, `gpu_useful_gflops` and
+`gpu_logical_gbs` using only full-run GPU time, plus GPU sample count, kept count,
+min/median/max and coefficient of variation (population stddev / mean, all samples).
+The sample filter is unchanged: mean inside median +/-10%, with median fallback
+if no sample survives. `sample_kept=0` records that fallback, not an empty timing.
+FAIL retains valid rates and its separate accuracy status. Interface/runtime ERROR
+must not be ranked as a usable result merely because an earlier timing exists.
+
+Input fingerprints hash quantized CPU values and int64-normalized coordinates /
+pointers; RHS fingerprints hash the effective RHS before opB storage transformation.
+They are generated outside timing. CSV records seed, device, software versions,
+source commit and dirty flag. Match fingerprints, dtype quadruple, opA/opB,
+layout, N, indices, actual algorithm/config and prepare/run boundary before comparing
+DCU and A800. A dirty flag alone does not identify a patch: retain the exact source
+diff with each experiment. Matrix fingerprints intentionally differ across formats.
+Report platform ratios from matched latency pairs, then summarize their geometric
+mean; do not divide aggregate GFLOP/s values for unrelated matrices.
+
+For actual memory traffic/occupancy/register/spill diagnosis, use hardware profiling
+in a separate run: NVIDIA [Nsight Compute Profiling Guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/)
+and AMD [ROCm Compute Profiler](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/develop/what-is-rocprof-compute.html).
+AMD tool availability does not establish support on a particular DCU/DTK build;
+confirm the local profiler and counters. Profiled/replayed time is not substituted
+for normal benchmark time. No peak-bandwidth constants are assumed by this interface.
+
+### Compute-node commands
+
+In an **already allocated CUDA compute node**, use the existing container wrapper.
+Set and validate the real matrix path in this shell. This includes CSC trans/conj
+so the new CSC candidates are actually exercised. SpMM remains N=32, row layout,
+opB=non; `--ops all` is opA. The two wide-output combinations are the first
+performance priority, not the complete four-combination correctness suite.
+
+```bash
+MATRIX_DIR="$HOME/run/matrix"
+test -d "$MATRIX_DIR" || exit 1
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+  --ops spmv_csr,spmm_csr,spmv_coo,spmm_coo,spmv_csc,spmm_csc \
+  --phase performance --mode quick --benchmark-input "$MATRIX_DIR" \
+  --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args "--type-combos float16:float16:float32,bfloat16:bfloat16:float32 --alg compare --ops all --index-dtypes int32 --indptr-dtypes int32 --perf-metrics --timing" \
+  --op-benchmark-args "spmm_csr=--op-b non --layout row --dense-cols 32" \
+  --op-benchmark-args "spmm_coo=--op-b non --layout row --dense-cols 32" \
+  --op-benchmark-args "spmm_csc=--op-b non --layout row --dense-cols 32" \
+  --results-dir pytest_results_mixed_metrics_cuda
+```
+
+This command keeps the vendor baseline enabled. For a DCU environment whose vendor
+support has already been checked as unavailable, use the same runner after activating
+the existing HIP environment, and explicitly disable only the baseline:
+
+```bash
+MATRIX_DIR=/path/to/matrix
+test -d "$MATRIX_DIR" || exit 1
+python run_flagsparse_pytest.py \
+  --ops spmv_csr,spmm_csr,spmv_coo,spmm_coo,spmv_csc,spmm_csc \
+  --phase performance --mode quick --benchmark-input "$MATRIX_DIR" \
+  --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args "--type-combos float16:float16:float32,bfloat16:bfloat16:float32 --alg compare --ops all --index-dtypes int32 --indptr-dtypes int32 --perf-metrics --timing --no-vendor" \
+  --op-benchmark-args "spmm_csr=--op-b non --layout row --dense-cols 32" \
+  --op-benchmark-args "spmm_coo=--op-b non --layout row --dense-cols 32" \
+  --op-benchmark-args "spmm_csc=--op-b non --layout row --dense-cols 32" \
+  --results-dir pytest_results_mixed_metrics_dcu
+```
+
+For all four tuples replace the type list with
+`float16:float16:float16,float16:float16:float32,bfloat16:bfloat16:bfloat16,bfloat16:bfloat16:float32`.
+For a small interface/compilation check before the matrix set, invoke an existing
+script via the wrapper, for example `--entry tests/test_spmv_csr.py -- --synthetic
+--type-combos float16:float16:float32 --alg compare --perf-metrics --warmup 2 --iters 5`.
+Repeat with each of the six script names; add `--ops all` to include CSC trans/conj.
+Do not pass a fictitious `synthetic` filename to `--benchmark-input`.
+Use the original accuracy phase first:
+
+```bash
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+  --ops spmv_csr,spmm_csr,spmv_coo,spmm_coo,spmv_csc,spmm_csc \
+  --phase accuracy --mode quick --results-dir pytest_results_mixed_accuracy_cuda
+```
+
+### Source audit and validation boundary
+
+Static review covers six CLI hooks into the shared mixed branch; runner forwarding
+and CSR SpMM script selection; query/high-level/run output-type arguments; SpMM
+opB handling; independent mixed kernel dispatch; FP32 atomic/partial buffers and
+wide output; CSC new-candidate trans/conj restrictions; configuration isolation;
+separate full-run/diagnostic measurement; vendor failure isolation and FAIL timing
+retention. Existing accuracy tests cover the four tuples, API/run equivalence,
+operations, tails, strided out, aliases, input immutability and configuration cases.
+The existing benchmark policy test file gains metric-formula, empty/invalid-time,
+sampling-window and six-script opt-in coverage; no new test entry point is created.
+
+This is **source integration and static audit, not hardware acceptance**. No operator,
+pytest, functional import or offline compilation was run locally. AST and diff
+checks cannot establish Triton lowering success, device capability, numerical
+correctness or speed. CUDA and DCU must each run the original quick accuracy and
+synthetic benchmark first; inspect ERROR/SKIP reasons and CSV coverage, then run the
+matrix set. Do not infer successful coverage solely from runner exit code.
+
+
+### Timing clarification and measured reference normalization (2026-11-10)
+
+The timing audit found that legacy CSR SpMM alg1/alg2 and COO SpMM alg1 construct
+CPU bucket descriptors **inside** the outer start/end event interval. Their CPU
+measurement also includes count/offset readback. Event elapsed time is a device
+timeline interval, not a sum of active kernel durations: submission gaps can be
+included. Consequently `process_cpu_ms + gpu_ms` can double-count part of the CPU
+interval. Never estimate an overlap correction by subtracting CPU time from events.
+New mixed candidates report zero CPU processing, so this particular sum does not
+add a second CPU term for them. This does not prove their events exclude idle gaps.
+
+Keep the existing `ms` sum and vendor speedup for historical compatibility. With
+`--perf-metrics` additionally measure `prepared_run_ms` in a **separate** loop:
+synchronize before starting the host clock, call the same prepared algorithm with
+internal timing/metadata/diagnostics disabled, synchronize after the call, stop the
+clock. Apply the same median-window filter. This includes the run API/host work and
+completion synchronization, excludes prepare and the pre-start synchronization,
+and measures single-call completion latency (not pipelined batch throughput).
+There is no separate CPU term to add to this measurement. GPU samples, wall samples
+and phase diagnostics are separate populations; their values need not sum or match.
+The metric switch therefore adds another `iters` calls, not extra work inside the
+original event samples. CUDA/ROCm compilation remains outside sampling.
+
+- Prefer `gpu_useful_gflops` / `gpu_logical_gbs` for the GPU event interval view;
+  they are not pure GPU arithmetic efficiency or active-kernel rates.
+- Prefer `prepared_run_ms`, `prepared_useful_gflops`, `prepared_logical_gbs` for
+  single prepared-call completion efficiency.
+- `cpu_gpu_overlap_risk` is true when any reported CPU sample is nonzero; it is
+  a conservative warning, not a measured overlap duration. Do not assume the
+  historical `ms` is wall-clock latency. The original speedup column is unchanged.
+- The optional terminal columns now show Wall, GPU-GF/s and GPU-LGB/s. Previous
+  section descriptions of the optional terminal columns are superseded here;
+  existing CSV `useful_gflops` and `logical_gbs` still use the historical ms sum.
+
+Optional reference arguments (decimal GB/s and GFLOP/s):
+
+```text
+--reference-bandwidth-gbs VALUE
+--reference-bandwidth-source "BabelStream version/backend; device; Triad; FP32; array size; iterations; statistic; clock/ECC; date/log"
+--reference-peak-gflops VALUE
+--reference-peak-source "same-device FP32 scalar/SIMT FMA peak; clock; theoretical or measured; source"
+```
+
+Bandwidth value and source must be supplied together. Compute peak and source are
+optional, but require the bandwidth reference to construct the logical Roofline.
+All values must be positive and finite; the options require `--perf-metrics`.
+No A800/BW200 bandwidth is guessed or hardcoded. Measure each device separately
+using [BabelStream](https://github.com/UoB-HPC/BabelStream), with arrays larger than
+cache and comparable test settings. If the tool prints decimal MB/s, divide by
+1000 for this argument. Record the operation (e.g. Triad), precision, data size,
+statistic and full log; do not silently treat its best/min-time rate as an average.
+The storage format of the sparse test need not equal BabelStream's data type, but
+its choice is part of the reference definition and must be disclosed.
+
+For Q logical bytes, F useful FLOPs, historical total time T, GPU interval Tg:
+
+- `logical_bw_ratio = logical_gbs / reference_bandwidth_gbs` (requested original ratio).
+- `gpu_logical_bw_ratio = gpu_logical_gbs / reference_bandwidth_gbs` (GPU-oriented view).
+- Model intensity `I = F/Q` in FLOPs/byte.
+- `logical_roofline_gflops = min(reference_peak_gflops, reference_bandwidth_gbs * I)`.
+- `gpu_logical_roofline_ratio = gpu_useful_gflops / logical_roofline_gflops`.
+
+Missing references leave derived fields empty, never zero or fabricated. Ratios
+are not clipped to one. They are **logical-model normalization**, not hardware HBM
+utilization or a rigorous upper bound: cache reuse and modeled repeated gathers
+can produce ratios above one. These references require no profiler, but a logical
+Roofline cannot by itself establish the physical memory/compute bottleneck.
+The present mixed kernels use FP32 scalar/SIMT arithmetic, not Tensor Cores. Do not
+use advertised FP16 Tensor Core throughput (or sparsity-doubled throughput) as their
+compute ceiling. If no matching FP32-path peak is established, omit peak arguments
+and use only measured bandwidth normalization.
+
+Append reference options inside the existing `--benchmark-args` string from the
+commands above; supply device-specific measured values, not the same number for
+A800 and BW200. Retain all raw CSV fields and separate accuracy status. Compare
+prepared wall times separately from historical event-plus-CPU speedups.
+
+Sources: [CUDA event semantics](https://docs.nvidia.com/cuda/archive/12.9.0/cuda-runtime-api/group__CUDART__EVENT.html)
+and [synchronized host timing](https://developer.nvidia.com/blog/how-implement-performance-metrics-cuda-cc/).
+Local verification remains source/AST/diff only; the new measurements and reference
+normalization have not been hardware-validated on either platform.

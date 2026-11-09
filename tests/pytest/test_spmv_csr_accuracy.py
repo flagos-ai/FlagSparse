@@ -757,6 +757,61 @@ def test_spmv_csr_nnz_tiles_batched_boundaries(plan_mode, workspace, dtype, wide
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
 
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("wide", [False, True])
+@pytest.mark.parametrize("plan_mode", ["compact", "fixed"])
+@pytest.mark.parametrize("return_time,return_meta,timing", list(itertools.product([False, True], repeat=3)))
+def test_spmv_csr_nnz_return_contract(dtype, wide, plan_mode, return_time, return_meta, timing):
+    """Benchmark requests time+metadata; tensor-only success is not sufficient."""
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    if "csr_nnz_tile_reduce" not in spmv_mod.list_spmv_csr_algorithms(dtype=dtype, backend=common._backend_name()):
+        pytest.skip("NNZ tile capability is unavailable on this backend")
+    device = accelerator_device()
+    output_dtype = torch.float32 if wide else dtype
+    values = torch.tensor([1, 0.00390625, -0.125, 0.5, 0.25], dtype=dtype, device=device)
+    indices = torch.tensor([0, 0, 1, 1, 2], dtype=torch.int32, device=device)
+    indptr = torch.tensor([0, 3, 3, 5], dtype=torch.int32, device=device)
+    x = torch.full((4,), 1.0078125, dtype=dtype, device=device)
+    expected = torch.tensor([0.87890625, 0, 0.75], dtype=torch.float64) * float(x[0].cpu())
+    out = torch.full((6,), float("nan"), dtype=output_dtype, device=device)[::2]
+    cfg = dict(plan_mode=plan_mode, block_nnz=2, reduce_block_size=4, workspace_bytes=256)
+    try:
+        prepared = spmv_mod.prepare_spmv_csr(values, indices, indptr, (3, 4),
+                                            alg="csr_nnz_tile_reduce", config=cfg)
+        result = spmv_mod.flagsparse_spmv_csr_run(
+            prepared, x, out=out, out_dtype=output_dtype,
+            return_time=return_time, return_meta=return_meta, timing=timing,
+        )
+        if return_meta:
+            if return_time:
+                actual, elapsed, meta = result
+                assert elapsed == meta["ms"]
+            else:
+                actual, meta = result
+            assert meta["plan_mode"] == plan_mode
+            assert meta["ms"] == meta["process_cpu_ms"] + meta["gpu_ms"]
+            assert meta["plan_builds"] == 1
+            assert meta["workspace_peak_bytes"] <= cfg["workspace_bytes"]
+            assert ("process_gpu_ms" in meta) == timing
+            assert ("compute_ms" in meta) == timing
+            expected_key = "boundary_slot_capacity" if plan_mode == "fixed" else "boundary_record_count"
+            other_key = "boundary_record_count" if plan_mode == "fixed" else "boundary_slot_capacity"
+            assert meta[expected_key] >= 0
+            assert other_key not in meta
+        elif return_time:
+            actual, elapsed = result
+            assert elapsed >= 0
+        else:
+            actual = result
+        assert actual is out
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(actual.cpu(), expected.to(output_dtype), rtol=rtol, atol=atol)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+
+
 _MIGRATED_ROUTES = (('row_subgroup_stream', 'non'), ('row_subgroup_stream', 'trans'), ('row_subgroup_stream', 'conj'))
 
 
@@ -845,7 +900,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmv_csr
 @pytest.mark.parametrize("alg,config", [(name, None) for name in [
-    "row_tile", "row_vector", "row_subgroup_stream",
+    "row_tile", "row_vector", "row_subgroup_stream", "csr_subgroup_pair_mixed",
     "csr_nnz_tile_reduce",
     "row_split_reduce", "row_adaptive_split",
     "legacy_rowpar", "legacy_segbin", "legacy_bucket_vector",
@@ -897,5 +952,66 @@ def test_spmv_csr_registered_wide_output(alg, config, dtype, op, wide, index_pai
             spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out, out_dtype=dtype if wide else torch.float32)
         with pytest.raises(ValueError, match="overlap"):
             spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=values)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("config", [None, {'csr_subgroup_pair_mixed': {'prefetch_chunks': 1, 'lanes_per_row': 2, 'row_tiles_per_program': 1}}], ids=lambda c: "default" if c is None else str(c))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
+@pytest.mark.parametrize("case", ["empty", "tails", "unordered", "zero_axis"])
+def test_spmv_csr_independent_mixed_boundaries(config, dtype, wide, case):
+    from importlib import import_module
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    module = import_module("flagsparse.sparse_operations.spmv_csr")
+    device = accelerator_device()
+    lengths = [0] * 13 if case == "empty" else [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 129, 257]
+    if case == "zero_axis":
+        lengths = []
+    axis = torch.repeat_interleave(torch.arange(len(lengths)), torch.tensor(lengths, dtype=torch.int64))
+    other = (torch.arange(axis.numel()) * 7) % 19
+    vals = ((torch.arange(axis.numel()) % 7 - 3).float() / 16).to(dtype)
+    rows, cols = (axis, other)
+    shape = (len(lengths), 19)
+    if case == "unordered":
+        # Reverse within each compressed object; COO additionally disperses owners.
+        order = torch.arange(axis.numel() - 1, -1, -1)
+        order = order[torch.argsort(axis[order], stable=True)]
+        rows, cols, vals = rows[order], cols[order], vals[order]
+    matrix = torch.zeros(shape, dtype=torch.float64)
+    matrix.index_put_((rows.long(), cols.long()), vals.double(), accumulate=True)
+    values = vals.to(device)
+    first = cols.to(device=device, dtype=torch.int32)
+    second = torch.tensor([0] + torch.tensor(lengths, dtype=torch.int64).cumsum(0).tolist(), dtype=torch.int64, device=device)
+    op = "non"
+    effective = matrix.T if op == "trans" else matrix
+    output_dtype = torch.float32 if wide else dtype
+    rhs = ((torch.arange(effective.shape[1]) % 5 - 2).float() / 8).to(dtype)
+    operand = torch.empty(rhs.numel() * 2, dtype=dtype, device=device)[::2]
+    operand.copy_(rhs.to(device))
+    expected = (effective @ rhs.double()).to(output_dtype)
+    backing = torch.full((*expected.shape[:-1], expected.shape[-1] * 2), float("nan"), dtype=output_dtype, device=device)
+    out = backing[..., ::2]
+    originals = [v.clone() for v in (values, first, second, operand)]
+    try:
+        prepared = module.prepare_spmv_csr(values, first, second, shape, op=op, alg="csr_subgroup_pair_mixed", config=config)
+        result, meta = module.flagsparse_spmv_csr_run(prepared, operand, out=out, out_dtype=output_dtype, return_meta=True)
+        assert result is out
+        if config is None and case == "tails":
+            measured, elapsed, diagnostic = module.flagsparse_spmv_csr_run(
+                prepared, operand, out=out, out_dtype=output_dtype,
+                return_meta=True, return_time=True, timing=True)
+            assert measured is out
+            assert elapsed == pytest.approx(diagnostic["gpu_ms"] + diagnostic.get("process_cpu_ms", 0.0))
+            assert diagnostic["compute_ms"] >= 0
+            assert diagnostic["process_gpu_ms"] >= 0
+            with pytest.raises(ValueError, match="op|prepared"):
+                module.flagsparse_spmv_csr_run(prepared, operand, op="non" if op == "trans" else "trans")
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+        for actual, original in zip((values, first, second, operand), originals):
+            torch.testing.assert_close(actual, original, rtol=0, atol=0)
+        assert meta.get("alg_resolved", meta.get("algorithm")) == "csr_subgroup_pair_mixed"
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))

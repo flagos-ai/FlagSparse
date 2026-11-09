@@ -27,6 +27,20 @@ def test_fixed_nnz_plan_has_no_dynamic_boundary_compaction():
                and n.func.attr == "tolist" for n in ast.walk(function)) == 1
 
 
+def test_panel_static_loop_does_not_redeclare_constexpr():
+    tree = ast.parse((SOURCE / "_spmm_csr_kernels.py").read_text(encoding="utf-8"))
+    kernel = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "row_panel_kernel")
+    loops = [n for n in ast.walk(kernel) if isinstance(n, ast.For)
+             and isinstance(n.iter, ast.Call) and isinstance(n.iter.func, ast.Attribute)
+             and n.iter.func.attr == "static_range"]
+    assert loops
+    for loop in loops:
+        assert not any(isinstance(n, ast.AnnAssign)
+                       and isinstance(n.annotation, ast.Attribute)
+                       and n.annotation.attr == "constexpr" for n in ast.walk(loop))
+
+
 spec = importlib.util.spec_from_file_location(
     "_csr_policy_test_config", SOURCE / "_spmv_csr_config.py"
 )
@@ -61,9 +75,9 @@ class ConfigPolicy(unittest.TestCase):
         )
 
     def test_registry_support(self):
-        self.assertEqual(len(policy.list_algorithms()), 9)
+        self.assertEqual(set(policy.list_algorithms()), set(policy.ALGORITHMS))
         for alg in policy.NEW_ALGORITHMS:
-            if alg == "csr_nnz_tile_reduce":
+            if alg in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed"):
                 self.assertNotIn(alg, policy.list_algorithms(dtype="float32"))
                 self.assertIn(alg, policy.list_algorithms(dtype="bfloat16", backend="rocm"))
                 continue
@@ -87,7 +101,7 @@ class ConfigPolicy(unittest.TestCase):
             self.assertEqual(spec["compute_dtype_by_input"]["complex64"], "complex64")
             self.assertEqual(spec["compute_dtype_by_input"]["float16"], "float32")
         for alg in policy.NEW_ALGORITHMS:
-            if alg == "csr_nnz_tile_reduce":
+            if alg in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed"):
                 continue
             policy.resolve_config(alg, no_fp64)
             for dtype in ("float16", "bfloat16", "complex64"):
@@ -462,7 +476,7 @@ class IntegrationPolicy(unittest.TestCase):
         rows = ops_support.build_rows(SOURCE)
         for alg in policy.NEW_ALGORITHMS:
             cases = [row for row in rows if row["route"] == alg]
-            self.assertEqual(len(cases), 12 if alg == "csr_nnz_tile_reduce" else 36)
+            self.assertEqual(len(cases), 12 if alg in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else 36)
             self.assertEqual({row["op"] for row in cases}, {"non", "trans", "conj"})
             self.assertEqual({row["status"] for row in cases}, {"UNVERIFIED"})
 
@@ -543,17 +557,17 @@ def test_migrated_policies_validate_capabilities_and_workspace():
         with unittest.TestCase().assertRaises(ValueError):
             csr.resolve_config(algorithm, "float16", 33, "row", caps, override)
     for alg in csr.NEW_ALGORITHMS:
-        cfg, info = csr.resolve_config(alg, "float16" if alg == "csr_nnz_panel_reduce" else "complex128", 33, "col", caps)
+        cfg, info = csr.resolve_config(alg, "float16" if alg in ("csr_nnz_panel_reduce", "csr_panel_staged_mixed") else "complex128", 33, "col", caps)
         assert info["backend_caps"]["backend"] == "rocm"
         assert cfg["workspace_bytes"] == 256 * 1024 * 1024
         assert csr.algorithm_spec(alg)["validation"] == "unverified"
         wave, capacity = csr.workspace_geometry(33, 16, cfg)
         assert 3 * wave * capacity * 16 <= cfg["workspace_bytes"]
     for alg in column.COO_ALGORITHMS:
-        cfg, _ = column.resolve_coo_config(alg, "float64", caps)
+        cfg, _ = column.resolve_coo_config(alg, "float16" if alg in column.COO_MIXED_ALGORITHMS else "float64", caps)
         assert cfg["num_warps"] in caps.legal_num_warps
     for alg, ops in column.CSC_ALGORITHMS.items():
-        cfg, _ = column.resolve_csc_config(alg, "complex128", 7, caps, op=ops[0])
+        cfg, _ = column.resolve_csc_config(alg, "bfloat16" if alg in column.CSC_MIXED_ALGORITHMS else "complex128", 7, caps, op=ops[0])
         assert cfg["num_warps"] in caps.legal_num_warps
     with unittest.TestCase().assertRaises(NotImplementedError):
         csr.resolve_config("csr_row_panel", "float32", 7, "row", csr.BackendCaps("unknown"))
@@ -574,3 +588,68 @@ def test_split_config_does_not_require_adaptive_threshold_order():
     with unittest.TestCase().assertRaises(ValueError):
         csr.resolve_config("csr_adaptive_tile_split", "float16", 7, "row", caps,
                            {"segment_nnz": 8})
+
+
+def test_independent_mixed_configuration_contracts():
+    csr, column = _extension_policies()
+    caps = csr.BackendCaps("rocm", "hip", "gfx936", 64, 1024, (1, 2, 4, 8),
+                           True, True, True, True, True, True, True)
+    check = unittest.TestCase()
+    for load in (1, 4, 8):
+        for accumulators in (1, 2, 4):
+            for stage in ("storage", "compute"):
+                cfg, _ = csr.resolve_config("csr_panel_staged_mixed", "float16", 33, "row", caps,
+                    {"panel_load_nnz": load, "panel_accumulators": accumulators, "value_stage": stage})
+                assert cfg["panel_load_nnz"] == load and cfg["value_stage"] == stage
+                column.resolve_csc_config("csc_panel_staged_mixed", "bfloat16", 33, caps,
+                    {"panel_load_nnz": load, "panel_accumulators": accumulators, "value_stage": stage}, op="trans")
+    for alg in column.COO_MIXED_ALGORITHMS:
+        for prefetch in (1, 2):
+            for blocks in (1, 2, 4, 8):
+                if blocks % prefetch:
+                    with check.assertRaises(ValueError):
+                        column.resolve_coo_config(alg, "float16", caps,
+                            {"prefetch_blocks": prefetch, "blocks_per_program": blocks})
+                else:
+                    column.resolve_coo_config(alg, "float16", caps,
+                        {"prefetch_blocks": prefetch, "blocks_per_program": blocks})
+        with check.assertRaises(TypeError):
+            column.resolve_coo_config(alg, "float32", caps)
+    for alg in column.CSC_MIXED_ALGORITHMS:
+        with check.assertRaises(ValueError):
+            column.resolve_csc_config(alg, "float16", 7, caps, op="non")
+        with check.assertRaises(TypeError):
+            column.resolve_csc_config(alg, "float32", 7, caps, op="trans")
+    for alg in ("csr_row_panel", "csr_panel_staged_mixed"):
+        with check.assertRaises(ValueError):
+            csr.resolve_config(alg, "float16", 7, "row", caps, {"value_stage": "invalid"})
+    with check.assertRaises(ValueError):
+        column.resolve_coo_config("coo_segmented_stream_atomic", "float16", caps, {"prefetch_blocks": 2})
+    with check.assertRaises(ValueError):
+        column.resolve_csc_config("csc_col_panel", "float16", 7, caps, {"value_stage": "storage"}, op="trans")
+    pcaps = policy.BackendCaps("rocm", "gfx936", "hip", 64, 1024, True, True, True)
+    for chunks in (1, 2):
+        cfg, _ = policy.resolve_config("csr_subgroup_pair_mixed", pcaps,
+            {"csr_subgroup_pair_mixed": {"prefetch_chunks": chunks}})
+        assert cfg["csr_subgroup_pair_mixed"]["prefetch_chunks"] == chunks
+    with check.assertRaises(ValueError):
+        policy.resolve_config("row_subgroup_stream", pcaps, {"csr_subgroup_pair_mixed": {"prefetch_chunks": 2}})
+    assert policy.algorithm_spec("csr_subgroup_pair_mixed")["value_dtypes"] == ("float16", "bfloat16")
+
+
+def test_independent_mixed_kernels_are_distinct_and_native():
+    expected = {
+        "_spmv_csr_kernels.py": ("subgroup_pair_mixed_kernel",),
+        "_spmm_csr_kernels.py": ("panel_staged_mixed_kernel",),
+        "spmv_coo.py": ("_coo_prefetch_mixed_kernel",),
+        "spmv_csc.py": ("_csc_subgroup_pair_mixed_kernel", "_csc_panel_staged_mixed_kernel"),
+    }
+    for filename, names in expected.items():
+        tree = ast.parse((SOURCE / filename).read_text(encoding="utf-8"))
+        for name in names:
+            function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            calls = {n.func.id for n in ast.walk(function) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            assert not calls & {"row_panel_kernel", "row_subgroup_stream_kernel", "_coo_stream_panel_kernel", "flagsparse_spmv_csr", "flagsparse_spmm_csr"}
+            for loop in ast.walk(function):
+                if isinstance(loop, ast.For):
+                    assert not any(isinstance(n, ast.AnnAssign) for n in ast.walk(loop))

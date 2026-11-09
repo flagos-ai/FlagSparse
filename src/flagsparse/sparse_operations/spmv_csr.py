@@ -34,6 +34,7 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "row_split_reduce",
     "row_adaptive_split",
     "row_subgroup_stream",
+    "csr_subgroup_pair_mixed",
     "csr_nnz_tile_reduce",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
@@ -1795,11 +1796,13 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
                        execution_indptr_dtype=str(execution.kernel_indptr.dtype).removeprefix("torch."))
 
     def compute():
-        vector = x.resolve_conj().contiguous()
+        vector = (x.resolve_conj().resolve_neg() if alg == "csr_subgroup_pair_mixed"
+                  else x.resolve_conj().contiguous())
         matrix = execution
-        if matrix.data.is_conj():
+        if matrix.data.is_conj() or (alg == "csr_subgroup_pair_mixed" and matrix.data.is_neg()):
             matrix = copy(matrix)
-            matrix.data = matrix.data.resolve_conj()
+            matrix.data = (matrix.data.resolve_conj().resolve_neg() if alg == "csr_subgroup_pair_mixed"
+                           else matrix.data.resolve_conj())
             matrix._baseline_data = None
         if alg in SPMV_CSR_NEW_ALGORITHMS:
             from . import _spmv_csr_kernels as kernels
@@ -1968,7 +1971,13 @@ def flagsparse_spmv_csr_run(
                 process_gpu_ms=phases["process_gpu_ms"], compute_ms=phases["compute_ms"]
             )
         if actual.alg == "csr_nnz_tile_reduce":
-            for key in ("boundary_record_count", "reduction_levels", "tile_batches",
+            # A fixed plan reports allocated slots, not a read-back count of
+            # valid records. Preserve that distinction in the public metadata.
+            mode = phases["plan_mode"]
+            boundary_key = (
+                "boundary_slot_capacity" if mode == "fixed" else "boundary_record_count"
+            )
+            for key in ("plan_mode", boundary_key, "reduction_levels", "tile_batches",
                         "workspace_peak_bytes", "descriptor_peak_bytes", "nnz_tile_count", "plan_builds"):
                 meta[key] = phases[key]
         if _is_rocm_runtime() and actual.rocm_nnz_plan is not None:

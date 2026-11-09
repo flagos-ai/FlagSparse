@@ -172,3 +172,125 @@ def test_spmx_filtered_measurement_preserves_optional_shared_default():
     assert "_spmm_csr_auto_prefers_alg1(data, indptr, shape)" in source
     assert "filter_samples=True" in source
     assert "first_call_ms = (time.perf_counter() - t0) * 1000.0" in source
+
+
+def test_sparse_work_metrics_use_complete_time_and_explicit_byte_model():
+    import math
+    import unittest
+    work = _timing_function(PROJECT_ROOT / "tests/utils.py", "sparse_work_metrics")
+    arguments = dict(operator="spmm_csr", shape=(3, 4), nnz=5, dense_cols=7,
+                     a_dtype="float16", rhs_dtype="float16", output_dtype="float32",
+                     index_dtype="int32", indptr_dtype="int64", op="non", ms=2.0, gpu_ms=1.0)
+    result = work(**arguments)
+    assert result["useful_flops"] == 70
+    assert result["sparse_input_bytes"] == 62
+    assert result["rhs_gather_bytes"] == 70
+    assert result["output_write_bytes"] == 84
+    assert result["logical_bytes"] == 216
+    assert math.isclose(result["useful_gflops"], 70 / 2e6)
+    assert math.isclose(result["logical_gbs"], 216 / 2e6)
+    assert math.isclose(result["gnnz_s"], 5 / 2e6)
+    assert result["gpu_useful_gflops"] == 2 * result["useful_gflops"]
+    assert work(**dict(arguments, operator="spmm_coo"))["logical_bytes"] == 224
+    assert work(**dict(arguments, operator="spmm_csc", op="trans"))["logical_bytes"] == 252
+    assert work(**dict(arguments, operator="spmv_csr"))["useful_flops"] == 10
+    assert work(**dict(arguments, output_dtype="float16"))["logical_bytes"] == 174
+    for dtype in ("float16", "bfloat16"):
+        assert work(**dict(arguments, a_dtype=dtype, rhs_dtype=dtype))["useful_flops"] == 70
+    for elapsed in (None, 0.0, -1.0, float("inf"), float("nan")):
+        row = work(**dict(arguments, ms=elapsed))
+        assert row["logical_gbs"] is None and row["metrics_reason"]
+    assert work(**dict(arguments, dense_cols=0))["logical_bytes"] == 0
+    assert work(**dict(arguments, nnz=0))["useful_gflops"] == 0
+    with unittest.TestCase().assertRaises(ValueError):
+        work(**dict(arguments, a_dtype="complex64"))
+
+
+def test_metric_sample_summary_does_not_modify_filter_rule():
+    summary = _timing_function(PROJECT_ROOT / "tests/utils.py", "benchmark_sample_summary")
+    result = summary([0.01, 1.0, 1.0, 1.0, 100.0])
+    assert result["sample_count"] == 5 and result["sample_kept"] == 3
+    assert result["sample_median_ms"] == 1.0
+    assert summary([1.0, 100.0])["sample_kept"] == 0  # filtered_avg_ms falls back to median
+    assert summary([])["sample_median_ms"] is None
+    assert summary([0.0, 0.0])["sample_cv"] == 0.0
+
+
+def test_mixed_metric_cli_is_shared_by_all_six_benchmarks():
+    import argparse
+    path = PROJECT_ROOT / "tests/benchmark_utils.py"
+    add = _timing_function(path, "add_type_combo_arguments")
+    parser = argparse.ArgumentParser()
+    add(parser, spmm=True)
+    assert parser.parse_args([]).perf_metrics is False
+    assert parser.parse_args(["--perf-metrics"]).perf_metrics is True
+    for kind in ("spmv", "spmm"):
+        for fmt in ("csr", "coo", "csc"):
+            source = (PROJECT_ROOT / f"tests/test_{kind}_{fmt}.py").read_text(encoding="utf-8")
+            assert "add_type_combo_arguments(" in source and "run_type_combo_benchmark(" in source
+    runner = (PROJECT_ROOT / "run_flagsparse_pytest.py").read_text(encoding="utf-8")
+    assert '"--type-combos"' in runner and '"tests/test_spmm_csr.py"' in runner
+    source = path.read_text(encoding="utf-8")
+    assert "--perf-metrics currently requires --type-combos" in source
+    assert 'row["ms"] = row["gpu_ms"] + row["process_cpu_ms"]' in source
+    assert "benchmark_sample_summary(gpu)" in source
+    assert "NOT DRAM/HBM" in source
+
+
+def test_mixed_benchmark_run_signatures_preserve_type_and_operation_contract():
+    import ast
+
+    for kind in ("spmv", "spmm"):
+        for fmt in ("csr", "coo", "csc"):
+            op = f"{kind}_{fmt}"
+            path = PROJECT_ROOT / "src/flagsparse/sparse_operations" / f"{op}.py"
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+            for name in (f"flagsparse_{op}", f"flagsparse_{op}_run", f"list_{op}_algorithms"):
+                function = functions[name]
+                arguments = {arg.arg for arg in function.args.args + function.args.kwonlyargs}
+                assert "out_dtype" in arguments, name
+                if name.startswith("list_"):
+                    assert "rhs_dtype" in arguments, name
+                else:
+                    assert {"out", "return_time", "return_meta"} <= arguments, name
+                    if kind == "spmm":
+                        assert "op_b" in arguments, name
+            run = functions[f"flagsparse_{op}_run"]
+            if kind == "spmm":
+                applications = [node for node in ast.walk(run) if isinstance(node, ast.Call)
+                                and isinstance(node.func, ast.Attribute)
+                                and node.func.attr == "apply_registered_op_b"]
+                assert len(applications) == 1, op
+
+
+def test_sparse_reference_normalization_is_not_clamped_utilization():
+    import unittest
+
+    normalize = _timing_function(PROJECT_ROOT / "tests/utils.py", "sparse_reference_metrics")
+    metrics = dict(logical_gbs=200.0, gpu_logical_gbs=400.0,
+                   arithmetic_intensity=2.0, gpu_useful_gflops=800.0)
+    result = normalize(metrics, reference_gbs=100.0, bandwidth_source="BabelStream Triad FP32 test",
+                       peak_gflops=1000.0, peak_source="FP32 scalar FMA, test reference")
+    assert result["logical_bw_ratio"] == 2.0
+    assert result["gpu_logical_bw_ratio"] == 4.0
+    assert result["logical_roofline_gflops"] == 200.0
+    assert result["gpu_logical_roofline_ratio"] == 4.0  # logical model can exceed one
+    assert normalize(metrics)["logical_bw_ratio"] is None
+    assert normalize({}, reference_gbs=100.0, bandwidth_source="test")["logical_bw_ratio"] is None
+    for options in (dict(reference_gbs=0.0, bandwidth_source="test"),
+                    dict(reference_gbs=float("nan"), bandwidth_source="test"),
+                    dict(reference_gbs=100.0), dict(peak_gflops=1000.0, peak_source="test"),
+                    dict(bandwidth_source="test")):
+        with unittest.TestCase().assertRaises(ValueError):
+            normalize(metrics, **options)
+
+
+def test_mixed_wall_measurement_is_separate_from_event_sum():
+    source = (PROJECT_ROOT / "tests/benchmark_utils.py").read_text(encoding="utf-8")
+    assert 'row["ms"] = row["gpu_ms"] + row["process_cpu_ms"]' in source
+    assert 'row["prepared_run_ms"] = filtered_avg_ms(wall_samples)' in source
+    assert 'wall_kwargs = dict(out_dtype=output_dtype)' in source
+    assert 'wall_result = run(prepared, rhs, **wall_kwargs)' in source
+    assert 'row["cpu_gpu_overlap_risk"] = any(value > 0 for value in cpu)' in source
+    assert 'reference bandwidth/peak options require --perf-metrics' in source

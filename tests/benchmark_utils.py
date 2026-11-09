@@ -51,6 +51,11 @@ def add_type_combo_arguments(parser, *, spmm=False):
         ("--fail-fast", dict(action="store_true")),
         ("--synthetic", dict(action="store_true")),
         ("--vendor-timeout", dict(type=float, default=180.0)),
+        ("--reference-bandwidth-gbs", dict(type=float, default=None)),
+        ("--reference-bandwidth-source", dict(default=None)),
+        ("--reference-peak-gflops", dict(type=float, default=None)),
+        ("--reference-peak-source", dict(default=None)),
+        ("--perf-metrics", dict(action="store_true", help="Useful throughput and modeled logical bandwidth (requires --type-combos; not hardware counters)")),
     ):
         if option not in parser._option_string_actions:
             parser.add_argument(option, **kwargs)
@@ -103,7 +108,14 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     import traceback
 
     tokens = list(sys.argv[1:] if argv is None else argv)
+    reference_options = dict(reference_gbs=args.reference_bandwidth_gbs,
+                             bandwidth_source=args.reference_bandwidth_source,
+                             peak_gflops=args.reference_peak_gflops, peak_source=args.reference_peak_source)
+    if any(value is not None for value in reference_options.values()) and not args.perf_metrics:
+        parser.error("reference bandwidth/peak options require --perf-metrics")
     if not args.type_combos:
+        if getattr(args, "perf_metrics", False):
+            parser.error("--perf-metrics currently requires --type-combos")
         if getattr(args, "op_b", "non") != "non":
             parser.error("--op-b currently requires --type-combos")
         if isinstance(getattr(args, "dense_cols", None), str):
@@ -114,7 +126,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     from tests import cusparse_generic_baseline as vendor
     from tests import mtx_fast
     from tests.pytest.accuracy_utils import close_tolerances
-    from tests.utils import filtered_avg_ms
+    from tests.utils import filtered_avg_ms, sparse_work_metrics, benchmark_sample_summary, sparse_reference_metrics
 
     def selection(value, allowed):
         result = tuple(allowed) if value == "all" else tuple(dict.fromkeys(str(value).split(",")))
@@ -136,6 +148,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     matrix = operator.startswith("spmm")
     fmt = operator.rsplit("_", 1)[1]
     try:
+        sparse_reference_metrics({}, **reference_options)  # Validate before device work.
         combos = parse_type_combos(args.type_combos, tokens)
         ops = selection(option("ops", "op", default="non") or "non", ("non", "trans", "conj"))
         op_bs = selection(args.op_b, ("non", "trans", "conj")) if matrix else ("non",)
@@ -166,6 +179,28 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     prepare = getattr(module, "prepare_" + operator + ("_route" if matrix else ""))
     run = getattr(module, "flagsparse_" + operator + "_run")
     backend, device = _backend_name(), accelerator_device()
+    metrics_enabled = getattr(args, "perf_metrics", False)
+    environment = {}
+    if metrics_enabled:
+        import platform
+        import triton
+        environment = dict(torch_version=str(torch.__version__), triton_version=str(triton.__version__),
+                           python_version=platform.python_version(), hip_version=getattr(torch.version, "hip", None),
+                           cuda_version=getattr(torch.version, "cuda", None), input_seed=2026)
+        import subprocess
+        try:
+            revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_PROJECT_ROOT,
+                                      capture_output=True, text=True, timeout=5)
+            state = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=_PROJECT_ROOT,
+                                   capture_output=True, text=True, timeout=5)
+            environment.update(source_commit=revision.stdout.strip() if revision.returncode == 0 else "unknown",
+                               source_dirty=bool(state.stdout.strip()) if state.returncode == 0 else None)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            environment.update(source_commit="unknown", source_dirty=None, source_info_reason=str(exc))
+        try:
+            environment["device_name"] = ACCEL.get_device_name(device)
+        except (AttributeError, TypeError, RuntimeError) as exc:
+            environment.update(device_name=str(device), device_info_reason=str(exc))
     csv_path = option("csv_" + fmt, "csv")
     fields = ["matrix", "dtype", "type_combo", "a_dtype", "rhs_dtype", "compute_dtype", "output_dtype",
               "op", "op_a", "op_b", "layout", "dense_cols", "index_dtype", "indptr_dtype",
@@ -174,6 +209,18 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
               "vendor_ms", "vendor_backend", "vendor_version", "vendor_alg", "vendor_preprocessed", "vendor_status",
               "vendor_reason", "vendor_max_error", "vendor_exit_code", "vendor_stdout", "vendor_stderr",
               "vendor_output_nonfinite", "source_nonfinite", "source_max_abs", "input_nonfinite", "rhs_nonfinite", "reference_nonfinite", "output_nonfinite", "speedup_vs_vendor", "metadata", "timed", "sample_rule"]
+    if metrics_enabled:
+        fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
+                   "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",
+                   "useful_gflops", "logical_gbs", "gnnz_s", "gpu_useful_gflops", "gpu_logical_gbs", "metrics_reason",
+                   "sample_count", "sample_kept", "sample_min_ms", "sample_median_ms", "sample_max_ms", "sample_cv",
+                   "matrix_fingerprint", "rhs_fingerprint", "input_seed", "device_name", "device_info_reason",
+                   "torch_version", "triton_version", "python_version", "hip_version", "cuda_version",
+                   "source_commit", "source_dirty", "source_info_reason",
+                   "prepared_run_ms", "prepared_run_time_basis", "prepared_useful_gflops", "prepared_logical_gbs",
+                   "cpu_gpu_overlap_risk", "reference_bandwidth_gbs", "reference_bandwidth_source",
+                   "reference_peak_gflops", "reference_peak_source", "logical_bw_ratio", "gpu_logical_bw_ratio",
+                   "logical_roofline_gflops", "gpu_logical_roofline_ratio"]
     stream = open(csv_path, "w", newline="", encoding="utf-8") if csv_path else None
     writer = csv.DictWriter(stream, fields, extrasaction="ignore") if stream else None
     if writer:
@@ -181,7 +228,10 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
         stream.flush()
     print("Registered type combinations; prepare excluded; full run includes required conversions and reductions.")
     print("ms=process_cpu_ms+gpu_ms; median +/-10% mean; phase diagnostics measured separately.")
-    print(f"{'Matrix':24} {'A/RHS/Out':23} {'A/B':9} {'Lay/N':9} {'Algorithm':32} {'ms':>9} {'CPU':>8} {'ProcGPU':>8} {'Compute':>8} {'Vendor':>9} {'V/Alg':>8} Status")
+    print(f"{'Matrix':24} {'A/RHS/Out':23} {'A/B':9} {'Lay/N':9} {'Algorithm':32} {'ms':>9} {'CPU':>8} {'ProcGPU':>8} {'Compute':>8} {'Vendor':>9} {'V/Alg':>8}"
+          + (" Wall GPU-GF/s GPU-LGB/s" if metrics_enabled else "") + " Status")
+    if metrics_enabled:
+        print("Extra columns: Wall=synchronized prepared run; GPU-GF/s and GPU-LGB/s use full GPU event time (NOT DRAM/HBM bandwidth or pure kernel-active time).")
     reported_vendor_reasons = set()
     vendor_log_dir = Path(str(csv_path) + ".vendor_logs") if csv_path else Path("vendor_logs") / operator
     vendor_case = 0
@@ -198,6 +248,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
         print(f"{Path(row['matrix']).name:24} {combo:23} {row['op_a']+'/'+row['op_b']:9} "
               f"{row['layout']+'/'+str(row['dense_cols']):9} {row['alg']:32} "
               + " ".join(f"{number(k):>8}" for k in ("ms", "process_cpu_ms", "process_gpu_ms", "compute_ms", "vendor_ms", "speedup_vs_vendor"))
+              + (f" {number('prepared_run_ms')} {number('gpu_useful_gflops')} {number('gpu_logical_gbs')}" if metrics_enabled else "")
               + f" {row['status']}")
         if row.get("reason"):
             print(row["reason"])
@@ -237,6 +288,13 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
             source_nonfinite = int((~torch.isfinite(a)).sum())
             source_max_abs = float(a.abs().max()) if a.numel() else 0.0
             a = a.to(dtype)
+            matrix_fingerprint = None
+            if metrics_enabled:
+                import hashlib
+                digest = hashlib.sha256(f"{fmt}:{tuple(shape)}:{combo[0]}".encode())
+                for tensor in (a, first.long(), second.long()):
+                    digest.update(tensor.contiguous().view(torch.uint8).numpy().tobytes())
+                matrix_fingerprint = digest.hexdigest()
             import scipy.sparse as sparse
             values = a.double().numpy()
             host = (sparse.coo_matrix((values, (first.numpy(), second.numpy())), shape=shape)
@@ -245,6 +303,9 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                 inner = shape[1] if op == "non" else shape[0]
                 generator = torch.Generator().manual_seed(2026)
                 effective = torch.randn((inner, ncols) if matrix else (inner,), generator=generator).to(rhs_dtype)
+                rhs_fingerprint = None
+                if metrics_enabled:
+                    rhs_fingerprint = hashlib.sha256(effective.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
                 golden = (host if op == "non" else host.T) @ effective.double().numpy()
                 rhs = (effective.T if matrix and op_b != "non" else effective).to(device)
                 if matrix:
@@ -271,6 +332,8 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                    indptr_dtype=ptr, alg=alg, alg_requested=alg, backend=backend, m=shape[0], n=shape[1], nnz=a.numel(),
                                    timed="prepared_run", sample_rule="median +/-10% mean", status="ERROR",
                                    source_nonfinite=source_nonfinite, source_max_abs=source_max_abs)
+                        if metrics_enabled:
+                            row.update(environment, matrix_fingerprint=matrix_fingerprint, rhs_fingerprint=rhs_fingerprint)
                         try:
                             if operator == "spmv_csr" and alg != "auto":
                                 spec = module.get_spmv_csr_algorithm_spec(alg)
@@ -297,6 +360,35 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 cpu.append(float(meta.get("process_cpu_ms", 0.0)))
                             row.update(gpu_ms=filtered_avg_ms(gpu), process_cpu_ms=filtered_avg_ms(cpu))
                             row["ms"] = row["gpu_ms"] + row["process_cpu_ms"]
+                            if metrics_enabled:
+                                row.update(sparse_work_metrics(operator=operator, shape=tuple(map(int, shape)), nnz=a.numel(),
+                                    dense_cols=ncols, a_dtype=combo[0], rhs_dtype=combo[1], output_dtype=combo[2],
+                                    index_dtype=index, indptr_dtype=ptr, op=op, ms=row["ms"], gpu_ms=row["gpu_ms"]))
+                                row.update(benchmark_sample_summary(gpu))
+                                row.update(sparse_reference_metrics(row, **reference_options))
+                                # CPU processing inside the outer event can already be included
+                                # in its elapsed interval. Keep historical ms, label the risk.
+                                row["cpu_gpu_overlap_risk"] = any(value > 0 for value in cpu)
+                                import time
+                                wall_samples = []
+                                wall_kwargs = dict(out_dtype=output_dtype)
+                                if matrix:
+                                    wall_kwargs["op_b"] = op_b
+                                    if fmt in ("csr", "coo"):
+                                        wall_kwargs["dense_layout"] = layout
+                                # Separate sampling: no internal timing/meta/phase events.
+                                for _ in range(args.iters):
+                                    ACCEL.synchronize()
+                                    started = time.perf_counter()
+                                    wall_result = run(prepared, rhs, **wall_kwargs)
+                                    ACCEL.synchronize()
+                                    wall_samples.append((time.perf_counter() - started) * 1000.0)
+                                    del wall_result
+                                row["prepared_run_ms"] = filtered_avg_ms(wall_samples)
+                                row["prepared_run_time_basis"] = "synchronized_wall_run_without_internal_timing"
+                                wall_ms = row["prepared_run_ms"]
+                                row["prepared_useful_gflops"] = row["useful_flops"] / (wall_ms * 1e6) if wall_ms > 0 else None
+                                row["prepared_logical_gbs"] = row["logical_bytes"] / (wall_ms * 1e6) if wall_ms > 0 else None
                             row["status"], row["max_error"] = accuracy(result, golden, output_dtype)
                             row.update(input_nonfinite=int((~torch.isfinite(a)).sum()),
                                        rhs_nonfinite=int((~torch.isfinite(effective)).sum()),
