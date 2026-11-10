@@ -74,7 +74,7 @@ venv=$(cd "$venv" && pwd -P)
 [[ -f "$repo/$entry" ]] || die "Entry not found: $repo/$entry"
 
 type module >/dev/null 2>&1 || die "module is unavailable; initialize the cluster module environment before sbatch"
-module load apptainer
+module load apptainer/1.2.4
 if command -v apptainer >/dev/null 2>&1; then
     container=apptainer
 elif command -v singularity >/dev/null 2>&1; then
