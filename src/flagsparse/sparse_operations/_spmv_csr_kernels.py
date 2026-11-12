@@ -7,6 +7,66 @@ import triton.language as tl
 from . import _common
 
 
+@triton.jit
+def _rowgroup_segment_add(a, ha, b, hb):
+    return tl.where(hb, b, a + b), ha | hb
+
+
+@triton.jit
+def rowgroup_stream_reduce_kernel(A, I, P, X, Y, M,
+                                  XS: tl.constexpr, YS: tl.constexpr,
+                                  R: tl.constexpr, T: tl.constexpr,
+                                  COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    first = tl.program_id(0).to(tl.int64) * R
+    rows = first + tl.arange(0, R)
+    last = tl.minimum(first + R, M)
+    starts = tl.load(P + rows, rows < M, 0).to(tl.int64)
+    ends = tl.load(P + rows + 1, rows < M, 0).to(tl.int64)
+    begin = tl.load(P + first).to(tl.int64)
+    stop = tl.load(P + last).to(tl.int64)
+    lane = tl.arange(0, T)
+    sr = tl.zeros((R,), ACC)
+    si = tl.zeros((R,), ACC)
+    for base in range(begin, stop, T):
+        pos = base + lane
+        valid = pos < stop
+        # upper_bound over this row group, including repeated pointers.
+        lo = tl.full((T,), first, tl.int64)
+        hi = tl.full((T,), last + 1, tl.int64)
+        while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+            mid = (lo + hi) // 2
+            pointer = tl.load(P + mid, (lo < hi) & (mid <= last), 0)
+            right = (lo < hi) & (pointer <= pos)
+            hi = tl.where((lo < hi) & ~right, mid, hi)
+            lo = tl.where(right, mid + 1, lo)
+        owner = tl.where(valid, lo - 1, -1)
+        prev = tl.gather(owner, tl.maximum(lane - 1, 0), 0)
+        head = (lane == 0) | (owner != prev)
+        col = tl.load(I + pos, valid, 0).to(tl.int64)
+        if COMPLEX:
+            ar = tl.load(A + 2 * pos, valid, 0).to(ACC)
+            ai = tl.load(A + 2 * pos + 1, valid, 0).to(ACC)
+            xr = tl.load(X + 2 * col * XS, valid, 0).to(ACC)
+            xi = tl.load(X + 2 * col * XS + 1, valid, 0).to(ACC)
+            re, _ = tl.associative_scan((ar * xr - ai * xi, head), 0, _rowgroup_segment_add)
+            im, _ = tl.associative_scan((ar * xi + ai * xr, head), 0, _rowgroup_segment_add)
+        else:
+            a = tl.load(A + pos, valid, 0).to(ACC)
+            x = tl.load(X + col * XS, valid, 0).to(ACC)
+            re, _ = tl.associative_scan((a * x, head), 0, _rowgroup_segment_add)
+        end = tl.minimum(ends, tl.minimum(base + T, stop))
+        active = (rows < M) & (tl.maximum(starts, base) < end)
+        pick = tl.minimum(tl.maximum(end - base - 1, 0), T - 1).to(tl.int32)
+        sr += tl.where(active, tl.gather(re, pick, 0), 0)
+        if COMPLEX:
+            si += tl.where(active, tl.gather(im, pick, 0), 0)
+    if COMPLEX:
+        tl.store(Y + 2 * rows * YS, sr, rows < M)
+        tl.store(Y + 2 * rows * YS + 1, si, rows < M)
+    else:
+        tl.store(Y + rows * YS, sr, rows < M)
+
+
 def uses_native_rocm_fp32_accumulation(prepared):
     """Return whether a real ROCm FP32 route can safely accumulate in FP32.
 
@@ -460,6 +520,17 @@ def build_plan(prepared, config, adaptive):
 def compute(prepared, x, y, alg, config, plan=None):
     m = prepared.n_rows
     if not m:
+        return y
+    if alg == "csr_rowgroup_stream_reduce":
+        complex_input = prepared.data.is_complex()
+        # Preserve component strides; reshape(-1) could copy a strided out.
+        view = lambda t: torch.view_as_real(t) if complex_input else t
+        acc = tl.float64 if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128) else tl.float32
+        rowgroup_stream_reduce_kernel[(triton.cdiv(m, config["rows_per_program"]),)](
+            view(prepared.data), prepared.kernel_indices, prepared.kernel_indptr,
+            view(x), view(y), m, x.stride(0), y.stride(0),
+            config["rows_per_program"], config["block_nnz"], complex_input, acc,
+            num_warps=config["num_warps"], num_stages=config["num_stages"], enable_fp_fusion=False)
         return y
     if _common._is_rocm_runtime() and alg == "row_tile" and prepared.rocm_nnz_plan is not None:
         from . import _spmv_csr_nnz

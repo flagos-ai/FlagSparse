@@ -18,12 +18,13 @@ from dataclasses import asdict, dataclass
 from ._spmv_csr_config import BackendCapabilityUnavailable
 
 NEW_ALGORITHMS = (
+    "csr_nnz_segment_panel_atomic",
     "csr_row_tile", "csr_row_kparallel", "csr_split_nnz_reduce",
     "csr_adaptive_tile_split", "csr_row_panel", "csr_nnz_panel_reduce", "csr_panel_staged_mixed",
 )
 BACKENDS = ()
 DTYPES = ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")
-IMPLEMENTATION_VERSION = 6
+IMPLEMENTATION_VERSION = 7
 CONFIG_FIELDS = frozenset((
     "tile_rows", "tile_k", "tile_n", "block_k", "block_n", "panels",
     "segment_nnz", "reduce_block_size", "num_warps", "num_stages",
@@ -60,7 +61,8 @@ def algorithm_spec(name):
                 index_dtypes=("int32", "int64"), execution_column_dtype="int32",
                 compute_dtype="float32" if name == "csr_panel_staged_mixed" else "native_component",
                 implementation_version=1 if name == "csr_panel_staged_mixed" else IMPLEMENTATION_VERSION,
-                config_candidates=({"panel_load_nnz": (1, 4, 8), "value_stage": ("storage", "compute"), "panel_accumulators": (1, 2, 4), "tile_n": (16, 32, 64)}
+                config_candidates=({"block_nnz": (32, 64, 128), "block_n": (8, 16, 32), "atomic_mode": ("boundary", "all")}
+                                   if name == "csr_nnz_segment_panel_atomic" else {"panel_load_nnz": (1, 4, 8), "value_stage": ("storage", "compute"), "panel_accumulators": (1, 2, 4), "tile_n": (16, 32, 64)}
                                    if name == "csr_panel_staged_mixed" else {"tile_n": (16, 32, 64), "panel_accumulators": (1, 2, 4), "panel_load_nnz": (1, 4, 8)}
                                    if name == "csr_row_panel" else {"plan_mode": ("compact", "fixed")}
                                    if name == "csr_nnz_panel_reduce" else {"tile_n" if name == "csr_row_tile" else "block_n": (16, 32, 64)}),
@@ -73,6 +75,8 @@ def capability_reason(caps, dtype, *, op="non", algorithm="csr_row_tile"):
     if not caps.subgroup_width or not caps.max_threads_per_block or not caps.legal_num_warps:
         return f"launch capabilities unknown for {caps.backend}/{caps.arch}"
     required = ["int64", "reduction"]
+    if algorithm == "csr_nnz_segment_panel_atomic":
+        required.extend(("scan", "fp64_atomic" if dtype in ("float64", "complex128") else "fp32_atomic"))
     if dtype in ("float64", "complex128"):
         required.append("fp64")
     if op != "non" or algorithm in ("csr_split_nnz_reduce", "csr_adaptive_tile_split", "csr_nnz_panel_reduce"):
@@ -108,6 +112,9 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
                    num_warps=2, panel_accumulators=2, panel_load_nnz=4, value_stage="storage")
     if algorithm == "csr_nnz_panel_reduce":
         cfg.update(block_k=32, block_n=16, plan_mode="compact")
+    if algorithm == "csr_nnz_segment_panel_atomic":
+        cfg.update(block_nnz=32, block_n=min(8 if dtype == "complex128" else 16,
+                   1 << (max(1, n) - 1).bit_length()), atomic_mode="boundary")
     source = "conservative"
     rejections = []
     if cfg["num_warps"] not in caps.legal_num_warps:
@@ -132,6 +139,10 @@ def resolve_config(algorithm, dtype, n, layout, caps, overrides=None, *, op="non
             else:
                 cfg, source = candidate, str(key)
     supplied = dict(overrides or {})
+    if algorithm == "csr_nnz_segment_panel_atomic":
+        unused = set(supplied) - {"block_nnz", "block_n", "num_warps", "num_stages", "atomic_mode"}
+        if unused:
+            raise ValueError(f"configuration fields not used by NNZ atomic panel: {sorted(unused)}")
     unknown = set(supplied) - set(cfg)
     if unknown:
         raise ValueError(f"unknown CSR SpMM configuration keys: {sorted(unknown)}")
@@ -147,9 +158,15 @@ def validate_config(cfg, caps, *, algorithm="csr_adaptive_tile_split"):
     fields = CONFIG_FIELDS | ({"panel_accumulators", "panel_load_nnz"} if algorithm == "csr_row_panel" else set()) | ({"plan_mode"} if algorithm == "csr_nnz_panel_reduce" else set())
     if algorithm == "csr_panel_staged_mixed":
         fields |= {"panel_accumulators", "panel_load_nnz", "value_stage"}
+    if algorithm == "csr_nnz_segment_panel_atomic":
+        fields |= {"block_nnz", "atomic_mode"}
     if set(cfg) != fields:
         raise ValueError(f"invalid configuration fields: {sorted(set(cfg) ^ CONFIG_FIELDS)}")
     for key, value in cfg.items():
+        if key == "atomic_mode":
+            if value not in ("boundary", "all"):
+                raise ValueError("atomic_mode must be boundary or all")
+            continue
         if key == "value_stage":
             if value not in ("storage", "compute"):
                 raise ValueError("value_stage must be storage or compute")
@@ -171,6 +188,9 @@ def validate_config(cfg, caps, *, algorithm="csr_adaptive_tile_split"):
         raise ValueError("launch exceeds target thread limit")
     if cfg["num_stages"] != 1:
         raise ValueError("initial CSR SpMM profiles support num_stages=1 only")
+    if algorithm == "csr_nnz_segment_panel_atomic":
+        if cfg["block_nnz"] not in (32, 64, 128) or cfg["block_n"] not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("unsupported NNZ atomic panel tile")
     if algorithm == "csr_panel_staged_mixed" and cfg["tile_rows"] * cfg["tile_n"] * cfg["panel_accumulators"] > 16384:
         raise ValueError("mixed panel accumulator tile exceeds supported bounds")
     if cfg.get("panel_load_nnz", 1) not in (1, 4, 8):

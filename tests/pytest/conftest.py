@@ -129,6 +129,8 @@ def pytest_runtest_makereport(item, call):
             "opname": _operator_marks(item),
         },
     )
+    if item.user_properties:
+        result["properties"] = dict(item.user_properties)
 
     if report.when == "setup" and report.outcome == "skipped":
         result["result"] = "skipped"

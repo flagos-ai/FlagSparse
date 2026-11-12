@@ -22,6 +22,8 @@ and ranked without changing the CSV schema.
 import argparse
 import csv
 import glob
+import json
+import traceback
 import os
 import sys
 from pathlib import Path
@@ -71,6 +73,7 @@ CUSPARSE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex1
 TLE_CSR_SPMM_ALGORITHMS = {"alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"}
 
 PERF_FIELDS = [
+    "metadata",
     "matrix",
     "dtype",
     "index_dtype",
@@ -361,10 +364,10 @@ def _cupy_event_benchmark(op, warmup, iters):
 
 
 def _time_route(
-    prepared, B, alg, warmup, iters, timing=False, diagnose=False, layout="row"
+    prepared, B, alg, warmup, iters, timing=False, diagnose=False, layout="row", config=None
 ):
     out, gpu_ms = _cuda_event_benchmark(
-        lambda: fs.flagsparse_spmm_csr_run(prepared, B, alg=alg, dense_layout=layout),
+        lambda: fs.flagsparse_spmm_csr_run(prepared, B, alg=alg, dense_layout=layout, config=config),
         warmup,
         iters,
     )
@@ -373,12 +376,14 @@ def _time_route(
         B,
         alg=alg,
         dense_layout=layout,
+        config=config,
         return_meta=True,
         timing=bool(timing),
         diagnostics=bool(diagnose),
     )
     process_cpu_ms = float(meta.get("process_cpu_ms", 0.0) or 0.0)
     row = {
+        "metadata": json.dumps(meta, default=str, ensure_ascii=False),
         "alg": meta.get("alg", alg),
         "ms": process_cpu_ms + gpu_ms,
         "gpu_ms": gpu_ms,
@@ -538,6 +543,7 @@ def run_one_case(
     timing,
     diagnose,
     exclude_tle=False,
+    config=None,
 ):
     device = accelerator_device()
     data, indices, indptr, shape = load_mtx_to_csr_torch(
@@ -602,6 +608,7 @@ def run_one_case(
                 timing=timing,
                 diagnose=diagnose,
                 layout=layout,
+                config=config,
             )
         except (fs.SpmmCsrAlgorithmUnavailable, ValueError, TypeError, RuntimeError) as exc:
             rows.append(
@@ -623,6 +630,11 @@ def run_one_case(
                     cusparse_reason=cusparse_reason,
                 )
             )
+            if alg == "csr_nnz_segment_panel_atomic" and not isinstance(exc, fs.SpmmCsrAlgorithmUnavailable):
+                from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+                if not isinstance(exc, BackendCapabilityUnavailable):
+                    rows[-1]["status"] = "FAIL"
+                    traceback.print_exc()
             continue
         out = result.pop("out")
         diagnostics = result.pop("diagnostics")
@@ -635,6 +647,7 @@ def run_one_case(
             "op": op,
             "layout": layout,
             "alg": result["alg"],
+            "metadata": result["metadata"],
             "n_rows": n_rows,
             "n_cols": n_cols,
             "nnz": int(data.numel()),
@@ -801,6 +814,9 @@ def main():
         )
         layout_names = _layout_names(args.layout)
         alg_names = _parse_algs(args.alg)
+        config = json.loads(args.config) if isinstance(args.config, str) else args.config
+        if config is not None and (not isinstance(config, dict) or len(alg_names) != 1 or alg_names[0] in ("auto", "all")):
+            raise ValueError("--config requires a JSON object and one explicit algorithm")
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -859,6 +875,7 @@ def main():
                                 args.timing,
                                 args.diagnose,
                                 exclude_tle=args.exclude_tle,
+                                config=config,
                             )
                             rows.extend(case_rows)
                             diag_rows.extend(case_diag)

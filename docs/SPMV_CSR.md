@@ -103,3 +103,28 @@ overrides it. It uses the existing main prepared/run boundary and does not enter
 row_tile-specific ROCm NNZ binding or graph replay. It retains FP64 accumulation
 for FP32, FP32 for FP16/BF16 and native complex component precision. It is not
 selected by default and remains unverified on hardware.
+
+
+## Generic row-group stream reduction (P1, hardware unverified)
+
+`alg="csr_rowgroup_stream_reduce"` owns a fixed consecutive row group per
+program and scans contiguous NNZ chunks. An upper-bound search handles repeated
+row pointers; segmented sums are gathered at the clipped row/chunk endpoints.
+It has no global owner map, floating-point atomic, or numerical workspace.
+Empty rows are written by the compute kernel. Long rows execute completely but
+are not distributed across programs.
+
+Explicit configuration defaults:
+`{"rows_per_program":16,"block_nnz":128,"num_warps":4,"num_stages":1}`.
+Supported R/T candidates are 8/16/32 and 64/128/256; launch parameters must meet
+the target capabilities. This algorithm requires scan, reduction and index
+support and retains the CUDA/ROCm boundary of the new CSR SpMV paths.
+
+All six floating/complex storage dtypes and non/trans/conj are declared.
+Half inputs accumulate in FP32 with same-type or FP32 output; FP32 and FP64
+inputs accumulate in FP64; complex inputs use their component precision.
+Positive-stride outputs are supported. Transpose follows the existing per-run
+CSR reconstruction contract; this is not a transpose optimization.
+The default route and existing kernels are unchanged. Accuracy and performance
+remain unverified until the computing-node runs described in
+`MIXED_PRECISION_IMPLEMENTATION_PLAN.md` complete.

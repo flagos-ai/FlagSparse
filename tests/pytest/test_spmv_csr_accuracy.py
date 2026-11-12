@@ -489,7 +489,8 @@ def test_spmv_csr_new_fallback_preserves_selection(alg, dtype, op, monkeypatch):
     data, col, ptr, x, shape = _native_case([0, 3, 65], dtype, torch.int64, torch.int64)
     if op != "non":
         x = _make_x(shape[0], dtype, data.device)
-    config = {"row_vector": {"block_nnz": 64}}
+    config = ({"block_nnz": 64} if alg == "csr_rowgroup_stream_reduce"
+              else {"row_vector": {"block_nnz": 64}})
     prepared = _new_prepared(data, col, ptr, shape, alg, config=config, op=op)
     original = kernels.compute
 
@@ -900,6 +901,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmv_csr
 @pytest.mark.parametrize("alg,config", [(name, None) for name in [
+    "csr_rowgroup_stream_reduce",
     "row_tile", "row_vector", "row_subgroup_stream", "csr_subgroup_pair_mixed",
     "csr_nnz_tile_reduce",
     "row_split_reduce", "row_adaptive_split",
@@ -1013,5 +1015,69 @@ def test_spmv_csr_independent_mixed_boundaries(config, dtype, wide, case):
         for actual, original in zip((values, first, second, operand), originals):
             torch.testing.assert_close(actual, original, rtol=0, atol=0)
         assert meta.get("alg_resolved", meta.get("algorithm")) == "csr_subgroup_pair_mixed"
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("case", ["empty", "boundaries"])
+@pytest.mark.parametrize("index_pair", [(torch.int32, torch.int64)] if _MIXED_QUICK_MODE else list(itertools.product((torch.int32, torch.int64), repeat=2)))
+def test_csr_rowgroup_stream_contract(dtype, op, case, monkeypatch, record_property, index_pair):
+    from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("rowgroup must not construct a runtime partition plan")
+    monkeypatch.setattr(kernels, "build_plan", forbidden)
+    device = accelerator_device()
+    lengths = torch.tensor([0] * 19 if case == "empty" else
+                           [0, 1, 63, 64, 65, 0, 129, 3, 0, 0, 513, 2, 1, 0, 7, 0, 9, 1, 0])
+    ptr = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    ids = torch.arange(int(ptr[-1]))
+    cols = (ids * 13 % 23).to(torch.int32)
+    raw = (ids % 7 - 3).double() / 32
+    if dtype.is_complex:
+        raw = raw + 1j * (ids % 5 - 2).double() / 16
+    values = raw.to(dtype)
+    golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    matrix = torch.zeros((19, 23), dtype=golden_dtype)
+    matrix.index_put_((torch.repeat_interleave(torch.arange(19), lengths), cols.long()),
+                      values.to(golden_dtype), accumulate=True)
+    effective = matrix if op == "non" else matrix.T if op == "trans" else matrix.mH
+    x_cpu = (torch.arange(effective.shape[1]).double() % 5 - 2) / 8
+    if dtype.is_complex:
+        x_cpu = x_cpu + 0.125j
+    x_cpu = x_cpu.to(dtype)
+    a, idx, p = values.to(device), cols.to(device=device, dtype=index_pair[0]), ptr.to(device=device, dtype=index_pair[1])
+    x_storage = torch.zeros(x_cpu.numel() * 2, dtype=dtype, device=device)
+    x = x_storage[::2]
+    x.copy_(x_cpu)
+    before = a.clone()
+    record_property("algorithm", "csr_rowgroup_stream_reduce")
+    record_property("a_dtype", str(dtype))
+    record_property("rhs_dtype", str(dtype))
+    record_property("output_dtypes", [str(dtype), "torch.float32"] if dtype in (torch.float16, torch.bfloat16) else [str(dtype)])
+    record_property("compute_dtype", "float64" if dtype in (torch.float32, torch.float64, torch.complex128) else "float32")
+    record_property("opA", op)
+    try:
+        prepared = spmv_mod.prepare_spmv_csr(a, idx, p, (19, 23), op=op,
+            alg="csr_rowgroup_stream_reduce", config={"rows_per_program": 8, "block_nnz": 64})
+        output_types = [dtype, torch.float32] if dtype in (torch.float16, torch.bfloat16) else [dtype]
+        for output_dtype in output_types:
+            out = torch.full((effective.shape[0] * 2,), float("nan"), dtype=output_dtype, device=device)[::2]
+            y, ms, meta = spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out,
+                out_dtype=output_dtype, return_time=True, return_meta=True, timing=True)
+            assert y is out
+            assert meta["workspace_peak_bytes"] == 0
+            assert meta["process_cpu_ms"] == 0
+            assert ms == meta["gpu_ms"] + meta["process_cpu_ms"]
+            expected = (effective @ x_cpu.to(golden_dtype)).to(output_dtype)
+            rtol, atol = close_tolerances(output_dtype)
+            torch.testing.assert_close(y.cpu(), expected, rtol=rtol, atol=atol)
+        torch.testing.assert_close(a, before, rtol=0, atol=0)
+        with pytest.raises(ValueError):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, x, op="trans" if op == "non" else "non")
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))

@@ -524,6 +524,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmm_csr
 @pytest.mark.parametrize("alg,config", [(name, None) for name in [
+    "csr_nnz_segment_panel_atomic",
     "csr_row_tile", "csr_row_kparallel", "csr_row_panel", "csr_panel_staged_mixed",
     "csr_nnz_panel_reduce",
     "csr_split_nnz_reduce", "csr_adaptive_tile_split",
@@ -648,5 +649,95 @@ def test_spmm_csr_independent_mixed_boundaries(config, dtype, wide, case, n):
         for actual, original in zip((values, first, second, operand), originals):
             torch.testing.assert_close(actual, original, rtol=0, atol=0)
         assert meta.get("alg_resolved", meta.get("algorithm")) == "csr_panel_staged_mixed"
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("op_b", ["non", "trans", "conj"])
+@pytest.mark.parametrize("layout", ["row", "col"])
+@pytest.mark.parametrize("index_pair", [(torch.int32, torch.int64)] if _MIXED_QUICK_MODE else [(torch.int32, torch.int32), (torch.int32, torch.int64), (torch.int64, torch.int32), (torch.int64, torch.int64)])
+def test_csr_nnz_atomic_panel_contract(dtype, op, op_b, layout, record_property, index_pair):
+    import importlib
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+    device = accelerator_device()
+    lengths = torch.tensor([0, 32, 0, 1, 31, 33, 0, 257, 2, 0])
+    ptr = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    ids = torch.arange(int(ptr[-1]))
+    cols = (ids * 7 % 13).to(torch.int32)
+    raw = (ids % 5 - 2).double() / 32
+    if dtype.is_complex:
+        raw = raw + 1j * (ids % 7 - 3).double() / 32
+    values = raw.to(dtype)
+    golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    matrix = torch.zeros((10, 13), dtype=golden_dtype)
+    matrix.index_put_((torch.repeat_interleave(torch.arange(10), lengths), cols.long()),
+                      values.to(golden_dtype), accumulate=True)
+    effective = matrix if op == "non" else matrix.T if op == "trans" else matrix.mH
+    n = 7 if _MIXED_QUICK_MODE else 33
+    b_cpu = ((torch.arange(effective.shape[1] * n).reshape(-1, n) % 7 - 3).double() / 8)
+    if dtype.is_complex:
+        b_cpu = b_cpu + 0.125j
+    b_cpu = b_cpu.to(dtype)
+    b = b_cpu.to(device)
+    # Construct the raw operand so op_b yields the same mathematical RHS.
+    raw_b = b if op_b == "non" else b.T if op_b == "trans" else b.mH.resolve_conj()
+    raw_b = raw_b.contiguous() if layout == "row" else raw_b.T.contiguous().T
+    a, idx, p = values.to(device), cols.to(device=device, dtype=index_pair[0]), ptr.to(device=device, dtype=index_pair[1])
+    original_a, original_b = a.clone(), raw_b.clone()
+    record_property("algorithm", "csr_nnz_segment_panel_atomic")
+    record_property("a_dtype", str(dtype))
+    record_property("rhs_dtype", str(dtype))
+    record_property("output_dtypes", [str(dtype), "torch.float32"] if dtype in (torch.float16, torch.bfloat16) else [str(dtype)])
+    record_property("compute_dtype", "float64" if dtype in (torch.float64, torch.complex128) else "float32")
+    record_property("opA", op)
+    record_property("opB", op_b)
+    try:
+        for mode in ("boundary", "all"):
+            prepared = module.prepare_spmm_csr_route(a, idx, p, (10, 13), op=op,
+                alg="csr_nnz_segment_panel_atomic", config={"atomic_mode": mode})
+            output_types = [dtype, torch.float32] if dtype in (torch.float16, torch.bfloat16) else [dtype]
+            for output_dtype in output_types:
+                out = torch.full((effective.shape[0], 2 * n), float("nan"), dtype=output_dtype, device=device)[:, ::2]
+                y, ms, meta = module.flagsparse_spmm_csr_run(prepared, raw_b, op_b=op_b,
+                    out=out, out_dtype=output_dtype, return_time=True, return_meta=True, timing=True)
+                assert y is out
+                assert ms == pytest.approx(meta["gpu_ms"] + meta["process_cpu_ms"])
+                assert meta["atomic_mode"] == mode
+                assert meta["descriptor_peak_bytes_estimate"] == 0
+                assert meta["process_cpu_ms"] == 0
+                rtol, atol = close_tolerances(output_dtype)
+                expected = (effective @ b_cpu.to(golden_dtype)).to(output_dtype)
+                torch.testing.assert_close(y.cpu(), expected, rtol=rtol, atol=atol)
+            with pytest.raises(ValueError):
+                module.flagsparse_spmm_csr_run(prepared, raw_b, op="trans" if op == "non" else "non", op_b=op_b)
+        torch.testing.assert_close(a, original_a, rtol=0, atol=0)
+        torch.testing.assert_close(raw_b, original_b, rtol=0, atol=0)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("shape,n", [((0, 3), 7), ((3, 0), 7), ((3, 4), 0), ((3, 4), 7)])
+def test_csr_nnz_atomic_empty_output(shape, n):
+    import importlib
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+    device = accelerator_device()
+    a = torch.empty(0, device=device)
+    idx = torch.empty(0, dtype=torch.int32, device=device)
+    ptr = torch.zeros(shape[0] + 1, dtype=torch.int64, device=device)
+    b = torch.ones((shape[1], n), device=device)
+    out = torch.full((shape[0], n), float("nan"), device=device)
+    try:
+        prepared = module.prepare_spmm_csr_route(a, idx, ptr, shape, alg="csr_nnz_segment_panel_atomic")
+        y = module.flagsparse_spmm_csr_run(prepared, b, out=out)
+        assert y is out
+        torch.testing.assert_close(y, torch.zeros_like(y), rtol=0, atol=0)
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))

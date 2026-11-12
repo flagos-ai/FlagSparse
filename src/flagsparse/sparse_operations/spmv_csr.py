@@ -29,6 +29,7 @@ from . import mixed_spmx as _mixed_spmx
 _csr_config.set_known_backends(spec.name for spec in _common_mod.backend_specs())
 
 SPMV_CSR_NEW_ALGORITHMS = (
+    "csr_rowgroup_stream_reduce",
     "row_tile",
     "row_vector",
     "row_split_reduce",
@@ -1476,7 +1477,8 @@ def _spmv_backend_caps(device):
         backend == "rocm" and target_name == "hip" and arch.startswith("gfx")
     )
     return _csr_config.BackendCaps(
-        backend, arch, target_name, width, max_threads, verified, verified, verified
+        backend, arch, target_name, width, max_threads, verified, verified, verified,
+        scan=verified,
     )
 
 
@@ -1656,9 +1658,9 @@ def _spmv_check_output(out, prepared, x, output_dtype=None):
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
-    if not out.is_contiguous() and prepared.alg != "csr_nnz_tile_reduce":
+    if not out.is_contiguous() and prepared.alg not in ("csr_nnz_tile_reduce", "csr_rowgroup_stream_reduce"):
         raise ValueError("out must be contiguous")
-    if prepared.alg == "csr_nnz_tile_reduce" and out.numel() > 1 and out.stride(0) <= 0:
+    if prepared.alg in ("csr_nnz_tile_reduce", "csr_rowgroup_stream_reduce") and out.numel() > 1 and out.stride(0) <= 0:
         raise ValueError("out must have non-overlapping positive strides")
     if out.is_conj() or out.is_neg():
         raise ValueError("out must not be a lazy conjugate or negative view")
@@ -1796,12 +1798,12 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
                        execution_indptr_dtype=str(execution.kernel_indptr.dtype).removeprefix("torch."))
 
     def compute():
-        vector = (x.resolve_conj().resolve_neg() if alg == "csr_subgroup_pair_mixed"
+        vector = (x.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce")
                   else x.resolve_conj().contiguous())
         matrix = execution
-        if matrix.data.is_conj() or (alg == "csr_subgroup_pair_mixed" and matrix.data.is_neg()):
+        if matrix.data.is_conj() or (alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce") and matrix.data.is_neg()):
             matrix = copy(matrix)
-            matrix.data = (matrix.data.resolve_conj().resolve_neg() if alg == "csr_subgroup_pair_mixed"
+            matrix.data = (matrix.data.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce")
                            else matrix.data.resolve_conj())
             matrix._baseline_data = None
         if alg in SPMV_CSR_NEW_ALGORITHMS:
@@ -1970,6 +1972,11 @@ def flagsparse_spmv_csr_run(
             meta.update(
                 process_gpu_ms=phases["process_gpu_ms"], compute_ms=phases["compute_ms"]
             )
+        if actual.alg == "csr_rowgroup_stream_reduce":
+            meta.update(execution_path="native_csr_rowgroup_stream_reduce", validation="unverified",
+                        initialization="kernel_writes_all_rows", output_conversion="final_store",
+                        workspace_peak_bytes=0, descriptor_peak_bytes=0,
+                        x_stride=tuple(x.stride()), y_stride=tuple(y.stride()))
         if actual.alg == "csr_nnz_tile_reduce":
             # A fixed plan reports allocated slots, not a read-back count of
             # valid records. Preserve that distinction in the public metadata.

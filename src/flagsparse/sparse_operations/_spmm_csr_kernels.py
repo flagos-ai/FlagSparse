@@ -19,6 +19,84 @@ import triton.language as tl
 
 
 @triton.jit
+def _nnz_owner(P, pos, low, high):
+    lo = low + tl.full(pos.shape, 0, tl.int64)
+    hi = high + tl.full(pos.shape, 0, tl.int64)
+    while tl.sum(tl.reshape((lo < hi).to(tl.int32), (-1,)), 0) > 0:
+        mid = (lo + hi) // 2
+        ptr = tl.load(P + mid, lo < hi, 0)
+        right = (lo < hi) & (ptr <= pos)
+        hi = tl.where((lo < hi) & ~right, mid, hi)
+        lo = tl.where(right, mid + 1, lo)
+    return lo - 1
+
+
+@triton.jit
+def _nnz_panel_add(a, ha, b, hb):
+    return tl.where(hb, b, a + b), ha | hb
+
+
+@triton.jit
+def nnz_segment_panel_atomic_kernel(A, I, P, B, C, M, N, NNZ,
+                                    B0: tl.constexpr, B1: tl.constexpr,
+                                    C0: tl.constexpr, C1: tl.constexpr,
+                                    T: tl.constexpr, BN: tl.constexpr,
+                                    COMPLEX: tl.constexpr, ACC: tl.constexpr,
+                                    ALL_ATOMIC: tl.constexpr):
+    base = tl.program_id(0).to(tl.int64) * T
+    stop = tl.minimum(base + T, NNZ)
+    lane = tl.arange(0, T)
+    pos = base + lane
+    valid = pos < stop
+    first = _nnz_owner(P, base, 0, M + 1)
+    last = _nnz_owner(P, stop - 1, first, M + 1)
+    if first == last:
+        owner = tl.full((T,), 0, tl.int64) + first
+    else:
+        owner = _nnz_owner(P, tl.minimum(pos, stop - 1), first, last + 2)
+    owner = tl.where(valid, owner, -1)
+    prev = tl.gather(owner, tl.maximum(lane - 1, 0), 0)
+    following = tl.gather(owner, tl.minimum(lane + 1, T - 1), 0)
+    head = (lane == 0) | (owner != prev)
+    tail = valid & ((pos == stop - 1) | (owner != following))
+    start_row = tl.load(P + owner, tail, 0).to(tl.int64)
+    end_row = tl.load(P + owner + 1, tail, 0).to(tl.int64)
+    complete = (start_row >= base) & (end_row <= stop)
+    ns = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN)
+    col = tl.load(I + pos, valid, 0).to(tl.int64)
+    bo = col[:, None] * B0 + ns[None, :] * B1
+    mask = valid[:, None] & (ns[None, :] < N)
+    flags = tl.broadcast_to(head[:, None], (T, BN))
+    if COMPLEX:
+        ar = tl.load(A + 2 * pos, valid, 0).to(ACC)
+        ai = tl.load(A + 2 * pos + 1, valid, 0).to(ACC)
+        br = tl.load(B + 2 * bo, mask, 0).to(ACC)
+        bi = tl.load(B + 2 * bo + 1, mask, 0).to(ACC)
+        re, _ = tl.associative_scan((ar[:, None] * br - ai[:, None] * bi, flags), 0, _nnz_panel_add)
+        im, _ = tl.associative_scan((ar[:, None] * bi + ai[:, None] * br, flags), 0, _nnz_panel_add)
+    else:
+        a = tl.load(A + pos, valid, 0).to(ACC)
+        b = tl.load(B + bo, mask, 0).to(ACC)
+        re, _ = tl.associative_scan((a[:, None] * b, flags), 0, _nnz_panel_add)
+    out_mask = tail[:, None] & (ns[None, :] < N)
+    direct = out_mask & complete[:, None]
+    atom = out_mask & ~complete[:, None]
+    if ALL_ATOMIC:
+        atom = out_mask
+    co = owner[:, None] * C0 + ns[None, :] * C1
+    if COMPLEX:
+        if not ALL_ATOMIC:
+            tl.store(C + 2 * co, re, direct)
+            tl.store(C + 2 * co + 1, im, direct)
+        tl.atomic_add(C + 2 * co, re, atom, sem="relaxed")
+        tl.atomic_add(C + 2 * co + 1, im, atom, sem="relaxed")
+    else:
+        if not ALL_ATOMIC:
+            tl.store(C + co, re, direct)
+        tl.atomic_add(C + co, re, atom, sem="relaxed")
+
+
+@triton.jit
 def rows_kernel(A, I, P, B, C, Rows, Starts, Ends,
                 M, N, B0: tl.constexpr, B1: tl.constexpr,
                 C0: tl.constexpr, C1: tl.constexpr, COL_START,

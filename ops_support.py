@@ -531,6 +531,11 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
                 ('spmm', 'spmm_csc', 'CSC', 'csc_panel_staged_mixed', ('trans', 'conj')),
             )
         ),
+        ApiSpec("spmm", "flagsparse_spmm_csr", "spmm_csr", "CSR",
+                "csr_nnz_segment_panel_atomic",
+                values=("float16", "bfloat16", "float32", "float64", "complex64", "complex128"),
+                indices=("int32", "int64"), ops=("non", "trans", "conj"),
+                notes="Native NNZ panel; FP32/FP64 component atomic required; hardware unverified"),
         ApiSpec(
             "spgemm",
             "flagsparse_spgemm_csr",
@@ -650,7 +655,7 @@ def rows_for_spec(
         status = "UNVERIFIED"
         notes.append("new CSR SpMV route requires backend-specific hardware validation")
 
-    if spec.route in ('csr_subgroup_pair_mixed', 'csr_panel_staged_mixed', 'coo_stream_prefetch_mixed', 'coo_stream_panel_prefetch_mixed', 'csc_subgroup_pair_mixed', 'csc_panel_staged_mixed') and status == "SUPPORTED":
+    if spec.route in ('csr_nnz_segment_panel_atomic', 'csr_subgroup_pair_mixed', 'csr_panel_staged_mixed', 'coo_stream_prefetch_mixed', 'coo_stream_panel_prefetch_mixed', 'csc_subgroup_pair_mixed', 'csc_panel_staged_mixed') and status == "SUPPORTED":
         status = "UNVERIFIED"
 
     ops = spec.ops

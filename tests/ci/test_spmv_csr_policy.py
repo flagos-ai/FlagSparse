@@ -69,9 +69,9 @@ class ConfigPolicy(unittest.TestCase):
             policy.validate_support("csr_nnz_tile_reduce", "non", "float32", "int32", "int32", caps)
 
     def setUp(self):
-        self.cuda = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True)
+        self.cuda = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True)
         self.hip = policy.BackendCaps(
-            "rocm", "gfx90a", "hip", 64, 1024, True, True, True
+            "rocm", "gfx90a", "hip", 64, 1024, True, True, True, scan=True
         )
 
     def test_registry_support(self):
@@ -92,7 +92,7 @@ class ConfigPolicy(unittest.TestCase):
             policy.normalize_alg("compare")
 
     def test_all_dtype_ops_and_precision_requirements(self):
-        no_fp64 = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, False, True, True)
+        no_fp64 = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, False, True, True, scan=True)
         for alg in policy.ALGORITHMS:
             for dtype in policy.algorithm_spec(alg)["value_dtypes"]:
                 for op in ("non", "trans", "conj"):
@@ -653,3 +653,34 @@ def test_independent_mixed_kernels_are_distinct_and_native():
             for loop in ast.walk(function):
                 if isinstance(loop, ast.For):
                     assert not any(isinstance(n, ast.AnnAssign) for n in ast.walk(loop))
+
+
+def test_generic_p1_config_and_capabilities():
+    import pytest
+    from dataclasses import replace
+
+    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True)
+    alg = "csr_rowgroup_stream_reduce"
+    cfg, _ = policy.resolve_config(alg, caps)
+    assert cfg == dict(rows_per_program=16, block_nnz=128, num_warps=4, num_stages=1)
+    for dtype in policy.VALUE_DTYPES:
+        policy.validate_support(alg, "conj", dtype, "int64", "int32", caps)
+    for bad in ({"rows_per_program": 3}, {"block_nnz": 32}, {"atomic_mode": "all"}, {"num_stages": 2}):
+        with pytest.raises(ValueError):
+            policy.resolve_config(alg, caps, bad)
+    with pytest.raises(policy.BackendCapabilityUnavailable):
+        policy.resolve_config(alg, replace(caps, scan=False))
+    csr, _ = _extension_policies()
+    pcaps = csr.BackendCaps("cuda", "cuda", "80", 32, 1024, (1, 2, 4, 8),
+                            True, True, True, True, True, True, True)
+    name = "csr_nnz_segment_panel_atomic"
+    for dtype in csr.DTYPES:
+        cfg, _ = csr.resolve_config(name, dtype, 7, "row", pcaps)
+        assert cfg["block_n"] == 8
+        assert cfg["atomic_mode"] == "boundary"
+    for bad in ({"atomic_mode": "invalid"}, {"block_nnz": 16}, {"panel_load_nnz": 4}):
+        with pytest.raises(ValueError):
+            csr.resolve_config(name, "float32", 32, "row", pcaps, bad)
+    for field, dtype in (("scan", "float32"), ("fp32_atomic", "complex64"), ("fp64_atomic", "complex128")):
+        with pytest.raises(csr.BackendCapabilityUnavailable):
+            csr.resolve_config(name, dtype, 32, "row", replace(pcaps, **{field: None}))

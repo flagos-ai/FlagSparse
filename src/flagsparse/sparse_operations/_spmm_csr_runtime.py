@@ -24,6 +24,7 @@ import triton.language as tl
 from . import _common as common
 from . import _spmm_csr_config as policy
 from ._spmm_csr_kernels import panel_staged_mixed_kernel, finish_kernel, reduce_kernel, row_panel_kernel, rows_kernel
+from ._spmm_csr_kernels import nnz_segment_panel_atomic_kernel
 
 
 def output_has_internal_overlap(out):
@@ -136,6 +137,47 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
     counts = {"tile_rows": 0, "kparallel_rows": 0, "split_rows": 0, "panel_rows": 0}
     stats = dict(segment_count=0, reduction_levels=0, workspace_peak_bytes=0,
                  descriptor_peak_bytes_estimate=0, segment_batches=0)
+    if algorithm == "csr_nnz_segment_panel_atomic":
+        if out is not None and (out.is_conj() or out.is_neg()):
+            raise ValueError("out must not be a lazy conjugate or negative view")
+        with phases.measure("compute_ms"):
+            A = prepared.data.resolve_conj().resolve_neg().contiguous()
+            B = B.resolve_conj().resolve_neg()
+            half_output = output_dtype in (torch.float16, torch.bfloat16)
+            dtype = torch.float32 if half_output else output_dtype
+            C = out if out is not None and not half_output else (
+                torch.empty_strided((m, n), (1, max(m, 1)), device=B.device, dtype=dtype)
+                if dense_layout == "col" else torch.empty((m, n), device=B.device, dtype=dtype))
+            C.zero_()
+            # Do not flatten complex strided views: flattening may allocate a copy.
+            view = lambda t: torch.view_as_real(t) if complex_input else t
+            if m and n and A.numel():
+                nnz_segment_panel_atomic_kernel[(triton.cdiv(A.numel(), cfg["block_nnz"]), triton.cdiv(n, cfg["block_n"]))](
+                    view(A), prepared.kernel_indices, prepared.kernel_indptr, view(B), view(C),
+                    m, n, A.numel(), *B.stride(), *C.stride(), cfg["block_nnz"], cfg["block_n"],
+                    complex_input, acc, cfg["atomic_mode"] == "all", **launch)
+            workspace = C.numel() * C.element_size() if half_output else 0
+            if half_output:
+                if out is not None:
+                    out.copy_(C)
+                    C = out
+                else:
+                    C = C.to(output_dtype)
+        meta = dict(config_meta, config=dict(cfg), algorithm=algorithm,
+                    implementation_version=policy.IMPLEMENTATION_VERSION,
+                    a_dtype=str(A.dtype), rhs_dtype=str(B.dtype), output_dtype=str(output_dtype),
+                    compute_dtype="float64" if acc == tl.float64 else "float32",
+                    process_cpu_ms=0.0, validation="unverified", b_stride=tuple(B.stride()),
+                    c_stride=tuple(C.stride()), dense_layout=dense_layout,
+                    output_layout="col" if C.stride(0) == 1 else "row" if C.stride(1) == 1 else "strided",
+                    component_dtype="float64" if acc == tl.float64 else "float32",
+                    atomic_mode=cfg["atomic_mode"],
+                    execution_path="native_csr_nnz_segment_panel_atomic", initialization="zero",
+                    output_conversion="fp32_to_output" if half_output else "none",
+                    output_buffer="user_out" if out is not None and not half_output else "allocated",
+                    workspace_peak_bytes=workspace, descriptor_peak_bytes_estimate=0)
+        meta.update(phases.results())
+        return C, meta
     if algorithm == "csr_nnz_panel_reduce":
         from ._spmv_csr_nnz import run_mixed
 

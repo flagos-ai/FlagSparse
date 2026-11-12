@@ -1159,3 +1159,82 @@ Sources: [CUDA event semantics](https://docs.nvidia.com/cuda/archive/12.9.0/cuda
 and [synchronized host timing](https://developer.nvidia.com/blog/how-implement-performance-metrics-cuda-cc/).
 Local verification remains source/AST/diff only; the new measurements and reference
 normalization have not been hardware-validated on either platform.
+
+
+## 2026-11-12：两个通用 CSR P1 候选接入
+
+目标：`FlagSparse-main/zyq_sparse`。本轮起点为
+`c1f7208152fd9ab1b4e0da5d0edc7968272b5673`，开始时工作区干净。
+只增加独立算法及测试联动，不替换旧 kernel、默认路由或 NNZ compact/fixed。
+源码接入与硬件验收分开：本地仅 AST、diff 和调用链审查；所有硬件组合仍为未验证。
+
+| 算子/算法 | 分工 | 默认配置 | 运行工作空间 |
+|---|---|---|---|
+| SpMV `csr_rowgroup_stream_reduce` | 固定行组独占输出，连续 NNZ 加载，组内 owner 搜索和分段 scan，行尾 gather | R=16、T=128、4 warps、1 stage | 不分配数值部分和或 owner-map |
+| SpMM `csr_nnz_segment_panel_atomic` | NNZ tile × 输出面板；完整行 store，跨 tile 行 atomic | T=32、BN=16（complex128 为8）、4 warps、1 stage | 半精度输出需要 FP32 输出大小缓冲；没有 tile×N 部分和 |
+
+六种输入 dtype 均接受。FP16/BF16 的计算/atomic 为 FP32，输出可为原类型或 FP32。
+SpMV FP32/FP64 输入使用 FP64；SpMM FP32 使用 FP32，FP64 使用 FP64；
+两算子的复数均使用对应实数分量精度。A 与 RHS 必须符合现有相同类型规则。
+SpMV 支持三种 op，SpMM 支持三种 opA/opB 和合法 dense/out stride。
+转置沿用原生命周期；新 kernel 内行定位计入 compute，无 CPU 计划工作。
+完整计时仍为 `ms=process_cpu_ms+gpu_ms`，诊断独立测量，精度 FAIL 保留有效性能。
+
+SpMV 专用 config 为扁平字典：`rows_per_program`（8/16/32）、
+`block_nnz`（64/128/256）、`num_warps`、`num_stages`。
+SpMM 专用 config 为 `block_nnz`（32/64/128）、`block_n`（8/16/32；
+小 N 内置配置可为1/2/4）、`num_warps`、`num_stages`、
+`atomic_mode`（boundary/all）。显式配置不裁剪，不能传给 compare。
+SpMM all 模式仅用于消融，每个局部行段均 atomic；boundary 模式确保
+跨 tile 行的全部贡献都 atomic，不与直接 store 混用。
+新能力要求由原 backend 对象判断；缺少 scan 或所需 atomic 精度时明确排除。
+
+### 计算节点命令
+
+以下命令在已经分配的 CUDA 计算节点、仓库根目录执行，使用原容器脚本。
+登录节点应通过 `sbatch` 提交并带站点要求的资源参数，不能直接 bash 运行算子。
+
+```bash
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+  --ops spmv_csr,spmm_csr --phase accuracy --mode quick \
+  --results-dir pytest_results_csr_p1_generic_accuracy
+```
+
+quick 通过后，同一命令改为 `--mode normal` 和独立结果目录。
+原 CSR accuracy marker 已包含新增算法，无需新增测试脚本。
+
+普通精度真实矩阵对比（CUDA baseline 保持启用）：
+
+```bash
+MATRIX_DIR="$HOME/run/matrix"
+test -d "$MATRIX_DIR" || exit 1
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+  --ops spmv_csr,spmm_csr --phase performance --mode quick \
+  --benchmark-input "$MATRIX_DIR" --benchmark-warmup 10 --benchmark-iters 50 \
+  --benchmark-args "--dtypes float32,float64 --alg compare --ops non --index-dtypes int32 --timing" \
+  --op-benchmark-args "spmm_csr=--layout row --dense-cols 32 --exclude-tle" \
+  --results-dir pytest_results_csr_p1_generic_real
+```
+
+半精度宽输出比较（保留 cuSPARSE baseline、吞吐和逻辑带宽）：
+
+```bash
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+  --ops spmv_csr,spmm_csr --phase performance --mode quick \
+  --benchmark-input "$MATRIX_DIR" --benchmark-warmup 10 --benchmark-iters 50 \
+  --benchmark-args "--type-combos float16:float16:float32,bfloat16:bfloat16:float32 --alg compare --ops non --index-dtypes int32 --indptr-dtypes int32 --timing --perf-metrics" \
+  --op-benchmark-args "spmm_csr=--op-b non --layout row --dense-cols 32 --exclude-tle" \
+  --results-dir pytest_results_csr_p1_generic_mixed
+```
+
+追加同类型输出时，将组合列表扩展为四种；操作覆盖使用 `--ops all`，
+mixed SpMM 透传 `--op-b all --layout all`。普通精度脚本的 opB 参数仍仅适用于
+显式 type-combos，普通精度九种操作组合由 accuracy 用例验证，不冒称 CLI 已扩展。
+ROCm 在其配置完成的计算环境直接运行 `python run_flagsparse_pytest.py` 并沿用
+上述 runner 参数。厂商不支持某组合时仅 baseline N/A，不停止自身算子测试。
+
+消融使用单个算法：SpMV 分别改变 R 和 T；SpMM 固定 T/BN 比较
+`{"atomic_mode":"boundary"}` 与 `{"atomic_mode":"all"}`，再改变 T、BN。
+通过原 `--op-benchmark-args` 为各算子传递 `--alg` 和 JSON `--config`，
+不得向 compare 传算法专用参数。完整性能、精度状态及 profiler 的 scan/gather
+布局转换、寄存器/spill、atomic 冲突均需实测后再作性能结论。

@@ -44,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
             "spmv-csc",
             "spmv-bsr",
             "spmm",
+            "spmm-csr",
             "spmm-coo",
             "spmm-csc",
             "spmm-bsr",
@@ -77,6 +78,12 @@ def _command_specs(
 ) -> List[Tuple[str, List[str]]]:
     no_cusparse = [] if args.with_cusparse else ["--no-cusparse"]
     commands: Dict[str, List[str]] = {
+        "spmm-csr": [
+            "tests/test_spmm_csr.py", "--synthetic", "--alg", "compare", "--exclude-tle",
+            "--type-combos", "float16:float16:float32,bfloat16:bfloat16:float32", "--ops", "non", "--dense-cols", "32",
+            "--warmup", str(args.warmup), "--iters", str(args.iters), "--timing",
+            "--csv-csr", str(results_dir / "spmm_csr.csv"), *no_cusparse,
+        ],
         "gather": [
             "tests/test_gather.py",
             "--warmup",
@@ -225,6 +232,7 @@ def _command_specs(
             "spmv-csc",
             "spmv-bsr",
             "spmm",
+            "spmm-csr",
             "spmm-coo",
             "spmm-csc",
             "spmm-bsr",

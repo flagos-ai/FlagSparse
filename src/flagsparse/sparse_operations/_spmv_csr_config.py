@@ -3,8 +3,8 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 7
-NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream", "csr_nnz_tile_reduce", "csr_subgroup_pair_mixed")
+IMPLEMENTATION_VERSION = 8
+NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream", "csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce")
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend")
@@ -25,6 +25,7 @@ class BackendCaps:
     fp64: bool = False
     int64: bool = False
     reduction: bool = False
+    scan: bool = False
 
 
 def dtype_name(dtype):
@@ -84,14 +85,15 @@ def algorithm_spec(alg):
         ),
         "transpose_strategy": "per_run_csr_rebuild",
         "cross_call_plan_cache": False,
-        "capability_requirements": ("int64", "reduction") if new else (),
+        "capability_requirements": ("int64", "reduction", "scan") if name == "csr_rowgroup_stream_reduce" else ("int64", "reduction") if new else (),
         "compute_dtype": "input_dependent",
         "compute_dtype_by_input": {dt: compute_dtype(name, dt) for dt in VALUE_DTYPES},
         "half_output_dtypes": {
             dt: (dt, "float32")
             for dt in ("float16", "bfloat16")
         },
-        "config_candidates": ({"prefetch_chunks": (1, 2), "lanes_per_row": (2, 4, 8, 16, 32, 64), "row_tiles_per_program": (1, 2, 4, 8)}
+        "config_candidates": ({"rows_per_program": (8, 16, 32), "block_nnz": (64, 128, 256)}
+                              if name == "csr_rowgroup_stream_reduce" else {"prefetch_chunks": (1, 2), "lanes_per_row": (2, 4, 8, 16, 32, 64), "row_tiles_per_program": (1, 2, 4, 8)}
                               if name == "csr_subgroup_pair_mixed" else {"lanes_per_row": (2, 4, 8, 16, 32, 64),
                                "row_tiles_per_program": (1, 2, 4, 8)}
                               if name == "row_subgroup_stream" else {"plan_mode": ("compact", "fixed")}
@@ -117,6 +119,8 @@ def list_algorithms(op=None, dtype=None, backend=None):
 
 def validate_support(alg, op, dtype, indices_dtype, indptr_dtype, caps):
     spec = algorithm_spec(alg)
+    if alg == "csr_rowgroup_stream_reduce" and not caps.scan:
+        raise BackendCapabilityUnavailable("rowgroup reduction requires scan capability")
     for value, key in (
         (op, "ops"),
         (dtype_name(dtype), "value_dtypes"),
@@ -262,6 +266,21 @@ def _validate_config(resolved, caps):
 def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_nnz=0):
     if config is not None and not isinstance(config, dict):
         raise TypeError("CSR SpMV config must be a dictionary")
+    if alg == "csr_rowgroup_stream_reduce":
+        if not caps.scan:
+            raise BackendCapabilityUnavailable("rowgroup reduction requires scan capability")
+        warps = [w for w in (1, 2, 4, 8) if w * caps.subgroup_width <= caps.max_threads_per_block]
+        if not warps or caps.subgroup_width not in (32, 64):
+            raise BackendCapabilityUnavailable("rowgroup launch capabilities unknown")
+        resolved = dict(rows_per_program=16, block_nnz=128,
+                        num_warps=max(w for w in warps if w <= 4), num_stages=1)
+        _merge(resolved, config or {})
+        if (resolved["rows_per_program"] not in (8, 16, 32)
+                or resolved["block_nnz"] not in (64, 128, 256)
+                or resolved["num_warps"] not in warps or resolved["num_stages"] != 1):
+            raise ValueError("invalid rowgroup tile or launch configuration")
+        result = (resolved, "explicit" if config else "conservative")
+        return result + ([],) if return_rejections else result
     if alg == "csr_nnz_tile_reduce":
         if caps.backend not in ("cuda", "rocm") or not (caps.int64 and caps.reduction and caps.subgroup_width in (32, 64)):
             raise BackendCapabilityUnavailable("NNZ tiles require verified CUDA/ROCm scan and index capabilities")
