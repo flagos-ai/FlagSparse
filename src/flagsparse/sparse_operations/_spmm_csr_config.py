@@ -24,7 +24,7 @@ NEW_ALGORITHMS = (
 )
 BACKENDS = ()
 DTYPES = ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")
-IMPLEMENTATION_VERSION = 7
+IMPLEMENTATION_VERSION = 8
 CONFIG_FIELDS = frozenset((
     "tile_rows", "tile_k", "tile_n", "block_k", "block_n", "panels",
     "segment_nnz", "reduce_block_size", "num_warps", "num_stages",

@@ -573,6 +573,43 @@ def prepare_spmm(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, *, backend
     return _Plan(run, (arrays, B, C, work, one, zero), destroy)
 
 
+def _vendor_python_launch(script, request, response):
+    """Pin a fresh worker to the already working parent's Python installation.
+
+    Venv symlinks inside an Apptainer image need not resolve to the same prefix
+    when Python starts again. PYTHONPATH must include the working stdlib *before*
+    startup imports encodings. -S avoids re-running site/.pth discovery; the
+    bootstrap restores the parent's complete paths and venv prefixes instead.
+    This does not bypass the container or select a different Python executable.
+    """
+    import encodings
+    import os
+    import sys
+    from pathlib import Path
+
+    paths = list(dict.fromkeys([
+        str(Path(script).parent),
+        str(Path(encodings.__file__).parent.parent),
+        *(os.path.abspath(p) for p in sys.path if isinstance(p, str)),
+    ]))
+    env = os.environ.copy()
+    env.pop("PYTHONHOME", None)
+    env["PYTHONPATH"] = os.pathsep.join(paths)
+    bootstrap = (
+        f"import sys; sys.path[:] = {paths!r}; "
+        f"sys.prefix = {sys.prefix!r}; sys.exec_prefix = {sys.exec_prefix!r}; "
+        f"sys.base_prefix = {sys.base_prefix!r}; sys.base_exec_prefix = {sys.base_exec_prefix!r}; "
+        "sys.argv = sys.argv[1:]; "
+        "import encodings; "
+        "print('vendor worker Python:', sys.executable, 'prefix:', sys.prefix, "
+        "'encodings:', encodings.__file__, flush=True); "
+        "import runpy; runpy.run_path(sys.argv[0], run_name='__main__')"
+    )
+    command = [sys.executable, "-S", "-c", bootstrap, str(script),
+               "--isolated-benchmark", str(request), str(response)]
+    return command, env
+
+
 def benchmark_isolated(payload, *, log_prefix, timeout=180):
     """CPU-only request transport; native failures stay in a fresh process.
 
@@ -582,7 +619,6 @@ def benchmark_isolated(payload, *, log_prefix, timeout=180):
     import json
     from pathlib import Path
     import subprocess
-    import sys
     import tempfile
 
     prefix = Path(log_prefix)
@@ -592,27 +628,32 @@ def benchmark_isolated(payload, *, log_prefix, timeout=180):
     with tempfile.TemporaryDirectory(prefix="flagsparse_vendor_") as directory:
         request, response = Path(directory) / "request.pt", Path(directory) / "response.json"
         torch.save(payload, request)
-        command = [sys.executable, str(Path(__file__).resolve()),
-                   "--isolated-benchmark", str(request), str(response)]
+        command, env = _vendor_python_launch(Path(__file__).resolve(), request, response)
         try:
             with open(logs["vendor_stdout"], "w", encoding="utf-8") as stdout, open(logs["vendor_stderr"], "w", encoding="utf-8") as stderr:
                 child = subprocess.run(command, stdout=stdout, stderr=stderr,
-                                       timeout=timeout, check=False)
+                                       timeout=timeout, check=False, env=env)
         except subprocess.TimeoutExpired:
-            return dict(logs, vendor_status="ERROR", vendor_exit_code="timeout",
+            return dict(logs, vendor_status="ERROR", vendor_exit_code="timeout", vendor_error_stage="timeout",
                         vendor_reason=f"vendor worker timed out after {timeout}s")
         except OSError as exc:
-            return dict(logs, vendor_status="ERROR", vendor_exit_code="launch_error",
+            return dict(logs, vendor_status="ERROR", vendor_exit_code="launch_error", vendor_error_stage="python_launch",
                         vendor_reason=f"cannot start vendor worker: {exc}")
         if child.returncode or not response.exists():
+            details = Path(logs["vendor_stderr"]).read_text(encoding="utf-8", errors="replace")
+            startup = "init_fs_encoding" in details or "No module named 'encodings'" in details
+            reason = ("vendor Python startup failed to locate encodings/stdlib; "
+                      "check that the container's parent stdlib paths remain accessible"
+                      if startup else f"vendor worker exited {child.returncode}; no usable result; see worker logs")
             return dict(logs, vendor_status="ERROR", vendor_exit_code=child.returncode,
-                        vendor_reason=f"vendor worker exited {child.returncode}; no usable result; see worker logs")
+                        vendor_error_stage="python_startup" if startup else "worker_exit",
+                        vendor_reason=reason)
         try:
             result = json.loads(response.read_text(encoding="utf-8"))
             if result.get("vendor_status") not in ("PASS", "FAIL", "SKIP", "ERROR"):
                 raise ValueError("missing vendor status")
         except (ValueError, OSError, AttributeError) as exc:
-            return dict(logs, vendor_status="ERROR", vendor_exit_code=child.returncode,
+            return dict(logs, vendor_status="ERROR", vendor_exit_code=child.returncode, vendor_error_stage="response",
                         vendor_reason=f"invalid vendor worker response: {exc}")
         return dict(result, **logs, vendor_exit_code=child.returncode)
 
@@ -627,6 +668,7 @@ def _isolated_benchmark_worker(request, response):
     payload = torch.load(request, map_location="cpu", weights_only=False)
     plan = None
     result = {}
+    stage = "device_setup"
     try:
         torch.cuda.set_device(payload["device_index"])
         device = torch.device("cuda", payload["device_index"])
@@ -636,6 +678,7 @@ def _isolated_benchmark_worker(request, response):
                                   dtype=payload["output_dtype"], device=device)
         print(f"vendor prepare: {payload['fmt']} {arrays[0].dtype}/{rhs.dtype}/{out.dtype} "
               f"{payload['op_a']}/{payload['op_b']} shape={payload['shape']} rhs_stride={rhs.stride()}", flush=True)
+        stage = "vendor_prepare"
         if payload["matrix"]:
             plan = prepare_spmm(payload["fmt"], arrays, payload["shape"], rhs, out,
                                 payload["op_a"], payload["op_b"], torch.float32, backend=payload["backend"])
@@ -643,10 +686,13 @@ def _isolated_benchmark_worker(request, response):
             plan = prepare_spmv(payload["fmt"], arrays, payload["shape"], rhs, out,
                                 payload["op_a"], torch.float32, backend=payload["backend"])
         print(f"vendor first run: {plan.metadata}", flush=True)
+        stage = "vendor_first_run"
         plan.run()
         torch.cuda.synchronize(device)
         print("vendor timing", flush=True)
+        stage = "vendor_timing"
         actual, elapsed = cuda_event_benchmark_filtered(plan.run, payload["warmup"], payload["iters"])
+        stage = "correctness"
         actual = actual.cpu()
         golden = payload["golden"].to(payload["output_dtype"])
         finite = bool(torch.isfinite(actual).all() and torch.isfinite(golden).all())
@@ -657,10 +703,10 @@ def _isolated_benchmark_worker(request, response):
                       vendor_reason="" if finite else "non-finite output or reference",
                       vendor_output_nonfinite=int((~torch.isfinite(actual)).sum()))
     except NotImplementedError as exc:
-        result = dict(vendor_status="SKIP", vendor_reason=str(exc))
+        result = dict(vendor_status="SKIP", vendor_reason=str(exc), vendor_error_stage=stage)
     except Exception as exc:
         traceback.print_exc()
-        result = dict(vendor_status="ERROR", vendor_reason=str(exc))
+        result = dict(vendor_status="ERROR", vendor_reason=str(exc), vendor_error_stage=stage)
     finally:
         if plan is not None:
             plan.close()

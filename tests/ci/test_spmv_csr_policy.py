@@ -684,3 +684,28 @@ def test_generic_p1_config_and_capabilities():
     for field, dtype in (("scan", "float32"), ("fp32_atomic", "complex64"), ("fp64_atomic", "complex128")):
         with pytest.raises(csr.BackendCapabilityUnavailable):
             csr.resolve_config(name, dtype, 32, "row", replace(pcaps, **{field: None}))
+
+
+def test_nnz_owner_search_has_explicit_block_shape():
+    tree = ast.parse((SOURCE / "_spmm_csr_kernels.py").read_text(encoding="utf-8"))
+    helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_nnz_owner")
+    assert helper.args.args[-1].arg == "WIDTH"
+    assert not any(isinstance(n, ast.Attribute) and n.attr in ("shape", "reshape")
+                   for n in ast.walk(helper))
+    kernel = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "nnz_segment_panel_atomic_kernel")
+    calls = [n for n in ast.walk(kernel) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "_nnz_owner"]
+    assert len(calls) == 3
+    assert sum(isinstance(n.args[-1], ast.Constant) and n.args[-1].value == 1 for n in calls) == 2
+    assert sum(isinstance(n.args[-1], ast.Name) and n.args[-1].id == "T" for n in calls) == 1
+
+
+def test_csr_spmm_benchmark_uses_four_field_reference_contract():
+    tree = ast.parse((ROOT / "tests/test_spmm_csr.py").read_text(encoding="utf-8"))
+    assignments = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                   and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name)
+                   and n.value.func.id == "_build_pytorch_reference"]
+    assert len(assignments) == 1
+    assert isinstance(assignments[0].targets[0], ast.Tuple)
+    assert len(assignments[0].targets[0].elts) == 4

@@ -173,6 +173,7 @@ def run(prepared, B, *, algorithm, config, config_meta, timing=False,
                     component_dtype="float64" if acc == tl.float64 else "float32",
                     atomic_mode=cfg["atomic_mode"],
                     execution_path="native_csr_nnz_segment_panel_atomic", initialization="zero",
+                    owner_search="rank1_upper_bound",
                     output_conversion="fp32_to_output" if half_output else "none",
                     output_buffer="user_out" if out is not None and not half_output else "allocated",
                     workspace_peak_bytes=workspace, descriptor_peak_bytes_estimate=0)

@@ -19,10 +19,13 @@ import triton.language as tl
 
 
 @triton.jit
-def _nnz_owner(P, pos, low, high):
-    lo = low + tl.full(pos.shape, 0, tl.int64)
-    hi = high + tl.full(pos.shape, 0, tl.int64)
-    while tl.sum(tl.reshape((lo < hi).to(tl.int32), (-1,)), 0) > 0:
+def _nnz_owner(P, pos, low, high, WIDTH: tl.constexpr):
+    # Always use a rank-one block, including endpoint searches (WIDTH=1).
+    # Do not infer a block shape from a scalar tensor or reshape a scalar loop
+    # predicate. Both bounds stay int64 across the loop's SSA back-edge.
+    lo = tl.full((WIDTH,), 0, tl.int64) + low
+    hi = tl.full((WIDTH,), 0, tl.int64) + high
+    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
         mid = (lo + hi) // 2
         ptr = tl.load(P + mid, lo < hi, 0)
         right = (lo < hi) & (ptr <= pos)
@@ -48,12 +51,13 @@ def nnz_segment_panel_atomic_kernel(A, I, P, B, C, M, N, NNZ,
     lane = tl.arange(0, T)
     pos = base + lane
     valid = pos < stop
-    first = _nnz_owner(P, base, 0, M + 1)
-    last = _nnz_owner(P, stop - 1, first, M + 1)
+    upper = M.to(tl.int64) + 1
+    first = tl.sum(_nnz_owner(P, base, 0, upper, 1), 0)
+    last = tl.sum(_nnz_owner(P, stop - 1, first, upper, 1), 0)
     if first == last:
         owner = tl.full((T,), 0, tl.int64) + first
     else:
-        owner = _nnz_owner(P, tl.minimum(pos, stop - 1), first, last + 2)
+        owner = _nnz_owner(P, tl.minimum(pos, stop - 1), first, last + 2, T)
     owner = tl.where(valid, owner, -1)
     prev = tl.gather(owner, tl.maximum(lane - 1, 0), 0)
     following = tl.gather(owner, tl.minimum(lane + 1, T - 1), 0)

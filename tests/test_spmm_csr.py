@@ -558,10 +558,14 @@ def run_one_case(
         layout,
     )
     b_stride = _stride_string(B)
-    ref, torch_op, _torch_format = _build_pytorch_reference(
+    ref, torch_op, _torch_format, _torch_reason = _build_pytorch_reference(
         data, indices, indptr, shape, B, op=op
     )
-    _torch_out, torch_ms = _cuda_event_benchmark(torch_op, warmup, iters)
+    # Some backends provide a correctness-only CPU reference, without a timed
+    # PyTorch device implementation. That does not disable the native routes.
+    torch_ms = None
+    if torch_op is not None:
+        _torch_out, torch_ms = _cuda_event_benchmark(torch_op, warmup, iters)
     cusparse_out = None
     cusparse_ms = None
     cusparse_reason = ""

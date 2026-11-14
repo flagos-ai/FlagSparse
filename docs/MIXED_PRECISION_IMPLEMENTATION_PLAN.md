@@ -1238,3 +1238,66 @@ ROCm 在其配置完成的计算环境直接运行 `python run_flagsparse_pytest
 通过原 `--op-benchmark-args` 为各算子传递 `--alg` 和 JSON `--config`，
 不得向 compare 传算法专用参数。完整性能、精度状态及 profiler 的 scan/gather
 布局转换、寄存器/spill、atomic 冲突均需实测后再作性能结论。
+
+
+## 2026-11-13：P1 SpMM 编译与 CSC baseline 启动修复
+
+修复起点：`zyq_sparse` / `06e744afc97190189bd3ca5cec4c51c54daa037b`，开始时工作区干净。
+
+- `csr_nnz_segment_panel_atomic` 的 owner 搜索改用显式 WIDTH 的一维块。
+  tile 首尾分别使用 WIDTH=1 并归约为标量，元素搜索使用 WIDTH=T；不再从标量
+  `pos.shape` 推导形状或 reshape 标量循环条件。行数在加1前转为int64。
+  保留 upper-bound、完整行store、跨tile atomic、boundary/all及全部精度策略。
+  版本8，元数据 `owner_search=rank1_upper_bound`。
+- 直接厂商 baseline 仍在新进程内调用原始 cuSPARSE/hipSPARSE C API，不转格式，
+  不预转换输入，不用其它库代替。所有格式共享修复，因此CSR/COO也受益。
+- worker启动时显式传入父进程已生效的stdlib、site-packages及其它sys.path，确保
+  Python启动导入encodings之前就能找到标准库；清除重新推断前缀的PYTHONHOME，
+  用-S避免重新运行site/.pth，随后恢复父进程venv前缀。保持原sys.executable，
+  不解引用venv路径到宿主Python，保留CUDA_VISIBLE_DEVICES和动态库环境。
+- worker日志记录Python、prefix、encodings路径。CSV新增vendor_error_stage：
+  python_launch/python_startup/worker_exit/timeout/response与vendor_prepare、
+  vendor_first_run、vendor_timing、correctness分开；启动失败是ERROR，不是“不支持”。
+  如果容器标准库文件本身消失，路径继承不能修复挂载，需根据日志修复容器环境。
+- 初始化、进程启动、传输、描述符准备仍在厂商事件计时之外；计算和计时契约不变。
+
+原accuracy增加T=32/64/128、boundary/all、连续空行、恰好行界、首尾同一长行、
+尾tile及strided out用例；原CI测试覆盖污染PYTHONHOME/PYTHONPATH、继承GPU/库环境、
+worker启动错误分类和stdout/stderr保留。当前仅做AST/diff，未执行这些用例。
+输入CSV未含SpMM内层完整编译traceback，修复针对已定位的标量形状风险；需计算节点
+确认该错误消失，不能把静态检查说成编译通过。
+
+### 先进行最小复测（已分配CUDA计算节点）
+
+```bash
+# CSR新内核：先准确性，保留原入口和marker
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+  --ops spmm_csr --phase accuracy --mode quick \
+  --results-dir pytest_results_spmm_p1_fix_accuracy
+
+# 一个真实矩阵同时核对新CSR算法与CSC原生baseline，勿关闭vendor
+MATRIX_DIR="$HOME/run/matrix"
+test -f "$MATRIX_DIR/ASIC_680ks.mtx" || exit 1
+bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
+  --ops spmm_csr,spmm_csc --phase performance --mode quick \
+  --benchmark-input "$MATRIX_DIR/ASIC_680ks.mtx" \
+  --benchmark-warmup 3 --benchmark-iters 10 \
+  --benchmark-args "--type-combos float16:float16:float16,float16:float16:float32,bfloat16:bfloat16:bfloat16,bfloat16:bfloat16:float32 --alg compare --ops non,trans --index-dtypes int32 --indptr-dtypes int32 --timing --perf-metrics" \
+  --op-benchmark-args "spmm_csr=--alg csr_nnz_segment_panel_atomic --op-b non --layout all --dense-cols 32" \
+  --op-benchmark-args "spmm_csc=--op-b non --layout all --dense-cols 32" \
+  --results-dir pytest_results_spmm_csc_baseline_fix_smoke
+```
+
+确认有实际耗时、无Triton编译ERROR、无python_startup/worker_exit后，再把输入换成
+完整矩阵目录并提高warmup/iters。厂商官方不支持的组合仍保留SKIP；API故障保留ERROR。
+真实矩阵精度FAIL不隐藏。baseline启动修复需要长批次复测，单矩阵成功不是稳定性验收。
+
+
+### 2026-11-14 regular入口补充修复
+
+新收到的regular结果：SpMV CSR 12240行、30矩阵；SpMM CSR仅表头。
+stdout反复报`too many values to unpack (expected 3)`。
+`test_spmm.py::_build_pytorch_reference`实际返回四项，CSR扫描脚本仍按三项解包。
+已改为四项，并在reference没有GPU计时callable时保留正确性reference、令torch_ms为None，
+继续执行FlagSparse和vendor。静态回归检查同步更新；未在本机执行pytest/算子。
+此修复与此前NNZ owner编译问题是两个独立问题，都需要部署后复测。

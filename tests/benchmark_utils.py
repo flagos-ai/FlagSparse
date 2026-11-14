@@ -207,7 +207,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
               "alg", "alg_requested", "alg_resolved", "backend", "m", "n", "nnz", "status", "reason", "max_error",
               "ms", "gpu_ms", "process_cpu_ms", "process_gpu_ms", "compute_ms",
               "vendor_ms", "vendor_backend", "vendor_version", "vendor_alg", "vendor_preprocessed", "vendor_status",
-              "vendor_reason", "vendor_max_error", "vendor_exit_code", "vendor_stdout", "vendor_stderr",
+              "vendor_reason", "vendor_max_error", "vendor_exit_code", "vendor_error_stage", "vendor_stdout", "vendor_stderr",
               "vendor_output_nonfinite", "source_nonfinite", "source_max_abs", "input_nonfinite", "rhs_nonfinite", "reference_nonfinite", "output_nonfinite", "speedup_vs_vendor", "metadata", "timed", "sample_rule"]
     if metrics_enabled:
         fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",

@@ -489,7 +489,7 @@ def test_hipsparse_partial_descriptor_failure_releases_resources(monkeypatch):
     assert released == ["hipsparseDestroySpMat", "hipsparseDestroy"]
 
 
-@pytest.mark.parametrize("outcome", ["abort", "timeout", "unsupported", "pass", "malformed"])
+@pytest.mark.parametrize("outcome", ["abort", "startup", "timeout", "unsupported", "pass", "malformed"])
 def test_vendor_worker_result_isolation(monkeypatch, tmp_path, outcome):
     import json
     import subprocess
@@ -498,24 +498,60 @@ def test_vendor_worker_result_isolation(monkeypatch, tmp_path, outcome):
     from tests import cusparse_generic_baseline as baseline
 
     def fake_run(command, **kwargs):
-        assert command[2] == "--isolated-benchmark"
+        assert command[-3] == "--isolated-benchmark"
+        assert command[1:3] == ["-S", "-c"]
+        assert "PYTHONHOME" not in kwargs["env"]
+        assert kwargs["env"]["PYTHONPATH"]
         assert kwargs["check"] is False
         if outcome == "timeout":
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if outcome == "abort":
             return SimpleNamespace(returncode=-6)
+        if outcome == "startup":
+            kwargs["stderr"].write("Fatal Python error: init_fs_encoding\nModuleNotFoundError: No module named 'encodings'\n")
+            return SimpleNamespace(returncode=1)
         response = {"vendor_status": "SKIP", "vendor_reason": "not supported"}
         if outcome == "pass":
             response = {"vendor_status": "PASS", "vendor_ms": 0.25}
-        Path(command[4]).write_text("invalid json" if outcome == "malformed" else json.dumps(response))
+        Path(command[-1]).write_text("invalid json" if outcome == "malformed" else json.dumps(response))
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     result = baseline.benchmark_isolated({}, log_prefix=tmp_path / "case")
-    expected = {"abort": "ERROR", "timeout": "ERROR", "malformed": "ERROR", "unsupported": "SKIP", "pass": "PASS"}
+    expected = {"abort": "ERROR", "startup": "ERROR", "timeout": "ERROR", "malformed": "ERROR", "unsupported": "SKIP", "pass": "PASS"}
     assert result["vendor_status"] == expected[outcome]
     assert Path(result["vendor_stderr"]).exists()
     if outcome == "abort":
         assert result["vendor_exit_code"] == -6
+    if outcome == "startup":
+        assert result["vendor_error_stage"] == "python_startup"
+        assert "stdlib" in result["vendor_reason"]
     if outcome != "pass":
         assert "vendor_ms" not in result
+
+
+def test_vendor_worker_inherits_working_python_paths(monkeypatch, tmp_path):
+    import encodings
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    from tests import cusparse_generic_baseline as baseline
+
+    # Exercise startup without importing an accelerator or invoking a vendor API.
+    script = tmp_path / "worker.py"
+    script.write_text("import sys, encodings, json\n"
+                      "print(json.dumps([sys.prefix, sys.exec_prefix, sys.argv[1:]]))\n", encoding="utf-8")
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "wrong-prefix"))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "wrong-search-path"))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-example")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/container/vendor/libs")
+    command, env = baseline._vendor_python_launch(script, "request", "response")
+    assert command[0] == sys.executable  # Do not resolve a venv symlink to host Python.
+    assert str(Path(encodings.__file__).parent.parent) in env["PYTHONPATH"].split(os.pathsep)
+    assert env["CUDA_VISIBLE_DEVICES"] == "GPU-example"
+    assert env["LD_LIBRARY_PATH"] == "/container/vendor/libs"
+    result = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
+    prefix, exec_prefix, argv = json.loads(result.stdout.splitlines()[-1])
+    assert (prefix, exec_prefix) == (sys.prefix, sys.exec_prefix)
+    assert argv == ["--isolated-benchmark", "request", "response"]

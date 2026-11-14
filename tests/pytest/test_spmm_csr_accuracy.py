@@ -741,3 +741,34 @@ def test_csr_nnz_atomic_empty_output(shape, n):
         torch.testing.assert_close(y, torch.zeros_like(y), rtol=0, atol=0)
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("block_nnz", [32, 64, 128])
+@pytest.mark.parametrize("atomic_mode", ["boundary", "all"])
+def test_csr_nnz_atomic_owner_bounds(block_nnz, atomic_mode):
+    """Scalar endpoints and vector owners must skip repeated CSR pointers."""
+    import importlib
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+    device = accelerator_device()
+    t = block_nnz
+    ptr = torch.tensor([0, 0, 0, t, t, t + 3, t + 3, 3 * t + 5, 3 * t + 5],
+                       dtype=torch.int64, device=device)
+    nnz = 3 * t + 5
+    values = torch.ones(nnz, device=device)
+    indices = (torch.arange(nnz, device=device) % 7).to(torch.int32)
+    b = torch.ones((7, 9), device=device)
+    out = torch.full((8, 18), float("nan"), device=device)[:, ::2]
+    try:
+        prepared = module.prepare_spmm_csr_route(
+            values, indices, ptr, (8, 7), alg="csr_nnz_segment_panel_atomic",
+            config={"block_nnz": t, "atomic_mode": atomic_mode},
+        )
+        actual = module.flagsparse_spmm_csr_run(prepared, b, out=out)
+        expected = (ptr[1:] - ptr[:-1]).float()[:, None].expand(8, 9)
+        assert actual is out
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
