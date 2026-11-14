@@ -105,14 +105,14 @@ def row_refill_real(A, I, P, X, Y, M, XS, YS,
         valid = active[:, None] & (p < end[:, None])
         col = tl.load(I + p, valid, other=0).to(tl.int64)
         a = tl.load(A + p, valid, other=0).to(ACC)
-        x = tl.load(X + col * XS.to(tl.int64), valid, other=0).to(ACC)
+        x = tl.load(X + col * tl.cast(XS, tl.int64), valid, other=0).to(ACC)
         acc = acc + a * x
         pos = tl.minimum(pos + V, end)
         done = active & (pos >= end)
         count = tl.sum(done.to(tl.int32), 0)
         if count > 0:
             result = tl.sum(acc, 1)
-            tl.store(Y + row * YS.to(tl.int64), result, done)
+            tl.store(Y + row * tl.cast(YS, tl.int64), result, done)
             rank = tl.cumsum(done.to(tl.int32), 0).to(tl.int64) - 1
             candidate = base + cursor + rank
             assign = done & (candidate < limit)
@@ -193,7 +193,7 @@ shard = pid % H
 col = tl.load(I + p, mask, other=0).to(tl.int64)
 value = tl.load(A + p, mask, other=0).to(ACC)
 product = value * x_row[:, None]
-offset = shard * N.to(tl.int64) + col
+offset = shard * tl.cast(N, tl.int64) + col
 tl.atomic_add(Z + offset, product, mask, sem="relaxed", scope="gpu")
 ```
 
@@ -426,3 +426,8 @@ done
 DCU已激活库环境后，把runner命令前缀替换为`python run_flagsparse_pytest.py`，
 直接benchmark前缀替换为`python tests/test_spmv_csr.py`，其余参数不变。若该DTK
 已确认不支持mixed vendor，可显式增加--no-vendor；自身准确性/性能仍须完整执行。
+
+
+### 2026-11-14 smoke 修复状态
+
+filter3D 的 FP16 non smoke 在 refill 首次编译时失败：单位 stride 特化为 Python int，不能调用 `XS.to(tl.int64)`。refill/sharded 的标量 stride、维度转换已改为 `tl.cast(..., tl.int64)`，保持64位寻址；同步修正 SpMM NNZ atomic 的单位行数转换。原测试补充连续/strided 输出和单行特化回归。当前仅完成源码与AST检查，未进行修复后的GPU编译及性能验收。

@@ -18,7 +18,7 @@ def _sharded_scatter(A, I, P, X, Z, M, N, XS, ZS,
     valid_row = row < M
     start = tl.load(P + row, valid_row, 0).to(tl.int64)
     end = tl.load(P + row + 1, valid_row, 0).to(tl.int64)
-    xp = row * XS.to(tl.int64)
+    xp = row * tl.cast(XS, tl.int64)
     if COMPLEX:
         xr = tl.load(X + 2 * xp, valid_row, 0).to(ACC)
         xi = tl.load(X + 2 * xp + 1, valid_row, 0).to(ACC)
@@ -30,7 +30,7 @@ def _sharded_scatter(A, I, P, X, Z, M, N, XS, ZS,
         p = start[:, None] + step * K + lane[None, :]
         valid = valid_row[:, None] & (p < end[:, None])
         col = tl.load(I + p, valid, 0).to(tl.int64)
-        zp = ((pid % H) * N.to(tl.int64) + col) * ZS.to(tl.int64)
+        zp = ((pid % H) * tl.cast(N, tl.int64) + col) * tl.cast(ZS, tl.int64)
         if COMPLEX:
             ar = tl.load(A + 2 * p, valid, 0).to(ACC)
             ai = tl.load(A + 2 * p + 1, valid, 0).to(ACC)
@@ -50,8 +50,8 @@ def _sharded_finish(Z, Y, N, YS, H: tl.constexpr, B: tl.constexpr,
                     COMPLEX: tl.constexpr):
     col = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B).to(tl.int64)
     shard = tl.arange(0, H).to(tl.int64)
-    offset = shard[:, None] * N.to(tl.int64) + col[None, :]
-    yp = col * YS.to(tl.int64)
+    offset = shard[:, None] * tl.cast(N, tl.int64) + col[None, :]
+    yp = col * tl.cast(YS, tl.int64)
     if COMPLEX:
         re = tl.load(Z + 2 * offset, col[None, :] < N, 0)
         im = tl.load(Z + 2 * offset + 1, col[None, :] < N, 0)

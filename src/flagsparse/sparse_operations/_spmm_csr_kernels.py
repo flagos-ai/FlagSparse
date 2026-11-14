@@ -51,7 +51,7 @@ def nnz_segment_panel_atomic_kernel(A, I, P, B, C, M, N, NNZ,
     lane = tl.arange(0, T)
     pos = base + lane
     valid = pos < stop
-    upper = M.to(tl.int64) + 1
+    upper = tl.cast(M, tl.int64) + 1
     first = tl.sum(_nnz_owner(P, base, 0, upper, 1), 0)
     last = tl.sum(_nnz_owner(P, stop - 1, first, upper, 1), 0)
     if first == last:

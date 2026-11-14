@@ -772,3 +772,45 @@ def test_csr_nnz_atomic_owner_bounds(block_nnz, atomic_mode):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
+
+
+@pytest.mark.spmm_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32,
+                                   torch.float64, torch.complex64, torch.complex128])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("n", [1, 7])
+def test_csr_nnz_atomic_single_execution_row(dtype, op, n):
+    """M=1 and unit strides must compile after scalar specialization."""
+    import importlib
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_csr")
+    device = accelerator_device()
+    shape = (1, 2) if op == "non" else (2, 1)
+    values = torch.tensor([0.25, -0.125], dtype=dtype, device=device)
+    if dtype.is_complex:
+        values = values + 0.125j
+    idx = torch.tensor([0, 1] if op == "non" else [0, 0], dtype=torch.int32, device=device)
+    ptr = torch.tensor([0, 2] if op == "non" else [0, 1, 2], dtype=torch.int64, device=device)
+    b_cpu = (torch.arange(2 * n).reshape(2, n).double() / 8 + 0.25).to(dtype)
+    if dtype.is_complex:
+        b_cpu = b_cpu + 0.25j
+    b = b_cpu.to(device)
+    ref_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    row = values.cpu().to(ref_dtype)
+    if op == "conj":
+        row = row.conj()
+    reference = row.reshape(1, 2) @ b_cpu.to(ref_dtype)
+    try:
+        for mode in ("boundary", "all"):
+            prepared = module.prepare_spmm_csr_route(values, idx, ptr, shape, op=op,
+                alg="csr_nnz_segment_panel_atomic", config={"atomic_mode": mode})
+            output_types = [dtype, torch.float32] if dtype in (torch.float16, torch.bfloat16) else [dtype]
+            for output_dtype in output_types:
+                out = torch.full((1, n), float("nan"), dtype=output_dtype, device=device)
+                actual = module.flagsparse_spmm_csr_run(prepared, b, out=out, out_dtype=output_dtype)
+                assert actual is out
+                rtol, atol = close_tolerances(output_dtype)
+                torch.testing.assert_close(actual.cpu(), reference.to(output_dtype), rtol=rtol, atol=atol)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))

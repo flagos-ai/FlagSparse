@@ -1095,7 +1095,8 @@ def test_csr_rowgroup_stream_contract(dtype, op, case, monkeypatch, record_prope
 @pytest.mark.parametrize("case", ["empty", "refill_tail", "hotspot"])
 @pytest.mark.parametrize("index_pair", [(torch.int32, torch.int64)] if _MIXED_QUICK_MODE else
                          list(itertools.product((torch.int32, torch.int64), repeat=2)))
-def test_spmv_csr_targeted_contract(alg, op, dtype, wide, case, index_pair, monkeypatch, record_property):
+@pytest.mark.parametrize("stride", [1, 2])
+def test_spmv_csr_targeted_contract(alg, op, dtype, wide, case, index_pair, stride, monkeypatch, record_property):
     from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
 
@@ -1116,7 +1117,7 @@ def test_spmv_csr_targeted_contract(alg, op, dtype, wide, case, index_pair, monk
     x_cpu = ((torch.arange(shape[1] if op == "non" else shape[0]) % 5 - 2).double() / 8).to(dtype)
     if dtype.is_complex:
         x_cpu += 0.125j
-    x = torch.zeros(2 * x_cpu.numel(), dtype=dtype, device=data.device)[::2]
+    x = torch.zeros(stride * x_cpu.numel(), dtype=dtype, device=data.device)[::stride]
     x.copy_(x_cpu)
     output_dtype = torch.float32 if wide else dtype
     output_size = shape[0] if op == "non" else shape[1]
@@ -1140,7 +1141,7 @@ def test_spmv_csr_targeted_contract(alg, op, dtype, wide, case, index_pair, monk
             prepared = spmv_mod.prepare_spmv_csr(data, col, ptr, shape, alg=alg, op=op, config=config)
         except BackendCapabilityUnavailable as exc:
             pytest.skip(str(exc))
-        out = torch.full((2 * output_size,), float("nan"), dtype=output_dtype, device=data.device)[::2]
+        out = torch.full((stride * output_size,), float("nan"), dtype=output_dtype, device=data.device)[::stride]
         actual, ms, meta = spmv_mod.flagsparse_spmv_csr_run(
             prepared, x, out=out, out_dtype=output_dtype, return_time=True, return_meta=True, timing=True)
         assert actual is out and meta["alg_resolved"] == alg

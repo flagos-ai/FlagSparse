@@ -25,7 +25,7 @@ def row_refill_kernel(A, I, P, X, Y, M, XS, YS,
         p = pos[:, None] + lane[None, :]
         valid = active[:, None] & (p < end[:, None])
         col = tl.load(I + p, valid, 0).to(tl.int64)
-        xp = col * XS.to(tl.int64)
+        xp = col * tl.cast(XS, tl.int64)
         if COMPLEX:
             ar = tl.load(A + 2 * p, valid, 0).to(ACC)
             ai = tl.load(A + 2 * p + 1, valid, 0).to(ACC)
@@ -41,7 +41,7 @@ def row_refill_kernel(A, I, P, X, Y, M, XS, YS,
         done = active & (pos >= end)
         count = tl.sum(done.to(tl.int32), 0)
         if count > 0:
-            yp = row * YS.to(tl.int64)
+            yp = row * tl.cast(YS, tl.int64)
             if COMPLEX:
                 tl.store(Y + 2 * yp, tl.sum(re, 1), done)
                 tl.store(Y + 2 * yp + 1, tl.sum(im, 1), done)

@@ -740,3 +740,28 @@ def test_csr_spmm_benchmark_uses_four_field_reference_contract():
     assert len(assignments) == 1
     assert isinstance(assignments[0].targets[0], ast.Tuple)
     assert len(assignments[0].targets[0].elts) == 4
+
+
+def test_csr_scalar_arguments_use_specialization_safe_casts():
+    # Unity dimensions/strides can specialize to Python ints, not tl.tensor.
+    cases = {
+        "_spmv_csr_kernels.py": {"row_refill_kernel": {"XS", "YS"}},
+        "_spmv_csr_transpose.py": {
+            "_sharded_scatter": {"XS", "ZS", "N"},
+            "_sharded_finish": {"YS", "N"},
+        },
+        "_spmm_csr_kernels.py": {"nnz_segment_panel_atomic_kernel": {"M"}},
+    }
+    for filename, functions in cases.items():
+        tree = ast.parse((SOURCE / filename).read_text(encoding="utf-8"))
+        for name, scalars in functions.items():
+            function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            for node in ast.walk(function):
+                assert not (isinstance(node, ast.Attribute) and node.attr == "to"
+                            and isinstance(node.value, ast.Name) and node.value.id in scalars), (filename, name)
+            casted = {node.args[0].id for node in ast.walk(function)
+                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                      and isinstance(node.func.value, ast.Name) and node.func.value.id == "tl"
+                      and node.func.attr == "cast" and node.args
+                      and isinstance(node.args[0], ast.Name)}
+            assert scalars <= casted, (filename, name)
