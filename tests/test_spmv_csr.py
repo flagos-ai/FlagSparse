@@ -62,6 +62,16 @@ FIELDS = [
     "commit",
     "warmup",
     "iters",
+    "execution_path",
+    "workspace_peak_bytes",
+    "descriptor_peak_bytes",
+    "output_shards",
+    "atomic_buffer",
+    "initialization",
+    "output_conversion",
+    "x_stride",
+    "y_stride",
+    "validation",
 ]
 
 

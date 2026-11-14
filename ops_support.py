@@ -364,8 +364,10 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
                 value_const="SPMV_CSR_NEW_VALUE_DTYPES",
                 values=("float16", "bfloat16") if algorithm in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else None,
                 index_const="SUPPORTED_INDEX_DTYPES",
-                ops=spmv_ops,
-                notes="CUDA/ROCm; input-dependent accumulation; per-run CSR transpose; hardware validation pending",
+                ops=("trans", "conj") if algorithm == "csr_transpose_sharded_atomic" else spmv_ops,
+                notes=("CUDA/ROCm; native CSR sharded transpose; compute-precision atomic; hardware validation pending"
+                       if algorithm == "csr_transpose_sharded_atomic" else
+                       "CUDA/ROCm; input-dependent accumulation; per-run CSR transpose; hardware validation pending"),
             )
             for algorithm in modules["spmv_csr"].get("SPMV_CSR_NEW_ALGORITHMS")
         ),

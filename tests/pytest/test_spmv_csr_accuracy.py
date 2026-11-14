@@ -309,7 +309,14 @@ TESTED_ALGORITHMS = spmv_mod.list_spmv_csr_algorithms(
 )
 TESTED_NEW_ALGORITHMS = tuple(
     alg for alg in NEW_ALGORITHMS if alg in TESTED_ALGORITHMS
+    and "non" in spmv_mod.get_spmv_csr_algorithm_spec(alg)["ops"]
 )
+TESTED_ROUTES = tuple((alg, op) for alg in TESTED_ALGORITHMS
+                      for op in spmv_mod.get_spmv_csr_algorithm_spec(alg)["ops"])
+TARGETED_ROUTES = tuple((alg, op) for alg in
+                       ("csr_row_refill_reduce", "csr_transpose_sharded_atomic")
+                       if alg in TESTED_ALGORITHMS
+                       for op in spmv_mod.get_spmv_csr_algorithm_spec(alg)["ops"])
 REGRESSIONS = json.loads(
     (Path(__file__).resolve().parents[1] / "data/spmv_csr_regressions.json").read_text()
 )
@@ -489,7 +496,8 @@ def test_spmv_csr_new_fallback_preserves_selection(alg, dtype, op, monkeypatch):
     data, col, ptr, x, shape = _native_case([0, 3, 65], dtype, torch.int64, torch.int64)
     if op != "non":
         x = _make_x(shape[0], dtype, data.device)
-    config = ({"block_nnz": 64} if alg == "csr_rowgroup_stream_reduce"
+    config = ({"window_rows": 128} if alg == "csr_row_refill_reduce"
+              else {"block_nnz": 64} if alg == "csr_rowgroup_stream_reduce"
               else {"row_vector": {"block_nnz": 64}})
     prepared = _new_prepared(data, col, ptr, shape, alg, config=config, op=op)
     original = kernels.compute
@@ -526,13 +534,12 @@ if not TESTED_NEW_ALGORITHMS:
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
+@pytest.mark.parametrize("alg,op", TESTED_ROUTES)
 @pytest.mark.parametrize(
     "dtype",
     spmv_mod.SUPPORTED_SPMV_VALUE_DTYPES,
     ids=lambda dtype: str(dtype).removeprefix("torch."),
 )
-@pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize("matrix_name", REGRESSIONS["matrices"])
 def test_spmv_csr_external_matrix_regressions(alg, dtype, op, matrix_name):
     """Set FLAGSPARSE_SPMV_CSR_MTX_DIR to run every supplied matrix, including FP32 failures."""
@@ -566,9 +573,8 @@ def test_spmv_csr_external_matrix_regressions(alg, dtype, op, matrix_name):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
+@pytest.mark.parametrize("alg,op", TESTED_ROUTES)
 @pytest.mark.parametrize("dtype", spmv_mod.SUPPORTED_SPMV_VALUE_DTYPES)
-@pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize(
     "col_dtype,ptr_dtype",
     [
@@ -609,7 +615,7 @@ def test_spmv_csr_full_dtype_op_surface(alg, dtype, op, col_dtype, ptr_dtype):
         expected_compute = "float64"
     assert meta["compute_dtype"] == expected_compute
     assert meta["transpose_strategy"] == (
-        "none" if op == "non" else "per_run_csr_rebuild"
+        "none" if op == "non" else spmv_mod.get_spmv_csr_algorithm_spec(alg)["transpose_strategy"]
     )
     assert meta["alg_resolved"] == alg
     with pytest.raises(ValueError):
@@ -619,7 +625,7 @@ def test_spmv_csr_full_dtype_op_surface(alg, dtype, op, col_dtype, ptr_dtype):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
+@pytest.mark.parametrize("alg", tuple(a for a in TESTED_ALGORITHMS if spmv_mod.get_spmv_csr_algorithm_spec(a)["transpose_strategy"] == "per_run_csr_rebuild"))
 @pytest.mark.parametrize("op", ["trans", "conj"])
 def test_spmv_csr_transpose_rebuilt_inside_each_run(alg, op, monkeypatch):
     data, col, ptr, _, shape = _native_case(
@@ -639,7 +645,7 @@ def test_spmv_csr_transpose_rebuilt_inside_each_run(alg, op, monkeypatch):
     monkeypatch.setattr(spmv_mod, "_transpose_csr_for_spmv", record)
     config = (
         {"row_split_reduce": {"segment_nnz": 8, "reduce_block_size": 2}}
-        if alg in NEW_ALGORITHMS
+        if alg in ("row_split_reduce", "row_adaptive_split")
         else None
     )
     prepared = _new_prepared(data, col, ptr, shape, alg, op=op, config=config)
@@ -666,11 +672,10 @@ def test_spmv_csr_transpose_rebuilt_inside_each_run(alg, op, monkeypatch):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
+@pytest.mark.parametrize("alg,op", TESTED_ROUTES)
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.complex64, torch.complex128]
 )
-@pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize("shape", [(0, 7), (5, 0), (0, 0), (5, 7)])
 def test_spmv_csr_empty_dtype_ops(alg, dtype, op, shape):
     device = accelerator_device()
@@ -685,9 +690,8 @@ def test_spmv_csr_empty_dtype_ops(alg, dtype, op, shape):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
+@pytest.mark.parametrize("alg,op", TESTED_ROUTES)
 @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
-@pytest.mark.parametrize("op", ["non", "trans", "conj"])
 def test_spmv_csr_complex_cancellation(alg, dtype, op):
     data, col, ptr, _, shape = _native_case(
         [1025, 0, 1031], dtype, torch.int32, torch.int64, n=3
@@ -1081,3 +1085,141 @@ def test_csr_rowgroup_stream_contract(dtype, op, case, monkeypatch, record_prope
             spmv_mod.flagsparse_spmv_csr_run(prepared, x, op="trans" if op == "non" else "non")
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("alg,op", TARGETED_ROUTES)
+@pytest.mark.parametrize("dtype,wide", [(dt, False) for dt in (
+    torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128)]
+    + [(torch.float16, True), (torch.bfloat16, True)])
+@pytest.mark.parametrize("case", ["empty", "refill_tail", "hotspot"])
+@pytest.mark.parametrize("index_pair", [(torch.int32, torch.int64)] if _MIXED_QUICK_MODE else
+                         list(itertools.product((torch.int32, torch.int64), repeat=2)))
+def test_spmv_csr_targeted_contract(alg, op, dtype, wide, case, index_pair, monkeypatch, record_property):
+    from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("targeted algorithms must not build a segment plan")
+    monkeypatch.setattr(kernels, "build_plan", forbidden)
+    if alg == "csr_transpose_sharded_atomic":
+        monkeypatch.setattr(spmv_mod, "_transpose_csr_for_spmv", forbidden)
+    lengths = ([0] * 19 if case == "empty" else
+               ([1, 1, 1, 64, 64, 1, 1, 1, 0] * 3 + [513, 0, 2]))
+    data, col, ptr, _, shape = _native_case(lengths, dtype, *index_pair, n=23)
+    ids = torch.arange(data.numel(), device=data.device)
+    data.copy_(((ids % 7 - 3).float() / 32).to(dtype))
+    if dtype.is_complex:
+        data.add_(1j * ((ids % 5 - 2).float() / 16))
+    if case == "hotspot":
+        col.zero_()
+    x_cpu = ((torch.arange(shape[1] if op == "non" else shape[0]) % 5 - 2).double() / 8).to(dtype)
+    if dtype.is_complex:
+        x_cpu += 0.125j
+    x = torch.zeros(2 * x_cpu.numel(), dtype=dtype, device=data.device)[::2]
+    x.copy_(x_cpu)
+    output_dtype = torch.float32 if wide else dtype
+    output_size = shape[0] if op == "non" else shape[1]
+    saved = [t.clone() for t in (data, col, ptr, x)]
+    configs = ([{"rows_per_program": 4, "lanes_per_row": 8, "window_rows": w} for w in (4, 16, 128)]
+               if alg == "csr_row_refill_reduce" else [{"output_shards": h} for h in (1, 2, 4, 8)])
+    # CPU reference retains FP64/complex128 until the requested final output.
+    cpu_a, cpu_col, cpu_ptr = data.cpu(), col.cpu().long(), ptr.cpu().long()
+    ref_type = torch.complex128 if dtype.is_complex else torch.float64
+    mat = torch.zeros(shape, dtype=ref_type)
+    owners = torch.repeat_interleave(torch.arange(shape[0]), cpu_ptr[1:] - cpu_ptr[:-1])
+    mat.index_put_((owners, cpu_col), cpu_a.to(ref_type), accumulate=True)
+    effective = mat if op == "non" else mat.T if op == "trans" else mat.mH
+    expected = (effective @ x_cpu.to(ref_type)).to(output_dtype)
+    record_property("algorithm", alg)
+    record_property("type_combo", f"{dtype}:{dtype}:{output_dtype}")
+    record_property("compute_dtype", "float64" if dtype in (torch.float32, torch.float64, torch.complex128) else "float32")
+    record_property("opA", op)
+    for config in configs:
+        try:
+            prepared = spmv_mod.prepare_spmv_csr(data, col, ptr, shape, alg=alg, op=op, config=config)
+        except BackendCapabilityUnavailable as exc:
+            pytest.skip(str(exc))
+        out = torch.full((2 * output_size,), float("nan"), dtype=output_dtype, device=data.device)[::2]
+        actual, ms, meta = spmv_mod.flagsparse_spmv_csr_run(
+            prepared, x, out=out, out_dtype=output_dtype, return_time=True, return_meta=True, timing=True)
+        assert actual is out and meta["alg_resolved"] == alg
+        assert ms == meta["gpu_ms"] + meta["process_cpu_ms"]
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+        high = spmv_mod.flagsparse_spmv_csr(data, col, ptr, x, shape, alg=alg, op=op,
+                                           config=config, out_dtype=output_dtype)
+        torch.testing.assert_close(high.cpu(), expected, rtol=rtol, atol=atol)
+        if alg == "csr_transpose_sharded_atomic":
+            assert meta["transpose_strategy"] == "native_csr_sharded_scatter"
+            assert meta["process_gpu_ms"] == 0
+        else:
+            assert meta["workspace_peak_bytes"] == 0
+        with pytest.raises(ValueError):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, x, op="non" if op != "non" else "trans")
+        with pytest.raises(ValueError, match="overlap"):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=x)
+        with pytest.raises((ValueError, TypeError)):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out,
+                out_dtype=torch.float64 if output_dtype != torch.float64 else torch.float32)
+        with pytest.raises(ValueError):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, x, alg="row_vector")
+    for tensor, before in zip((data, col, ptr, x), saved):
+        torch.testing.assert_close(tensor, before, rtol=0, atol=0)
+
+
+@pytest.mark.spmv_csr
+def test_spmv_sharded_workspace_and_fallback(monkeypatch):
+    from flagsparse.sparse_operations import _spmv_csr_transpose as transpose
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    data, col, ptr, _, shape = _native_case([0, 3, 5], torch.float16, torch.int64, torch.int64, n=7)
+    x = torch.ones(shape[0], dtype=data.dtype, device=data.device)
+    try:
+        prepared = spmv_mod.prepare_spmv_csr(data, col, ptr, shape, op="trans",
+            alg="csr_transpose_sharded_atomic", config={"output_shards": 2})
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    original = transpose.compute_sharded
+    def inject(route, vector, out=None):
+        if route.kernel_indices.dtype == torch.int64:
+            raise RuntimeError("unsupported int64 kernel indices")
+        assert route.config == prepared.config and route.op == prepared.op
+        return original(route, vector, out)
+    monkeypatch.setattr(transpose, "compute_sharded", inject)
+    out = torch.empty(shape[1], dtype=torch.float32, device=data.device)
+    actual, meta = spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out, return_meta=True)
+    assert actual is out and meta["index_fallback_applied"]
+    assert meta["compute_dtype"] == "float32" and meta["output_dtype"] == "float32"
+    prepared.index_fallback_policy = "strict"
+    with pytest.raises(RuntimeError, match="unsupported int64"):
+        spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out)
+    monkeypatch.setattr(transpose, "compute_sharded", original)
+    small = spmv_mod.prepare_spmv_csr(data, col, ptr, shape, op="trans",
+        alg="csr_transpose_sharded_atomic", config={"workspace_limit_bytes": 1})
+    with pytest.raises(MemoryError, match="workspace"):
+        spmv_mod.flagsparse_spmv_csr_run(small, x)
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("alg", ["csr_row_refill_reduce", "csr_transpose_sharded_atomic"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_spmv_targeted_wide_output_not_roundtrip(alg, dtype):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    device = accelerator_device()
+    delta = 2 ** (-11 if dtype == torch.float16 else -9)
+    a = torch.tensor([1.0, delta], dtype=dtype, device=device)
+    if alg == "csr_row_refill_reduce":
+        shape, op, offsets, columns = (1, 2), "non", [0, 2], [0, 1]
+    else:
+        shape, op, offsets, columns = (2, 1), "trans", [0, 1, 2], [0, 0]
+    ptr = torch.tensor(offsets, dtype=torch.int64, device=device)
+    col = torch.tensor(columns, dtype=torch.int32, device=device)
+    x = torch.ones(2, dtype=dtype, device=device)
+    try:
+        prepared = spmv_mod.prepare_spmv_csr(a, col, ptr, shape, alg=alg, op=op)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    y = spmv_mod.flagsparse_spmv_csr_run(prepared, x, out_dtype=torch.float32)
+    expected = torch.tensor([1 + delta], dtype=torch.float32, device=device)
+    torch.testing.assert_close(y, expected, rtol=0, atol=0)
+    assert not torch.equal(y, y.to(dtype).float())

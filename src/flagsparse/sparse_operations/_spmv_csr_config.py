@@ -3,8 +3,10 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 8
+IMPLEMENTATION_VERSION = 9
 NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream", "csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce")
+TARGETED_ALGORITHMS = ("csr_row_refill_reduce", "csr_transpose_sharded_atomic")
+NEW_ALGORITHMS += TARGETED_ALGORITHMS
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend")
@@ -26,6 +28,8 @@ class BackendCaps:
     int64: bool = False
     reduction: bool = False
     scan: bool = False
+    fp32_atomic: object = None
+    fp64_atomic: object = None
 
 
 def dtype_name(dtype):
@@ -69,23 +73,23 @@ def algorithm_spec(alg):
     return {
         "name": name,
         "implementation_version": IMPLEMENTATION_VERSION,
-        "ops": ("non", "trans", "conj"),
+        "ops": ("trans", "conj") if name == "csr_transpose_sharded_atomic" else ("non", "trans", "conj"),
         "value_dtypes": ("float16", "bfloat16") if name in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else VALUE_DTYPES,
         "index_dtypes": (
             ("int32",) if name == "legacy_bucket_vector" else ("int32", "int64")
         ),
         "indptr_dtypes": ("int32", "int64"),
         "backends": ("cuda", "rocm") if new else BACKENDS,
-        "runtime_process": True,
-        "runtime_process_ops": (
+        "runtime_process": name != "csr_transpose_sharded_atomic",
+        "runtime_process_ops": () if name == "csr_transpose_sharded_atomic" else (
             ("non", "trans", "conj")
             if name
             in ("row_split_reduce", "row_adaptive_split", "legacy_bucket_vector", "csr_nnz_tile_reduce")
             else ("trans", "conj")
         ),
-        "transpose_strategy": "per_run_csr_rebuild",
+        "transpose_strategy": "native_csr_sharded_scatter" if name == "csr_transpose_sharded_atomic" else "per_run_csr_rebuild",
         "cross_call_plan_cache": False,
-        "capability_requirements": ("int64", "reduction", "scan") if name == "csr_rowgroup_stream_reduce" else ("int64", "reduction") if new else (),
+        "capability_requirements": ("int64", "reduction", "atomic_by_compute_dtype") if name == "csr_transpose_sharded_atomic" else ("int64", "reduction", "scan") if name in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce") else ("int64", "reduction") if new else (),
         "compute_dtype": "input_dependent",
         "compute_dtype_by_input": {dt: compute_dtype(name, dt) for dt in VALUE_DTYPES},
         "half_output_dtypes": {
@@ -119,8 +123,12 @@ def list_algorithms(op=None, dtype=None, backend=None):
 
 def validate_support(alg, op, dtype, indices_dtype, indptr_dtype, caps):
     spec = algorithm_spec(alg)
-    if alg == "csr_rowgroup_stream_reduce" and not caps.scan:
+    if alg in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce") and not caps.scan:
         raise BackendCapabilityUnavailable("rowgroup reduction requires scan capability")
+    if alg == "csr_transpose_sharded_atomic":
+        feature = "fp64_atomic" if compute_dtype(alg, dtype) in ("float64", "complex128") else "fp32_atomic"
+        if getattr(caps, feature) is not True:
+            raise BackendCapabilityUnavailable(f"{alg} requires known {feature} capability")
     for value, key in (
         (op, "ops"),
         (dtype_name(dtype), "value_dtypes"),
@@ -266,6 +274,42 @@ def _validate_config(resolved, caps):
 def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_nnz=0):
     if config is not None and not isinstance(config, dict):
         raise TypeError("CSR SpMV config must be a dictionary")
+    if alg in TARGETED_ALGORITHMS:
+        if caps.backend not in ("cuda", "rocm") or caps.subgroup_width not in (32, 64):
+            raise BackendCapabilityUnavailable("targeted CSR launch capabilities unknown")
+        warps = [w for w in (1, 2, 4, 8) if w * caps.subgroup_width <= caps.max_threads_per_block]
+        if not warps:
+            raise BackendCapabilityUnavailable("no legal targeted CSR launch")
+        refill = alg == "csr_row_refill_reduce"
+        preferred = 2 if refill else 4
+        warp = max((w for w in warps if w <= preferred), default=min(warps))
+        cfg = (dict(rows_per_program=warp * caps.subgroup_width // 8,
+                    lanes_per_row=8, window_rows=128, num_warps=warp, num_stages=1)
+               if refill else dict(output_shards=4, rows_per_program=4, block_nnz=32,
+                                   num_warps=warp, num_stages=1, workspace_limit_bytes=268435456))
+        supplied = config or {}
+        if set(supplied) - set(cfg):
+            raise ValueError(f"unused {alg} config fields: {sorted(set(supplied) - set(cfg))}")
+        cfg.update(supplied)
+        if any(type(v) is not int for v in cfg.values()):
+            raise ValueError("targeted CSR configuration values must be integers")
+        if cfg["num_warps"] not in warps or cfg["num_stages"] != 1:
+            raise ValueError("invalid targeted CSR launch configuration")
+        if refill:
+            if not caps.scan:
+                raise BackendCapabilityUnavailable("refill requires integer scan")
+            if "rows_per_program" not in supplied:
+                cfg["rows_per_program"] = cfg["num_warps"] * caps.subgroup_width // cfg["lanes_per_row"] if cfg["lanes_per_row"] > 0 else 0
+            r, v, w = (cfg[k] for k in ("rows_per_program", "lanes_per_row", "window_rows"))
+            if r not in (4, 8, 16, 32) or v not in (2, 4, 8, 16, 32, 64) or v > caps.subgroup_width:
+                raise ValueError("invalid refill row/lane tile")
+            if not r <= w <= 1024 or w % r:
+                raise ValueError("window_rows must be a row-tile multiple in [R,1024]")
+        elif (cfg["output_shards"] not in (1, 2, 4, 8) or cfg["rows_per_program"] not in (1, 2, 4, 8)
+              or cfg["block_nnz"] not in (8, 16, 32, 64) or cfg["workspace_limit_bytes"] <= 0):
+            raise ValueError("invalid sharded scatter configuration")
+        result = (cfg, "explicit" if supplied else "targeted-conservative-v1")
+        return result + ([],) if return_rejections else result
     if alg == "csr_rowgroup_stream_reduce":
         if not caps.scan:
             raise BackendCapabilityUnavailable("rowgroup reduction requires scan capability")

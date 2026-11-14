@@ -9,6 +9,98 @@ import triton.language as tl
 from ._common import _gather_values
 
 
+@triton.jit
+def _sharded_scatter(A, I, P, X, Z, M, N, XS, ZS,
+                     H: tl.constexpr, R: tl.constexpr, K: tl.constexpr,
+                     COMPLEX: tl.constexpr, CONJ: tl.constexpr, ACC: tl.constexpr):
+    pid = tl.program_id(0).to(tl.int64)
+    row = pid * R + tl.arange(0, R).to(tl.int64)
+    valid_row = row < M
+    start = tl.load(P + row, valid_row, 0).to(tl.int64)
+    end = tl.load(P + row + 1, valid_row, 0).to(tl.int64)
+    xp = row * XS.to(tl.int64)
+    if COMPLEX:
+        xr = tl.load(X + 2 * xp, valid_row, 0).to(ACC)
+        xi = tl.load(X + 2 * xp + 1, valid_row, 0).to(ACC)
+    else:
+        xr = tl.load(X + xp, valid_row, 0).to(ACC)
+    lane = tl.arange(0, K).to(tl.int64)
+    steps = tl.max(tl.cdiv(end - start, K), 0)
+    for step in tl.range(0, steps, num_stages=1):
+        p = start[:, None] + step * K + lane[None, :]
+        valid = valid_row[:, None] & (p < end[:, None])
+        col = tl.load(I + p, valid, 0).to(tl.int64)
+        zp = ((pid % H) * N.to(tl.int64) + col) * ZS.to(tl.int64)
+        if COMPLEX:
+            ar = tl.load(A + 2 * p, valid, 0).to(ACC)
+            ai = tl.load(A + 2 * p + 1, valid, 0).to(ACC)
+            if CONJ:
+                ai = -ai
+            re = ar * xr[:, None] - ai * xi[:, None]
+            im = ar * xi[:, None] + ai * xr[:, None]
+            tl.atomic_add(Z + 2 * zp, re, valid, sem="relaxed", scope="gpu")
+            tl.atomic_add(Z + 2 * zp + 1, im, valid, sem="relaxed", scope="gpu")
+        else:
+            a = tl.load(A + p, valid, 0).to(ACC)
+            tl.atomic_add(Z + zp, a * xr[:, None], valid, sem="relaxed", scope="gpu")
+
+
+@triton.jit
+def _sharded_finish(Z, Y, N, YS, H: tl.constexpr, B: tl.constexpr,
+                    COMPLEX: tl.constexpr):
+    col = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B).to(tl.int64)
+    shard = tl.arange(0, H).to(tl.int64)
+    offset = shard[:, None] * N.to(tl.int64) + col[None, :]
+    yp = col * YS.to(tl.int64)
+    if COMPLEX:
+        re = tl.load(Z + 2 * offset, col[None, :] < N, 0)
+        im = tl.load(Z + 2 * offset + 1, col[None, :] < N, 0)
+        tl.store(Y + 2 * yp, tl.sum(re, 0), col < N)
+        tl.store(Y + 2 * yp + 1, tl.sum(im, 0), col < N)
+    else:
+        value = tl.load(Z + offset, col[None, :] < N, 0)
+        tl.store(Y + yp, tl.sum(value, 0), col < N)
+
+
+def compute_sharded(prepared, x, out=None):
+    """Per-run native CSR scatter; no transpose plan or persistent workspace."""
+    cfg = prepared.config
+    a = prepared.data.resolve_conj().resolve_neg().contiguous()
+    x = x.resolve_conj().resolve_neg()
+    n = prepared.n_cols
+    y = out if out is not None else torch.empty(n, dtype=a.dtype, device=a.device)
+    dtype = (torch.float32 if a.dtype in (torch.float16, torch.bfloat16)
+             else torch.float64 if a.dtype == torch.float32 else a.dtype)
+    h = cfg["output_shards"]
+    direct = h == 1 and y.dtype == dtype
+    element_bytes = {torch.float32: 4, torch.float64: 8, torch.complex64: 8, torch.complex128: 16}[dtype]
+    workspace = 0 if direct else h * n * element_bytes
+    if workspace > cfg["workspace_limit_bytes"]:
+        raise MemoryError(f"CSR sharded scatter needs {workspace} numerical workspace bytes; limit={cfg['workspace_limit_bytes']}")
+    stats = dict(output_shards=h, workspace_peak_bytes=workspace, descriptor_peak_bytes=0,
+                 atomic_buffer="out" if direct else "compute_workspace",
+                 initialization="zero_compute_buffer", output_conversion="none" if direct else "final_store",
+                 x_stride=tuple(x.stride()), y_stride=tuple(y.stride()))
+    if n == 0:
+        return y, stats
+    z = y if direct else torch.empty((h, n), dtype=dtype, device=a.device)
+    z.zero_()
+    complex_input = a.is_complex()
+    view = lambda t: torch.view_as_real(t) if complex_input else t
+    if a.numel() and prepared.n_rows:
+        _sharded_scatter[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+            view(a), prepared.kernel_indices, prepared.kernel_indptr, view(x), view(z),
+            prepared.n_rows, n, x.stride(0), y.stride(0) if direct else 1,
+            h, cfg["rows_per_program"], cfg["block_nnz"], complex_input, prepared.op == 2,
+            tl.float64 if dtype in (torch.float64, torch.complex128) else tl.float32,
+            num_warps=cfg["num_warps"], num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    if not direct:
+        _sharded_finish[(triton.cdiv(n, 128),)](
+            view(z), view(y), n, y.stride(0), h, 128, complex_input,
+            num_warps=cfg["num_warps"], num_stages=1)
+    return y, stats
+
+
 def prepare(indices, indptr, shape):
     """Prepare transpose topology; values are refreshed lazily during compute."""
     m, n = shape

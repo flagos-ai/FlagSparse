@@ -81,6 +81,8 @@ ops:
       New dtype/op combinations require hardware validation.
       Explicit csr_subgroup_pair_mixed: FP16/BF16 inputs, FP32 compute, same-type/FP32 output; hardware unverified.
       Explicit csr_rowgroup_stream_reduce: six floating/complex dtypes, non/trans/conj, four half mixed combinations; scan required; hardware unverified.
+      Explicit csr_row_refill_reduce: six floating/complex dtypes, non/trans/conj; local row-slot refill with no runtime partition plan; hardware unverified.
+      Explicit csr_transpose_sharded_atomic: six floating/complex dtypes, trans/conj only; native CSR output shards with compute-precision atomics; hardware unverified.
     for:
       - flagsparse_spmv_csr
       - flagsparse_spmv_csr_run

@@ -113,6 +113,8 @@ def _command_specs(
             "compare",
             "--dtypes",
             "float32,float64",
+            "--ops",
+            "all",
             "--index-dtypes",
             "int32,int64",
             "--timing",

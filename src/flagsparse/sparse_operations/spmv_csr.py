@@ -29,6 +29,8 @@ from . import mixed_spmx as _mixed_spmx
 _csr_config.set_known_backends(spec.name for spec in _common_mod.backend_specs())
 
 SPMV_CSR_NEW_ALGORITHMS = (
+    "csr_row_refill_reduce",
+    "csr_transpose_sharded_atomic",
     "csr_rowgroup_stream_reduce",
     "row_tile",
     "row_vector",
@@ -1476,9 +1478,15 @@ def _spmv_backend_caps(device):
     verified = (backend == "cuda" and target_name == "cuda" and arch.isdigit()) or (
         backend == "rocm" and target_name == "hip" and arch.startswith("gfx")
     )
+    atomic32 = atomic64 = None
+    if verified:
+        from ._spmm_csr_runtime import backend_caps
+
+        shared = backend_caps(device)
+        atomic32, atomic64 = shared.fp32_atomic, shared.fp64_atomic
     return _csr_config.BackendCaps(
         backend, arch, target_name, width, max_threads, verified, verified, verified,
-        scan=verified,
+        scan=verified, fp32_atomic=atomic32, fp64_atomic=atomic64,
     )
 
 
@@ -1658,9 +1666,10 @@ def _spmv_check_output(out, prepared, x, output_dtype=None):
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
-    if not out.is_contiguous() and prepared.alg not in ("csr_nnz_tile_reduce", "csr_rowgroup_stream_reduce"):
+    strided_algorithms = ("csr_nnz_tile_reduce", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic")
+    if not out.is_contiguous() and prepared.alg not in strided_algorithms:
         raise ValueError("out must be contiguous")
-    if prepared.alg in ("csr_nnz_tile_reduce", "csr_rowgroup_stream_reduce") and out.numel() > 1 and out.stride(0) <= 0:
+    if prepared.alg in strided_algorithms and out.numel() > 1 and out.stride(0) <= 0:
         raise ValueError("out must have non-overlapping positive strides")
     if out.is_conj() or out.is_neg():
         raise ValueError("out must not be a lazy conjugate or negative view")
@@ -1755,6 +1764,17 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
             "execution_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix("torch."),
         }
     alg = prepared.alg
+    if alg == "csr_transpose_sharded_atomic":
+        from ._spmv_csr_transpose import compute_sharded
+
+        (y, stats), compute_ms = _spmv_phase(
+            lambda: compute_sharded(prepared, x, out), timing
+        )
+        return y, dict(process_cpu_ms=0.0, process_gpu_ms=0.0 if timing else None,
+                       compute_ms=compute_ms,
+                       execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                       execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                       **stats)
     needs_process = prepared.transpose or alg in (
         "row_split_reduce",
         "row_adaptive_split",
@@ -1797,13 +1817,15 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
                        execution_indices_dtype=str(execution.kernel_indices.dtype).removeprefix("torch."),
                        execution_indptr_dtype=str(execution.kernel_indptr.dtype).removeprefix("torch."))
 
+    runtime_info = {}
+
     def compute():
-        vector = (x.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce")
+        vector = (x.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce")
                   else x.resolve_conj().contiguous())
         matrix = execution
-        if matrix.data.is_conj() or (alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce") and matrix.data.is_neg()):
+        if matrix.data.is_conj() or (alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce") and matrix.data.is_neg()):
             matrix = copy(matrix)
-            matrix.data = (matrix.data.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce")
+            matrix.data = (matrix.data.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce")
                            else matrix.data.resolve_conj())
             matrix._baseline_data = None
         if alg in SPMV_CSR_NEW_ALGORITHMS:
@@ -1816,6 +1838,8 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
                     matrix.n_rows, dtype=matrix.data.dtype, device=matrix.data.device
                 )
             )
+            if alg == "csr_row_refill_reduce":
+                runtime_info.update(x_stride=tuple(vector.stride()), y_stride=tuple(y.stride()))
             return kernels.compute(matrix, vector, y, alg, matrix.config, plan)
         if alg == "legacy_bucket_vector":
             return _triton_spmv_csr_impl_opt_prepared(
@@ -1829,6 +1853,7 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
 
     y, compute_ms = _spmv_phase(compute, timing)
     return y, {
+        **runtime_info,
         "process_cpu_ms": 0.0,
         "process_gpu_ms": process_ms,
         "compute_ms": compute_ms,
@@ -1955,6 +1980,7 @@ def flagsparse_spmv_csr_run(
             ),
             "transpose_strategy": (
                 "prepared_structure_gather" if _spmv_transpose_scatter_enabled(actual)
+                else "native_csr_sharded_scatter" if actual.alg == "csr_transpose_sharded_atomic"
                 else "per_run_csr_rebuild" if prepared.transpose else "none"
             ),
             "output_dtype": str(output_dtype).removeprefix("torch."),
@@ -1972,11 +1998,18 @@ def flagsparse_spmv_csr_run(
             meta.update(
                 process_gpu_ms=phases["process_gpu_ms"], compute_ms=phases["compute_ms"]
             )
-        if actual.alg == "csr_rowgroup_stream_reduce":
-            meta.update(execution_path="native_csr_rowgroup_stream_reduce", validation="unverified",
+        if actual.alg in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce"):
+            meta.update(execution_path="native_" + actual.alg, validation="unverified",
                         initialization="kernel_writes_all_rows", output_conversion="final_store",
                         workspace_peak_bytes=0, descriptor_peak_bytes=0,
-                        x_stride=tuple(x.stride()), y_stride=tuple(y.stride()))
+                        x_stride=phases.get("x_stride", tuple(x.stride())),
+                        y_stride=phases.get("y_stride", tuple(y.stride())))
+        if actual.alg == "csr_transpose_sharded_atomic":
+            meta.update(execution_path="native_csr_transpose_sharded_atomic", validation="unverified",
+                        x_stride=phases["x_stride"], y_stride=phases["y_stride"])
+            for key in ("output_shards", "workspace_peak_bytes", "descriptor_peak_bytes",
+                        "atomic_buffer", "initialization", "output_conversion"):
+                meta[key] = phases[key]
         if actual.alg == "csr_nnz_tile_reduce":
             # A fixed plan reports allocated slots, not a read-back count of
             # valid records. Preserve that distinction in the public metadata.

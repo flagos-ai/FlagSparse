@@ -50,6 +50,32 @@ spec.loader.exec_module(policy)
 
 
 class ConfigPolicy(unittest.TestCase):
+    def test_targeted_configuration_and_capabilities(self):
+        refill, shard = policy.TARGETED_ALGORITHMS
+        cfg, _ = policy.resolve_config(refill, self.cuda)
+        self.assertEqual((cfg["rows_per_program"], cfg["window_rows"]), (8, 128))
+        hip, _ = policy.resolve_config(refill, self.hip)
+        self.assertEqual(hip["rows_per_program"], 16)
+        for alg, bad in ((refill, {"window_rows": 7}), (refill, {"lanes_per_row": 3}),
+                         (refill, {"rows_per_program": 0}), (refill, {"output_shards": 2}),
+                         (shard, {"output_shards": 3}), (shard, {"workspace_limit_bytes": 0}),
+                         (shard, {"num_stages": 2}), (shard, {"output_shards": True})):
+            with self.subTest(alg=alg, config=bad), self.assertRaises(ValueError):
+                policy.resolve_config(alg, self.cuda, bad)
+        self.assertNotIn(shard, policy.list_algorithms(op="non"))
+        with self.assertRaises(NotImplementedError):
+            policy.validate_support(shard, "non", "float16", "int32", "int32", self.cuda)
+        unknown = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True)
+        with self.assertRaisesRegex(policy.BackendCapabilityUnavailable, "atomic"):
+            policy.validate_support(shard, "trans", "float16", "int32", "int32", unknown)
+        fp32_only = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True,
+                                      scan=True, fp32_atomic=True, fp64_atomic=False)
+        policy.validate_support(shard, "trans", "float16", "int32", "int32", fp32_only)
+        with self.assertRaisesRegex(policy.BackendCapabilityUnavailable, "fp64_atomic"):
+            policy.validate_support(shard, "trans", "float32", "int32", "int32", fp32_only)
+        with self.assertRaises(ValueError):
+            policy.assert_route_match(refill, cfg, alg=shard)
+
     def test_mixed_nnz_type_and_workspace_contract(self):
         caps = policy.BackendCaps("rocm", "gfx936", "hip", 64, 1024, True, True, True)
         spec = policy.algorithm_spec("csr_nnz_tile_reduce")
@@ -69,9 +95,9 @@ class ConfigPolicy(unittest.TestCase):
             policy.validate_support("csr_nnz_tile_reduce", "non", "float32", "int32", "int32", caps)
 
     def setUp(self):
-        self.cuda = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True)
+        self.cuda = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True, fp32_atomic=True, fp64_atomic=True)
         self.hip = policy.BackendCaps(
-            "rocm", "gfx90a", "hip", 64, 1024, True, True, True, scan=True
+            "rocm", "gfx90a", "hip", 64, 1024, True, True, True, scan=True, fp32_atomic=True, fp64_atomic=True
         )
 
     def test_registry_support(self):
@@ -81,9 +107,9 @@ class ConfigPolicy(unittest.TestCase):
                 self.assertNotIn(alg, policy.list_algorithms(dtype="float32"))
                 self.assertIn(alg, policy.list_algorithms(dtype="bfloat16", backend="rocm"))
                 continue
-            self.assertIn(alg, policy.list_algorithms("non", "torch.float32", "rocm"))
+            self.assertEqual(alg in policy.list_algorithms("non", "torch.float32", "rocm"), "non" in policy.algorithm_spec(alg)["ops"])
             self.assertIn(alg, policy.list_algorithms("trans", "float32", "cuda"))
-            self.assertIn(alg, policy.list_algorithms("non", "complex64", "cuda"))
+            self.assertEqual(alg in policy.list_algorithms("non", "complex64", "cuda"), "non" in policy.algorithm_spec(alg)["ops"])
             for backend in ("metax", "mthreads", "ascend"):
                 self.assertNotIn(alg, policy.list_algorithms(backend=backend))
         with self.assertRaises(ValueError):
@@ -92,10 +118,10 @@ class ConfigPolicy(unittest.TestCase):
             policy.normalize_alg("compare")
 
     def test_all_dtype_ops_and_precision_requirements(self):
-        no_fp64 = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, False, True, True, scan=True)
+        no_fp64 = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, False, True, True, scan=True, fp32_atomic=True, fp64_atomic=True)
         for alg in policy.ALGORITHMS:
             for dtype in policy.algorithm_spec(alg)["value_dtypes"]:
-                for op in ("non", "trans", "conj"):
+                for op in policy.algorithm_spec(alg)["ops"]:
                     policy.validate_support(alg, op, dtype, "int32", "int64", self.cuda)
             spec = policy.algorithm_spec(alg)
             self.assertEqual(spec["compute_dtype_by_input"]["complex64"], "complex64")
@@ -476,9 +502,14 @@ class IntegrationPolicy(unittest.TestCase):
         rows = ops_support.build_rows(SOURCE)
         for alg in policy.NEW_ALGORITHMS:
             cases = [row for row in rows if row["route"] == alg]
-            self.assertEqual(len(cases), 12 if alg in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else 36)
-            self.assertEqual({row["op"] for row in cases}, {"non", "trans", "conj"})
+            spec = policy.algorithm_spec(alg)
+            self.assertEqual(len(cases), len(spec["value_dtypes"]) * len(spec["index_dtypes"]) * len(spec["ops"]))
+            self.assertEqual({row["op"] for row in cases}, set(spec["ops"]))
             self.assertEqual({row["status"] for row in cases}, {"UNVERIFIED"})
+        tree = ast.parse((SOURCE / "spmv_csr.py").read_text(encoding="utf-8"))
+        declaration = next(n.value for n in tree.body if isinstance(n, ast.Assign)
+                           and any(isinstance(t, ast.Name) and t.id == "SPMV_CSR_NEW_ALGORITHMS" for t in n.targets))
+        self.assertEqual(set(ast.literal_eval(declaration)), set(policy.NEW_ALGORITHMS))
 
     def test_runner_preserves_algorithm_identity_and_latency(self):
         import run_flagsparse_pytest as runner
@@ -659,7 +690,7 @@ def test_generic_p1_config_and_capabilities():
     import pytest
     from dataclasses import replace
 
-    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True)
+    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True, fp32_atomic=True, fp64_atomic=True)
     alg = "csr_rowgroup_stream_reduce"
     cfg, _ = policy.resolve_config(alg, caps)
     assert cfg == dict(rows_per_program=16, block_nnz=128, num_warps=4, num_stages=1)

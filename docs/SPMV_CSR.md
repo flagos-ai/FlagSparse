@@ -2,9 +2,11 @@
 
 ## Algorithms and types
 
-All eight registered algorithms implement `non`, `trans`, and `conj`, with
-float16, bfloat16, float32, float64, complex64 and complex128 inputs. `conj` means
-`A.conj().T @ x`, not conjugation of x. Output dtype matches the input dtype.
+Consult `get_spmv_csr_algorithm_spec` for each algorithm's types and operations.
+General paths accept float16, bfloat16, float32, float64, complex64 and complex128;
+mixed-only candidates remain restricted to their declared half inputs.
+`csr_transpose_sharded_atomic` accepts only `trans/conj`; `conj` means
+`A.conj().T @ x`, not conjugation of x. Half inputs support same-type or FP32 output.
 
 The five new algorithms retain CUDA/ROCm profiles only. Other backends keep their
 existing paths; an explicit unsupported new algorithm must raise. Support
@@ -128,3 +130,14 @@ CSR reconstruction contract; this is not a transpose optimization.
 The default route and existing kernels are unchanged. Accuracy and performance
 remain unverified until the computing-node runs described in
 `MIXED_PRECISION_IMPLEMENTATION_PLAN.md` complete.
+
+## Targeted scheduling candidates (source integrated, hardware unverified)
+
+See [SpMV targeted algorithm design](SPMV_TARGETED_ALGORITHM_DESIGN.md) for
+the `csr_row_refill_reduce` and `csr_transpose_sharded_atomic` paths.
+Both names are registered through the original API, benchmark and pytest routes.
+Refill supports all three operations; sharded supports only trans/conj, directly
+reading original CSR without rebuilding a transpose. The design documents
+their differences from existing kernels, type and operation contracts,
+correctness arguments, expected costs, and controlled validation criteria.
+Existing algorithms and defaults remain unchanged.

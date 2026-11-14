@@ -8,6 +8,61 @@ from . import _common
 
 
 @triton.jit
+def row_refill_kernel(A, I, P, X, Y, M, XS, YS,
+                      R: tl.constexpr, V: tl.constexpr, W: tl.constexpr,
+                      COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    base = tl.program_id(0).to(tl.int64) * W
+    limit = tl.minimum(base + W, M)
+    row = base + tl.arange(0, R).to(tl.int64)
+    lane = tl.arange(0, V).to(tl.int64)
+    active = row < limit
+    pos = tl.load(P + row, active, 0).to(tl.int64)
+    end = tl.load(P + row + 1, active, 0).to(tl.int64)
+    cursor = tl.full((), R, tl.int64)
+    re = tl.zeros((R, V), ACC)
+    im = tl.zeros((R, V), ACC)
+    while tl.sum(active.to(tl.int32), 0) > 0:
+        p = pos[:, None] + lane[None, :]
+        valid = active[:, None] & (p < end[:, None])
+        col = tl.load(I + p, valid, 0).to(tl.int64)
+        xp = col * XS.to(tl.int64)
+        if COMPLEX:
+            ar = tl.load(A + 2 * p, valid, 0).to(ACC)
+            ai = tl.load(A + 2 * p + 1, valid, 0).to(ACC)
+            xr = tl.load(X + 2 * xp, valid, 0).to(ACC)
+            xi = tl.load(X + 2 * xp + 1, valid, 0).to(ACC)
+            re += ar * xr - ai * xi
+            im += ar * xi + ai * xr
+        else:
+            a = tl.load(A + p, valid, 0).to(ACC)
+            x = tl.load(X + xp, valid, 0).to(ACC)
+            re += a * x
+        pos = tl.minimum(pos + V, end)
+        done = active & (pos >= end)
+        count = tl.sum(done.to(tl.int32), 0)
+        if count > 0:
+            yp = row * YS.to(tl.int64)
+            if COMPLEX:
+                tl.store(Y + 2 * yp, tl.sum(re, 1), done)
+                tl.store(Y + 2 * yp + 1, tl.sum(im, 1), done)
+            else:
+                tl.store(Y + yp, tl.sum(re, 1), done)
+            rank = tl.cumsum(done.to(tl.int32), 0).to(tl.int64) - 1
+            candidate = base + cursor + rank
+            assign = done & (candidate < limit)
+            fresh_pos = tl.load(P + candidate, assign, 0).to(tl.int64)
+            fresh_end = tl.load(P + candidate + 1, assign, 0).to(tl.int64)
+            row = tl.where(done, candidate, row)
+            pos = tl.where(done, fresh_pos, pos)
+            end = tl.where(done, fresh_end, end)
+            re = tl.where(done[:, None], tl.full((R, V), 0, ACC), re)
+            if COMPLEX:
+                im = tl.where(done[:, None], tl.full((R, V), 0, ACC), im)
+            active = (active & ~done) | assign
+            cursor += count.to(tl.int64)
+
+
+@triton.jit
 def _rowgroup_segment_add(a, ha, b, hb):
     return tl.where(hb, b, a + b), ha | hb
 
@@ -520,6 +575,17 @@ def build_plan(prepared, config, adaptive):
 def compute(prepared, x, y, alg, config, plan=None):
     m = prepared.n_rows
     if not m:
+        return y
+    if alg == "csr_row_refill_reduce":
+        complex_input = prepared.data.is_complex()
+        view = lambda t: torch.view_as_real(t) if complex_input else t
+        acc = tl.float64 if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128) else tl.float32
+        row_refill_kernel[(triton.cdiv(m, config["window_rows"]),)](
+            view(prepared.data), prepared.kernel_indices, prepared.kernel_indptr,
+            view(x), view(y), m, x.stride(0), y.stride(0),
+            config["rows_per_program"], config["lanes_per_row"], config["window_rows"],
+            complex_input, acc, num_warps=config["num_warps"],
+            num_stages=config["num_stages"], enable_fp_fusion=False)
         return y
     if alg == "csr_rowgroup_stream_reduce":
         complex_input = prepared.data.is_complex()
