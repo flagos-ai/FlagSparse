@@ -374,6 +374,15 @@ _HIP_INDEX = {torch.int32: 2, torch.int64: 3}
 _HIP_ORDER = {"col": 1, "row": 2}
 
 
+def _native_operations(op_a, op_b, a_dtype, rhs_dtype):
+    """Real conjugate-transpose is transpose; complex conjugation is preserved."""
+    if op_a not in _OP or op_b not in _OP:
+        raise ValueError(f"invalid native baseline operations: {op_a}/{op_b}")
+    actual_a = "trans" if op_a == "conj" and not a_dtype.is_complex else op_a
+    actual_b = "trans" if op_b == "conj" and not rhs_dtype.is_complex else op_b
+    return actual_a, actual_b
+
+
 def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
                                 compute_dtype, backend, matrix):
     """Explicit native baseline, with a device-local handle owned by this plan.
@@ -420,6 +429,7 @@ def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
 
     types = _HIP_TYPES if hip else _CUDA_TYPES
     operations = _HIP_OP if hip else _OP
+    actual_a, actual_b = _native_operations(op_a, op_b, arrays[0].dtype, rhs.dtype)
     index_types = _HIP_INDEX if hip else {torch.int32: _INDEX_32I, torch.int64: _INDEX_64I}
     orders = _HIP_ORDER if hip else {"col": _ORDER_COL, "row": _ORDER_ROW}
     if any(t.device != rhs.device for t in (*arrays, out)):
@@ -474,9 +484,9 @@ def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
             rhs_d, out_d = dense(rhs), dense(out)
             one, zero = _scalar(1, compute_dtype), _scalar(0, compute_dtype)
             operation = "SpMM" if matrix else "SpMV"
-            arguments = (handle, operations[op_a])
+            arguments = (handle, operations[actual_a])
             if matrix:
-                arguments += (operations[op_b],)
+                arguments += (operations[actual_b],)
             arguments += (ctypes.byref(one), sparse, rhs_d, ctypes.byref(zero), out_d, types[compute_dtype], 0)
             size = ctypes.c_size_t()
             execute = function(operation)
@@ -497,6 +507,10 @@ def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
         plan = _Plan(run, (library, arrays, rhs, out, one, zero, workspace), list(reversed(destroy)))
         plan.metadata = dict(vendor_backend=prefix, vendor_version=version.value,
                              vendor_alg="default", vendor_preprocessed=preprocessed,
+                             vendor_op_a_requested=op_a, vendor_op_b_requested=op_b,
+                             vendor_op_a_executed=actual_a, vendor_op_b_executed=actual_b,
+                             vendor_operation_mapping=("real_conjugate_transpose_equals_transpose"
+                                                       if (actual_a, actual_b) != (op_a, op_b) else "identity"),
                              compute_dtype=str(compute_dtype))
         return plan
     except BaseException:
@@ -509,6 +523,8 @@ def prepare_spmv(fmt, arrays, shape, x, y, op, compute_dtype, *, backend=None):
     """y = op(A) @ x; x / y dtypes may differ from A's (mixed precision)."""
     if backend is not None:
         return _prepare_registered_generic(fmt, arrays, shape, x, y, op, "non", compute_dtype, backend, False)
+    requested_op = op
+    op, _ = _native_operations(op, "non", arrays[0].dtype, x.dtype)
     lib, handle = _lib(), _handle()
     values = arrays[0]
     m = _spmat(fmt, arrays, shape, values.dtype)
@@ -536,13 +552,20 @@ def prepare_spmv(fmt, arrays, shape, x, y, op, compute_dtype, *, backend=None):
         return y
 
     destroy = [(lib.cusparseDestroySpMat, m), (lib.cusparseDestroyDnVec, x_d), (lib.cusparseDestroyDnVec, y_d)]
-    return _Plan(run, (arrays, x, y, work, one, zero), destroy)
+    plan = _Plan(run, (arrays, x, y, work, one, zero), destroy)
+    plan.metadata = dict(vendor_op_a_requested=requested_op, vendor_op_b_requested="non",
+                         vendor_op_a_executed=op, vendor_op_b_executed="non",
+                         vendor_operation_mapping="identity" if op == requested_op else
+                         "real_conjugate_transpose_equals_transpose")
+    return plan
 
 
 def prepare_spmm(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, *, backend=None):
     """C = op(A) @ op(B); B / C may be row- or column-major views."""
     if backend is not None:
         return _prepare_registered_generic(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, backend, True)
+    requested_a, requested_b = op_a, op_b
+    op_a, op_b = _native_operations(op_a, op_b, arrays[0].dtype, B.dtype)
     lib, handle = _lib(), _handle()
     values = arrays[0]
     m = _spmat(fmt, arrays, shape, values.dtype)
@@ -570,7 +593,12 @@ def prepare_spmm(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, *, backend
         return C
 
     destroy = [(lib.cusparseDestroySpMat, m), (lib.cusparseDestroyDnMat, b_d), (lib.cusparseDestroyDnMat, c_d)]
-    return _Plan(run, (arrays, B, C, work, one, zero), destroy)
+    plan = _Plan(run, (arrays, B, C, work, one, zero), destroy)
+    plan.metadata = dict(vendor_op_a_requested=requested_a, vendor_op_b_requested=requested_b,
+                         vendor_op_a_executed=op_a, vendor_op_b_executed=op_b,
+                         vendor_operation_mapping="identity" if (op_a, op_b) == (requested_a, requested_b) else
+                         "real_conjugate_transpose_equals_transpose")
+    return plan
 
 
 def _vendor_python_launch(script, request, response):
@@ -700,7 +728,7 @@ def _isolated_benchmark_worker(request, response):
         passed = finite and torch.allclose(actual, golden, rtol=payload["rtol"], atol=payload["atol"])
         result = dict(plan.metadata, vendor_status="PASS" if passed else "FAIL",
                       vendor_ms=elapsed, vendor_max_error=error,
-                      vendor_reason="" if finite else "non-finite output or reference",
+                      vendor_reason=("" if passed else "correctness check failed" if finite else "non-finite output or reference"),
                       vendor_output_nonfinite=int((~torch.isfinite(actual)).sum()))
     except NotImplementedError as exc:
         result = dict(vendor_status="SKIP", vendor_reason=str(exc), vendor_error_stage=stage)

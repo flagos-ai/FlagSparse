@@ -444,6 +444,76 @@ def test_generic_plan_close_is_idempotent():
     assert released == ["descriptor"]
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32,
+                                   torch.float64, torch.complex64, torch.complex128])
+@pytest.mark.parametrize("op_a", ["non", "trans", "conj"])
+@pytest.mark.parametrize("op_b", ["non", "trans", "conj"])
+def test_vendor_real_operation_mapping(dtype, op_a, op_b):
+    from tests.cusparse_generic_baseline import _native_operations
+
+    expected = lambda op: "trans" if op == "conj" and not dtype.is_complex else op
+    assert _native_operations(op_a, op_b, dtype, dtype) == (expected(op_a), expected(op_b))
+    # A and B are normalized independently, never discard complex conjugation.
+    assert _native_operations("conj", "conj", torch.float16, torch.complex64) == ("trans", "conj")
+    with pytest.raises(ValueError):
+        _native_operations("invalid", op_b, dtype, dtype)
+
+
+@pytest.mark.parametrize("backend", ["cuda", "rocm"])
+@pytest.mark.parametrize("matrix", [False, True])
+@pytest.mark.parametrize("fmt", ["csr", "coo", "csc"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.complex64])
+def test_vendor_effective_operations_reach_native_call(monkeypatch, backend, matrix, fmt, dtype):
+    import ctypes
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from tests import cusparse_generic_baseline as baseline
+
+    prefix = "hipsparse" if backend == "rocm" else "cusparse"
+    operation = "SpMM" if matrix else "SpMV"
+    captured, released = [], []
+
+    class Function:
+        def __init__(self, name):
+            self.name = name
+
+        def __call__(self, *args):
+            if self.name == prefix + operation + "_bufferSize":
+                captured.append(args[1:3] if matrix else args[1:2])
+                return 3  # Unknown invalid arguments must remain ERROR, never SKIP.
+            if self.name.startswith(prefix + "Create"):
+                ctypes.cast(args[0], ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(17)
+            elif self.name == prefix + "GetVersion":
+                ctypes.cast(args[1], ctypes.POINTER(ctypes.c_int))[0] = 12000
+            elif self.name.startswith(prefix + "Destroy"):
+                released.append(self.name)
+            return 0
+
+    suffixes = ["Create", "Destroy", "SetStream", "GetVersion", "Create" + fmt.capitalize(), "DestroySpMat",
+                "CreateDnMat" if matrix else "CreateDnVec", "DestroyDnMat" if matrix else "DestroyDnVec",
+                operation, operation + "_bufferSize"]
+    library = SimpleNamespace(**{prefix + suffix: Function(prefix + suffix) for suffix in suffixes})
+    monkeypatch.setattr(baseline.ctypes, "CDLL", lambda name: library)
+    monkeypatch.setattr(baseline.ctypes.util, "find_library", lambda name: name)
+    monkeypatch.setattr(torch.version, "hip", "6.1" if backend == "rocm" else None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=23))
+
+    def tensor(dt, dense=False):
+        return SimpleNamespace(dtype=dt, device=torch.device("cuda:0"), ndim=2 if dense and matrix else 1,
+                               shape=(1, 1), is_contiguous=lambda: True, numel=lambda: 1,
+                               stride=lambda axis: 1, data_ptr=lambda: 19)
+
+    arrays = (tensor(dtype), tensor(torch.int32), tensor(torch.int32))
+    with pytest.raises(RuntimeError, match="bufferSize.*status 3"):
+        baseline._prepare_registered_generic(fmt, arrays, (1, 1), tensor(dtype, True),
+            tensor(dtype, True), "conj", "conj" if matrix else "non",
+            torch.complex64 if dtype.is_complex else torch.float32, backend, matrix)
+    op = 2 if dtype.is_complex else 1
+    assert captured == [(op, op) if matrix else (op,)]
+    assert len(released) == 4  # two dense descriptors, sparse descriptor, handle
+
+
 def test_hipsparse_partial_descriptor_failure_releases_resources(monkeypatch):
     import ctypes
     from contextlib import nullcontext

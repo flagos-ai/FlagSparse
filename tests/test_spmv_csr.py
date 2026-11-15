@@ -4,9 +4,11 @@
 import argparse
 import csv
 import json
+import math
 import platform
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 __test__ = False
@@ -461,8 +463,10 @@ def main(argv=None):
                                     )
                                     row["speedup_vs_vendor"] = (
                                         row["vendor_ms"] / row["ms"]
-                                        if ok
-                                        and row["vendor_status"] == "PASS"
+                                        if isinstance(row.get("vendor_ms"), (int, float))
+                                        and math.isfinite(row["vendor_ms"])
+                                        and row["vendor_ms"] > 0
+                                        and math.isfinite(row["ms"])
                                         and row["ms"] > 0
                                         else None
                                     )
@@ -470,10 +474,11 @@ def main(argv=None):
                                 except NotImplementedError as exc:
                                     row.update(status="SKIP", reason=str(exc))
                                 except Exception as exc:
-                                    row.update(status="FAIL", reason=str(exc))
+                                    traceback.print_exc()
+                                    row.update(status="ERROR", reason=str(exc))
                                     failures += 1
                                 emit(row)
-                                if args.fail_fast and row["status"] == "FAIL":
+                                if args.fail_fast and row["status"] == "ERROR":
                                     raise RuntimeError(row["reason"])
     finally:
         if csv_file:
