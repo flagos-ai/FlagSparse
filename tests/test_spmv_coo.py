@@ -387,7 +387,7 @@ def _time_flagsparse_coo_row_run(
             warmup,
             iters,
         )
-        total_ms = process_gpu_ms + compute_ms
+        # Keep the original full-run measurement as the primary result.
     return {
         "out": y,
         "ms": total_ms,
@@ -409,19 +409,16 @@ def _time_flagsparse_coo_atomic(
     iters,
     timing=False,
 ):
-    launch = _build_flagsparse_coo_launch(
-        data,
-        row,
-        col,
-        shape,
-        False,
-        str(op).lower(),
-    )
-    y, gpu_ms = _cuda_event_benchmark(
-        lambda: _run_flagsparse_coo_launch(launch, x),
-        warmup,
-        iters,
-    )
+    launch = (_build_flagsparse_coo_launch(data, row, col, shape, False, "non")
+              if str(op).lower() == "non" else None)
+
+    def full_op():
+        # Preserve non setup; only requested trans/conj work moves into timing.
+        runtime = (launch if launch is not None else
+                   _build_flagsparse_coo_launch(data, row, col, shape, False, str(op).lower()))
+        return _run_flagsparse_coo_launch(runtime, x)
+
+    y, gpu_ms = _cuda_event_benchmark(full_op, warmup, iters)
     return {
         "out": y,
         "ms": gpu_ms,

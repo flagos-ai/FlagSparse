@@ -126,7 +126,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     from tests import cusparse_generic_baseline as vendor
     from tests import mtx_fast
     from tests.pytest.accuracy_utils import close_tolerances
-    from tests.utils import filtered_avg_ms, sparse_work_metrics, benchmark_sample_summary, sparse_reference_metrics
+    from tests.utils import filtered_avg_ms, paired_timing_summary, sparse_work_metrics, benchmark_sample_summary, sparse_reference_metrics
 
     def selection(value, allowed):
         result = tuple(allowed) if value == "all" else tuple(dict.fromkeys(str(value).split(",")))
@@ -228,7 +228,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
         writer.writeheader()
         stream.flush()
     print("Registered type combinations; prepare excluded; full run includes required conversions and reductions.")
-    print("ms=process_cpu_ms+gpu_ms; median +/-10% mean; phase diagnostics measured separately.")
+    print("ms=process_cpu_ms+gpu_ms; paired total median +/-10% mean; phase diagnostics measured separately.")
     print(f"{'Matrix':24} {'A/RHS/Out':23} {'A/B':9} {'Lay/N':9} {'Algorithm':32} {'ms':>9} {'CPU':>8} {'ProcGPU':>8} {'Compute':>8} {'Vendor':>9} {'V/Alg':>8}"
           + (" Wall GPU-GF/s GPU-LGB/s" if metrics_enabled else "") + " Status")
     if metrics_enabled:
@@ -331,7 +331,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                    rhs_dtype=combo[1], compute_dtype="float32", output_dtype=combo[2], op=op,
                                    op_a=op, op_b=op_b, layout=layout, dense_cols=ncols, index_dtype=index,
                                    indptr_dtype=ptr, alg=alg, alg_requested=alg, backend=backend, m=shape[0], n=shape[1], nnz=a.numel(),
-                                   timed="prepared_run", sample_rule="median +/-10% mean", status="ERROR",
+                                   timed="prepared_run", sample_rule="paired total median +/-10% mean", status="ERROR",
                                    source_nonfinite=source_nonfinite, source_max_abs=source_max_abs)
                         if metrics_enabled:
                             row.update(environment, matrix_fingerprint=matrix_fingerprint, rhs_fingerprint=rhs_fingerprint)
@@ -359,13 +359,15 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 result, elapsed, meta = run(prepared, rhs, **kwargs)
                                 gpu.append(float(meta.get("gpu_ms", elapsed)))
                                 cpu.append(float(meta.get("process_cpu_ms", 0.0)))
-                            row.update(gpu_ms=filtered_avg_ms(gpu), process_cpu_ms=filtered_avg_ms(cpu))
+                            row.update(paired_timing_summary(cpu, gpu))
                             row["ms"] = row["gpu_ms"] + row["process_cpu_ms"]
                             if metrics_enabled:
                                 row.update(sparse_work_metrics(operator=operator, shape=tuple(map(int, shape)), nnz=a.numel(),
                                     dense_cols=ncols, a_dtype=combo[0], rhs_dtype=combo[1], output_dtype=combo[2],
                                     index_dtype=index, indptr_dtype=ptr, op=op, ms=row["ms"], gpu_ms=row["gpu_ms"]))
-                                row.update(benchmark_sample_summary(gpu))
+                                sample_summary = benchmark_sample_summary([c + g for c, g in zip(cpu, gpu)])
+                                sample_summary.pop("sample_kept", None)  # retain the paired median fallback count
+                                row.update(sample_summary)
                                 row.update(sparse_reference_metrics(row, **reference_options))
                                 # CPU processing inside the outer event can already be included
                                 # in its elapsed interval. Keep historical ms, label the risk.
@@ -429,7 +431,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                     vendor_results[output_stride] = vendor_result
                                 row.update({key: value for key, value in vendor_result.items()
                                             if key.startswith("vendor_")})
-                                if row.get("vendor_ms") is not None and row["ms"] > 0:
+                                if row["status"] == "PASS" and row["vendor_status"] == "PASS" and row.get("vendor_ms") is not None and row["ms"] > 0:
                                     row["speedup_vs_vendor"] = row["vendor_ms"] / row["ms"]
                                 if row["vendor_status"] == "ERROR":
                                     if args.fail_fast:

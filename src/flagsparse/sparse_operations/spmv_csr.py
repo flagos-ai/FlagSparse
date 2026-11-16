@@ -1056,12 +1056,7 @@ def prepare_spmv_csr(
         index_fallback_policy=index_fallback_policy,
     )
     prepared = _configure_spmv_route(prepared, requested_alg, config)
-    if _spmv_transpose_scatter_enabled(prepared):
-        from . import _spmv_csr_transpose
-        prepared.transpose_plan = _spmv_csr_transpose.prepare(
-            kernel_indices, kernel_indptr, shape
-        )
-    elif (not transpose and requested_alg == "auto" and config is None
+    if (not transpose and requested_alg == "auto" and config is None
           and _backend_name() == "cuda" and data.dtype in (torch.float16, torch.complex64)):
         from . import _spmv_csr_transpose
         prepared.non_gather_plan = _spmv_csr_transpose.make_plan(
@@ -1753,12 +1748,17 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
     if _spmv_transpose_scatter_enabled(prepared):
         from . import _spmv_csr_transpose
 
+        # Build invocation-local transpose topology inside the full-run event.
+        execution = copy(prepared)
+        execution.transpose_plan, process_ms = _spmv_phase(
+            lambda: _spmv_csr_transpose.prepare(
+                prepared.kernel_indices, prepared.kernel_indptr, prepared.shape), timing)
         y, compute_ms = _spmv_phase(
-            lambda: _spmv_csr_transpose.compute(prepared, x, out), timing
+            lambda: _spmv_csr_transpose.compute(execution, x, out), timing
         )
         return y, {
             "process_cpu_ms": 0.0,
-            "process_gpu_ms": 0.0 if timing else None,
+            "process_gpu_ms": process_ms,
             "compute_ms": compute_ms,
             "execution_indices_dtype": str(prepared.kernel_indices.dtype).removeprefix("torch."),
             "execution_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix("torch."),
@@ -1979,7 +1979,7 @@ def flagsparse_spmv_csr_run(
                 compute_dtype, compute_dtype
             ),
             "transpose_strategy": (
-                "prepared_structure_gather" if _spmv_transpose_scatter_enabled(actual)
+                "per_run_structure_gather" if _spmv_transpose_scatter_enabled(actual)
                 else "native_csr_sharded_scatter" if actual.alg == "csr_transpose_sharded_atomic"
                 else "per_run_csr_rebuild" if prepared.transpose else "none"
             ),

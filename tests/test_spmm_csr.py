@@ -38,9 +38,9 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 if __package__:
-    from .utils import filtered_avg_ms, cupy_event_benchmark_filtered
+    from .utils import filtered_avg_ms, cupy_event_benchmark_filtered, operator_benchmark_filtered
 else:
-    from utils import filtered_avg_ms, cupy_event_benchmark_filtered
+    from utils import filtered_avg_ms, cupy_event_benchmark_filtered, operator_benchmark_filtered
 
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
@@ -366,8 +366,8 @@ def _cupy_event_benchmark(op, warmup, iters):
 def _time_route(
     prepared, B, alg, warmup, iters, timing=False, diagnose=False, layout="row", config=None
 ):
-    out, gpu_ms = _cuda_event_benchmark(
-        lambda: fs.flagsparse_spmm_csr_run(prepared, B, alg=alg, dense_layout=layout, config=config),
+    out, measured, _ = operator_benchmark_filtered(
+        lambda: fs.flagsparse_spmm_csr_run(prepared, B, alg=alg, dense_layout=layout, config=config, return_time=True, return_meta=True),
         warmup,
         iters,
     )
@@ -381,7 +381,10 @@ def _time_route(
         timing=bool(timing),
         diagnostics=bool(diagnose),
     )
-    process_cpu_ms = float(meta.get("process_cpu_ms", 0.0) or 0.0)
+    process_cpu_ms = measured["process_cpu_ms"]
+    gpu_ms = measured["gpu_ms"]
+    meta.update(gpu_ms=gpu_ms, process_cpu_ms=process_cpu_ms,
+                operator_ms=measured["ms"], op_total_ms=measured["ms"])
     row = {
         "metadata": json.dumps(meta, default=str, ensure_ascii=False),
         "alg": meta.get("alg", alg),

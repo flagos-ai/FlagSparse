@@ -1144,7 +1144,16 @@ def flagsparse_spmv_coo(
             op_code = prepared.op
         elif not op_explicit and transpose is not None:
             op_code = _normalize_spmv_coo_op(None, transpose=transpose_flag)
-    launch = _resolve_spmv_coo_launch(prepared, op_code)
+    t0 = None
+    if return_time:
+        _ACCEL.synchronize()
+        t0 = time.perf_counter()
+    if _spmv_coo_op_transposes(op_code) and getattr(prepared, "original_inputs", ()):
+        launch = _prepare_spmv_coo_launch_from_raw(
+            *prepared.original_inputs, prepared.shape, sort_by_row=prepared.sort_by_row,
+            op=op_code, index_fallback_policy=prepared.index_fallback_policy)
+    else:
+        launch = _resolve_spmv_coo_launch(prepared, op_code)
     output_dtype = _mixed_spmx.resolve_registered_types(
         launch.data.dtype, x.dtype, out=out, out_dtype=out_dtype
     )["output_dtype"]
@@ -1162,10 +1171,6 @@ def flagsparse_spmv_coo(
         raise ValueError("num_warps must be a power of 2 in [1, 32]")
     if block_inner <= 0 or (block_inner & (block_inner - 1)) != 0:
         raise ValueError("block_inner must be a positive power of 2")
-    t0 = None
-    if return_time:
-        _ACCEL.synchronize()
-        t0 = time.perf_counter()
     if launch.data.dtype in (torch.float16, torch.bfloat16):
         from copy import copy
 
@@ -1518,6 +1523,8 @@ def _coo_measure_run(execute, return_time, return_meta, timing):
         meta["gpu_ms"] = start.elapsed_time(end)
         meta["process_cpu_ms"] = 0.0
         meta["operator_ms"] = meta["gpu_ms"]
+        meta["ms"] = meta["op_total_ms"] = meta["operator_ms"]
+        meta["timing_method"] = "full_gpu_event"
     if timing:
         phases = Phases(True)
         execute(phases)

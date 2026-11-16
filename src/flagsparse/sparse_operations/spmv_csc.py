@@ -514,7 +514,7 @@ def prepare_spmv_csc(
     ), original_inputs)
 
 
-def _validate_spmv_csc_x(x, prepared, op_code):
+def _validate_spmv_csc_x(x, prepared, op_code, *, materialize=True):
     if x is None or not torch.is_tensor(x):
         raise TypeError("x must be a torch.Tensor")
     if x.ndim != 1:
@@ -528,7 +528,7 @@ def _validate_spmv_csc_x(x, prepared, op_code):
         raise ValueError(f"x length must be {expected}, got {x.numel()}")
     if x.device != prepared.data.device:
         raise ValueError("x must be on the same device as sparse matrix data")
-    return x.contiguous()
+    return x.contiguous() if materialize else x
 
 
 @triton.jit
@@ -1579,48 +1579,49 @@ def flagsparse_spmv_csc_run(prepared, x, *, alg=None, config=None, op=None, out=
                                   out_dtype=out_dtype, return_time=return_time, return_meta=return_meta, timing=timing)
     if alg not in (None, "auto", "spmv_csc_base") or config is not None:
         raise ValueError("prepare with alg before switching a legacy CSC prepared route")
-    if prepared.data.dtype in (torch.float16, torch.bfloat16):
-        from copy import copy
-        from .spmv_coo import _coo_measure_run
-        from ._spmm_csr_runtime import output_has_internal_overlap
+    from copy import copy
+    from .spmv_coo import _coo_measure_run
+    from ._spmm_csr_runtime import output_has_internal_overlap
 
-        code = prepared.op if op is None else _normalize_spmv_csc_op(op)
-        if code != prepared.op:
-            raise ValueError("op conflicts with prepared CSC")
-        output_dtype = _mixed_spmx.resolve_registered_types(
-            prepared.data.dtype, x.dtype, out=out, out_dtype=out_dtype
-        )["output_dtype"]
-        rows = prepared.n_cols if _spmv_csc_op_transposes(code) else prepared.n_rows
-        if out is not None:
-            if out.shape != (rows,) or out.dtype != output_dtype or out.device != prepared.data.device:
-                raise ValueError("out shape/dtype/device mismatch")
-            if any(torch._C._overlaps(out, value) for value in
-                   (prepared.data, prepared.kernel_indices, prepared.kernel_indptr, x)):
-                raise ValueError("out overlaps an input")
-            if output_has_internal_overlap(out):
-                raise ValueError("out must have non-overlapping storage")
-        vector = _validate_spmv_csc_x(x, prepared, code)
+    code = prepared.op if op is None else _normalize_spmv_csc_op(op)
+    if code != prepared.op:
+        raise ValueError("op conflicts with prepared CSC")
+    output_dtype = _mixed_spmx.resolve_registered_types(
+        prepared.data.dtype, x.dtype, out=out, out_dtype=out_dtype
+    )["output_dtype"]
+    rows = prepared.n_cols if _spmv_csc_op_transposes(code) else prepared.n_rows
+    if out is not None:
+        if out.shape != (rows,) or out.dtype != output_dtype or out.device != prepared.data.device:
+            raise ValueError("out shape/dtype/device mismatch")
+        if any(torch._C._overlaps(out, value) for value in
+               (prepared.data, prepared.kernel_indices, prepared.kernel_indptr, x)):
+            raise ValueError("out overlaps an input")
+        if output_has_internal_overlap(out):
+            raise ValueError("out must have non-overlapping storage")
+    vector = _validate_spmv_csc_x(x, prepared, code, materialize=False)
 
-        def execute(phases):
-            with phases.measure("process_gpu_ms"):
-                execution = copy(prepared)
-                execution.data = prepared.data.float()
-                operand = vector.float()
-            with phases.measure("compute_ms"):
-                result = _run_spmv_csc_prepared_with_fallback(execution, operand, code).to(output_dtype)
-                if out is not None:
-                    out.copy_(result)
-                    result = out
-            return result, dict(alg="spmv_csc_base", alg_resolved="spmv_csc_base",
-                a_dtype=str(prepared.data.dtype), rhs_dtype=str(x.dtype),
-                compute_dtype="torch.float32", output_dtype=str(output_dtype),
-                conversion_mode="materialize", op=_spmv_csc_op_to_name(code),
-                execution_path="torch_npu" if _is_ascend_runtime() else "native_csc",
-                process_cpu_ms=0.0)
+    def execute(phases):
+        with phases.measure("process_gpu_ms"):
+            half_input = prepared.data.dtype in (torch.float16, torch.bfloat16)
+            execution = copy(prepared)
+            execution.data = prepared.data.resolve_conj().resolve_neg()
+            operand = vector.resolve_conj().resolve_neg().contiguous()
+            if half_input:
+                execution.data = execution.data.float()
+                operand = operand.float()
+        with phases.measure("compute_ms"):
+            result = _run_spmv_csc_prepared_with_fallback(execution, operand, code).to(output_dtype)
+            if out is not None:
+                out.copy_(result)
+                result = out
+        return result, dict(alg="spmv_csc_base", alg_resolved="spmv_csc_base",
+            a_dtype=str(prepared.data.dtype), rhs_dtype=str(x.dtype),
+            compute_dtype="torch.float32" if half_input else str(prepared.data.dtype), output_dtype=str(output_dtype),
+            conversion_mode="materialize" if half_input else "native", op=_spmv_csc_op_to_name(code),
+            execution_path="torch_npu" if _is_ascend_runtime() else "native_csc",
+            process_cpu_ms=0.0)
 
-        return _coo_measure_run(execute, return_time, return_meta, timing)
-    return flagsparse_spmv_csc(prepared=prepared, x=x, op=op, out=out,
-                               out_dtype=out_dtype, return_time=return_time, return_meta=return_meta)
+    return _coo_measure_run(execute, return_time, return_meta, timing)
 
 
 @triton.jit

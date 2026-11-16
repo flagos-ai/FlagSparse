@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 
 from ._common import *
+from ._timing_contract import separate_timing_diagnostics
 from . import _common as _common_mod
 from ._rocm_sparse_cache import TensorPlanCache
 
@@ -1722,6 +1723,7 @@ def _run_spmm_csc_prepared_with_fallback(prepared, B, algorithm, collect_timing=
         return C, meta
 
 
+@separate_timing_diagnostics
 def flagsparse_spmm_csc_run(
     prepared,
     B,
@@ -1787,7 +1789,7 @@ def flagsparse_spmm_csc_run(
     if timing:
         conversion_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
         conversion_events[0].record()
-    operand = B.resolve_conj()
+    operand = B.resolve_conj().resolve_neg()
     half_input = prepared.data.dtype in (torch.float16, torch.bfloat16)
     if half_input:
         from copy import copy
@@ -1854,12 +1856,8 @@ def flagsparse_spmm_csc_run(
             "index_fallback_applied": bool(route_meta.get("index_fallback_applied", prepared.index_fallback_applied)),
             "index_fallback_reason": route_meta.get("index_fallback_reason", prepared.index_fallback_reason),
         }
-        if timing:
-            meta["op_total_ms"] = (
-                process_cpu_ms + meta["process_gpu_ms"] + float(meta["compute_ms"] or 0.0)
-            )
-        else:
-            meta["op_total_ms"] = operator_ms
+        # Split diagnostics must never redefine the full-run denominator.
+        meta["op_total_ms"] = operator_ms
         if return_time:
             return C, operator_ms, meta
         return C, meta

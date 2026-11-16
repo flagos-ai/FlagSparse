@@ -496,29 +496,18 @@ def _time_cusparse_csc(data, indices, indptr, B, shape, op, layout, warmup, iter
     ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
     B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
     A = cpx_sparse.csc_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    # Everything that is a format conversion is hoisted out of the timed window, the
-    # same contract the other operators' baselines use.  Two things used to sit inside:
-    #
-    #  * cupy's dense-operand path (`_csc.py`/`_csr.py`, the `other.ndim == 2` branch)
-    #    calls `cupy.asfortranarray(other)`, so a C-contiguous B was transposed into a
-    #    fresh n_cols x k buffer on *every* iteration.  Measured cost: 1.28x on
-    #    ecology1 and 1.23x on roadNet-TX (both ~1e6 columns), <=1.03x elsewhere --
-    #    i.e. it inflated the baseline, making our ratio look better than it is.
-    #  * `A.conj()` allocates a conjugated copy of all nnz values per call; `.T` on a
-    #    csc_matrix is a zero-copy csr view, but the conj in front of it is not.
-    #
-    # `cupyx.cusparse.spmm(csc, B_f)` is not a separate faster path here: cupy maps csc
-    # to `csrmm2(self.T, ..., transa=True)` either way (measured within 0.03%).
-    B_cp = cp.asfortranarray(B_cp)
-    if op == "non":
-        A_eff = A
-    elif op == "trans":
-        A_eff = A.T
-    elif op == "conj":
-        A_eff = A.conj().T
-    else:
-        raise ValueError(f"unsupported op: {op}")
-    fn = lambda: A_eff @ B_cp
+    # Input descriptor construction is setup; op(A) and RHS layout work
+    # required by each wrapper call belong to the measured invocation.
+    def fn():
+        if op == "non":
+            operand = A
+        elif op == "trans":
+            operand = A.T
+        elif op == "conj":
+            operand = A.conj().T
+        else:
+            raise ValueError(f"unsupported op: {op}")
+        return operand @ B_cp
     out_cp, elapsed_ms = cupy_event_benchmark_filtered(fn, warmup, iters)
     out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
     return elapsed_ms, None, out

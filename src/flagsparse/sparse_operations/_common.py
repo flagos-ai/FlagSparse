@@ -3398,27 +3398,40 @@ def _benchmark_spmv_coo_sparse_ref(
         result["reason"] = None
         return result
 
-    data_cp = _cupy_from_torch(data)
-    row_cp = _cupy_from_torch(row.to(torch.int64))
-    col_cp = _cupy_from_torch(col.to(torch.int64))
-    x_cp = _cupy_from_torch(x)
-    matrix = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
-    # cupy has no native COO matvec: cupyx.scipy.sparse._base.__matmul__ delegates to
-    # __mul__, which is ``self.tocsr().__mul__(other)``, and coo_matrix does not
-    # override it.  Timing ``coo_matrix @ x`` therefore charges cuSPARSE a full
-    # COO->CSR sort+scan on *every* iteration, which is what made this column read
-    # ~75x slower than the kernel it is meant to represent.  Hoist the conversion out
-    # so the timed window holds only the SpMV kernel, matching how every other
-    # operator's vendor baseline is measured.
-    matrix_csr = matrix.tocsr()
-    values_cp, ms = _benchmark_cuda_op(
-        lambda: _apply_cupy_sparse_matmul_op(matrix_csr, x_cp, op_name),
-        warmup=warmup,
-        iters=iters,
-        filter_samples=True,
-    )
+    try:
+        from cupyx import cusparse as cupy_cusparse
+        if not cupy_cusparse.check_availability("spmv"):
+            raise NotImplementedError("CuPy native COO SpMV is unavailable")
+    except (ImportError, AttributeError, NotImplementedError) as exc:
+        result.update(backend=None, reason=str(exc))
+        return result
+    # Keep CuPy work and Event measurements on one explicit stream.
+    with cp.cuda.ExternalStream(_ACCEL.current_stream().cuda_stream):
+        data_cp = _cupy_from_torch(data)
+        row_cp = _cupy_from_torch(row)
+        col_cp = _cupy_from_torch(col)
+        x_cp = _cupy_from_torch(x)
+        matrix = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+        matrix.sum_duplicates()
+
+        def run():
+            operand = matrix.conj() if op_name == "conj" and data.is_complex() else matrix
+            return cupy_cusparse.spmv(operand, x_cp, transa=op_name != "non")
+
+        values_cp = run()  # Resolve API support before measuring, even warmup=0.
+        for _ in range(max(0, int(warmup))):
+            values_cp = run()
+        cp.cuda.get_current_stream().synchronize()
+        samples = []
+        for _ in range(max(1, int(iters))):
+            start, end = cp.cuda.Event(), cp.cuda.Event()
+            start.record()
+            values_cp = run()
+            end.record()
+            end.synchronize()
+            samples.append(cp.cuda.get_elapsed_time(start, end))
     result["values"] = _torch_from_cupy(values_cp)
-    result["ms"] = ms
+    result["ms"] = _filtered_benchmark_avg_ms(samples)
     result["reason"] = None
     return result
 

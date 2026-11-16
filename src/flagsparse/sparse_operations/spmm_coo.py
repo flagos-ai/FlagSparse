@@ -22,6 +22,7 @@ from . import _common as _common_mod
 from ._common import *
 from . import spmv_coo as _coo_native
 from . import mixed_spmx as _mixed_spmx
+from ._timing_contract import separate_timing_diagnostics
 from .spmm_csr import (
     SUPPORTED_SPMM_VALUE_DTYPES,
     _select_spmm_alg1_warp_and_factor,
@@ -755,6 +756,8 @@ class PreparedCooSpmmRoute:
 
     __slots__ = (
         "original_inputs",
+        "source_shape",
+        "deferred_op",
         "data",
         "row",
         "col",
@@ -786,7 +789,12 @@ class PreparedCooSpmmRoute:
         compute_dtype,
         op,
         alg,
+        *,
+        deferred_op=False,
+        source_shape=None,
     ):
+        self.source_shape = tuple(shape if source_shape is None else source_shape)
+        self.deferred_op = deferred_op
         self.data = data
         self.row = row
         self.col = col
@@ -804,7 +812,7 @@ class PreparedCooSpmmRoute:
         self.op = str(op)
         self.alg = str(alg)
         self.gather_ptr = None
-        if _backend_name() == "cuda" and self.output_dtype == torch.complex64:
+        if not deferred_op and _backend_name() == "cuda" and self.output_dtype == torch.complex64:
             counts = torch.bincount(row.long(), minlength=self.n_rows)
             self.gather_ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(row.dtype)
 
@@ -2146,7 +2154,6 @@ def _run_spmm_coo_atomic_route(
 
 def _spmm_coo_alg1_build_bucket_descriptors(segs_flat, counts, offsets):
     _ACCEL.synchronize()
-    t0 = time.perf_counter()
     counts_cpu = counts.detach().cpu().tolist()
     offsets_cpu = offsets.detach().cpu().tolist()
     buckets = []
@@ -2163,7 +2170,8 @@ def _spmm_coo_alg1_build_bucket_descriptors(segs_flat, counts, offsets):
                 "block_nnz": (32, 64, 128, 128, 256)[bucket_id],
             }
         )
-    process_cpu_ms = (time.perf_counter() - t0) * 1000.0
+    # GPU-built segment views only select launches; do not double charge the event.
+    process_cpu_ms = 0.0
     return buckets, process_cpu_ms
 
 
@@ -2518,7 +2526,7 @@ def list_spmm_coo_algorithms(op=None, dtype=None, backend=None, layout=None, *, 
 
 
 def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto", config=None):
-    """Prepare matrix-level canonical COO metadata for registered SpMM algorithms."""
+    """Prepare a COO route; trans/conj and half materialization are deferred to run."""
     from .mixed_spmx import remember_registered_inputs
     original_inputs = (data, row, col)
     name = _normalize_spmm_coo_alg(alg)
@@ -2530,7 +2538,25 @@ def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto", confi
         raise ValueError("config requires an explicit COO extension algorithm")
     op_code = _normalize_spmm_coo_op(op)
     op_name = _spmm_coo_op_to_name(op_code)
+    if op_name != "non" or data.dtype in (torch.float16, torch.bfloat16):
+        # Defer requested matrix operations and half-value materialization.
+        # Numerical snapshots must not hide conversion time or stale input values.
+        data, row, col, source_shape = _prepare_spmm_coo_matrix(data, row, col, shape)
+        effective_shape = source_shape if op_name == "non" else (source_shape[1], source_shape[0])
+        resolve_spmm_coo_algorithm(name, op_name, data.dtype)
+        return remember_registered_inputs(PreparedCooSpmmRoute(
+            data, row, col, effective_shape, None,
+            torch.empty((0,), dtype=torch.int32, device=data.device),
+            data.dtype, _spmm_coo_compute_dtype(data.dtype), op_name, name,
+            deferred_op=True, source_shape=source_shape), original_inputs)
     data, row, col, shape = _materialize_spmm_coo_op(data, row, col, shape, op_code)
+    return _prepare_spmm_coo_materialized_route(
+        data, row, col, shape, op_name, alg, original_inputs)
+
+
+def _prepare_spmm_coo_materialized_route(data, row, col, shape, op_name, alg, original_inputs):
+    """Canonical execution data; invoked inside run for transformed/mixed inputs."""
+    from .mixed_spmx import remember_registered_inputs
     output_dtype = data.dtype
     compute_dtype = _spmm_coo_compute_dtype(output_dtype)
     data, row, col, shape = _prepare_spmm_coo_matrix(data, row, col, shape)
@@ -2598,6 +2624,17 @@ def _select_spmm_coo_auto_alg(prepared):
     return "coo_rowrun"
 
 
+def _materialize_spmm_coo_route_op(prepared):
+    if not prepared.deferred_op:
+        return prepared
+    data, row, col, shape = _materialize_spmm_coo_op(
+        *prepared.original_inputs, prepared.source_shape,
+        _normalize_spmm_coo_op(prepared.op))
+    return _prepare_spmm_coo_materialized_route(
+        data, row, col, shape, prepared.op, prepared.alg, prepared.original_inputs)
+
+
+@separate_timing_diagnostics
 def flagsparse_spmm_coo_run(
     prepared,
     B,
@@ -2671,14 +2708,25 @@ def flagsparse_spmm_coo_run(
     if start is not None:
         _ACCEL.synchronize()
         start.record()
+    op_events = None
+    if timing and prepared.deferred_op:
+        op_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))
+        op_events[0].record()
+    runtime_prepared = _materialize_spmm_coo_route_op(prepared)
+    operand = B.resolve_conj().resolve_neg()
+    if op_events is not None:
+        op_events[1].record()
     C, route_meta = algorithm.run(
-        prepared,
-        B,
+        runtime_prepared,
+        operand,
         timing=bool(timing),
         diagnostics=bool(diagnostics),
         dense_layout=dense_layout,
         out_dtype=output_dtype,
     )
+    if op_events is not None:
+        op_events[1].synchronize()
+        route_meta["process_gpu_ms"] = float(route_meta.get("process_gpu_ms") or 0.0) + op_events[0].elapsed_time(op_events[1])
     output_events = None
     if timing and out is not None:
         output_events = (_ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True))

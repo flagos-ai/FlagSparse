@@ -301,19 +301,15 @@ def _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters):
     ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr.to(torch.int64)))
     x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
     A = cpx_sparse.csc_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    # Build the operand once, outside the timed window, as every other operator's
-    # baseline here does.  ``.T`` on a csc_matrix is a zero-copy csr view, but
-    # ``A.conj()`` allocates a conjugated copy of all nnz values, and it used to sit
-    # inside the timing lambda -- one copy per iteration.  That inflated the conj
-    # baseline enough to make conj read 1.42x against 0.37x for trans on float32,
-    # although the two share the same Triton kernel (conj == trans for real dtypes).
-    if op == "non":
-        A_eff = A
-    elif op == "trans":
-        A_eff = A.T
-    else:
-        A_eff = A.conj().T
-    fn = lambda: A_eff @ x_cp
+    # Keep the requested operation inside the measured Python call.
+    def fn():
+        if op == "non":
+            operand = A
+        elif op == "trans":
+            operand = A.T
+        else:
+            operand = A.conj().T
+        return operand @ x_cp
     _, elapsed_ms = cupy_event_benchmark_filtered(fn, warmup, iters)
     return elapsed_ms
 

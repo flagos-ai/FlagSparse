@@ -444,25 +444,8 @@ def _spmv(v, mat, gen, warmup, iters, row):
         row["timed"] = "prepared"
         if v.fmt == "csr":
             prepared = fs.prepare_spmv_csr(vals, mat.cols, mat.ptr, mat.shape, op=v.op_a)
-            if (
-                _is_rocm_runtime()
-                and prepared.alg == "row_tile"
-                and v.op_a == "non"
-                and v.value in (
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float32,
-                    torch.float64,
-                    torch.complex64,
-                )
-            ):
-                # The vendor plan owns its output buffer. Bind the same
-                # prepared Triton launch so allocation and wrapper dispatch do
-                # not dominate short-row delivery timings.
-                target = torch.empty(m, dtype=v.out, device=mat.dev)
-                ours = _prepared_row_tile_op(prepared, x, target)
-            else:
-                ours = lambda: fs.flagsparse_spmv_csr(prepared=prepared, x=x)  # noqa: E731
+            # Measure the ordinary prepared API, matching native vendor submission.
+            ours = lambda: fs.flagsparse_spmv_csr(prepared=prepared, x=x)  # noqa: E731
         elif v.fmt == "coo":
             prepared = fs.prepare_spmv_coo(vals, mat.rows, mat.cols, mat.shape, op=v.op_a)
             ours = lambda: fs.flagsparse_spmv_coo(prepared=prepared, x=x)  # noqa: E731
@@ -561,18 +544,18 @@ def _spmm(v, mat, gen, warmup, iters, row):
                 B,
                 mat.shape,
                 op=v.op_a,
+                op_b=v.op_b,
                 dense_layout=v.layout,
                 **kw,
             )
     else:
         row["timed"] = "prepared"
-        B_eff = _op_t(B, v.op_b)  # op(B) as a strided view; the run reads its strides
         if v.fmt == "csr":
             prepared = fs.prepare_spmm_csr_route(vals, mat.cols, mat.ptr, mat.shape, op=v.op_a)
-            ours = lambda: fs.flagsparse_spmm_csr_run(prepared, B_eff, alg="auto")  # noqa: E731
+            ours = lambda: fs.flagsparse_spmm_csr_run(prepared, B, alg="auto", op_b=v.op_b)  # noqa: E731
         else:
             prepared = fs.prepare_spmm_coo_route(vals, mat.rows, mat.cols, mat.shape, op=v.op_a)
-            ours = lambda: fs.flagsparse_spmm_coo_run(prepared, B_eff, alg="auto")  # noqa: E731
+            ours = lambda: fs.flagsparse_spmm_coo_run(prepared, B, alg="auto", op_b=v.op_b)  # noqa: E731
     first = ours()
     first = first[0] if isinstance(first, tuple) else first
     row["max_error"] = _error(first, ref)
@@ -831,7 +814,8 @@ def run_variants(
             except Exception as exc:
                 row["status"] = "ERROR"
                 row["error"] = f"{type(exc).__name__}: {exc}"
-            row["speedup_vs_vendor"] = _ratio(row.get("vendor_ms"), row.get("ours_ms"))
+            row["speedup_vs_vendor"] = (_ratio(row.get("vendor_ms"), row.get("ours_ms"))
+                                        if row["status"] == "PASS" else None)
             row["speedup_vs_pytorch"] = _ratio(row.get("pytorch_ms"), row.get("ours_ms"))
             rows.append(row)
             log(

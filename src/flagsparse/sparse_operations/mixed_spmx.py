@@ -317,9 +317,9 @@ def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
     result_dtype, acc_dtype = _resolve_types(data.dtype, x.dtype, out, out_dtype, True)
     if out is not None and (out.shape != (n_rows,) or out.device != x.device):
         raise ValueError("out shape/device must match the CSR SpMV result")
-    data, x = data.contiguous(), x.contiguous()
-    cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
     t0 = _start(return_time)
+    data, x = data.resolve_conj().resolve_neg().contiguous(), x.resolve_conj().resolve_neg().contiguous()
+    cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
     if (
         _is_rocm_runtime()
         and data.dtype == torch.float16
@@ -404,8 +404,8 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
     if out is not None and (out.shape != (n_rows,) or out.device != x.device):
         raise ValueError("out shape/device must match the COO SpMV result")
     sources = (data, row, col)
-    data, x = data.contiguous(), x.contiguous()
     t0 = _start(return_time)
+    data, x = data.resolve_conj().resolve_neg().contiguous(), x.resolve_conj().resolve_neg().contiguous()
     if _is_ascend_runtime():
         rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
         y = _torch_spmv_rows(data, rows.to(torch.int64), cols, x, n_rows, acc_dtype)
@@ -539,9 +539,10 @@ def spmm_csr_mixed(data, indices, indptr, B, shape, *, op=None, transpose=None,
     n_dense = int(B.shape[1])
     if out is not None and (tuple(out.shape) != (n_rows, n_dense) or out.device != B.device):
         raise ValueError("out shape/device must match the CSR SpMM result")
-    data = data.contiguous()
-    cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
     t0 = _start(return_time)
+    B = B.resolve_conj().resolve_neg()
+    data = data.resolve_conj().resolve_neg().contiguous()
+    cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
     if _is_ascend_runtime():
         rows = _csr_row_ids(ptr, n_rows, data.numel())
         C = torch.zeros(n_rows, n_dense, dtype=acc_dtype, device=B.device)
@@ -624,9 +625,10 @@ def spmm_coo_mixed(data, row, col, B, shape, *, op=None, transpose=None,
     n_dense = int(B.shape[1])
     if out is not None and (tuple(out.shape) != (n_rows, n_dense) or out.device != B.device):
         raise ValueError("out shape/device must match the COO SpMM result")
-    data = data.contiguous()
-    rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
     t0 = _start(return_time)
+    B = B.resolve_conj().resolve_neg()
+    data = data.resolve_conj().resolve_neg().contiguous()
+    rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
     if _is_ascend_runtime():
         C = torch.zeros(n_rows, n_dense, dtype=acc_dtype, device=B.device)
         C.index_add_(

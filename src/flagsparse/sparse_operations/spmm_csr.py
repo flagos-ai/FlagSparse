@@ -19,6 +19,7 @@ import math
 
 from . import _common as _common_mod
 from ._common import *
+from ._timing_contract import separate_timing_diagnostics
 from . import mixed_spmx as _mixed_spmx
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
@@ -817,7 +818,7 @@ class PreparedCsrSpmmRoute:
         self.avg_nnz_per_row = float(self.nnz) / float(max(1, self.n_rows))
         self.op = str(op)
         self.alg = str(alg)
-        # Filled in by prepare_spmm_csr_route for trans/conj; see the note there.
+        # Compatibility fields only; trans/conj numerical data is built per run.
         self.materialized_op = None
         self.materialized_route = None
         self.config = None
@@ -964,9 +965,6 @@ def _spmm_csr_route_from_materialized(prepared, data, indices, indptr, shape, op
 def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
     if op_name == "non":
         return prepared, 0.0 if timing else None
-    cached = prepared.materialized_route
-    if cached is not None and prepared.materialized_op == op_name:
-        return cached, 0.0 if timing else None
 
     start = _ACCEL.Event(enable_timing=True) if timing else None
     end = _ACCEL.Event(enable_timing=True) if timing else None
@@ -1391,7 +1389,6 @@ def _spmm_csr_alg1_empty_split_metadata(device, row_index_dtype):
 
 def _spmm_csr_alg1_build_bucket_descriptors(rows_flat, counts, offsets):
     _ACCEL.synchronize()
-    t0 = time.perf_counter()
     counts_cpu = counts.cpu().tolist()
     offsets_cpu = offsets.cpu().tolist()
     row_index_dtype = rows_flat.dtype
@@ -1435,7 +1432,8 @@ def _spmm_csr_alg1_build_bucket_descriptors(rows_flat, counts, offsets):
             long_rows = rows
         if upper is not None:
             lower = upper
-    process_cpu_ms = (time.perf_counter() - t0) * 1000.0
+    # Launch-only bridge; the full event spans it. Do not add it twice.
+    process_cpu_ms = 0.0
     return buckets, long_rows, process_cpu_ms
 
 
@@ -2165,7 +2163,6 @@ def _spmm_csr_alg2_process_compact_kernel(
 
 def _spmm_csr_alg2_build_bucket_descriptors(rows_flat, counts, offsets, dtype):
     _ACCEL.synchronize()
-    t0 = time.perf_counter()
     counts_cpu = counts.cpu().tolist()
     offsets_cpu = offsets.cpu().tolist()
     buckets = []
@@ -2190,7 +2187,8 @@ def _spmm_csr_alg2_build_bucket_descriptors(rows_flat, counts, offsets, dtype):
                 "segments": int(spec.get("segments", 1)),
             }
         )
-    process_cpu_ms = (time.perf_counter() - t0) * 1000.0
+    # Launch-only bridge; the full event spans it. Do not add it twice.
+    process_cpu_ms = 0.0
     return buckets, long_row_count, process_cpu_ms
 
 
@@ -2842,7 +2840,7 @@ def list_spmm_csr_algorithms(op=None, dtype=None, backend=None, layout=None, *,
 
 
 def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto", config=None):
-    """Prepare matrix-level CSR SpMM metadata for the route-based run API."""
+    """Prepare CSR metadata; requested matrix operations are materialized in run."""
     from .mixed_spmx import remember_registered_inputs
     original_inputs = (data, indices, indptr)
     op_code = _normalize_spmm_op(op)
@@ -2877,27 +2875,11 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
         if not isinstance(config, dict):
             raise TypeError("config must be a dictionary")
         route.config = dict(config)
-    if op_name != "non" and _backend_name() == "cuda":
-        # Materialise A.T (A.conj().T for conj) here instead of on every run.  The
-        # transpose is a sort + bincount + cumsum over nnz, and it used to run inside
-        # flagsparse_spmm_csr_run -- i.e. once per timed iteration -- while the cuSPARSE
-        # baseline materialises ``A_csr.transpose().tocsr()`` once outside its timed
-        # window (see tests/test_spmm.py).  Caching it here makes the two sides
-        # symmetric; a run-time ``op=`` override still re-materialises below.
-        t_data, t_indices, t_indptr, t_shape = _materialize_spmm_csr_op(
-            data,
-            kernel_indices,
-            kernel_indptr,
-            shape,
-            op_code,
-        )
-        route.materialized_route = _spmm_csr_route_from_materialized(
-            route, t_data, t_indices, t_indptr, t_shape, op_name
-        )
-        route.materialized_op = op_name
+    # trans/conj are invocation work, not a prepared numerical snapshot.
     return remember_registered_inputs(route, original_inputs)
 
 
+@separate_timing_diagnostics
 def flagsparse_spmm_csr_run(
     prepared,
     B,
@@ -3000,7 +2982,8 @@ def flagsparse_spmm_csr_run(
     )
     # Preserve the selected legacy algorithm while materializing its FP32 inputs
     # inside the measured run. Never store a half result before a wide output.
-    runtime_B = B
+    # op_b creates views only; materialization belongs inside the event.
+    runtime_B = B.resolve_conj().resolve_neg()
     half_legacy = not extension and prepared.data.dtype in (torch.float16, torch.bfloat16)
     conversion_events = None
     if timing and half_legacy:
@@ -3079,8 +3062,7 @@ def flagsparse_spmm_csr_run(
             meta.update({key: value for key, value in route_meta.items()
                          if key not in ("process_gpu_ms", "compute_ms")})
             meta["transpose_strategy"] = (
-                "prepare_csr_rebuild" if prepared.materialized_op == op_name and op_name != "non"
-                else "run_csr_rebuild" if op_name != "non" else "none"
+                "run_csr_rebuild" if op_name != "non" else "none"
             )
         if timing:
             meta["process_gpu_ms"] = process_gpu_ms
@@ -4570,7 +4552,7 @@ def _spmm_csr_auto_prefers_alg1(data, indptr, shape):
 
 
 def _apply_spmm_op_b(B, op_b):
-    """View ``op(B)``: a transpose is a strided view, conj materialises (complex only)."""
+    """Build only op(B) views; resolve conjugation in the measured execution."""
     token = "non" if op_b is None else str(op_b).strip().lower()
     token = {"0": "non", "n": "non", "non_trans": "non", "1": "trans", "t": "trans",
              "2": "conj", "c": "conj", "conj_trans": "conj"}.get(token, token)
@@ -4582,7 +4564,7 @@ def _apply_spmm_op_b(B, op_b):
         raise ValueError("B must be a 2D tensor")
     B_t = B.transpose(0, 1)
     if token == "conj" and B.is_complex():
-        B_t = B_t.conj().resolve_conj()
+        B_t = B_t.conj()
     return B_t
 
 
@@ -4778,7 +4760,6 @@ def flagsparse_spmm_csr(
         raise ValueError("B must be on the same CUDA device as the sparse matrix")
     if B.dtype != data.dtype:
         raise TypeError("B dtype must match data dtype")
-    B = B.contiguous()
     n_dense_cols = int(B.shape[1])
 
     if out is not None:
@@ -4797,6 +4778,7 @@ def flagsparse_spmm_csr(
     if do_timing:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
+    B = B.resolve_conj().resolve_neg().contiguous()
     if _spmm_op_transposes(op_code):
         data, indices, indptr, shape = _materialize_spmm_csr_op(
             data,

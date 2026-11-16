@@ -41,9 +41,9 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 if __package__:
-    from .utils import filtered_avg_ms, cupy_event_benchmark_filtered
+    from .utils import filtered_avg_ms, cupy_event_benchmark_filtered, operator_benchmark_filtered
 else:
-    from utils import filtered_avg_ms, cupy_event_benchmark_filtered
+    from utils import filtered_avg_ms, cupy_event_benchmark_filtered, operator_benchmark_filtered
 
 import flagsparse as ast
 import flagsparse.sparse_operations._common as fs_common
@@ -661,8 +661,8 @@ def _cuda_event_benchmark(op, warmup, iters):
 def _time_coo_algorithm(
     prepared, B, alg, warmup, iters, timing=False, diagnose=False, layout="row"
 ):
-    out, gpu_ms = _cuda_event_benchmark(
-        lambda: ast.flagsparse_spmm_coo_run(prepared, B, alg=alg, dense_layout=layout),
+    out, measured, _ = operator_benchmark_filtered(
+        lambda: ast.flagsparse_spmm_coo_run(prepared, B, alg=alg, dense_layout=layout, return_time=True, return_meta=True),
         warmup,
         iters,
     )
@@ -675,7 +675,10 @@ def _time_coo_algorithm(
         timing=bool(timing),
         diagnostics=bool(diagnose),
     )
-    process_cpu_ms = float(meta.get("process_cpu_ms", 0.0) or 0.0)
+    process_cpu_ms = measured["process_cpu_ms"]
+    gpu_ms = measured["gpu_ms"]
+    meta.update(gpu_ms=gpu_ms, process_cpu_ms=process_cpu_ms,
+                operator_ms=measured["ms"], op_total_ms=measured["ms"])
     row = {
         "alg": meta.get("alg", alg),
         "ms": process_cpu_ms + gpu_ms,
@@ -805,15 +808,13 @@ def _time_cusparse_coo(prepared_case, ref_C, dtype, warmup, iters, layout="row")
         # stand-in was the more forgiving baseline.  sum_duplicates()/asfortranarray()
         # are format conversions and stay outside the timed window.
         A_coo.sum_duplicates()
-        # cusparseSpMM wants a column-major dense operand; converting once here keeps
-        # the conversion out of the timed window for every layout, which is why the old
-        # col-major-only asfortranarray fallback is gone.
-        B_f = cp.asfortranarray(B_cp)
+        # This wrapper requires column-major RHS; charge actual per-call layout
+        # materialization instead of silently changing the row-major input.
 
         def _run(rhs):
-            return cupyx.cusparse.spmm(A_coo, rhs)
+            return cupyx.cusparse.spmm(A_coo, cp.asfortranarray(rhs))
 
-        out_cp, ms = _cupy_event_benchmark(_run, B_f, warmup, iters)
+        out_cp, ms = _cupy_event_benchmark(_run, B_cp, warmup, iters)
         reason = ""
         out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
         del ref_C
@@ -1181,6 +1182,9 @@ def _benchmark_spmm_coo_route_policy(
         plan = _spmm_coo_rowrun_process(base)
 
         def full_op():
+            if op != "non":
+                runtime = _prepare_spmm_coo_timing_base(data, row, col, B, shape, op=op, layout=layout)
+                return _spmm_coo_rowrun_compute(runtime, _spmm_coo_rowrun_process(runtime))
             return _spmm_coo_rowrun_compute(base, plan)
 
         ACCEL.synchronize()
@@ -1201,11 +1205,13 @@ def _benchmark_spmm_coo_route_policy(
             )
             # The reported route latency is the prepared compute path. The
             # preparation cost remains available as a separate diagnostic.
-            total_ms = compute_ms
+            # Diagnostics do not replace the full-run total.
     else:
 
         def full_op():
-            return _spmm_coo_atomic_compute(base)
+            runtime = (_prepare_spmm_coo_timing_base(data, row, col, B, shape, op=op, layout=layout)
+                       if op != "non" else base)
+            return _spmm_coo_atomic_compute(runtime)
 
         ACCEL.synchronize()
         t0 = time.perf_counter()
@@ -1218,7 +1224,7 @@ def _benchmark_spmm_coo_route_policy(
         total_ms = gpu_ms
         if timing:
             values, compute_ms = _cuda_event_benchmark(full_op, warmup, iters)
-            total_ms = compute_ms
+            # Diagnostics do not replace the full-run total.
 
     return {
         "values": values,

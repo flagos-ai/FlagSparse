@@ -38,6 +38,42 @@ def filtered_avg_ms(times, tolerance=0.10):
     return sum(kept) / len(kept) if kept else median
 
 
+def paired_timing_summary(cpu_samples, gpu_samples, tolerance=0.10):
+    """Filter complete invocation totals, retaining the same CPU/GPU pairs."""
+    if not cpu_samples or len(cpu_samples) != len(gpu_samples):
+        raise ValueError("require equally sized nonempty CPU and GPU samples")
+    cpu, gpu = list(map(float, cpu_samples)), list(map(float, gpu_samples))
+    totals = [c + g for c, g in zip(cpu, gpu)]
+    ordered = sorted(totals)
+    n = len(ordered)
+    median = ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+    kept = [i for i, value in enumerate(totals)
+            if median * (1 - tolerance) <= value <= median * (1 + tolerance)]
+    if not kept:
+        # Match filtered_avg_ms: use the median, with its original paired samples.
+        ranked = sorted(range(n), key=totals.__getitem__)
+        kept = ranked[(n - 1) // 2:n // 2 + 1]
+    cpu_ms = sum(cpu[i] for i in kept) / len(kept)
+    gpu_ms = sum(gpu[i] for i in kept) / len(kept)
+    return dict(ms=cpu_ms + gpu_ms, process_cpu_ms=cpu_ms, gpu_ms=gpu_ms,
+                sample_count=n, sample_kept=len(kept))
+
+
+def operator_benchmark_filtered(op, warmup, iters):
+    """Sample an operator's (output, elapsed, meta) contract without outer events."""
+    if warmup < 0 or iters < 1:
+        raise ValueError("require warmup >= 0 and iters >= 1")
+    op()  # Compile before sampling, including warmup=0.
+    for _ in range(warmup):
+        op()
+    cpu, gpu = [], []
+    for _ in range(iters):
+        out, elapsed, meta = op()
+        cpu.append(float(meta.get("process_cpu_ms", 0.0) or 0.0))
+        gpu.append(float(meta.get("gpu_ms", elapsed)))
+    return out, paired_timing_summary(cpu, gpu), meta
+
+
 def cuda_event_benchmark_filtered(op, warmup, iters):
     import torch
 

@@ -233,7 +233,7 @@ def test_mixed_metric_cli_is_shared_by_all_six_benchmarks():
     source = path.read_text(encoding="utf-8")
     assert "--perf-metrics currently requires --type-combos" in source
     assert 'row["ms"] = row["gpu_ms"] + row["process_cpu_ms"]' in source
-    assert "benchmark_sample_summary(gpu)" in source
+    assert "benchmark_sample_summary([c + g for c, g in zip(cpu, gpu)])" in source
     assert "NOT DRAM/HBM" in source
 
 

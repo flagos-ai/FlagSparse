@@ -180,31 +180,9 @@ def measure_route(prepared, x, warmup=10, iters=50, timing=False):
         out = torch.empty(
             output_size, dtype=prepared.data.dtype, device=prepared.data.device
         )
-        # hipSPARSE's reference window invokes an already prepared SpMV
-        # descriptor directly.  A non-transpose row_tile has no runtime plan,
-        # conversion, or fallback work, so time its prepared kernel launch
-        # directly as well.  Starting an event before the public Python API
-        # otherwise charges its validation/dispatch latency (~32us on gfx936)
-        # to the GPU event while the stream is empty.  Keep the generic route
-        # for paths that genuinely perform runtime processing.
-        direct_row_tile = (
-            common._is_rocm_runtime()
-            and
-            prepared.alg == "row_tile"
-            and not prepared.transpose
-            and not x.is_conj()
-            and not prepared.data.is_conj()
-            and x.is_contiguous()
-            and prepared.data.dtype in (
-                torch.float16, torch.bfloat16, torch.float32, torch.float64
-            )
-        )
-        if direct_row_tile:
-            timed_op = _prepared_row_tile_op(prepared, x, out)
-            timed_op = _rocm_graph_replay(timed_op, out)
-        else:
-            def timed_op():
-                return flagsparse_spmv_csr_run(prepared, x, out=out)
+        # Use the same ordinary API submission mode as the vendor baseline.
+        def timed_op():
+            return flagsparse_spmv_csr_run(prepared, x, out=out)
         value, gpu_ms = event_benchmark(
             timed_op, warmup, iters
         )
