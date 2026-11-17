@@ -625,3 +625,44 @@ def test_vendor_worker_inherits_working_python_paths(monkeypatch, tmp_path):
     prefix, exec_prefix, argv = json.loads(result.stdout.splitlines()[-1])
     assert (prefix, exec_prefix) == (sys.prefix, sys.exec_prefix)
     assert argv == ["--isolated-benchmark", "request", "response"]
+
+
+@pytest.mark.parametrize("status", ["PASS", "FAIL", "SKIP", "ERROR"])
+def test_benchmark_checkpoint_replaces_pending(tmp_path, status):
+    import json
+    from tests.benchmark_utils import _write_benchmark_state
+
+    path = tmp_path / "logs" / "case.flagsparse.json"
+    _write_benchmark_state(path, {"vendor_status": "PENDING", "checkpoint_state": "before_vendor"})
+    final = {"vendor_status": status, "checkpoint_state": "completed", "matrix": "test.mtx"}
+    _write_benchmark_state(path, final)
+    assert json.loads(path.read_text(encoding="utf-8")) == final
+    assert not path.with_name(path.name + ".tmp").exists()
+
+
+def test_mixed_progress_is_outside_measured_iteration_loops():
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "benchmark_utils.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    bench = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "run_type_combo_benchmark")
+    calls = lambda node, name: [n for n in ast.walk(node) if isinstance(n, ast.Call)
+                               and isinstance(n.func, ast.Name) and n.func.id == name]
+    stages = {n.args[0].value for n in calls(bench, "progress") if n.args
+              and isinstance(n.args[0], ast.Constant)}
+    assert {"source_load", "prepare", "first_run_compile_and_execute", "warmup",
+            "event_samples", "wall_samples", "accuracy", "phase_diagnostics",
+            "vendor_payload", "vendor_worker", "case_completed", "benchmark_completed"} <= stages
+    for node in ast.walk(bench):
+        if isinstance(node, ast.For) and isinstance(node.iter, ast.Call):
+            if any(isinstance(n, ast.Attribute) and n.attr in ("iters", "warmup")
+                   for n in ast.walk(node.iter)):
+                assert not calls(node, "progress")
+                assert not calls(node, "_write_benchmark_state")
+    emit = next(n for n in bench.body if isinstance(n, ast.FunctionDef) and n.name == "emit")
+    assert calls(emit, "_write_benchmark_state")
+    assert any(isinstance(n, ast.keyword) and n.arg == "checkpoint_state"
+               and isinstance(n.value, ast.Constant) and n.value.value == "completed"
+               for n in ast.walk(emit))

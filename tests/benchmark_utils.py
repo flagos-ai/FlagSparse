@@ -32,6 +32,17 @@ from flagsparse.sparse_operations._common import _ACCEL, _ACCEL_DEVICE_TYPE
 ACCEL = _ACCEL
 
 
+def _write_benchmark_state(path, payload):
+    """Publish a complete snapshot; readers must never see partial JSON."""
+    import json
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, default=str, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
 def accelerator_available() -> bool:
     return bool(ACCEL.is_available())
 
@@ -236,12 +247,29 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     reported_vendor_reasons = set()
     vendor_log_dir = Path(str(csv_path) + ".vendor_logs") if csv_path else Path("vendor_logs") / operator
     vendor_case = 0
+    checkpoint = None
+    progress_path = Path(str(csv_path) + ".progress.json") if csv_path else vendor_log_dir / "progress.json"
+
+    def progress(stage, context):
+        import os
+        import socket
+        from datetime import datetime, timezone
+
+        keys = ("matrix", "type_combo", "op_a", "op_b", "layout", "dense_cols",
+                "index_dtype", "indptr_dtype", "alg", "status", "vendor_status", "reason")
+        _write_benchmark_state(progress_path, dict(
+            operator=operator, stage=stage, pid=os.getpid(), hostname=socket.gethostname(),
+            updated_at=datetime.now(timezone.utc).isoformat(),
+            **{key: context[key] for key in keys if key in context}))
 
     def emit(row):
         if writer:
             writer.writerow({k: json.dumps(v, default=str, sort_keys=True) if isinstance(v, dict) else v
                              for k, v in row.items()})
             stream.flush()
+        if checkpoint is not None:
+            _write_benchmark_state(checkpoint, dict(row, checkpoint_state="completed"))
+        progress("case_completed", row)
         def number(key):
             value = row.get(key)
             return "N/A" if value is None else f"{value:.4f}"
@@ -275,6 +303,8 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     try:
         sources = paths + ([None] if args.synthetic else [])
         for source, combo in itertools.product(sources, combos):
+            context = dict(matrix=str(source or "synthetic"), type_combo=":".join(combo))
+            progress("source_load", context)
             dtype, rhs_dtype, output_dtype = (getattr(torch, item) for item in combo)
             # Construct once per matrix/type; quantize before forming the CPU golden.
             if source is None:
@@ -286,6 +316,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                 shape = host.shape
             else:
                 a, first, second, shape = getattr(mtx_fast, "load_" + fmt)(source, dtype=torch.float64, device="cpu")
+            progress("input_conversion_and_fingerprint", context)
             source_nonfinite = int((~torch.isfinite(a)).sum())
             source_max_abs = float(a.abs().max()) if a.numel() else 0.0
             a = a.to(dtype)
@@ -301,6 +332,8 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
             host = (sparse.coo_matrix((values, (first.numpy(), second.numpy())), shape=shape)
                     if fmt == "coo" else getattr(sparse, fmt + "_matrix")((values, first.numpy(), second.numpy()), shape=shape))
             for op, op_b, layout, ncols in itertools.product(ops, op_bs, layouts, ns):
+                context.update(op_a=op, op_b=op_b, layout=layout, dense_cols=ncols)
+                progress("reference_and_rhs", context)
                 inner = shape[1] if op == "non" else shape[0]
                 generator = torch.Generator().manual_seed(2026)
                 effective = torch.randn((inner, ncols) if matrix else (inner,), generator=generator).to(rhs_dtype)
@@ -322,11 +355,14 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                 elif requested != "auto" and any(name not in supported for name in selected):
                     raise ValueError(f"{requested} does not support {combo}, {op}, {layout}, {backend}")
                 for index, ptr in ((i, p) for i in indices for p in (pointers or (i,))):
+                    context.update(index_dtype=index, indptr_dtype=ptr)
+                    progress("input_transfer", context)
                     arrays = (a.to(device), first.to(device=device, dtype=getattr(torch, index)),
                               second.to(device=device, dtype=getattr(torch, ptr)))
                     vendor_results = {}
                     vendor_case += 1
                     for alg in selected:
+                        checkpoint = None
                         row = dict(matrix=str(source or "synthetic"), dtype=combo[0], type_combo=":".join(combo), a_dtype=combo[0],
                                    rhs_dtype=combo[1], compute_dtype="float32", output_dtype=combo[2], op=op,
                                    op_a=op, op_b=op_b, layout=layout, dense_cols=ncols, index_dtype=index,
@@ -344,6 +380,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                         emit(row)
                                         continue
                                     raise ValueError(f"{alg} does not support column indices {index}")
+                            progress("prepare", row)
                             prepared = prepare(*arrays, shape, op=op, alg=alg, config=config)
                             kwargs = dict(out_dtype=output_dtype, return_time=True, return_meta=True)
                             if matrix:
@@ -351,9 +388,12 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 if fmt in ("csr", "coo"):
                                     kwargs["dense_layout"] = layout
                             # Compile and validate once even when --warmup=0.
+                            progress("first_run_compile_and_execute", row)
                             run(prepared, rhs, **kwargs)
+                            progress("warmup", row)
                             for _ in range(args.warmup):
                                 run(prepared, rhs, **kwargs)
+                            progress("event_samples", row)
                             gpu, cpu = [], []
                             for _ in range(args.iters):
                                 result, elapsed, meta = run(prepared, rhs, **kwargs)
@@ -373,6 +413,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 # in its elapsed interval. Keep historical ms, label the risk.
                                 row["cpu_gpu_overlap_risk"] = any(value > 0 for value in cpu)
                                 import time
+                                progress("wall_samples", row)
                                 wall_samples = []
                                 wall_kwargs = dict(out_dtype=output_dtype)
                                 if matrix:
@@ -392,6 +433,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 wall_ms = row["prepared_run_ms"]
                                 row["prepared_useful_gflops"] = row["useful_flops"] / (wall_ms * 1e6) if wall_ms > 0 else None
                                 row["prepared_logical_gbs"] = row["logical_bytes"] / (wall_ms * 1e6) if wall_ms > 0 else None
+                            progress("accuracy", row)
                             row["status"], row["max_error"] = accuracy(result, golden, output_dtype)
                             if row["status"] == "FAIL":
                                 row["reason"] = "correctness check failed"
@@ -402,6 +444,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                             if any(row[key] for key in ("input_nonfinite", "rhs_nonfinite", "reference_nonfinite", "output_nonfinite")):
                                 row.update(status="FAIL", reason="non-finite input/reference/output; see finite-count columns")
                             if args.timing:
+                                progress("phase_diagnostics", row)
                                 _, _, diagnostics = run(prepared, rhs, timing=True, **kwargs)
                                 row.update({key: diagnostics.get(key) for key in ("process_gpu_ms", "compute_ms")})
                             row["metadata"] = meta
@@ -411,12 +454,15 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                             if not (getattr(args, "no_vendor", False) or getattr(args, "no_cusparse", False)):
                                 vendor_log_dir.mkdir(parents=True, exist_ok=True)
                                 checkpoint = vendor_log_dir / f"case_{vendor_case:06d}_{alg}.flagsparse.json"
-                                checkpoint.write_text(json.dumps(dict(row, vendor_status="PENDING", vendor_reason="worker not completed"), default=str), encoding="utf-8")
+                                _write_benchmark_state(checkpoint, dict(row, checkpoint_state="before_vendor",
+                                    vendor_status="PENDING", vendor_reason="baseline resolution not completed"))
                                 # Reuse this condition's measured baseline across algorithms,
                                 # never a prepared plan or device allocation across processes.
                                 output_stride = tuple(result.stride())
                                 vendor_result = vendor_results.get(output_stride)
                                 if vendor_result is None:
+                                    row.update(vendor_status="PENDING", vendor_reason="baseline resolution not completed")
+                                    progress("vendor_payload", row)
                                     rtol, atol = close_tolerances(output_dtype)
                                     payload = dict(fmt=fmt, arrays=tuple(t.detach().cpu() for t in arrays),
                                                    shape=shape, rhs=rhs.detach().cpu(),
@@ -425,6 +471,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                                    golden=torch.as_tensor(golden), rtol=rtol, atol=atol,
                                                    warmup=args.warmup, iters=args.iters,
                                                    device_index=rhs.device.index or 0)
+                                    progress("vendor_worker", row)
                                     vendor_result = vendor.benchmark_isolated(
                                         payload, log_prefix=vendor_log_dir / f"case_{vendor_case:06d}_layout_{len(vendor_results)}",
                                         timeout=args.vendor_timeout)
@@ -441,11 +488,14 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                             row.update(status="SKIP", reason=str(exc))
                         except Exception as exc:
                             row.update(status="ERROR", reason=f"{operator}/{alg}/{combo}/{op}/{op_b}: {exc}")
+                            if row.get("vendor_status") == "PENDING":
+                                row.update(vendor_status="ERROR", vendor_reason=str(exc))
                             traceback.print_exc()
                             if args.fail_fast:
                                 emit(row)
                                 raise
                         emit(row)
+        progress("benchmark_completed", {})
     finally:
         if stream:
             stream.close()

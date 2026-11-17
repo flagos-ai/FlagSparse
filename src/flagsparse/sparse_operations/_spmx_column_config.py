@@ -172,6 +172,7 @@ CSC_ALGORITHMS = {
     "csc_col_tile_atomic": ("non",),
     "csc_col_panel": ("trans", "conj"),
     "csc_col_tile_panel_atomic": ("non",),
+    "csc_col_partition_panel_atomic": ("non",),
 }
 CSC_ARCH_PROFILES = {}
 CSC_BACKEND_PROFILES = {}
@@ -185,6 +186,8 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
         raise ValueError(f"unknown CSC algorithm {algorithm!r}")
     if op not in CSC_ALGORITHMS[algorithm]:
         raise ValueError(f"{algorithm} does not support op={op}")
+    if algorithm == "csc_col_partition_panel_atomic" and kind != "spmm":
+        raise ValueError("csc_col_partition_panel_atomic requires SpMM")
     if algorithm in CSC_MIXED_ALGORITHMS and dtype not in ("float16", "bfloat16"):
         raise TypeError(f"{algorithm} requires float16/bfloat16 inputs")
     if dtype not in DTYPES:
@@ -192,12 +195,14 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
     if caps.backend not in _csr_policy.BACKENDS or not caps.legal_num_warps or not caps.subgroup_width:
         raise _csr_policy.BackendCapabilityUnavailable("CSC launch capabilities unavailable or unknown")
     required = ["int64"]
-    atomic = algorithm in ("csc_col_tile_atomic", "csc_col_tile_panel_atomic")
+    atomic = algorithm in ("csc_col_tile_atomic", "csc_col_tile_panel_atomic", "csc_col_partition_panel_atomic")
     if dtype in ("float64", "complex128"):
         required.append("fp64")
     if atomic:
         required.append("fp64_atomic" if dtype in ("float64", "complex128") else "fp32_atomic")
     else:
+        required.append("reduction")
+    if algorithm == "csc_col_partition_panel_atomic":
         required.append("reduction")
     for key in required:
         if getattr(caps, key) is not True:
@@ -209,7 +214,12 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
         warps = max((w for w in caps.legal_num_warps if w <= warps), default=min(caps.legal_num_warps))
     bn = 8 if dtype == "complex128" and not atomic else 16
     cfg = dict(num_warps=warps, num_stages=1)
-    if algorithm in ("csc_col_vector", "csc_col_kparallel", "csc_col_split_reduce"):
+    if algorithm == "csc_col_partition_panel_atomic":
+        bn = 8 if dtype == "complex128" else 16
+        cfg.update(segments_per_column=2, output_shards=1, block_nnz=32,
+                   block_n=min(bn, 1 << (max(1, n)-1).bit_length()),
+                   workspace_bytes=256 * 1024 * 1024)
+    elif algorithm in ("csc_col_vector", "csc_col_kparallel", "csc_col_split_reduce"):
         cfg.update(block_nnz=128 if kind == "spmv" or algorithm == "csc_col_vector" else 32,
                    block_n=1 if kind == "spmv" or algorithm == "csc_col_vector" else min(bn, 1 << (max(1, n)-1).bit_length()))
         if algorithm == "csc_col_split_reduce":
@@ -245,6 +255,12 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
                 raise ValueError(f"{key} must be a power of two")
         if candidate["num_stages"] != 1:
             raise ValueError("CSC num_stages must be 1")
+        if algorithm == "csc_col_partition_panel_atomic" and (
+                candidate["segments_per_column"] not in (1, 2, 4) or
+                candidate["output_shards"] not in (1, 2, 4) or
+                candidate["block_nnz"] not in (16, 32, 64) or
+                candidate["block_n"] not in (1, 2, 4, 8, 16, 32)):
+            raise ValueError("invalid CSC column partition or panel configuration")
         if algorithm == "csc_col_split_reduce" and (not 2 <= candidate["reduce_block_size"] <= 256 or candidate["workspace_bytes"] < 64):
             raise ValueError("split needs 2 <= reduce_block_size <= 256 and workspace_bytes >= 64")
         if candidate["num_warps"] not in caps.legal_num_warps:

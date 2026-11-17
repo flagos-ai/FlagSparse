@@ -1323,6 +1323,119 @@ def _run_csc_split(data, indices, ptr, dense, shape, op, cfg, phases, stats, out
     return result[:, 0] if vector else result
 
 
+@triton.jit
+def _csc_partition_scatter_kernel(A, I, P, B, Z, WIDTH, OFFSET, BS0, BS1, ZH, Z0, Z1,
+                                   S: tl.constexpr, H: tl.constexpr, K: tl.constexpr,
+                                   BN: tl.constexpr, COMPLEX: tl.constexpr, FP64: tl.constexpr):
+    task = tl.program_id(0).to(tl.int64)
+    column, segment = task // S, task % S
+    lane = tl.arange(0, K).to(tl.int64)
+    n = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN).to(tl.int64)
+    start = tl.load(P + column).to(tl.int64)
+    end = tl.load(P + column + 1).to(tl.int64)
+    chunks = tl.cdiv(end - start, K)
+    first, stop = chunks * segment // S, chunks * (segment + 1) // S
+    dtype: tl.constexpr = tl.float64 if FP64 else tl.float32
+    if first < stop:
+        bp = column * tl.cast(BS0, tl.int64) + (n + OFFSET) * tl.cast(BS1, tl.int64)
+        if COMPLEX:
+            br = tl.load(B + 2 * bp, n < WIDTH, 0).to(dtype)
+            bi = tl.load(B + 2 * bp + 1, n < WIDTH, 0).to(dtype)
+        else:
+            br = tl.load(B + bp, n < WIDTH, 0).to(dtype)
+        for chunk in range(first, stop):
+            pos = start + chunk * K + lane
+            mask = pos < end
+            row = tl.load(I + pos, mask, 0).to(tl.int64)
+            dest = ((task % H) * tl.cast(ZH, tl.int64) +
+                    row[:, None] * tl.cast(Z0, tl.int64) + n[None, :] * tl.cast(Z1, tl.int64))
+            valid = mask[:, None] & (n[None, :] < WIDTH)
+            if COMPLEX:
+                ar = tl.load(A + 2 * pos, mask, 0).to(dtype)
+                ai = tl.load(A + 2 * pos + 1, mask, 0).to(dtype)
+                re = ar[:, None] * br[None, :] - ai[:, None] * bi[None, :]
+                im = ar[:, None] * bi[None, :] + ai[:, None] * br[None, :]
+                tl.atomic_add(Z + 2 * dest, re, valid, sem="relaxed")
+                tl.atomic_add(Z + 2 * dest + 1, im, valid, sem="relaxed")
+            else:
+                value = tl.load(A + pos, mask, 0).to(dtype)
+                tl.atomic_add(Z + dest, value[:, None] * br[None, :], valid, sem="relaxed")
+
+
+@triton.jit
+def _csc_partition_finish_kernel(Z, Y, M, WIDTH, CAPACITY, OFFSET, Y0, Y1,
+                                  H: tl.constexpr, T: tl.constexpr,
+                                  COMPLEX: tl.constexpr, FP64: tl.constexpr):
+    item = tl.program_id(0).to(tl.int64) * T + tl.arange(0, T).to(tl.int64)
+    valid = item < M * tl.cast(WIDTH, tl.int64)
+    row, col = item // WIDTH, item % WIDTH
+    shard = tl.arange(0, H).to(tl.int64)
+    pos = ((shard[:, None] * M + row[None, :]) * tl.cast(CAPACITY, tl.int64) + col[None, :])
+    dtype: tl.constexpr = tl.float64 if FP64 else tl.float32
+    dest = row * tl.cast(Y0, tl.int64) + (col + OFFSET) * tl.cast(Y1, tl.int64)
+    if COMPLEX:
+        re = tl.load(Z + 2 * pos, valid[None, :], 0).to(dtype)
+        im = tl.load(Z + 2 * pos + 1, valid[None, :], 0).to(dtype)
+        tl.store(Y + 2 * dest, tl.sum(re, 0), valid)
+        tl.store(Y + 2 * dest + 1, tl.sum(im, 0), valid)
+    else:
+        value = tl.load(Z + pos, valid[None, :], 0).to(dtype)
+        tl.store(Y + dest, tl.sum(value, 0), valid)
+
+
+def _launch_csc_partition_panel(data, indices, indptr, dense, shape, cfg, stats, *, out=None, out_dtype=None):
+    """Fixed column partitions and bounded output waves; no owner-map or plan."""
+    m, columns = shape
+    n = dense.shape[1]
+    dtype = data.dtype if out_dtype is None else out_dtype
+    result = out if out is not None else torch.empty((m, n), dtype=dtype, device=data.device)
+    compute_dtype = torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype
+    shards, segments, bn = cfg["output_shards"], cfg["segments_per_column"], cfg["block_n"]
+    direct = shards == 1 and result.dtype == compute_dtype
+    stats.update(segments_per_column=segments, output_shards=shards,
+                 workspace_peak_bytes=0, descriptor_peak_bytes=0, wave_columns=0, wave_count=0,
+                 atomic_buffer="out" if direct and out is not None else "result" if direct else "workspace",
+                 initialization="zero_atomic_target", output_conversion="none" if direct else "final_store",
+                 implementation_version=1)
+    if not m or not n:
+        return result
+    if not data.numel():
+        result.zero_()
+        return result
+    complex_input = data.is_complex()
+    view = lambda t: torch.view_as_real(t) if complex_input else t
+    a, b, y = view(data), view(dense), view(result)
+    launch = dict(num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+    common = dict(H=shards, COMPLEX=complex_input, FP64=data.dtype in (torch.float64, torch.complex128))
+    if direct:
+        width = n
+        buffer = result
+        stride_h, stride_r, stride_n = 0, result.stride(0), result.stride(1)
+    else:
+        element_bytes = 4 if data.dtype in (torch.float16, torch.bfloat16) else data.element_size()
+        capacity = cfg["workspace_bytes"] // (shards * m * element_bytes)
+        if capacity < 1:
+            raise ValueError("workspace_bytes cannot hold one CSC output column across all shards")
+        width = min(n, capacity)
+        if width < n and width >= bn:
+            width = width // bn * bn
+        buffer = torch.empty((shards, m, width), dtype=compute_dtype, device=data.device)
+        stride_h, stride_r, stride_n = buffer.stride()
+        stats["workspace_peak_bytes"] = buffer.numel() * buffer.element_size()
+    z = view(buffer)
+    stats.update(wave_columns=width, wave_count=triton.cdiv(n, width))
+    for offset in range(0, n, width):
+        active_width = min(width, n - offset)
+        buffer.zero_()
+        _csc_partition_scatter_kernel[(columns * segments, triton.cdiv(active_width, bn))](
+            a, indices, indptr, b, z, active_width, offset, *dense.stride(),
+            stride_h, stride_r, stride_n, S=segments, K=cfg["block_nnz"], BN=bn, **common, **launch)
+        if not direct:
+            _csc_partition_finish_kernel[(triton.cdiv(m * active_width, 128),)](
+                z, y, m, active_width, width, offset, *result.stride(), T=128, **common, **launch)
+    return result
+
+
 def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg, *, out=None, out_dtype=None):
     """Shared native CSC launch; all strides are in logical (possibly complex) elements."""
     vector = dense.ndim == 1
@@ -1401,13 +1514,15 @@ def _csc_spec(alg, kind):
     base = "spmv_csc_base" if kind == "spmv" else "spmm_csc_base"
     names = (("csc_col_subgroup", "csc_col_tile_atomic", "csc_col_vector", "csc_col_split_reduce", "csc_subgroup_pair_mixed")
              if kind == "spmv" else
-             ("csc_col_panel", "csc_col_tile_panel_atomic", "csc_col_kparallel", "csc_col_split_reduce", "csc_panel_staged_mixed"))
+             ("csc_col_panel", "csc_col_tile_panel_atomic", "csc_col_kparallel", "csc_col_split_reduce", "csc_panel_staged_mixed", "csc_col_partition_panel_atomic"))
     if alg not in (base, *names):
         raise ValueError(f"unknown {kind} CSC algorithm {alg!r}")
     return dict(name=alg, ops=CSC_ALGORITHMS.get(alg, ("non", "trans", "conj")),
                 value_dtypes=((torch.float16, torch.bfloat16) if alg in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else SUPPORTED_SPMV_CSC_VALUE_DTYPES),
                 backends=BACKENDS,
-                layouts=("row", "col", "strided"), implementation_version=4 if alg in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else 3,
+                layouts=("row", "col", "strided"),
+                implementation_version=(1 if alg == "csc_col_partition_panel_atomic" else
+                                        4 if alg in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else 3),
                 half_output_dtypes={dtype: (dtype, torch.float32)
                                     for dtype in (torch.float16, torch.bfloat16)},
                 compute_dtype="native_component", validation="unverified")
@@ -1490,6 +1605,8 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
         from ._spmm_csr_runtime import output_has_internal_overlap
         if output_has_internal_overlap(out):
             raise ValueError("out must have non-overlapping storage")
+        if selected == "csc_col_partition_panel_atomic" and (out.is_conj() or out.is_neg()):
+            raise ValueError("out must not be a lazy conjugate or negative view")
     cfg, info = {}, dict(backend=_backend_name())
     if selected in CSC_ALGORITHMS:
         cfg, info = resolve_csc_config(selected, str(data.dtype).removeprefix("torch."),
@@ -1504,13 +1621,16 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
             a = data.resolve_conj().contiguous()
             i, p = indices.contiguous(), ptr.contiguous()
             b = dense.resolve_conj()
-            if selected in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed"):
+            if selected in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed", "csc_col_partition_panel_atomic"):
                 a = data.resolve_conj().resolve_neg().contiguous()
                 b = dense.resolve_conj().resolve_neg()
             if selected == "csc_col_split_reduce" and data.dtype in (torch.float16, torch.bfloat16):
                 a, b = a.float(), b.float()
         stats = {}
         def compute(ii, pp):
+            if selected == "csc_col_partition_panel_atomic":
+                return _launch_csc_partition_panel(a, ii, pp, b, prepared.shape, cfg, stats,
+                                                   out=out, out_dtype=output_dtype)
             if selected == "csc_col_split_reduce":
                 return _run_csc_split(a, ii, pp, b, prepared.shape, prepared.op, cfg, phases, stats, output_dtype)
             if selected in CSC_ALGORITHMS:

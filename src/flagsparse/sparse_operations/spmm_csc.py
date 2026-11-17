@@ -141,7 +141,8 @@ def _normalize_spmm_csc_index_fallback_policy(index_fallback_policy):
 
 
 SPMM_CSC_NEW_ALGORITHMS = ("csc_col_panel", "csc_col_tile_panel_atomic",
-                           "csc_col_kparallel", "csc_col_split_reduce", "csc_panel_staged_mixed")
+                           "csc_col_kparallel", "csc_col_split_reduce", "csc_panel_staged_mixed",
+                           "csc_col_partition_panel_atomic")
 
 
 class PreparedCscSpmm:
@@ -1581,7 +1582,7 @@ def _run_spmm_csc_extension(prepared, B, **kwargs):
 for _name in SPMM_CSC_NEW_ALGORITHMS:
     SPMM_CSC_ALGORITHMS[_name] = SpmmCscAlgorithm(
         name=_name, display_name=_name,
-        supported_ops=("non",) if _name == "csc_col_tile_panel_atomic" else ("trans", "conj"),
+        supported_ops=("non",) if _name in ("csc_col_tile_panel_atomic", "csc_col_partition_panel_atomic") else ("trans", "conj"),
         supported_dtypes=((torch.float16, torch.bfloat16) if _name == "csc_panel_staged_mixed" else
                           (torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128)),
         run=_run_spmm_csc_extension,

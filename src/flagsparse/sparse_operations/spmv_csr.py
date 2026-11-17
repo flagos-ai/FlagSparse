@@ -39,6 +39,8 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "row_subgroup_stream",
     "csr_subgroup_pair_mixed",
     "csr_nnz_tile_reduce",
+    "csr_row_scalar_strip",
+    "csr_row_static_tile",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1661,7 +1663,7 @@ def _spmv_check_output(out, prepared, x, output_dtype=None):
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
-    strided_algorithms = ("csr_nnz_tile_reduce", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic")
+    strided_algorithms = ("csr_nnz_tile_reduce", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS)
     if not out.is_contiguous() and prepared.alg not in strided_algorithms:
         raise ValueError("out must be contiguous")
     if prepared.alg in strided_algorithms and out.numel() > 1 and out.stride(0) <= 0:
@@ -1820,12 +1822,12 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
     runtime_info = {}
 
     def compute():
-        vector = (x.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce")
+        vector = (x.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", *_csr_config.SHORT_ROW_ALGORITHMS)
                   else x.resolve_conj().contiguous())
         matrix = execution
-        if matrix.data.is_conj() or (alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce") and matrix.data.is_neg()):
+        if matrix.data.is_conj() or (alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", *_csr_config.SHORT_ROW_ALGORITHMS) and matrix.data.is_neg()):
             matrix = copy(matrix)
-            matrix.data = (matrix.data.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce")
+            matrix.data = (matrix.data.resolve_conj().resolve_neg() if alg in ("csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", *_csr_config.SHORT_ROW_ALGORITHMS)
                            else matrix.data.resolve_conj())
             matrix._baseline_data = None
         if alg in SPMV_CSR_NEW_ALGORITHMS:
@@ -1838,7 +1840,7 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
                     matrix.n_rows, dtype=matrix.data.dtype, device=matrix.data.device
                 )
             )
-            if alg == "csr_row_refill_reduce":
+            if alg in ("csr_row_refill_reduce", *_csr_config.SHORT_ROW_ALGORITHMS):
                 runtime_info.update(x_stride=tuple(vector.stride()), y_stride=tuple(y.stride()))
             return kernels.compute(matrix, vector, y, alg, matrix.config, plan)
         if alg == "legacy_bucket_vector":
@@ -1998,7 +2000,7 @@ def flagsparse_spmv_csr_run(
             meta.update(
                 process_gpu_ms=phases["process_gpu_ms"], compute_ms=phases["compute_ms"]
             )
-        if actual.alg in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce"):
+        if actual.alg in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce", *_csr_config.SHORT_ROW_ALGORITHMS):
             meta.update(execution_path="native_" + actual.alg, validation="unverified",
                         initialization="kernel_writes_all_rows", output_conversion="final_store",
                         workspace_peak_bytes=0, descriptor_peak_bytes=0,

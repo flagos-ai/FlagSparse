@@ -318,7 +318,7 @@ def test_spmm_csc_int64_strict_no_fallback(monkeypatch):
 
 
 # Explicit migrated algorithms share this operator's marker, golden and tolerance.
-_MIGRATED_ROUTES = (('csc_col_panel', 'trans'), ('csc_col_panel', 'conj'), ('csc_col_kparallel', 'trans'), ('csc_col_kparallel', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('csc_col_tile_panel_atomic', 'non'))
+_MIGRATED_ROUTES = (('csc_col_panel', 'trans'), ('csc_col_panel', 'conj'), ('csc_col_kparallel', 'trans'), ('csc_col_kparallel', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('csc_col_tile_panel_atomic', 'non'), ('csc_col_partition_panel_atomic', 'non'))
 
 
 @pytest.mark.spmm_csc
@@ -328,6 +328,7 @@ _MIGRATED_ROUTES = (('csc_col_panel', 'trans'), ('csc_col_panel', 'conj'), ('csc
 @pytest.mark.parametrize("layout", ["row", "col"])
 def test_spmm_csc_migrated_routes(alg, op, dtype, index_dtype, layout):
     import importlib
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     from tests.pytest.conftest import QUICK_MODE
 
     module = importlib.import_module("flagsparse.sparse_operations.spmm_csc")
@@ -365,7 +366,7 @@ def test_spmm_csc_migrated_routes(alg, op, dtype, index_dtype, layout):
         out = backing[:, ::2]
         result = module.flagsparse_spmm_csc_run(prepared, operand, out=out)
         direct = module.flagsparse_spmm_csc(data, first, second, operand, shape, op=op, alg=alg)
-    except NotImplementedError as exc:
+    except BackendCapabilityUnavailable as exc:
         pytest.skip(f"backend capability unavailable: {exc}")
     assert result is out
     rtol, atol = close_tolerances(dtype)
@@ -426,6 +427,7 @@ def test_spmm_csc_split_bounded_workspace(dtype, output_dtype):
 @pytest.mark.parametrize("shape", [(0, 0), (3, 0), (0, 5), (3, 5)])
 def test_spmm_csc_migrated_empty(alg, op, shape):
     import importlib
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
 
     module = importlib.import_module("flagsparse.sparse_operations.spmm_csc")
     device = accelerator_device()
@@ -440,7 +442,7 @@ def test_spmm_csc_migrated_empty(alg, op, shape):
     try:
         prepared = module.prepare_spmm_csc_route(data, first, second, shape, op=op, alg=alg)
         result = module.flagsparse_spmm_csc_run(prepared, operand, out=out)
-    except NotImplementedError as exc:
+    except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
     assert result is out
     assert torch.equal(result.cpu(), torch.zeros_like(result.cpu()))
@@ -454,7 +456,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
     (torch.int64, torch.int32), (torch.int64, torch.int64),
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmm_csc
-@pytest.mark.parametrize("alg,op", [('csc_panel_staged_mixed', 'trans'), ('csc_panel_staged_mixed', 'conj'), ('csc_col_tile_panel_atomic', 'non'), ('csc_col_panel', 'trans'), ('csc_col_panel', 'conj'), ('csc_col_kparallel', 'trans'), ('csc_col_kparallel', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('spmm_csc_base', 'non'), ('spmm_csc_base', 'trans'), ('spmm_csc_base', 'conj')])
+@pytest.mark.parametrize("alg,op", [('csc_panel_staged_mixed', 'trans'), ('csc_panel_staged_mixed', 'conj'), ('csc_col_tile_panel_atomic', 'non'), ('csc_col_partition_panel_atomic', 'non'), ('csc_col_panel', 'trans'), ('csc_col_panel', 'conj'), ('csc_col_kparallel', 'trans'), ('csc_col_kparallel', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('spmm_csc_base', 'non'), ('spmm_csc_base', 'trans'), ('spmm_csc_base', 'conj')])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["f16", "bf16"])
 @pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
 @pytest.mark.parametrize("op_b", ["non", "trans", "conj"])
@@ -577,3 +579,119 @@ def test_spmm_csc_independent_mixed_boundaries(config, dtype, wide, case, n):
         assert meta.get("alg_resolved", meta.get("algorithm")) == "csc_panel_staged_mixed"
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
+
+
+@pytest.mark.spmm_csc
+@pytest.mark.parametrize("segments,shards", [(1, 1), (2, 1), (4, 1), (2, 2), (4, 4)])
+@pytest.mark.parametrize("dtype,output_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
+    (torch.float32, torch.float32), (torch.float64, torch.float64),
+    (torch.complex64, torch.complex64), (torch.complex128, torch.complex128),
+], ids=lambda dtype: str(dtype).removeprefix("torch."))
+@pytest.mark.parametrize("n", [7, 33] if _MIXED_QUICK_MODE else [0, 1, 7, 16, 31, 32, 33, 65, 128])
+def test_spmm_csc_column_partitions(segments, shards, dtype, output_dtype, n, monkeypatch):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    native = importlib.import_module("flagsparse.sparse_operations.spmv_csc")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("partitioned CSC must not delegate to old column or split kernels")
+
+    monkeypatch.setattr(native, "_launch_csc_columns", forbidden)
+    monkeypatch.setattr(native, "_run_csc_split", forbidden)
+    # Empty partitions, K-1/K/K+1, unequal tails, repeated and unsorted target rows.
+    lengths = torch.tensor([0, 1, 15, 16, 17, 31, 32, 33, 257, 2, 0], dtype=torch.int64)
+    ptr = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    owner = torch.repeat_interleave(torch.arange(lengths.numel()), lengths)
+    count = int(ptr[-1])
+    index = (torch.arange(count) * 7) % 17
+    index[::3] = 0  # Cross-column hotspot, including within-column duplicates.
+    real = ((torch.arange(count) % 9) - 4).double() / 32
+    values = (torch.complex(real, real.flip(0) / 2) if dtype.is_complex else real).to(dtype)
+    reference_type = torch.complex128 if dtype.is_complex else torch.float64
+    matrix = torch.zeros((17, lengths.numel()), dtype=reference_type)
+    matrix.index_put_((index, owner), values.to(reference_type), accumulate=True)
+    operand = ((torch.arange(lengths.numel() * n).reshape(-1, n) % 11 - 5).double() / 16
+               if n else torch.empty((lengths.numel(), 0), dtype=torch.float64))
+    if dtype.is_complex:
+        operand = torch.complex(operand, operand.flip(0) / 2)
+    operand = operand.to(dtype)
+    expected = (matrix @ operand.to(reference_type)).to(output_dtype)
+    device = accelerator_device()
+    data, indices, pointer = values.to(device), index.to(device=device, dtype=torch.int32), ptr.to(device)
+    # Use opB=conj for complex inputs too, so a mistaken double conjugation is observable.
+    b = operand.to(device).T.conj().resolve_conj()
+    out_storage = torch.full((17, n * 2), float("nan"), dtype=output_dtype, device=device)
+    out = out_storage[:, ::2]
+    element_bytes = 4 if dtype in (torch.float16, torch.bfloat16) else values.element_size()
+    budget = shards * 17 * element_bytes * 3  # Wave width 3, smaller than BN=16.
+    config = dict(segments_per_column=segments, output_shards=shards,
+                  block_nnz=16, block_n=16, workspace_bytes=budget)
+    originals = [t.clone() for t in (data, indices, pointer, b)]
+    try:
+        prepared = spmm_csc_mod.prepare_spmm_csc_route(
+            data, indices, pointer, (17, lengths.numel()), op="non",
+            alg="csc_col_partition_panel_atomic", config=config)
+        actual, meta = spmm_csc_mod.flagsparse_spmm_csc_run(
+            prepared, b, op_b="conj", out=out, timing=True, return_meta=True)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    assert actual is out
+    rtol, atol = close_tolerances(output_dtype)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+    assert meta["workspace_peak_bytes"] <= budget
+    direct = shards == 1 and output_dtype not in (torch.float16, torch.bfloat16)
+    if n:
+        assert meta["atomic_buffer"] == ("out" if direct else "workspace")
+        assert meta["wave_count"] == (1 if direct else (n + 2) // 3)
+    assert meta["process_cpu_ms"] == 0 and meta["operator_ms"] == meta["gpu_ms"]
+    assert meta["alg_resolved"] == "csc_col_partition_panel_atomic"
+    assert torch.isnan(out_storage[:, 1::2]).all()
+    for tensor, original in zip((data, indices, pointer, b), originals):
+        torch.testing.assert_close(tensor, original, rtol=0, atol=0)
+    if n and not direct:
+        with pytest.raises(ValueError, match="workspace_bytes"):
+            spmm_csc_mod.flagsparse_spmm_csc_run(
+                prepared, b, op_b="conj", out=out, config=dict(config, workspace_bytes=1))
+    with pytest.raises(ValueError, match="op"):
+        spmm_csc_mod.flagsparse_spmm_csc_run(prepared, b, op_b="conj", op="trans")
+
+
+@pytest.mark.spmm_csc
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_spmm_csc_partition_fallback_and_wide_precision(dtype, monkeypatch):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    native = importlib.import_module("flagsparse.sparse_operations.spmv_csc")
+    device = accelerator_device()
+    delta = 2 ** (-11 if dtype == torch.float16 else -9)
+    data = torch.tensor([1.0, delta], dtype=dtype, device=device)
+    index = torch.zeros(2, dtype=torch.int64, device=device)
+    ptr = torch.tensor([0, 1, 2], dtype=torch.int64, device=device)
+    b = torch.ones((2, 7), dtype=dtype, device=device)
+    config = dict(segments_per_column=2, output_shards=2)
+    prepared = spmm_csc_mod.prepare_spmm_csc_route(data, index, ptr, (1, 2),
+        alg="csc_col_partition_panel_atomic", config=config)
+    original = native._launch_csc_partition_panel
+    calls = []
+
+    def reject_int64(a, i, p, dense, shape, cfg, stats, **kwargs):
+        calls.append(i.dtype)
+        assert cfg["segments_per_column"] == 2 and cfg["output_shards"] == 2
+        assert kwargs["out_dtype"] == torch.float32 and kwargs["out"] is out
+        if i.dtype == torch.int64:
+            raise RuntimeError("unsupported int64 kernel indices")
+        return original(a, i, p, dense, shape, cfg, stats, **kwargs)
+
+    out = torch.full((1, 7), float("nan"), dtype=torch.float32, device=device)
+    monkeypatch.setattr(native, "_launch_csc_partition_panel", reject_int64)
+    try:
+        actual, meta = spmm_csc_mod.flagsparse_spmm_csc_run(prepared, b, out=out, return_meta=True)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    assert actual is out and calls == [torch.int64, torch.int32]
+    assert meta["index_fallback_applied"] and meta["compute_dtype"] == "float32"
+    torch.testing.assert_close(actual, torch.full_like(out, 1 + delta), rtol=0, atol=0)
+    assert not torch.equal(actual, actual.to(dtype).float())
+    prepared.index_fallback_policy = "strict"
+    with pytest.raises(RuntimeError, match="unsupported int64"):
+        spmm_csc_mod.flagsparse_spmm_csc_run(prepared, b, out=out)

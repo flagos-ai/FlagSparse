@@ -185,7 +185,8 @@ def test_interpreted_public_api_and_fallback(alg, monkeypatch):
     col = torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64)
     ptr = torch.tensor([0, 2, 2, 5], dtype=torch.int32)
     x = torch.tensor([2.0, 5.0, 3.0])
-    config = {"row_vector": {"block_nnz": 64}}
+    config = ({} if alg in policy.SHORT_ROW_ALGORITHMS
+              else {"row_vector": {"block_nnz": 64}})
     prepared = mod.prepare_spmv_csr(data, col, ptr, (3, 3), alg=alg, config=config)
     out = torch.empty(3)
     y, ms, meta = mod.flagsparse_spmv_csr_run(

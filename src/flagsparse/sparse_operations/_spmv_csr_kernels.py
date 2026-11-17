@@ -8,6 +8,86 @@ from . import _common
 
 
 @triton.jit
+def row_scalar_strip_kernel(A, I, P, X, Y, M, XS, YS,
+                            R: tl.constexpr, COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    valid = row < M
+    pos = tl.load(P + row, valid, 0).to(tl.int64)
+    end = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    re = tl.zeros((R,), ACC)
+    im = tl.zeros((R,), ACC)
+    while tl.sum((valid & (pos < end)).to(tl.int32), 0) > 0:
+        active = valid & (pos < end)
+        col = tl.load(I + pos, active, 0).to(tl.int64)
+        xp = col * tl.cast(XS, tl.int64)
+        if COMPLEX:
+            ar = tl.load(A + 2 * pos, active, 0).to(ACC)
+            ai = tl.load(A + 2 * pos + 1, active, 0).to(ACC)
+            xr = tl.load(X + 2 * xp, active, 0).to(ACC)
+            xi = tl.load(X + 2 * xp + 1, active, 0).to(ACC)
+            re += ar * xr - ai * xi
+            im += ar * xi + ai * xr
+        else:
+            a = tl.load(A + pos, active, 0).to(ACC)
+            x = tl.load(X + xp, active, 0).to(ACC)
+            re += a * x
+        pos = tl.minimum(pos + 1, end)
+    yp = row * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * yp, re, valid)
+        tl.store(Y + 2 * yp + 1, im, valid)
+    else:
+        tl.store(Y + yp, re, valid)
+
+
+@triton.jit
+def _short_row_product(A, I, X, pos, mask, XS, COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    col = tl.load(I + pos, mask, 0).to(tl.int64)
+    xp = col * tl.cast(XS, tl.int64)
+    if COMPLEX:
+        ar = tl.load(A + 2 * pos, mask, 0).to(ACC)
+        ai = tl.load(A + 2 * pos + 1, mask, 0).to(ACC)
+        xr = tl.load(X + 2 * xp, mask, 0).to(ACC)
+        xi = tl.load(X + 2 * xp + 1, mask, 0).to(ACC)
+        return ar * xr - ai * xi, ar * xi + ai * xr
+    a = tl.load(A + pos, mask, 0).to(ACC)
+    x = tl.load(X + xp, mask, 0).to(ACC)
+    return a * x, tl.full(pos.shape, 0, ACC)
+
+
+@triton.jit
+def row_static_tile_kernel(A, I, P, X, Y, M, XS, YS,
+                           R: tl.constexpr, K: tl.constexpr,
+                           COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    valid = row < M
+    start = tl.load(P + row, valid, 0).to(tl.int64)
+    end = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    lane = tl.arange(0, K).to(tl.int64)
+    longest = tl.max(end - start, 0)
+    re = tl.zeros((R, K), ACC)
+    im = tl.zeros((R, K), ACC)
+    if longest <= K:
+        pos = start[:, None] + lane[None, :]
+        mask = valid[:, None] & (pos < end[:, None])
+        re, im = _short_row_product(A, I, X, pos, mask, XS, COMPLEX, ACC)
+    else:
+        for base in range(0, longest, K):
+            pos = start[:, None] + base + lane[None, :]
+            mask = valid[:, None] & (pos < end[:, None])
+            pr, pi = _short_row_product(A, I, X, pos, mask, XS, COMPLEX, ACC)
+            re += pr
+            if COMPLEX:
+                im += pi
+    yp = row * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * yp, tl.sum(re, 1), valid)
+        tl.store(Y + 2 * yp + 1, tl.sum(im, 1), valid)
+    else:
+        tl.store(Y + yp, tl.sum(re, 1), valid)
+
+
+@triton.jit
 def row_refill_kernel(A, I, P, X, Y, M, XS, YS,
                       R: tl.constexpr, V: tl.constexpr, W: tl.constexpr,
                       COMPLEX: tl.constexpr, ACC: tl.constexpr):
@@ -575,6 +655,18 @@ def build_plan(prepared, config, adaptive):
 def compute(prepared, x, y, alg, config, plan=None):
     m = prepared.n_rows
     if not m:
+        return y
+    if alg in ("csr_row_scalar_strip", "csr_row_static_tile"):
+        complex_input = prepared.data.is_complex()
+        view = lambda t: torch.view_as_real(t) if complex_input else t
+        acc = tl.float64 if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128) else tl.float32
+        kernel = row_scalar_strip_kernel if alg == "csr_row_scalar_strip" else row_static_tile_kernel
+        extra = {} if alg == "csr_row_scalar_strip" else {"K": config["block_nnz"]}
+        kernel[(triton.cdiv(m, config["rows_per_program"]),)](
+            view(prepared.data), prepared.kernel_indices, prepared.kernel_indptr,
+            view(x), view(y), m, x.stride(0), y.stride(0),
+            R=config["rows_per_program"], COMPLEX=complex_input, ACC=acc, **extra,
+            num_warps=config["num_warps"], num_stages=config["num_stages"], enable_fp_fusion=False)
         return y
     if alg == "csr_row_refill_reduce":
         complex_input = prepared.data.is_complex()

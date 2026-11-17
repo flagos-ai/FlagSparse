@@ -7,6 +7,8 @@ IMPLEMENTATION_VERSION = 9
 NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream", "csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce")
 TARGETED_ALGORITHMS = ("csr_row_refill_reduce", "csr_transpose_sharded_atomic")
 NEW_ALGORITHMS += TARGETED_ALGORITHMS
+SHORT_ROW_ALGORITHMS = ("csr_row_scalar_strip", "csr_row_static_tile")
+NEW_ALGORITHMS += SHORT_ROW_ALGORITHMS
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend")
@@ -72,22 +74,22 @@ def algorithm_spec(alg):
     new = name in NEW_ALGORITHMS
     return {
         "name": name,
-        "implementation_version": IMPLEMENTATION_VERSION,
-        "ops": ("trans", "conj") if name == "csr_transpose_sharded_atomic" else ("non", "trans", "conj"),
+        "implementation_version": 1 if name in SHORT_ROW_ALGORITHMS else IMPLEMENTATION_VERSION,
+        "ops": ("non",) if name in SHORT_ROW_ALGORITHMS else ("trans", "conj") if name == "csr_transpose_sharded_atomic" else ("non", "trans", "conj"),
         "value_dtypes": ("float16", "bfloat16") if name in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else VALUE_DTYPES,
         "index_dtypes": (
             ("int32",) if name == "legacy_bucket_vector" else ("int32", "int64")
         ),
         "indptr_dtypes": ("int32", "int64"),
         "backends": ("cuda", "rocm") if new else BACKENDS,
-        "runtime_process": name != "csr_transpose_sharded_atomic",
-        "runtime_process_ops": () if name == "csr_transpose_sharded_atomic" else (
+        "runtime_process": name not in SHORT_ROW_ALGORITHMS + ("csr_transpose_sharded_atomic",),
+        "runtime_process_ops": () if name in SHORT_ROW_ALGORITHMS + ("csr_transpose_sharded_atomic",) else (
             ("non", "trans", "conj")
             if name
             in ("row_split_reduce", "row_adaptive_split", "legacy_bucket_vector", "csr_nnz_tile_reduce")
             else ("trans", "conj")
         ),
-        "transpose_strategy": "native_csr_sharded_scatter" if name == "csr_transpose_sharded_atomic" else "per_run_csr_rebuild",
+        "transpose_strategy": "unsupported" if name in SHORT_ROW_ALGORITHMS else "native_csr_sharded_scatter" if name == "csr_transpose_sharded_atomic" else "per_run_csr_rebuild",
         "cross_call_plan_cache": False,
         "capability_requirements": ("int64", "reduction", "atomic_by_compute_dtype") if name == "csr_transpose_sharded_atomic" else ("int64", "reduction", "scan") if name in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce") else ("int64", "reduction") if new else (),
         "compute_dtype": "input_dependent",
@@ -96,7 +98,9 @@ def algorithm_spec(alg):
             dt: (dt, "float32")
             for dt in ("float16", "bfloat16")
         },
-        "config_candidates": ({"rows_per_program": (8, 16, 32), "block_nnz": (64, 128, 256)}
+        "config_candidates": ({"rows_per_program": (32, 64, 128)} if name == "csr_row_scalar_strip" else
+                              {"rows_per_program": (4, 8, 16), "block_nnz": (8, 16, 32, 64)} if name == "csr_row_static_tile" else
+                              {"rows_per_program": (8, 16, 32), "block_nnz": (64, 128, 256)}
                               if name == "csr_rowgroup_stream_reduce" else {"prefetch_chunks": (1, 2), "lanes_per_row": (2, 4, 8, 16, 32, 64), "row_tiles_per_program": (1, 2, 4, 8)}
                               if name == "csr_subgroup_pair_mixed" else {"lanes_per_row": (2, 4, 8, 16, 32, 64),
                                "row_tiles_per_program": (1, 2, 4, 8)}
@@ -274,6 +278,29 @@ def _validate_config(resolved, caps):
 def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_nnz=0):
     if config is not None and not isinstance(config, dict):
         raise TypeError("CSR SpMV config must be a dictionary")
+    if alg in SHORT_ROW_ALGORITHMS:
+        if caps.backend not in ("cuda", "rocm") or caps.subgroup_width not in (32, 64):
+            raise BackendCapabilityUnavailable("short-row launch capabilities unknown")
+        warps = [w for w in (1, 2, 4, 8) if w * caps.subgroup_width <= caps.max_threads_per_block]
+        if not warps:
+            raise BackendCapabilityUnavailable("no legal short-row launch")
+        scalar = alg == "csr_row_scalar_strip"
+        cfg = dict(rows_per_program=64 if scalar else 8,
+                   num_warps=max((w for w in warps if w <= 2), default=min(warps)), num_stages=1)
+        if not scalar:
+            cfg["block_nnz"] = 16
+        supplied = config or {}
+        if set(supplied) - set(cfg):
+            raise ValueError(f"unused {alg} config fields: {sorted(set(supplied) - set(cfg))}")
+        cfg.update(supplied)
+        if any(type(v) is not int for v in cfg.values()):
+            raise ValueError("short-row configuration values must be integers")
+        if (cfg["num_warps"] not in warps or cfg["num_stages"] != 1 or
+                cfg["rows_per_program"] not in ((32, 64, 128) if scalar else (4, 8, 16)) or
+                (not scalar and cfg["block_nnz"] not in (8, 16, 32, 64))):
+            raise ValueError("invalid short-row tile or launch configuration")
+        result = (cfg, "explicit" if supplied else "short-row-conservative-v1")
+        return result + ([],) if return_rejections else result
     if alg in TARGETED_ALGORITHMS:
         if caps.backend not in ("cuda", "rocm") or caps.subgroup_width not in (32, 64):
             raise BackendCapabilityUnavailable("targeted CSR launch capabilities unknown")

@@ -112,3 +112,35 @@ def test_independent_mixed_cases_use_existing_gpu_delivery_files():
     benchmark = _read(PROJECT_ROOT / "tests" / "benchmark_utils.py")
     assert '"compare"' in benchmark and "supported = query(" in benchmark
     assert 'row["metadata"] = meta' in benchmark
+
+
+def test_short_csr_and_partition_csc_use_original_delivery():
+    for op, names in {
+        "spmv_csr": ("csr_row_scalar_strip", "csr_row_static_tile"),
+        "spmm_csc": ("csc_col_partition_panel_atomic",),
+    }.items():
+        accuracy = PROJECT_ROOT / "tests" / "pytest" / f"test_{op}_accuracy.py"
+        assert list((PROJECT_ROOT / "tests").rglob(accuracy.name)) == [accuracy]
+        text = _read(accuracy)
+        assert f"@pytest.mark.{op}" in text
+        for name in names:
+            assert name in text
+        benchmark = _read(PROJECT_ROOT / "tests" / f"test_{op}.py")
+        assert "run_type_combo_benchmark" in benchmark
+    # The existing runner and workflows collect the same operator markers.
+    assert "run_flagsparse_accuracy.py" in _read(WORKFLOWS_DIR / "gpu-ci.yml")
+
+
+def test_csc_regular_benchmark_forwards_explicit_configuration():
+    import ast
+    tree = ast.parse(_read(PROJECT_ROOT / "tests/test_spmm_csc.py"))
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    prepare = next(node for node in ast.walk(functions["_time_flagsparse_csc"])
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and node.func.attr == "prepare_spmm_csc_route")
+    assert any(key.arg == "config" and isinstance(key.value, ast.Name)
+               and key.value.id == "config" for key in prepare.keywords)
+    call = next(node for node in ast.walk(functions["_run_case"])
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_time_flagsparse_csc")
+    assert any(key.arg == "config" for key in call.keywords)

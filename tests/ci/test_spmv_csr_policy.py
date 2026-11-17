@@ -108,7 +108,8 @@ class ConfigPolicy(unittest.TestCase):
                 self.assertIn(alg, policy.list_algorithms(dtype="bfloat16", backend="rocm"))
                 continue
             self.assertEqual(alg in policy.list_algorithms("non", "torch.float32", "rocm"), "non" in policy.algorithm_spec(alg)["ops"])
-            self.assertIn(alg, policy.list_algorithms("trans", "float32", "cuda"))
+            self.assertEqual(alg in policy.list_algorithms("trans", "float32", "cuda"),
+                             "trans" in policy.algorithm_spec(alg)["ops"])
             self.assertEqual(alg in policy.list_algorithms("non", "complex64", "cuda"), "non" in policy.algorithm_spec(alg)["ops"])
             for backend in ("metax", "mthreads", "ascend"):
                 self.assertNotIn(alg, policy.list_algorithms(backend=backend))
@@ -130,12 +131,13 @@ class ConfigPolicy(unittest.TestCase):
             if alg in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed"):
                 continue
             policy.resolve_config(alg, no_fp64)
+            op = "non" if alg in policy.SHORT_ROW_ALGORITHMS else "conj"
             for dtype in ("float16", "bfloat16", "complex64"):
-                policy.validate_support(alg, "conj", dtype, "int64", "int32", no_fp64)
+                policy.validate_support(alg, op, dtype, "int64", "int32", no_fp64)
             for dtype in ("float32", "float64", "complex128"):
                 with self.assertRaisesRegex(NotImplementedError, "FP64"):
                     policy.validate_support(
-                        alg, "trans", dtype, "int64", "int32", no_fp64
+                        alg, op, dtype, "int64", "int32", no_fp64
                     )
 
     def test_backend_profiles_and_mixed_indices(self):
@@ -765,3 +767,84 @@ def test_csr_scalar_arguments_use_specialization_safe_casts():
                       and node.func.attr == "cast" and node.args
                       and isinstance(node.args[0], ast.Name)}
             assert scalars <= casted, (filename, name)
+
+
+def test_short_row_specs_and_configuration_isolation():
+    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True)
+    for alg, rows in (("csr_row_scalar_strip", 64), ("csr_row_static_tile", 8)):
+        cfg, _ = policy.resolve_config(alg, caps)
+        assert cfg["rows_per_program"] == rows
+        assert cfg["num_warps"] == 2 and cfg["num_stages"] == 1
+        spec = policy.algorithm_spec(alg)
+        assert spec["ops"] == ("non",) and not spec["runtime_process_ops"]
+        assert spec["compute_dtype_by_input"]["float32"] == "float64"
+        for dtype in policy.VALUE_DTYPES:
+            policy.validate_support(alg, "non", dtype, "int64", "int32", caps)
+        assert alg in policy.list_algorithms("non", "float16", "cuda")
+        assert alg not in policy.list_algorithms("trans", "float16", "cuda")
+        with unittest.TestCase().assertRaises(NotImplementedError):
+            policy.validate_support(alg, "trans", "float16", "int32", "int32", caps)
+        for invalid in ({"num_stages": 2}, {"num_warps": 3}, {"rows_per_program": True},
+                        {"rows_per_program": 3}, {"output_shards": 2},
+                        {"row_vector": {"block_nnz": 128}}):
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.resolve_config(alg, caps, invalid)
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.resolve_config(alg, policy.BackendCaps("unknown"))
+    with unittest.TestCase().assertRaises(ValueError):
+        policy.resolve_config("csr_row_scalar_strip", caps, {"block_nnz": 16})
+    for k in (8, 16, 32, 64):
+        cfg, _ = policy.resolve_config("csr_row_static_tile", caps, {"block_nnz": k})
+        assert cfg["block_nnz"] == k
+
+
+def test_column_partition_policy_and_workspace():
+    csr, column = _extension_policies()
+    caps = csr.BackendCaps("cuda", "cuda", "80", 32, 1024, (1, 2, 4, 8),
+                          True, True, True, True, True, True, True)
+    alg = "csc_col_partition_panel_atomic"
+    for dtype in csr.DTYPES:
+        cfg, _ = column.resolve_csc_config(alg, dtype, 33, caps)
+        assert cfg["segments_per_column"] == 2 and cfg["output_shards"] == 1
+        assert cfg["block_n"] == (8 if dtype == "complex128" else 16)
+    for s in (1, 2, 4):
+        for h in (1, 2, 4):
+            cfg, _ = column.resolve_csc_config(alg, "float16", 7, caps,
+                {"segments_per_column": s, "output_shards": h, "workspace_bytes": 101})
+            assert cfg["workspace_bytes"] == 101 and cfg["block_n"] == 8
+    for invalid in ({"segments_per_column": 3}, {"output_shards": 8},
+                    {"workspace_bytes": 0}, {"workspace_bytes": True},
+                    {"block_nnz": 8}, {"columns_per_program": 4}, {"num_stages": 2}):
+        with unittest.TestCase().assertRaises(ValueError):
+            column.resolve_csc_config(alg, "float16", 7, caps, invalid)
+    with unittest.TestCase().assertRaises(ValueError):
+        column.resolve_csc_config(alg, "float16", 7, caps, op="trans")
+    with unittest.TestCase().assertRaises(ValueError):
+        column.resolve_csc_config(alg, "float16", 7, caps, kind="spmv")
+    from dataclasses import replace
+    for capability in ("fp32_atomic", "reduction", "int64"):
+        with unittest.TestCase().assertRaises(csr.BackendCapabilityUnavailable):
+            column.resolve_csc_config(alg, "float16", 7, replace(caps, **{capability: None}))
+
+
+def test_targeted_native_kernels_do_not_construct_structural_plans():
+    tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
+    kernels = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    for name in ("row_scalar_strip_kernel", "row_static_tile_kernel"):
+        calls = {node.func.attr for node in ast.walk(kernels[name])
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        assert "store" in calls and "atomic_add" not in calls
+    tree = ast.parse((SOURCE / "spmv_csc.py").read_text(encoding="utf-8"))
+    launch = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "_launch_csc_partition_panel")
+    calls = {node.func.attr for node in ast.walk(launch)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+    assert not calls & {"item", "tolist", "cumsum", "repeat_interleave", "nonzero", "argsort"}
+    # Test delivery remains the existing operator marker and registry-driven benchmark.
+    for filename, names in (
+        ("test_spmv_csr_accuracy.py", ("csr_row_scalar_strip", "csr_row_static_tile")),
+        ("test_spmm_csc_accuracy.py", ("csc_col_partition_panel_atomic",)),
+    ):
+        source = (ROOT / "tests/pytest" / filename).read_text(encoding="utf-8")
+        for name in names:
+            assert name in source

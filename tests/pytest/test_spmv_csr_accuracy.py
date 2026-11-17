@@ -340,7 +340,8 @@ def _new_prepared(data, col, ptr, shape, alg, **kwargs):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", TESTED_NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg", tuple(a for a in TESTED_NEW_ALGORITHMS
+                                      if a not in spmv_mod._csr_config.SHORT_ROW_ALGORITHMS))
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_spmv_csr_default_segment_multilevel(alg, dtype):
     data, col, ptr, x, shape = _native_case(
@@ -487,9 +488,9 @@ def test_spmv_csr_new_out_and_prepared_validation():
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", TESTED_NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg,op", tuple((a, op) for a in TESTED_NEW_ALGORITHMS
+                                        for op in spmv_mod.get_spmv_csr_algorithm_spec(a)["ops"]))
 @pytest.mark.parametrize("dtype", [torch.float32, torch.complex64, torch.complex128])
-@pytest.mark.parametrize("op", ["non", "trans", "conj"])
 def test_spmv_csr_new_fallback_preserves_selection(alg, dtype, op, monkeypatch):
     from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
 
@@ -498,6 +499,8 @@ def test_spmv_csr_new_fallback_preserves_selection(alg, dtype, op, monkeypatch):
         x = _make_x(shape[0], dtype, data.device)
     config = ({"window_rows": 128} if alg == "csr_row_refill_reduce"
               else {"block_nnz": 64} if alg == "csr_rowgroup_stream_reduce"
+              else {"rows_per_program": 32} if alg == "csr_row_scalar_strip"
+              else {"block_nnz": 16} if alg == "csr_row_static_tile"
               else {"row_vector": {"block_nnz": 64}})
     prepared = _new_prepared(data, col, ptr, shape, alg, config=config, op=op)
     original = kernels.compute
@@ -1202,14 +1205,15 @@ def test_spmv_sharded_workspace_and_fallback(monkeypatch):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", ["csr_row_refill_reduce", "csr_transpose_sharded_atomic"])
+@pytest.mark.parametrize("alg", ["csr_row_refill_reduce", "csr_transpose_sharded_atomic",
+                                  "csr_row_scalar_strip", "csr_row_static_tile"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_spmv_targeted_wide_output_not_roundtrip(alg, dtype):
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     device = accelerator_device()
     delta = 2 ** (-11 if dtype == torch.float16 else -9)
     a = torch.tensor([1.0, delta], dtype=dtype, device=device)
-    if alg == "csr_row_refill_reduce":
+    if alg != "csr_transpose_sharded_atomic":
         shape, op, offsets, columns = (1, 2), "non", [0, 2], [0, 1]
     else:
         shape, op, offsets, columns = (2, 1), "trans", [0, 1, 2], [0, 0]
@@ -1224,3 +1228,61 @@ def test_spmv_targeted_wide_output_not_roundtrip(alg, dtype):
     expected = torch.tensor([1 + delta], dtype=torch.float32, device=device)
     torch.testing.assert_close(y, expected, rtol=0, atol=0)
     assert not torch.equal(y, y.to(dtype).float())
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("alg,config", [
+    ("csr_row_scalar_strip", None), ("csr_row_scalar_strip", {"rows_per_program": 32}),
+    ("csr_row_static_tile", None),
+    ("csr_row_static_tile", {"rows_per_program": 4, "block_nnz": 8}),
+])
+@pytest.mark.parametrize("dtype,output_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
+    (torch.float32, torch.float32), (torch.float64, torch.float64),
+    (torch.complex64, torch.complex64), (torch.complex128, torch.complex128),
+], ids=lambda dtype: str(dtype).removeprefix("torch."))
+@pytest.mark.parametrize("index_pair", [(torch.int64, torch.int32)] if _MIXED_QUICK_MODE else [
+    (torch.int32, torch.int32), (torch.int32, torch.int64),
+    (torch.int64, torch.int32), (torch.int64, torch.int64),
+])
+def test_spmv_csr_short_rows_native(alg, config, dtype, output_dtype, index_pair, monkeypatch):
+    from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("short rows must not build a runtime plan")
+
+    monkeypatch.setattr(kernels, "build_plan", forbidden)
+    # Empty groups, a full fast group, both K boundaries, a long-row group and R tail.
+    lengths = [0] * 64 + [1, 2, 4, 7] * 2 + [8, 9, 15, 16, 17, 257, 0, 2, 1]
+    data, col, ptr, x, shape = _native_case(lengths, dtype, *index_pair, n=19)
+    x_storage = torch.empty(38, dtype=dtype, device=x.device)
+    x_storage[::2] = x
+    x = x_storage[::2]
+    originals = [t.clone() for t in (data, col, ptr, x)]
+    backing = torch.full((shape[0] * 2,), float("nan"), dtype=output_dtype, device=x.device)
+    out = backing[::2]
+    try:
+        prepared = _new_prepared(data, col, ptr, shape, alg, config=config)
+        result, meta = spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=out, return_meta=True, timing=True)
+        direct = spmv_mod.flagsparse_spmv_csr(data, col, ptr, x, shape,
+                                            alg=alg, config=config, out_dtype=output_dtype)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    # Golden from stored input values, before any low-precision output conversion.
+    reference_type = torch.complex128 if dtype.is_complex else torch.float64
+    expected = golden_csr(data.to(reference_type), col, ptr, x.to(reference_type), shape).to(output_dtype)
+    rtol, atol = close_tolerances(output_dtype)
+    torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+    torch.testing.assert_close(direct, result, rtol=rtol, atol=atol)
+    assert result is out and meta["alg_resolved"] == alg
+    assert meta["process_cpu_ms"] == 0 and meta["process_gpu_ms"] == 0
+    assert meta["ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+    assert torch.isnan(backing[1::2]).all()
+    for tensor, original in zip((data, col, ptr, x), originals):
+        torch.testing.assert_close(tensor, original, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="op"):
+        spmv_mod.flagsparse_spmv_csr_run(prepared, x, op="trans")
+    with pytest.raises(ValueError, match="overlap"):
+        spmv_mod.flagsparse_spmv_csr_run(prepared, x, out=data[:shape[0]])

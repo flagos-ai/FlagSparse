@@ -17,6 +17,7 @@
 import argparse
 import csv
 import glob
+import json
 import os
 import sys
 from pathlib import Path
@@ -86,6 +87,8 @@ PERF_FIELDS = [
     "reason",
     "fallback_used",
     "cusparse_reason",
+    "config",
+    "metadata",
 ]
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
 
@@ -399,8 +402,8 @@ def _cuda_event_benchmark(op, warmup, iters):
     return out, filtered_avg_ms(samples)
 
 
-def _time_flagsparse_csc(data, indices, indptr, B, shape, alg, op, warmup, iters, timing=False):
-    prepared = fs.prepare_spmm_csc_route(data, indices, indptr, shape, alg=alg, op=op)
+def _time_flagsparse_csc(data, indices, indptr, B, shape, alg, op, warmup, iters, timing=False, config=None):
+    prepared = fs.prepare_spmm_csc_route(data, indices, indptr, shape, alg=alg, op=op, config=config)
     out, gpu_ms = _cuda_event_benchmark(
         lambda: fs.flagsparse_spmm_csc_run(prepared, B, alg=alg, op=op),
         warmup,
@@ -429,6 +432,7 @@ def _time_flagsparse_csc(data, indices, indptr, B, shape, alg, op, warmup, iters
         "process_cpu_ms": process_cpu_ms,
         "process_gpu_ms": process_gpu_ms,
         "compute_ms": compute_ms,
+        "metadata": meta,
     }
 
 
@@ -529,6 +533,7 @@ def _run_case(
     iters,
     timing,
     run_cusparse,
+    config=None,
 ):
     B = _materialize_dense_layout(
         _random_values((_logical_b_rows(shape, op), int(dense_cols)), dtype, data.device) * 0.125,
@@ -587,6 +592,7 @@ def _run_case(
             warmup,
             iters,
             timing=timing,
+            config=config,
         )
         if promoted_fp16:
             csc["out"] = csc["out"].to(dtype)
@@ -599,6 +605,8 @@ def _run_case(
                 "compute_ms": csc["compute_ms"],
                 "c_stride": _stride_string(csc["out"]),
                 "err_vs_ref": _error_ratio(csc["out"], ref, dtype),
+                "config": json.dumps(csc["metadata"].get("config", {}), default=str),
+                "metadata": json.dumps(csc["metadata"], default=str),
             }
         )
         row["status"] = "PASS" if row["err_vs_ref"] is not None and row["err_vs_ref"] <= 1.0 else "FAIL"
@@ -606,6 +614,11 @@ def _run_case(
             row["reason"] = "correctness check failed"
     except Exception as exc:
         row["reason"] = str(exc)
+        if alg == "csc_col_partition_panel_atomic":
+            import traceback
+            print(f"CSC execution error: matrix={matrix_name} dtype={dtype} op={op} "
+                  f"layout={layout} N={dense_cols} alg={alg} config={config}", file=sys.stderr)
+            traceback.print_exc()
     if row["status"] != "ERROR" and fs_common._is_maca_runtime():
         # torch.sparse.mm documents CSC @ Dense as unsupported, but MACA's PyTorch
         # accepts it, so it is a real baseline there and nowhere else.
@@ -740,6 +753,9 @@ def main():
     index_dtypes = _parse_csv_tokens(args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes")
     ops = _parse_ops(args.ops)
     algs = _parse_algs(args.alg)
+    config = json.loads(args.config) if isinstance(args.config, str) else args.config
+    if config is not None and (not isinstance(config, dict) or len(algs) != 1 or algs[0] in ("auto", "all", "compare")):
+        parser.error("--config requires a JSON object and one explicit algorithm")
     layouts = _layout_names(args.layout)
     run_cusparse = not args.no_cusparse
     _print_notes(run_cusparse)
@@ -846,6 +862,7 @@ def main():
                                     args.iters,
                                     args.timing,
                                     run_cusparse,
+                                    config=config,
                                 )
                                 rows.append(row)
                                 _print_row(row, timing=args.timing)
