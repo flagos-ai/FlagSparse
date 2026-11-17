@@ -8,6 +8,173 @@ from . import _common
 
 
 @triton.jit
+def row_scalar_bound_kernel(A, I, P, X, Y, M, XS, YS,
+                            R: tl.constexpr, COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    valid = row < M
+    start = tl.load(P + row, valid, 0).to(tl.int64)
+    end = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    steps = tl.max(end - start, 0)
+    re = tl.zeros((R,), ACC)
+    im = tl.zeros((R,), ACC)
+    for step in range(steps):
+        pos = start + step
+        pr, pi = _short_row_product(A, I, X, pos, valid & (pos < end), XS, COMPLEX, ACC)
+        re += pr
+        if COMPLEX:
+            im += pi
+    yp = row * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * yp, re, valid)
+        tl.store(Y + 2 * yp + 1, im, valid)
+    else:
+        tl.store(Y + yp, re, valid)
+
+
+@triton.jit
+def longrow_producer_kernel(A, I, P, X, Y, COUNTERS, OWNERS, JOB_SLOT, JOB_START,
+                            JOB_END, M, XS, YS, R: tl.constexpr, K: tl.constexpr,
+                            L: tl.constexpr, S: tl.constexpr,
+                            COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    valid = row < M
+    start = tl.load(P + row, valid, 0).to(tl.int64)
+    end = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    long = valid & (end - start > L)
+    long_flags = long.to(tl.int32)
+    count = tl.sum(long_flags, 0)
+    if count > 0:
+        first_slot = tl.atomic_add(COUNTERS, count, sem="relaxed").to(tl.int64)
+        slots = first_slot + tl.cumsum(long_flags, 0).to(tl.int64) - 1
+        tl.store(OWNERS + slots, row, long)
+        jobs = tl.where(long, tl.cdiv(end - start, S), 0)
+        job_prefix = tl.cumsum(jobs, 0)
+        first_job = tl.atomic_add(COUNTERS + 1, tl.sum(jobs, 0).to(tl.int32), sem="relaxed").to(tl.int64)
+        job_base = first_job + job_prefix - jobs
+        # Bounded descriptor tiles: no storage proportional to the longest row in registers.
+        lane = tl.arange(0, 32).to(tl.int64)
+        for base in range(0, tl.max(jobs, 0), 32):
+            j = base + lane
+            active = long[:, None] & (j[None, :] < jobs[:, None])
+            offset = job_base[:, None] + j[None, :]
+            begin = start[:, None] + j[None, :] * S
+            tl.store(JOB_SLOT + offset, tl.broadcast_to(slots[:, None], (R, 32)), active)
+            tl.store(JOB_START + offset, begin, active)
+            tl.store(JOB_END + offset, tl.minimum(begin + S, end[:, None]), active)
+    ordinary = valid & ~long
+    steps = tl.max(tl.where(ordinary, tl.cdiv(end - start, K), 0), 0)
+    lane = tl.arange(0, K).to(tl.int64)
+    re = tl.zeros((R, K), ACC)
+    im = tl.zeros((R, K), ACC)
+    for step in range(steps):
+        pos = start[:, None] + step * K + lane[None, :]
+        mask = ordinary[:, None] & (pos < end[:, None])
+        pr, pi = _short_row_product(A, I, X, pos, mask, XS, COMPLEX, ACC)
+        re += pr
+        if COMPLEX:
+            im += pi
+    yp = row * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * yp, tl.sum(re, 1), ordinary)
+        tl.store(Y + 2 * yp + 1, tl.sum(im, 1), ordinary)
+    else:
+        tl.store(Y + yp, tl.sum(re, 1), ordinary)
+
+
+@triton.jit
+def longrow_consumer_kernel(A, I, X, COUNTERS, JOB_SLOT, JOB_START, JOB_END,
+                            PARTIAL, XS, K: tl.constexpr, COMPLEX: tl.constexpr,
+                            ACC: tl.constexpr):
+    count = tl.load(COUNTERS + 1)
+    job = tl.atomic_add(COUNTERS + 2, 1, sem="relaxed")
+    lane = tl.arange(0, K).to(tl.int64)
+    while job < count:
+        slot = tl.load(JOB_SLOT + job.to(tl.int64))
+        start = tl.load(JOB_START + job.to(tl.int64))
+        end = tl.load(JOB_END + job.to(tl.int64))
+        re = tl.zeros((K,), ACC)
+        im = tl.zeros((K,), ACC)
+        for base in range(start, end, K):
+            pos = base + lane
+            pr, pi = _short_row_product(A, I, X, pos, pos < end, XS, COMPLEX, ACC)
+            re += pr
+            if COMPLEX:
+                im += pi
+        if COMPLEX:
+            tl.atomic_add(PARTIAL + 2 * slot, tl.sum(re, 0), sem="relaxed")
+            tl.atomic_add(PARTIAL + 2 * slot + 1, tl.sum(im, 0), sem="relaxed")
+        else:
+            tl.atomic_add(PARTIAL + slot, tl.sum(re, 0), sem="relaxed")
+        job = tl.atomic_add(COUNTERS + 2, 1, sem="relaxed")
+
+
+@triton.jit
+def longrow_finish_kernel(COUNTERS, OWNERS, PARTIAL, Y, YS,
+                          B: tl.constexpr, COMPLEX: tl.constexpr):
+    slot = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B).to(tl.int64)
+    valid = slot < tl.load(COUNTERS)
+    row = tl.load(OWNERS + slot, valid, 0)
+    yp = row * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        re = tl.load(PARTIAL + 2 * slot, valid, 0)
+        im = tl.load(PARTIAL + 2 * slot + 1, valid, 0)
+        tl.store(Y + 2 * yp, re, valid)
+        tl.store(Y + 2 * yp + 1, im, valid)
+    else:
+        tl.store(Y + yp, tl.load(PARTIAL + slot, valid, 0), valid)
+
+
+def run_longrow_queue(prepared, x, out, timing, phase):
+    from ._spmv_csr_config import longrow_queue_capacity
+
+    cfg = prepared.config
+    complex_input = prepared.data.is_complex()
+    dtype = torch.float64 if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128) else torch.float32
+    channels = 2 if complex_input else 1
+    stats = longrow_queue_capacity(prepared.n_rows, prepared.data.numel(), cfg,
+                                  8 if dtype == torch.float64 else 4, channels)
+    capacity, jobs = stats["long_row_capacity"], stats["job_capacity"]
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    def initialize():
+        data = prepared.data.resolve_conj().resolve_neg()
+        vector = x.resolve_conj().resolve_neg()
+        counters = torch.zeros(3, dtype=torch.int32, device=x.device)
+        owners = torch.empty(capacity, dtype=torch.int64, device=x.device)
+        descriptors = tuple(torch.empty(jobs, dtype=torch.int64, device=x.device) for _ in range(3))
+        partial = torch.zeros(capacity * channels, dtype=dtype, device=x.device)
+        return data, vector, counters, owners, descriptors, partial
+    (data, vector, counters, owners, descriptors, partial), process_ms = phase(initialize, timing)
+    view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+    common = dict(COMPLEX=complex_input, ACC=tl.float64 if dtype == torch.float64 else tl.float32,
+                  num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    def produce():
+        if prepared.n_rows:
+            longrow_producer_kernel[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                counters, owners, *descriptors, prepared.n_rows, vector.stride(0), y.stride(0),
+                R=cfg["rows_per_program"], K=cfg["short_block_nnz"],
+                L=cfg["long_row_threshold"], S=cfg["segment_nnz"],
+                num_warps=cfg["producer_num_warps"], **common)
+    _, fused_ms = phase(produce, timing)
+    def consume_and_finish():
+        if capacity:
+            longrow_consumer_kernel[(cfg["worker_programs"],)](
+                view(data), prepared.kernel_indices, view(vector), counters, *descriptors,
+                partial, vector.stride(0), K=cfg["block_nnz"], num_warps=cfg["num_warps"], **common)
+            longrow_finish_kernel[(triton.cdiv(capacity, 128),)](
+                counters, owners, partial, view(y), y.stride(0), B=128, COMPLEX=complex_input,
+                num_warps=cfg["num_warps"], num_stages=1)
+    _, tail_ms = phase(consume_and_finish, timing)
+    return y, dict(stats, process_cpu_ms=0.0, process_gpu_ms=process_ms,
+                   compute_ms=(fused_ms + tail_ms) if timing else None,
+                   fused_plan_compute_ms=fused_ms, queue_count_readback=False,
+                   execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                   execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                   x_stride=tuple(x.stride()), y_stride=tuple(y.stride()),
+                   plan_strategy="per_run_long_rows_only", output_buffer_identity="out" if out is not None else "allocated")
+
+
+@triton.jit
 def row_scalar_strip_kernel(A, I, P, X, Y, M, XS, YS,
                             R: tl.constexpr, COMPLEX: tl.constexpr, ACC: tl.constexpr):
     row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
@@ -656,12 +823,13 @@ def compute(prepared, x, y, alg, config, plan=None):
     m = prepared.n_rows
     if not m:
         return y
-    if alg in ("csr_row_scalar_strip", "csr_row_static_tile"):
+    if alg in ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound"):
         complex_input = prepared.data.is_complex()
         view = lambda t: torch.view_as_real(t) if complex_input else t
         acc = tl.float64 if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128) else tl.float32
-        kernel = row_scalar_strip_kernel if alg == "csr_row_scalar_strip" else row_static_tile_kernel
-        extra = {} if alg == "csr_row_scalar_strip" else {"K": config["block_nnz"]}
+        kernel = {"csr_row_scalar_strip": row_scalar_strip_kernel, "csr_row_static_tile": row_static_tile_kernel,
+                  "csr_row_scalar_bound": row_scalar_bound_kernel}[alg]
+        extra = {"K": config["block_nnz"]} if alg == "csr_row_static_tile" else {}
         kernel[(triton.cdiv(m, config["rows_per_program"]),)](
             view(prepared.data), prepared.kernel_indices, prepared.kernel_indptr,
             view(x), view(y), m, x.stride(0), y.stride(0),

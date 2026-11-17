@@ -2341,6 +2341,12 @@ def _detail_shape(row: dict[str, str], index: int, seen: set[str]) -> str:
         "mode",
         "case_id",
         "seed",
+        "indptr_dtype",
+        "op_b",
+        "layout",
+        "vendor_alg_requested",
+        "vendor_preprocess_requested",
+        "diagnostic_case",
     ):
         value = row.get(key)
         if value:

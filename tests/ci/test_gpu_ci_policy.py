@@ -116,7 +116,8 @@ def test_independent_mixed_cases_use_existing_gpu_delivery_files():
 
 def test_short_csr_and_partition_csc_use_original_delivery():
     for op, names in {
-        "spmv_csr": ("csr_row_scalar_strip", "csr_row_static_tile"),
+        "spmv_csr": ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_longrow_queue_atomic"),
+        "spmv_csc": ("csc_col_scalar_bound",),
         "spmm_csc": ("csc_col_partition_panel_atomic",),
     }.items():
         accuracy = PROJECT_ROOT / "tests" / "pytest" / f"test_{op}_accuracy.py"

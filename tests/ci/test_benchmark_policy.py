@@ -237,6 +237,35 @@ def test_mixed_metric_cli_is_shared_by_all_six_benchmarks():
     assert "NOT DRAM/HBM" in source
 
 
+def test_vendor_diagnostic_cli_is_pure_and_keeps_boolean_preprocess():
+    import argparse
+    import unittest
+    path = PROJECT_ROOT / "tests/benchmark_utils.py"
+    add = _timing_function(path, "add_type_combo_arguments")
+    parse = _timing_function(path, "parse_vendor_options")
+    parser = argparse.ArgumentParser()
+    add(parser, spmm=True)
+    defaults = parser.parse_args([])
+    assert parse("spmm_csc", defaults)[:3] == (("default",), (None,), ())
+    options = parser.parse_args(["--type-combos", "float16:float16:float32",
+        "--vendor-alg", "csr_alg1,csr_alg2", "--vendor-preprocess", "off,on",
+        "--vendor-diagnostic", "ones_fanin", "--diagnostic-lengths", "128,512"])
+    assert parse("spmm_csc", options) == (("csr_alg1", "csr_alg2"), (False, True), ("ones_fanin",), (128, 512))
+    with unittest.TestCase().assertRaises(ValueError):
+        parse("spmv_csc", options)
+    options.type_combos = None
+    with unittest.TestCase().assertRaises(ValueError):
+        parse("spmm_csc", options)
+
+
+def test_valid_performance_is_not_conditioned_on_accuracy():
+    ratio = _timing_function(PROJECT_ROOT / "tests/utils.py", "finite_speedup")
+    assert ratio(1, 2) == 0.5
+    for invalid in (None, 0, -1, float("inf"), float("nan")):
+        assert ratio(invalid, 1) is None
+        assert ratio(1, invalid) is None
+
+
 def test_mixed_benchmark_run_signatures_preserve_type_and_operation_contract():
     import ast
 

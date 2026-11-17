@@ -17,6 +17,42 @@
 import time
 
 
+def finite_speedup(reference_ms, operator_ms):
+    """Timing validity is independent of either implementation's accuracy."""
+    import math
+
+    try:
+        reference, actual = float(reference_ms), float(operator_ms)
+    except (TypeError, ValueError):
+        return None
+    return reference / actual if all(math.isfinite(x) and x > 0 for x in (reference, actual)) else None
+
+
+def tensor_accuracy_metrics(actual, reference, rtol, atol):
+    """CPU diagnostics; use the existing elementwise tolerance, never relax it."""
+    import math
+    import torch
+
+    actual, reference = actual.detach().cpu(), reference.detach().cpu()
+    if actual.shape != reference.shape:
+        raise ValueError("accuracy shapes differ")
+    finite = torch.isfinite(actual) & torch.isfinite(reference)
+    close = torch.isclose(actual, reference, rtol=rtol, atol=atol, equal_nan=False) & finite
+    work_dtype = torch.complex128 if actual.is_complex() or reference.is_complex() else torch.float64
+    error = (actual.to(work_dtype) - reference.to(work_dtype)).abs()
+    scale = reference.to(work_dtype).abs()
+    def maximum(value):
+        result = float(value.max()) if value.numel() else 0.0
+        return result if math.isfinite(result) else None
+    return dict(
+        passed=bool(close.all()), max_error=maximum(error),
+        max_relative_error=maximum(error / scale.clamp_min(max(atol, torch.finfo(torch.float64).tiny))),
+        normalized_max_error=maximum(error / (atol + rtol * scale).clamp_min(torch.finfo(torch.float64).tiny)),
+        failed_elements=int((~close).sum()), output_nonfinite=int((~torch.isfinite(actual)).sum()),
+        reference_nonfinite=int((~torch.isfinite(reference)).sum()),
+    )
+
+
 def filtered_avg_ms(times, tolerance=0.10):
     if not times:
         return None

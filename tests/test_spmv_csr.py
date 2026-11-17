@@ -66,6 +66,13 @@ FIELDS = [
     "iters",
     "execution_path",
     "workspace_peak_bytes",
+    "long_row_capacity",
+    "job_capacity",
+    "descriptor_bytes",
+    "numeric_workspace_bytes",
+    "queue_count_readback",
+    "plan_strategy",
+    "output_buffer_identity",
     "descriptor_peak_bytes",
     "output_shards",
     "atomic_buffer",
@@ -283,7 +290,7 @@ def main(argv=None):
             p.error("no registered algorithms support the selected combinations")
     else:
         explicit_algorithms = choices(args.alg, ("auto",) + registered)
-    fields = FIELDS + (["process_gpu_ms", "compute_ms"] if args.timing else [])
+    fields = FIELDS + (["process_gpu_ms", "compute_ms", "fused_plan_compute_ms"] if args.timing else [])
     if common._is_rocm_runtime():
         fields += ["execution_kernel", "nnz_prepare_ms", "nnz_metadata_bytes"]
     csv_file = None

@@ -22,6 +22,19 @@ from pathlib import Path
 import pytest
 
 import run_flagsparse_pytest as runner
+
+
+def test_vendor_diagnostic_variants_keep_distinct_detail_keys():
+    base = dict(matrix="diagnostic_rectangular", type_combo="bfloat16:bfloat16:float32",
+                alg="csc_col_tile_panel_atomic", op="non", op_b="trans", layout="row",
+                status="FAIL", vendor_status="FAIL", vendor_ms="2.0", ms="4.0",
+                speedup_vs_vendor="0.5", vendor_alg_requested="csr_alg1",
+                vendor_preprocess_requested="off")
+    seen = set()
+    first = runner._detail_shape(base, 0, seen)
+    second = runner._detail_shape(dict(base, vendor_preprocess_requested="on"), 1, seen)
+    assert first != second and "vendor_preprocess_requested=on" in second
+    assert runner._performance_row_has_complete_speedup(base)
 from tools.delivery_variants import load_delivery_variants
 
 ROOT = Path(__file__).resolve().parents[2]

@@ -75,6 +75,7 @@ def backend_caps(device):
         reduction=capability("supports_reduction", default=True if documented_cuda_hip else None),
         stable_sort=capability("supports_stable_sort", default=True if backend in ("cuda", "rocm") else None),
         scan=capability("supports_scan", default=True if backend in ("cuda", "rocm") else None),
+        int32_atomic=capability("supports_int32_atomic", default=True if documented_cuda_hip else None),
         fp32_atomic=capability("supports_fp32_atomic", default=True if documented_cuda_hip else None),
         fp64_atomic=capability("supports_fp64_atomic", default=(
             True if backend == "rocm" and target_name == "hip" else

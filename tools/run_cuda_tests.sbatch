@@ -102,6 +102,11 @@ gpu_env=()
 if [[ ${CUDA_VISIBLE_DEVICES+x} ]]; then
     gpu_env+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 fi
+# Forward only the explicit external-matrix accuracy opt-in through --cleanenv.
+if [[ -n ${FLAGSPARSE_SPMV_CSR_MTX_DIR:-} ]]; then
+    [[ -d "$FLAGSPARSE_SPMV_CSR_MTX_DIR" ]] || die "External CSR matrix directory does not exist"
+    gpu_env+=(--env "FLAGSPARSE_SPMV_CSR_MTX_DIR=$FLAGSPARSE_SPMV_CSR_MTX_DIR")
+fi
 printf 'Job=%s Host=%s Repo=%s\nImage=%s Venv=%s Entry=%s\n' \
     "$job_tag" "$(hostname)" "$repo" "$image" "$venv" "$entry"
 

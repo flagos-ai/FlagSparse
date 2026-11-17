@@ -50,6 +50,7 @@ class BackendCaps:
     scan: object = None
     fp32_atomic: object = None
     fp64_atomic: object = None
+    int32_atomic: object = None
 
 
 def algorithm_spec(name):

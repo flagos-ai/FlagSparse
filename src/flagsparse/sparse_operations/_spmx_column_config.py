@@ -163,6 +163,7 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
 
 CSC_MIXED_ALGORITHMS = ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed")
 CSC_ALGORITHMS = {
+    "csc_col_scalar_bound": ("trans", "conj"),
     "csc_subgroup_pair_mixed": ("trans", "conj"),
     "csc_panel_staged_mixed": ("trans", "conj"),
     "csc_col_vector": ("trans", "conj"),
@@ -186,6 +187,8 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
         raise ValueError(f"unknown CSC algorithm {algorithm!r}")
     if op not in CSC_ALGORITHMS[algorithm]:
         raise ValueError(f"{algorithm} does not support op={op}")
+    if algorithm == "csc_col_scalar_bound" and kind != "spmv":
+        raise ValueError("csc_col_scalar_bound requires SpMV")
     if algorithm == "csc_col_partition_panel_atomic" and kind != "spmm":
         raise ValueError("csc_col_partition_panel_atomic requires SpMM")
     if algorithm in CSC_MIXED_ALGORITHMS and dtype not in ("float16", "bfloat16"):
@@ -224,6 +227,8 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
                    block_n=1 if kind == "spmv" or algorithm == "csc_col_vector" else min(bn, 1 << (max(1, n)-1).bit_length()))
         if algorithm == "csc_col_split_reduce":
             cfg.update(segment_nnz=1024, reduce_block_size=256, workspace_bytes=256 * 1024 * 1024)
+    elif algorithm == "csc_col_scalar_bound":
+        cfg.update(columns_per_program=64)
     elif algorithm == "csc_col_subgroup":
         cfg.update(lanes_per_column=8, columns_per_program=warps * caps.subgroup_width // 8)
     elif algorithm == "csc_col_tile_atomic":
@@ -253,6 +258,8 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
                 raise ValueError(f"{key} must be a positive integer")
             if key not in ("num_stages", "workspace_bytes") and value & (value-1):
                 raise ValueError(f"{key} must be a power of two")
+        if algorithm == "csc_col_scalar_bound" and candidate["columns_per_program"] not in (32, 64, 128):
+            raise ValueError("columns_per_program must be 32/64/128")
         if candidate["num_stages"] != 1:
             raise ValueError("CSC num_stages must be 1")
         if algorithm == "csc_col_partition_panel_atomic" and (

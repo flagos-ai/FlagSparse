@@ -266,7 +266,99 @@ def test_spmv_csc_int64_strict_no_fallback(monkeypatch):
 
 
 # Explicit migrated algorithms share this operator's marker, golden and tolerance.
-_MIGRATED_ROUTES = (('csc_col_subgroup', 'trans'), ('csc_col_subgroup', 'conj'), ('csc_col_vector', 'trans'), ('csc_col_vector', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('csc_col_tile_atomic', 'non'))
+_MIGRATED_ROUTES = (('csc_col_scalar_bound', 'trans'), ('csc_col_scalar_bound', 'conj'), ('csc_col_subgroup', 'trans'), ('csc_col_subgroup', 'conj'), ('csc_col_vector', 'trans'), ('csc_col_vector', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('csc_col_tile_atomic', 'non'))
+
+
+@pytest.mark.spmv_csc
+@pytest.mark.parametrize("dtype,output_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
+    (torch.float32, torch.float32), (torch.float64, torch.float64),
+    (torch.complex64, torch.complex64), (torch.complex128, torch.complex128),
+], ids=lambda dtype: str(dtype).removeprefix("torch."))
+@pytest.mark.parametrize("op", ["trans", "conj"])
+@pytest.mark.parametrize("columns_per_program", [32, 128])
+def test_spmv_csc_scalar_bound_native(dtype, output_dtype, op, columns_per_program, monkeypatch):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    module = spmv_csc_mod
+    def forbidden(*args, **kwargs):
+        raise AssertionError("scalar CSC must not generate an owner-map or split plan")
+    monkeypatch.setattr(module, "_run_csc_split", forbidden)
+    device = accelerator_device()
+    lengths = [0] * 128 + [1, 7, 8, 9, 31, 32, 33, 257, 0, 3]
+    owners = torch.repeat_interleave(torch.arange(len(lengths)), torch.tensor(lengths))
+    index = (torch.arange(owners.numel()) * 7) % 19
+    values = (torch.arange(owners.numel()) % 7 - 3).double() / 16
+    rhs = (torch.arange(19) % 5 - 2).double() / 8
+    if dtype.is_complex:
+        values = torch.complex(values, values.flip(0) / 2)
+        rhs = torch.complex(rhs, rhs.flip(0))
+    values, rhs = values.to(dtype), rhs.to(dtype)
+    ref_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    matrix = torch.zeros((19, len(lengths)), dtype=ref_dtype)
+    matrix.index_put_((index, owners), values.to(ref_dtype), accumulate=True)
+    expected = ((matrix.T.conj() if op == "conj" else matrix.T) @ rhs.to(ref_dtype)).to(output_dtype)
+    a, i = values.to(device), index.to(device=device, dtype=torch.int64)
+    p = torch.tensor([0] + torch.tensor(lengths).cumsum(0).tolist(), device=device, dtype=torch.int32)
+    x = torch.empty(38, dtype=dtype, device=device)[::2]
+    x.copy_(rhs)
+    storage = torch.full((len(lengths) * 2,), float("nan"), dtype=output_dtype, device=device)
+    out = storage[::2]
+    originals = [t.clone() for t in (a, i, p, x)]
+    cfg = dict(columns_per_program=columns_per_program)
+    try:
+        prepared = module.prepare_spmv_csc(a, i, p, matrix.shape, op=op, alg="csc_col_scalar_bound", config=cfg)
+        actual, elapsed, meta = module.flagsparse_spmv_csc_run(prepared, x, out=out,
+                                                timing=True, return_meta=True, return_time=True)
+        direct = module.flagsparse_spmv_csc(a, i, p, x, matrix.shape, op=op,
+                                    alg="csc_col_scalar_bound", config=cfg, out_dtype=output_dtype)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    rtol, atol = close_tolerances(output_dtype)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+    torch.testing.assert_close(direct, actual, rtol=rtol, atol=atol)
+    assert actual is out and meta["alg_resolved"] == "csc_col_scalar_bound"
+    assert elapsed == meta["gpu_ms"] + meta["process_cpu_ms"]
+    assert meta["transpose_strategy"] == "native_column_reduce"
+    assert torch.isnan(storage[1::2]).all()
+    for value, original in zip((a, i, p, x), originals):
+        torch.testing.assert_close(value, original, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="op"):
+        module.flagsparse_spmv_csc_run(prepared, x, op="non")
+    with pytest.raises(ValueError, match="overlap"):
+        module.flagsparse_spmv_csc_run(prepared, x, out=a[:len(lengths)])
+
+
+@pytest.mark.spmv_csc
+def test_spmv_csc_scalar_bound_fallback_preserves_wide_output(monkeypatch):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    module = spmv_csc_mod
+    device = accelerator_device()
+    a = torch.tensor([1, 0.00390625, -0.5], dtype=torch.bfloat16, device=device)
+    i = torch.tensor([0, 0, 1], dtype=torch.int64, device=device)
+    p = torch.tensor([0, 2, 2, 3], dtype=torch.int64, device=device)
+    x = torch.ones(2, dtype=a.dtype, device=device)
+    out = torch.full((6,), float("nan"), device=device)[::2]
+    original = module._launch_csc_columns
+    def inject(data, index, ptr, dense, shape, op, alg, cfg, **kwargs):
+        if index.dtype == torch.int64:
+            raise RuntimeError("unsupported int64 kernel indices")
+        assert alg == "csc_col_scalar_bound" and op == "conj"
+        assert cfg["columns_per_program"] == 32
+        assert kwargs["out"] is out and kwargs["out_dtype"] == torch.float32
+        return original(data, index, ptr, dense, shape, op, alg, cfg, **kwargs)
+    monkeypatch.setattr(module, "_launch_csc_columns", inject)
+    prepared = module.prepare_spmv_csc(a, i, p, (2, 3), op="conj",
+                                alg="csc_col_scalar_bound", config={"columns_per_program": 32})
+    try:
+        actual, meta = module.flagsparse_spmv_csc_run(prepared, x, out=out, return_meta=True)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    assert actual is out and meta["index_fallback_applied"]
+    torch.testing.assert_close(actual.cpu(), torch.tensor([1.00390625, 0, -0.5]), rtol=0, atol=0)
+    prepared.index_fallback_policy = "strict"
+    with pytest.raises(RuntimeError, match="unsupported int64"):
+        module.flagsparse_spmv_csc_run(prepared, x, out=out)
 
 
 @pytest.mark.spmv_csc
@@ -400,7 +492,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
     (torch.int64, torch.int32), (torch.int64, torch.int64),
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmv_csc
-@pytest.mark.parametrize("alg,op", [('csc_subgroup_pair_mixed', 'trans'), ('csc_subgroup_pair_mixed', 'conj'), ('csc_col_tile_atomic', 'non'), ('csc_col_subgroup', 'trans'), ('csc_col_subgroup', 'conj'), ('csc_col_vector', 'trans'), ('csc_col_vector', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('spmv_csc_base', 'non'), ('spmv_csc_base', 'trans'), ('spmv_csc_base', 'conj')])
+@pytest.mark.parametrize("alg,op", [('csc_col_scalar_bound', 'trans'), ('csc_col_scalar_bound', 'conj'), ('csc_subgroup_pair_mixed', 'trans'), ('csc_subgroup_pair_mixed', 'conj'), ('csc_col_tile_atomic', 'non'), ('csc_col_subgroup', 'trans'), ('csc_col_subgroup', 'conj'), ('csc_col_vector', 'trans'), ('csc_col_vector', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('spmv_csc_base', 'non'), ('spmv_csc_base', 'trans'), ('spmv_csc_base', 'conj')])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["f16", "bf16"])
 @pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
 def test_spmv_csc_registered_half_combinations(alg, op, dtype, wide, index_pair):

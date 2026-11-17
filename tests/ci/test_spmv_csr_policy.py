@@ -95,9 +95,9 @@ class ConfigPolicy(unittest.TestCase):
             policy.validate_support("csr_nnz_tile_reduce", "non", "float32", "int32", "int32", caps)
 
     def setUp(self):
-        self.cuda = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True, fp32_atomic=True, fp64_atomic=True)
+        self.cuda = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True, fp32_atomic=True, fp64_atomic=True, int32_atomic=True)
         self.hip = policy.BackendCaps(
-            "rocm", "gfx90a", "hip", 64, 1024, True, True, True, scan=True, fp32_atomic=True, fp64_atomic=True
+            "rocm", "gfx90a", "hip", 64, 1024, True, True, True, scan=True, fp32_atomic=True, fp64_atomic=True, int32_atomic=True
         )
 
     def test_registry_support(self):
@@ -119,7 +119,7 @@ class ConfigPolicy(unittest.TestCase):
             policy.normalize_alg("compare")
 
     def test_all_dtype_ops_and_precision_requirements(self):
-        no_fp64 = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, False, True, True, scan=True, fp32_atomic=True, fp64_atomic=True)
+        no_fp64 = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, False, True, True, scan=True, fp32_atomic=True, fp64_atomic=True, int32_atomic=True)
         for alg in policy.ALGORITHMS:
             for dtype in policy.algorithm_spec(alg)["value_dtypes"]:
                 for op in policy.algorithm_spec(alg)["ops"]:
@@ -131,7 +131,7 @@ class ConfigPolicy(unittest.TestCase):
             if alg in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed"):
                 continue
             policy.resolve_config(alg, no_fp64)
-            op = "non" if alg in policy.SHORT_ROW_ALGORITHMS else "conj"
+            op = policy.algorithm_spec(alg)["ops"][0]
             for dtype in ("float16", "bfloat16", "complex64"):
                 policy.validate_support(alg, op, dtype, "int64", "int32", no_fp64)
             for dtype in ("float32", "float64", "complex128"):
@@ -600,7 +600,8 @@ def test_migrated_policies_validate_capabilities_and_workspace():
         cfg, _ = column.resolve_coo_config(alg, "float16" if alg in column.COO_MIXED_ALGORITHMS else "float64", caps)
         assert cfg["num_warps"] in caps.legal_num_warps
     for alg, ops in column.CSC_ALGORITHMS.items():
-        cfg, _ = column.resolve_csc_config(alg, "bfloat16" if alg in column.CSC_MIXED_ALGORITHMS else "complex128", 7, caps, op=ops[0])
+        cfg, _ = column.resolve_csc_config(alg, "bfloat16" if alg in column.CSC_MIXED_ALGORITHMS else "complex128", 7, caps, op=ops[0],
+                                             kind="spmv" if alg == "csc_col_scalar_bound" else "spmm")
         assert cfg["num_warps"] in caps.legal_num_warps
     with unittest.TestCase().assertRaises(NotImplementedError):
         csr.resolve_config("csr_row_panel", "float32", 7, "row", csr.BackendCaps("unknown"))
@@ -692,7 +693,7 @@ def test_generic_p1_config_and_capabilities():
     import pytest
     from dataclasses import replace
 
-    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True, fp32_atomic=True, fp64_atomic=True)
+    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True, scan=True, fp32_atomic=True, fp64_atomic=True, int32_atomic=True)
     alg = "csr_rowgroup_stream_reduce"
     cfg, _ = policy.resolve_config(alg, caps)
     assert cfg == dict(rows_per_program=16, block_nnz=128, num_warps=4, num_stages=1)
@@ -771,7 +772,7 @@ def test_csr_scalar_arguments_use_specialization_safe_casts():
 
 def test_short_row_specs_and_configuration_isolation():
     caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True)
-    for alg, rows in (("csr_row_scalar_strip", 64), ("csr_row_static_tile", 8)):
+    for alg, rows in (("csr_row_scalar_strip", 64), ("csr_row_static_tile", 8), ("csr_row_scalar_bound", 64)):
         cfg, _ = policy.resolve_config(alg, caps)
         assert cfg["rows_per_program"] == rows
         assert cfg["num_warps"] == 2 and cfg["num_stages"] == 1
@@ -796,6 +797,65 @@ def test_short_row_specs_and_configuration_isolation():
     for k in (8, 16, 32, 64):
         cfg, _ = policy.resolve_config("csr_row_static_tile", caps, {"block_nnz": k})
         assert cfg["block_nnz"] == k
+
+
+def test_longrow_queue_capacity_and_capabilities():
+    from dataclasses import replace
+    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True,
+                              scan=True, fp32_atomic=True, fp64_atomic=True, int32_atomic=True)
+    alg = "csr_longrow_queue_atomic"
+    cfg, _ = policy.resolve_config(alg, caps)
+    assert policy.algorithm_spec(alg)["ops"] == ("non",)
+    for dtype in policy.VALUE_DTYPES:
+        policy.validate_support(alg, "non", dtype, "int64", "int32", caps)
+    for field in ("scan", "int32_atomic", "fp64_atomic"):
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.validate_support(alg, "non", "float32", "int32", "int64", replace(caps, **{field: None}))
+    for bad in ({"long_row_threshold": 3}, {"segment_nnz": 64}, {"num_stages": 2},
+                {"worker_programs": 0}, {"worker_programs": 31}, {"rows_per_program": 32},
+                {"workspace_limit_bytes": True}, {"output_shards": 2}):
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config(alg, caps, bad)
+    for lengths in ([], [0, 1, 1024], [1025] * 17, [8193], [0, 1025, 8193, 1]):
+        capacity = policy.longrow_queue_capacity(len(lengths), sum(lengths), cfg, 8, 2)
+        long = [n for n in lengths if n > cfg["long_row_threshold"]]
+        jobs = sum((n + cfg["segment_nnz"] - 1) // cfg["segment_nnz"] for n in long)
+        assert len(long) <= capacity["long_row_capacity"] and jobs <= capacity["job_capacity"]
+        assert capacity["workspace_peak_bytes"] == capacity["descriptor_bytes"] + capacity["numeric_workspace_bytes"]
+    with unittest.TestCase().assertRaisesRegex(ValueError, "workspace"):
+        policy.longrow_queue_capacity(1, 8193, dict(cfg, workspace_limit_bytes=1), 8, 2)
+    with unittest.TestCase().assertRaisesRegex(ValueError, "int32"):
+        policy.longrow_queue_capacity(1 << 31, 1 << 50, dict(cfg, workspace_limit_bytes=1 << 62), 4, 1)
+
+
+def test_native_column_scalar_configuration():
+    csr, column = _extension_policies()
+    caps = csr.BackendCaps("cuda", "cuda", "80", 32, 1024, (1, 2, 4, 8),
+                          True, True, True, True, True, True, True)
+    for dtype in csr.DTYPES:
+        for op in ("trans", "conj"):
+            cfg, _ = column.resolve_csc_config("csc_col_scalar_bound", dtype, 1, caps, op=op, kind="spmv")
+            assert cfg == dict(columns_per_program=64, num_warps=2, num_stages=1)
+    for invalid in ({"block_nnz": 16}, {"columns_per_program": 16}, {"num_stages": 2}):
+        with unittest.TestCase().assertRaises(ValueError):
+            column.resolve_csc_config("csc_col_scalar_bound", "float32", 1, caps, invalid, op="trans", kind="spmv")
+    with unittest.TestCase().assertRaises(ValueError):
+        column.resolve_csc_config("csc_col_scalar_bound", "float32", 1, caps, op="non", kind="spmv")
+
+
+def test_queue_has_ordered_launches_and_no_host_count_readback():
+    tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    host = functions["run_longrow_queue"]
+    calls = {n.func.attr for n in ast.walk(host) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert not calls & {"item", "tolist", "nonzero", "argsort", "cumsum", "repeat_interleave"}
+    for name in ("row_scalar_bound_kernel",):
+        assert not any(isinstance(n, ast.While) for n in ast.walk(functions[name]))
+        assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == "atomic_add" for n in ast.walk(functions[name]))
+    consumer = functions["longrow_consumer_kernel"]
+    assert "OWNERS" not in {arg.arg for arg in consumer.args.args}
+    assert "row_scalar_bound_kernel" in functions
 
 
 def test_column_partition_policy_and_workspace():

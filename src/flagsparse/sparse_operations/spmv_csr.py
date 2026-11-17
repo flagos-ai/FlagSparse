@@ -41,6 +41,8 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "csr_nnz_tile_reduce",
     "csr_row_scalar_strip",
     "csr_row_static_tile",
+    "csr_row_scalar_bound",
+    "csr_longrow_queue_atomic",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1475,15 +1477,16 @@ def _spmv_backend_caps(device):
     verified = (backend == "cuda" and target_name == "cuda" and arch.isdigit()) or (
         backend == "rocm" and target_name == "hip" and arch.startswith("gfx")
     )
-    atomic32 = atomic64 = None
+    atomic32 = atomic64 = integer_atomic = None
     if verified:
         from ._spmm_csr_runtime import backend_caps
 
         shared = backend_caps(device)
         atomic32, atomic64 = shared.fp32_atomic, shared.fp64_atomic
+        integer_atomic = shared.int32_atomic
     return _csr_config.BackendCaps(
         backend, arch, target_name, width, max_threads, verified, verified, verified,
-        scan=verified, fp32_atomic=atomic32, fp64_atomic=atomic64,
+        scan=verified, fp32_atomic=atomic32, fp64_atomic=atomic64, int32_atomic=integer_atomic,
     )
 
 
@@ -1663,7 +1666,7 @@ def _spmv_check_output(out, prepared, x, output_dtype=None):
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
-    strided_algorithms = ("csr_nnz_tile_reduce", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS)
+    strided_algorithms = ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_longrow_queue_atomic", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS)
     if not out.is_contiguous() and prepared.alg not in strided_algorithms:
         raise ValueError("out must be contiguous")
     if prepared.alg in strided_algorithms and out.numel() > 1 and out.stride(0) <= 0:
@@ -1766,6 +1769,9 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
             "execution_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix("torch."),
         }
     alg = prepared.alg
+    if alg == "csr_longrow_queue_atomic":
+        from ._spmv_csr_kernels import run_longrow_queue
+        return run_longrow_queue(prepared, x, out, timing, _spmv_phase)
     if alg == "csr_transpose_sharded_atomic":
         from ._spmv_csr_transpose import compute_sharded
 
@@ -2006,6 +2012,15 @@ def flagsparse_spmv_csr_run(
                         workspace_peak_bytes=0, descriptor_peak_bytes=0,
                         x_stride=phases.get("x_stride", tuple(x.stride())),
                         y_stride=phases.get("y_stride", tuple(y.stride())))
+        if actual.alg == "csr_longrow_queue_atomic":
+            meta.update(execution_path="native_csr_longrow_queue_atomic", validation="unverified",
+                        initialization="queue_counters_and_partial_slots", output_conversion="final_store")
+            for key in ("long_row_capacity", "job_capacity", "descriptor_bytes", "numeric_workspace_bytes",
+                        "workspace_peak_bytes", "queue_count_readback", "plan_strategy",
+                        "x_stride", "y_stride", "output_buffer_identity"):
+                meta[key] = phases[key]
+            if timing:
+                meta["fused_plan_compute_ms"] = phases["fused_plan_compute_ms"]
         if actual.alg == "csr_transpose_sharded_atomic":
             meta.update(execution_path="native_csr_transpose_sharded_atomic", validation="unverified",
                         x_stride=phases["x_stride"], y_stride=phases["y_stride"])

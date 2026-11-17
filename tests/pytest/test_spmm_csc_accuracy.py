@@ -36,6 +36,37 @@ pytestmark = pytest.mark.skipif(
 SPMM_CSC_MKN_SHAPES = ((7, 5, 4), (16, 32, 8), (64, 96, 16))
 
 
+@pytest.mark.spmm_csc
+@pytest.mark.parametrize("dtype,output_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
+], ids=lambda dtype: str(dtype).removeprefix("torch."))
+@pytest.mark.parametrize("length", [128, 512])
+def test_spmm_csc_native_vendor_fanin(dtype, output_dtype, length, tmp_path, record_property):
+    """Vendor correctness is a separate verdict, never a FlagSparse pass proxy."""
+    from flagsparse.sparse_operations._common import _backend_name
+    from tests.cusparse_generic_baseline import benchmark_isolated
+    if _backend_name() != "cuda":
+        pytest.skip("this diagnostic targets the CUDA CSC low-precision baseline")
+    device = accelerator_device()
+    rtol, atol = close_tolerances(output_dtype)
+    payload = dict(fmt="csc", arrays=(torch.ones(length, dtype=dtype),
+                   torch.zeros(length, dtype=torch.int32), torch.arange(length + 1, dtype=torch.int32)),
+                   shape=(1, length), rhs=torch.ones((length, 32), dtype=dtype),
+                   output_shape=(1, 32), output_stride=(32, 1), output_dtype=output_dtype,
+                   op_a="non", op_b="non", backend="cuda", matrix=True,
+                   golden=torch.full((1, 32), float(length), dtype=torch.float64),
+                   rtol=rtol, atol=atol, narrow_tolerances=close_tolerances(dtype),
+                   warmup=1, iters=2, device_index=device.index or 0, diagnostic=True,
+                   vendor_alg="default", vendor_preprocess=False)
+    result = benchmark_isolated(payload, log_prefix=tmp_path / "csc_vendor", timeout=120)
+    record_property("vendor_diagnostic", result)
+    if result["vendor_status"] == "SKIP":
+        pytest.skip(result["vendor_reason"])
+    assert result["vendor_status"] == "PASS", result
+    assert result["vendor_ms"] > 0
+
+
 def _value_dtype_cases():
     return [
         ("float32", torch.float32),

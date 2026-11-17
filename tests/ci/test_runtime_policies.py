@@ -666,3 +666,99 @@ def test_mixed_progress_is_outside_measured_iteration_loops():
     assert any(isinstance(n, ast.keyword) and n.arg == "checkpoint_state"
                and isinstance(n.value, ast.Constant) and n.value.value == "completed"
                for n in ast.walk(emit))
+
+
+def test_vendor_diagnostic_cli_and_accuracy_metrics():
+    import argparse
+    from tests.benchmark_utils import add_type_combo_arguments, parse_vendor_options
+    from tests.utils import finite_speedup, tensor_accuracy_metrics
+
+    parser = argparse.ArgumentParser()
+    add_type_combo_arguments(parser, spmm=True)
+    args = parser.parse_args(["--type-combos", "bfloat16:bfloat16:float32",
+                              "--vendor-diagnostic", "ones_fanin,rectangular",
+                              "--vendor-alg", "default,csr_alg1,csr_alg2,csr_alg3",
+                              "--vendor-preprocess", "off,on"])
+    algorithms, preprocessing, cases, lengths = parse_vendor_options("spmm_csc", args)
+    assert algorithms == ("default", "csr_alg1", "csr_alg2", "csr_alg3")
+    assert preprocessing == (False, True) and cases == ("ones_fanin", "rectangular")
+    assert lengths == (128, 256, 512, 1024, 2048, 4096)
+    with pytest.raises(ValueError):
+        parse_vendor_options("spmv_csc", args)
+    args.type_combos = None
+    with pytest.raises(ValueError):
+        parse_vendor_options("spmm_csc", args)
+    assert finite_speedup(2.0, 4.0) == 0.5  # Independent of either accuracy status.
+    for value in (None, 0, -1, float("nan"), float("inf")):
+        assert finite_speedup(value, 1.0) is None
+        assert finite_speedup(1.0, value) is None
+    expected = torch.tensor([1., 0., 2.])
+    metrics = tensor_accuracy_metrics(torch.tensor([1., 1., float("nan")]), expected, 1e-3, 1e-4)
+    assert not metrics["passed"] and metrics["failed_elements"] == 2
+    assert metrics["output_nonfinite"] == 1 and metrics["reference_nonfinite"] == 0
+    assert tensor_accuracy_metrics(expected, expected, 0, 0)["passed"]
+
+
+@pytest.mark.parametrize("algorithm,number,preprocess", [
+    ("default", 0, False), ("csr_alg1", 4, False), ("csr_alg1", 4, True),
+    ("csr_alg2", 6, False), ("csr_alg3", 12, False), ("csr_alg3", 12, True),
+])
+def test_cuda_vendor_algorithm_and_preprocess_reach_c_api(monkeypatch, algorithm, number, preprocess):
+    import ctypes
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from tests import cusparse_generic_baseline as baseline
+
+    calls, released = [], []
+    class Function:
+        def __init__(self, name):
+            self.name = name
+        def __call__(self, *args):
+            if self.name.startswith("Create"):
+                ctypes.cast(args[0], ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(17)
+            if self.name == "GetVersion":
+                ctypes.cast(args[1], ctypes.POINTER(ctypes.c_int))[0] = 12900
+            if self.name.startswith("SpMM"):
+                calls.append((self.name, args[-2]))
+            if self.name.startswith("Destroy"):
+                released.append(self.name)
+            return 0
+    library = SimpleNamespace(_name="mock-cusparse", **{"cusparse" + name: Function(name) for name in (
+        "Create", "Destroy", "SetStream", "GetVersion", "CreateCsc", "DestroySpMat",
+        "CreateDnMat", "DestroyDnMat", "SpMM", "SpMM_bufferSize", "SpMM_preprocess")})
+    monkeypatch.setattr(baseline.ctypes, "CDLL", lambda name: library)
+    monkeypatch.setattr(baseline.ctypes.util, "find_library", lambda name: name)
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=23))
+    monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: SimpleNamespace(data_ptr=lambda: 999))
+    def tensor(dtype, dense=False):
+        return SimpleNamespace(dtype=dtype, device=torch.device("cuda:0"), ndim=2 if dense else 1,
+            shape=(2, 2), stride=lambda axis: 2 if axis == 0 else 1,
+            is_contiguous=lambda: True, numel=lambda: 4, data_ptr=lambda: 19)
+    arrays = (tensor(torch.bfloat16), tensor(torch.int32), tensor(torch.int64))
+    out = tensor(torch.float32, True)
+    plan = baseline.prepare_spmm("csc", arrays, (2, 2), tensor(torch.bfloat16, True), out,
+                                 "non", "non", torch.float32, backend="cuda",
+                                 algorithm=algorithm, preprocess=preprocess)
+    assert plan.run() is out
+    assert calls == [("SpMM_bufferSize", number)] + ([("SpMM_preprocess", number)] if preprocess else []) + [("SpMM", number)]
+    assert plan.metadata["vendor_preprocessed"] is preprocess
+    assert plan.metadata["vendor_alg"] == algorithm
+    plan.close()
+    plan.close()
+    assert len(released) == 4
+
+
+def test_vendor_scan_reuses_native_measurements_outside_timing():
+    import ast
+    from pathlib import Path
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "benchmark_utils.py").read_text(encoding="utf-8"))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_type_combo_benchmark")
+    variant_loop = next(n for n in ast.walk(function) if isinstance(n, ast.For)
+                        and isinstance(n.target, ast.Tuple) and isinstance(n.target.elts[0], ast.Name)
+                        and n.target.elts[0].id == "variant_index")
+    names = {n.func.id for n in ast.walk(variant_loop) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "emit" in names and "finite_speedup" in names and "run" not in names
+    assert not any(isinstance(n, ast.Compare) and any(isinstance(v, ast.Constant) and v.value == "PASS"
+                   for v in n.comparators) for n in ast.walk(variant_loop))

@@ -82,6 +82,7 @@ ops:
       Explicit csr_subgroup_pair_mixed: FP16/BF16 inputs, FP32 compute, same-type/FP32 output; hardware unverified.
       Explicit csr_rowgroup_stream_reduce: six floating/complex dtypes, non/trans/conj, four half mixed combinations; scan required; hardware unverified.
       Explicit csr_row_refill_reduce: six floating/complex dtypes, non/trans/conj; local row-slot refill with no runtime partition plan; hardware unverified.
+      Explicit csr_row_scalar_bound and csr_longrow_queue_atomic: six dtypes, non only; half/bfloat16 same-type or FP32 output; independent bound-loop and GPU long-row queue, hardware unverified.
       Explicit csr_row_scalar_strip and csr_row_static_tile: six floating/complex dtypes, non only; independent short-row candidates, no runtime plan; half/bfloat16 support same-type or FP32 output; hardware unverified.
       Explicit csr_transpose_sharded_atomic: six floating/complex dtypes, trans/conj only; native CSR output shards with compute-precision atomics; hardware unverified.
     for:
@@ -125,6 +126,7 @@ ops:
   - id: spmv_csc
     description: |
       Computes sparse matrix-vector multiplication for a CSC matrix.
+      Explicit csc_col_scalar_bound: six dtypes, native trans/conj; half/bfloat16 same-type or FP32 output, hardware unverified.
       Explicit csc_subgroup_pair_mixed: FP16/BF16 inputs, FP32 compute, same-type/FP32 output; hardware unverified.
     for:
       - flagsparse_spmv_csc

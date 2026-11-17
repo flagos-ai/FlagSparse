@@ -133,6 +133,7 @@ def _command_specs(
         "spmv-csc": [
             "tests/test_spmv_csc.py",
             "--synthetic",
+            "--alg", "compare", "--ops", "non,trans,conj",
             "--warmup",
             str(args.warmup),
             "--iters",

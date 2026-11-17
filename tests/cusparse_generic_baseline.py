@@ -53,6 +53,8 @@ _BASE_ZERO = 0
 _OP = {"non": 0, "trans": 1, "conj": 2}
 _SPMV_SELL_ALG1 = 5
 _ALG_DEFAULT = 0
+# NVIDIA HPC SDK 25.9 CUDA interfaces, cusparseSpMMAlg_t (CUDA only).
+_CUDA_SPMM_ALGORITHMS = {"default": 0, "csr_alg1": 4, "csr_alg2": 6, "csr_alg3": 12}
 _ORDER_COL, _ORDER_ROW = 1, 2
 
 _LIB = None
@@ -384,7 +386,7 @@ def _native_operations(op_a, op_b, a_dtype, rhs_dtype):
 
 
 def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
-                                compute_dtype, backend, matrix):
+                                compute_dtype, backend, matrix, *, algorithm="default", preprocess=None):
     """Explicit native baseline, with a device-local handle owned by this plan.
 
     Unlike the historical q4 entry points, this path supports either vendor and
@@ -393,6 +395,14 @@ def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
     if backend not in ("cuda", "rocm"):
         raise NotImplementedError(f"direct sparse C API is unavailable on {backend}")
     hip = backend == "rocm"
+    if algorithm not in _CUDA_SPMM_ALGORITHMS:
+        raise ValueError(f"unknown vendor algorithm {algorithm!r}")
+    if preprocess is not None and type(preprocess) is not bool:
+        raise ValueError("preprocess must be None, False or True")
+    if algorithm != "default" and (hip or not matrix or fmt not in ("csr", "csc")):
+        raise NotImplementedError("explicit csr_alg1/2/3 require CUDA CSR/CSC SpMM")
+    if preprocess is True and (not matrix or (not hip and algorithm not in ("csr_alg1", "csr_alg3"))):
+        raise NotImplementedError("explicit CUDA SpMM preprocess requires csr_alg1 or csr_alg3")
     if hip != bool(getattr(torch.version, "hip", None)) or rhs.device.type != "cuda":
         raise NotImplementedError(f"{backend} baseline requires a matching CUDA/HIP device")
     if fmt not in ("csr", "coo", "csc"):
@@ -487,15 +497,16 @@ def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
             arguments = (handle, operations[actual_a])
             if matrix:
                 arguments += (operations[actual_b],)
-            arguments += (ctypes.byref(one), sparse, rhs_d, ctypes.byref(zero), out_d, types[compute_dtype], 0)
+            arguments += (ctypes.byref(one), sparse, rhs_d, ctypes.byref(zero), out_d,
+                          types[compute_dtype], _CUDA_SPMM_ALGORITHMS[algorithm])
             size = ctypes.c_size_t()
             execute = function(operation)
             check(function(operation + "_bufferSize")(*arguments, ctypes.byref(size)), operation + "_bufferSize")
             workspace = torch.empty(max(1, size.value), dtype=torch.uint8, device=rhs.device)
             preprocessed = False
-            if hip and matrix and hasattr(library, "hipsparseSpMM_preprocess"):
-                preprocess = function("SpMM_preprocess", _SIGNATURES["cusparseSpMM"])
-                check(preprocess(*arguments, _P(workspace.data_ptr())), "SpMM_preprocess")
+            if preprocess is True or (preprocess is None and hip and matrix and hasattr(library, "hipsparseSpMM_preprocess")):
+                preprocess_fn = function("SpMM_preprocess", _SIGNATURES["cusparseSpMM"])
+                check(preprocess_fn(*arguments, _P(workspace.data_ptr())), "SpMM_preprocess")
                 preprocessed = True
 
         def run():
@@ -506,7 +517,12 @@ def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
 
         plan = _Plan(run, (library, arrays, rhs, out, one, zero, workspace), list(reversed(destroy)))
         plan.metadata = dict(vendor_backend=prefix, vendor_version=version.value,
-                             vendor_alg="default", vendor_preprocessed=preprocessed,
+                             vendor_alg=algorithm, vendor_algorithm_id=_CUDA_SPMM_ALGORITHMS[algorithm],
+                             vendor_format=fmt, vendor_alpha=1, vendor_beta=0,
+                             vendor_a_dtype=str(arrays[0].dtype), vendor_rhs_dtype=str(rhs.dtype),
+                             vendor_output_dtype=str(out.dtype), vendor_preprocessed=preprocessed,
+                             vendor_workspace_bytes=size.value,
+                             vendor_library_name=str(getattr(library, "_name", "unknown")),
                              vendor_op_a_requested=op_a, vendor_op_b_requested=op_b,
                              vendor_op_a_executed=actual_a, vendor_op_b_executed=actual_b,
                              vendor_operation_mapping=("real_conjugate_transpose_equals_transpose"
@@ -560,10 +576,14 @@ def prepare_spmv(fmt, arrays, shape, x, y, op, compute_dtype, *, backend=None):
     return plan
 
 
-def prepare_spmm(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, *, backend=None):
+def prepare_spmm(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, *, backend=None,
+                 algorithm="default", preprocess=None):
     """C = op(A) @ op(B); B / C may be row- or column-major views."""
     if backend is not None:
-        return _prepare_registered_generic(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, backend, True)
+        return _prepare_registered_generic(fmt, arrays, shape, B, C, op_a, op_b, compute_dtype, backend, True,
+                                           algorithm=algorithm, preprocess=preprocess)
+    if algorithm != "default" or preprocess is not None:
+        raise ValueError("explicit vendor algorithm/preprocess requires backend selection")
     requested_a, requested_b = op_a, op_b
     op_a, op_b = _native_operations(op_a, op_b, arrays[0].dtype, B.dtype)
     lib, handle = _lib(), _handle()
@@ -653,6 +673,9 @@ def benchmark_isolated(payload, *, log_prefix, timeout=180):
     prefix.parent.mkdir(parents=True, exist_ok=True)
     logs = dict(vendor_stdout=str(prefix) + ".stdout.log",
                 vendor_stderr=str(prefix) + ".stderr.log")
+    payload = dict(payload)
+    if payload.get("diagnostic"):
+        payload["diagnostic_path"] = str(prefix) + ".diagnostic.pt"
     with tempfile.TemporaryDirectory(prefix="flagsparse_vendor_") as directory:
         request, response = Path(directory) / "request.pt", Path(directory) / "response.json"
         torch.save(payload, request)
@@ -690,7 +713,8 @@ def _isolated_benchmark_worker(request, response):
     import json
     from pathlib import Path
     import traceback
-    from utils import cuda_event_benchmark_filtered
+    import time
+    from utils import cuda_event_benchmark_filtered, tensor_accuracy_metrics
 
     # Only load the private request written by the parent invocation.
     payload = torch.load(request, map_location="cpu", weights_only=False)
@@ -707,13 +731,60 @@ def _isolated_benchmark_worker(request, response):
         print(f"vendor prepare: {payload['fmt']} {arrays[0].dtype}/{rhs.dtype}/{out.dtype} "
               f"{payload['op_a']}/{payload['op_b']} shape={payload['shape']} rhs_stride={rhs.stride()}", flush=True)
         stage = "vendor_prepare"
+        started = time.perf_counter()
         if payload["matrix"]:
             plan = prepare_spmm(payload["fmt"], arrays, payload["shape"], rhs, out,
-                                payload["op_a"], payload["op_b"], torch.float32, backend=payload["backend"])
+                                payload["op_a"], payload["op_b"], torch.float32, backend=payload["backend"],
+                                algorithm=payload.get("vendor_alg", "default"),
+                                preprocess=payload.get("vendor_preprocess"))
         else:
             plan = prepare_spmv(payload["fmt"], arrays, payload["shape"], rhs, out,
                                 payload["op_a"], torch.float32, backend=payload["backend"])
+        torch.cuda.synchronize(device)
+        result.update(plan.metadata, vendor_prepare_wall_ms=(time.perf_counter()-started)*1000,
+                      vendor_compute_dtype="float32")
         print(f"vendor first run: {plan.metadata}", flush=True)
+        golden = payload["golden"].to(payload["output_dtype"])
+        diagnostics, snapshots = {}, {}
+        if payload.get("diagnostic"):
+            stage = "output_initial_state"
+            for name, initial in (("zero", 0.0), ("nan", float("nan")), ("repeat", None)):
+                if initial is not None:
+                    out.fill_(initial)
+                plan.run()
+                torch.cuda.synchronize(device)
+                value = out.cpu()
+                snapshots[name] = value
+                diagnostics[name] = tensor_accuracy_metrics(value, golden, payload["rtol"], payload["atol"])
+            # Wide-output conversion is a numerical control, never a timed native baseline.
+            if out.dtype == torch.float32:
+                low_dtype = arrays[0].dtype
+                diagnostics["wide_then_narrow"] = tensor_accuracy_metrics(
+                    snapshots["repeat"].to(low_dtype), payload["golden"].to(low_dtype),
+                    *payload["narrow_tolerances"])
+            torch.save(dict(outputs=snapshots, golden=golden, diagnostics=diagnostics,
+                            arrays=payload["arrays"], rhs=payload["rhs"], metadata=plan.metadata),
+                       payload["diagnostic_path"])
+            result.update(vendor_diagnostic_path=payload["diagnostic_path"], vendor_diagnostics=diagnostics)
+            # Resolve the actual loaded object; find_library alone can return just a soname.
+            try:
+                maps = Path("/proc/self/maps")
+                if maps.exists():
+                    names = sorted({line.split()[-1] for line in maps.read_text().splitlines()
+                                    if ("libcusparse.so" if payload["backend"] == "cuda" else "libhipsparse.so") in line
+                                    and line.split()[-1].startswith("/")})
+                    if len(names) == 1:
+                        import hashlib
+                        result["vendor_library_path"] = names[0]
+                        digest = hashlib.sha256()
+                        with open(names[0], "rb") as stream:
+                            for chunk in iter(lambda: stream.read(1024*1024), b""):
+                                digest.update(chunk)
+                        result["vendor_library_sha256"] = digest.hexdigest()
+                    else:
+                        result["vendor_library_identity_reason"] = f"expected one loaded sparse library; found {names}"
+            except OSError as exc:
+                result["vendor_library_identity_reason"] = str(exc)
         stage = "vendor_first_run"
         plan.run()
         torch.cuda.synchronize(device)
@@ -722,22 +793,25 @@ def _isolated_benchmark_worker(request, response):
         actual, elapsed = cuda_event_benchmark_filtered(plan.run, payload["warmup"], payload["iters"])
         stage = "correctness"
         actual = actual.cpu()
-        golden = payload["golden"].to(payload["output_dtype"])
-        finite = bool(torch.isfinite(actual).all() and torch.isfinite(golden).all())
-        error = float((actual.double() - golden.double()).abs().max()) if actual.numel() and finite else (0.0 if not actual.numel() else None)
-        passed = finite and torch.allclose(actual, golden, rtol=payload["rtol"], atol=payload["atol"])
-        result = dict(plan.metadata, vendor_status="PASS" if passed else "FAIL",
-                      vendor_ms=elapsed, vendor_max_error=error,
-                      vendor_reason=("" if passed else "correctness check failed" if finite else "non-finite output or reference"),
-                      vendor_output_nonfinite=int((~torch.isfinite(actual)).sum()))
+        metrics = tensor_accuracy_metrics(actual, golden, payload["rtol"], payload["atol"])
+        passed = metrics["passed"] and all(value["passed"] for key, value in diagnostics.items()
+                                         if key != "wide_then_narrow")
+        result.update({"vendor_" + key: value for key, value in metrics.items() if key != "passed"})
+        result.update(vendor_status="PASS" if passed else "FAIL", vendor_ms=elapsed,
+                      vendor_reason="" if passed else "correctness/initial-state check failed")
     except NotImplementedError as exc:
-        result = dict(vendor_status="SKIP", vendor_reason=str(exc), vendor_error_stage=stage)
+        result.update(vendor_status="SKIP", vendor_reason=str(exc), vendor_error_stage=stage)
     except Exception as exc:
         traceback.print_exc()
-        result = dict(vendor_status="ERROR", vendor_reason=str(exc), vendor_error_stage=stage)
+        result.update(vendor_status="ERROR", vendor_reason=str(exc), vendor_error_stage=stage)
     finally:
         if plan is not None:
-            plan.close()
+            try:
+                plan.close()
+            except Exception as exc:
+                traceback.print_exc()
+                result.update(vendor_status="ERROR", vendor_reason=f"vendor cleanup failed: {exc}",
+                              vendor_error_stage="cleanup")
     Path(response).write_text(json.dumps(result), encoding="utf-8")
 
 
