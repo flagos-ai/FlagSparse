@@ -42,7 +42,10 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "csr_row_scalar_strip",
     "csr_row_static_tile",
     "csr_row_scalar_bound",
+    "csr_row_scalar_tail_reduce",
     "csr_longrow_queue_atomic",
+    "csr_longrow_grid_atomic",
+    "csr_nnz_local_reduce_atomic",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1666,7 +1669,7 @@ def _spmv_check_output(out, prepared, x, output_dtype=None):
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
-    strided_algorithms = ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_longrow_queue_atomic", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS)
+    strided_algorithms = ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_longrow_queue_atomic", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS)
     if not out.is_contiguous() and prepared.alg not in strided_algorithms:
         raise ValueError("out must be contiguous")
     if prepared.alg in strided_algorithms and out.numel() > 1 and out.stride(0) <= 0:
@@ -1769,6 +1772,9 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
             "execution_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix("torch."),
         }
     alg = prepared.alg
+    if alg == "csr_longrow_grid_atomic":
+        from ._spmv_csr_kernels import run_longrow_grid
+        return run_longrow_grid(prepared, x, out, timing, _spmv_phase)
     if alg == "csr_longrow_queue_atomic":
         from ._spmv_csr_kernels import run_longrow_queue
         return run_longrow_queue(prepared, x, out, timing, _spmv_phase)
@@ -1807,6 +1813,13 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
     else:
         execution, plan, buckets = prepared, None, None
         process_ms = 0.0 if timing else None
+
+    if alg == "csr_nnz_local_reduce_atomic":
+        from ._spmv_csr_kernels import run_nnz_local_reduce
+        y, stats = run_nnz_local_reduce(execution, x, out, timing, _spmv_phase)
+        if timing:
+            stats["process_gpu_ms"] += process_ms or 0.0
+        return y, stats
 
     if alg == "csr_nnz_tile_reduce":
         from ._spmv_csr_nnz import run_mixed
@@ -2012,8 +2025,12 @@ def flagsparse_spmv_csr_run(
                         workspace_peak_bytes=0, descriptor_peak_bytes=0,
                         x_stride=phases.get("x_stride", tuple(x.stride())),
                         y_stride=phases.get("y_stride", tuple(y.stride())))
-        if actual.alg == "csr_longrow_queue_atomic":
-            meta.update(execution_path="native_csr_longrow_queue_atomic", validation="unverified",
+        if actual.alg == "csr_row_scalar_tail_reduce":
+            meta.update(execution_path="native_csr_scalar_tail_reduce", scalar_steps=actual.config["scalar_steps"],
+                        tail_block_nnz=actual.config["block_nnz"], workspace_peak_bytes=0,
+                        plan_strategy="none", validation="unverified")
+        if actual.alg in _csr_config.LONGROW_ALGORITHMS:
+            meta.update(execution_path="native_" + actual.alg, validation="unverified",
                         initialization="queue_counters_and_partial_slots", output_conversion="final_store")
             for key in ("long_row_capacity", "job_capacity", "descriptor_bytes", "numeric_workspace_bytes",
                         "workspace_peak_bytes", "queue_count_readback", "plan_strategy",
@@ -2021,6 +2038,16 @@ def flagsparse_spmv_csr_run(
                 meta[key] = phases[key]
             if timing:
                 meta["fused_plan_compute_ms"] = phases["fused_plan_compute_ms"]
+        if actual.alg == "csr_longrow_grid_atomic":
+            meta.update(grid_capacity=phases["grid_capacity"], task_acquisition=phases["task_acquisition"])
+            if timing:
+                meta.update({key: phases[key] for key in ("init_ms", "producer_ms", "consumer_ms", "finish_ms")})
+        if actual.alg == "csr_nnz_local_reduce_atomic":
+            meta.update(execution_path="native_csr_nnz_local_reduce_atomic", validation="unverified")
+            meta.update({key: actual.config[key] for key in ("owner_search", "single_row_fastpath", "atomic_mode")})
+            for key in ("nnz_tile_count", "plan_strategy", "descriptor_peak_bytes", "workspace_peak_bytes",
+                        "output_buffer_identity", "initialization", "output_conversion", "x_stride", "y_stride"):
+                meta[key] = phases[key]
         if actual.alg == "csr_transpose_sharded_atomic":
             meta.update(execution_path="native_csr_transpose_sharded_atomic", validation="unverified",
                         x_stride=phases["x_stride"], y_stride=phases["y_stride"])

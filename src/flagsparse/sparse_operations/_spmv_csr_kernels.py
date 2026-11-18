@@ -4,7 +4,229 @@ import torch
 import triton
 import triton.language as tl
 
+
+@triton.jit
+def _nnz_local_owner(P, POS, VALID, LOW, HIGH, WIDTH: tl.constexpr):
+    lo = tl.full((WIDTH,), 0, tl.int64) + LOW
+    hi = tl.full((WIDTH,), 0, tl.int64) + HIGH
+    while tl.sum(((lo < hi) & VALID).to(tl.int32), 0) > 0:
+        active = (lo < hi) & VALID
+        mid = (lo + hi + 1) // 2
+        boundary = tl.load(P + mid, active, 0).to(tl.int64)
+        right = boundary <= POS
+        lo = tl.where(active & right, mid, lo)
+        hi = tl.where(active & ~right, mid - 1, hi)
+    return lo
+
+
+@triton.jit
+def _nnz_local_scan(lr, li, lh, rr, ri, rh):
+    return tl.where(rh, rr, lr + rr), tl.where(rh, ri, li + ri), lh | rh
+
+
+@triton.jit
+def _nnz_local_write(Y, ROW, RE, IM, MASK, FULL, YS,
+                     COMPLEX: tl.constexpr, BOUNDARY: tl.constexpr):
+    offset = ROW.to(tl.int64) * tl.cast(YS, tl.int64)
+    direct = MASK & FULL if BOUNDARY else MASK & False
+    atomic = MASK & ~direct
+    if COMPLEX:
+        tl.store(Y + 2 * offset, RE, direct)
+        tl.store(Y + 2 * offset + 1, IM, direct)
+        tl.atomic_add(Y + 2 * offset, RE, atomic, sem="relaxed")
+        tl.atomic_add(Y + 2 * offset + 1, IM, atomic, sem="relaxed")
+    else:
+        tl.store(Y + offset, RE, direct)
+        tl.atomic_add(Y + offset, RE, atomic, sem="relaxed")
+
+
+@triton.jit
+def nnz_local_reduce_atomic_kernel(A, I, P, X, Y, M, NNZ, XS, YS,
+                                   T: tl.constexpr, ACC: tl.constexpr,
+                                   COMPLEX: tl.constexpr, BOUNDED: tl.constexpr,
+                                   FAST: tl.constexpr, BOUNDARY: tl.constexpr):
+    begin = tl.program_id(0).to(tl.int64) * T
+    end = tl.minimum(begin + T, NNZ)
+    lane = tl.arange(0, T).to(tl.int64)
+    pos = begin + lane
+    valid = pos < end
+    if FAST or BOUNDED:
+        edges = tl.where(tl.arange(0, 2) == 0, begin, end - 1)
+        owners = _nnz_local_owner(P, edges, tl.full((2,), True, tl.int1), 0, M - 1, 2)
+        first, last = tl.min(owners, 0), tl.max(owners, 0)
+    else:
+        first, last = tl.full((), 0, tl.int64), tl.cast(M, tl.int64) - 1
+    re, im = _short_row_product(A, I, X, pos, valid, XS, COMPLEX, ACC)
+    if FAST & (first == last):
+        start = tl.load(P + first).to(tl.int64)
+        stop = tl.load(P + first + 1).to(tl.int64)
+        _nnz_local_write(Y, first, tl.sum(re, 0), tl.sum(im, 0),
+                         tl.full((), True, tl.int1), (start >= begin) & (stop <= end),
+                         YS, COMPLEX, BOUNDARY)
+    else:
+        if BOUNDED:
+            row = _nnz_local_owner(P, pos, valid, first, last, T)
+        else:
+            row = _nnz_local_owner(P, pos, valid, 0, M - 1, T)
+        start = tl.load(P + row, valid, 0).to(tl.int64)
+        stop = tl.load(P + row + 1, valid, 0).to(tl.int64)
+        head = (lane == 0) | (pos == start) | ~valid
+        sr, si, _ = tl.associative_scan((re, im, head), 0, _nnz_local_scan)
+        tail = valid & ((pos + 1 == stop) | (pos + 1 == end))
+        _nnz_local_write(Y, row, sr, si, tail, (start >= begin) & (stop <= end),
+                         YS, COMPLEX, BOUNDARY)
+
+
+def run_nnz_local_reduce(prepared, x, out, timing, phase):
+    cfg = prepared.config
+    complex_input = prepared.data.is_complex()
+    component = torch.float64 if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128) else torch.float32
+    dtype = (torch.complex128 if component == torch.float64 else torch.complex64) if complex_input else component
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    def compute():
+        target = y if y.dtype == dtype else torch.empty(prepared.n_rows, dtype=dtype, device=y.device)
+        target.zero_()
+        data, vector = prepared.data.resolve_conj().resolve_neg(), x.resolve_conj().resolve_neg()
+        view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+        if data.numel():
+            nnz_local_reduce_atomic_kernel[(triton.cdiv(data.numel(), cfg["block_nnz"]),)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(target),
+                prepared.n_rows, data.numel(), vector.stride(0), target.stride(0),
+                T=cfg["block_nnz"], ACC=tl.float64 if component == torch.float64 else tl.float32,
+                COMPLEX=complex_input, BOUNDED=cfg["owner_search"] == "bounded",
+                FAST=cfg["single_row_fastpath"], BOUNDARY=cfg["atomic_mode"] == "boundary",
+                num_warps=cfg["num_warps"], num_stages=1, enable_fp_fusion=False)
+        if target is not y:
+            y.copy_(target)
+        return target is y
+    direct, compute_ms = phase(compute, timing)
+    return y, dict(process_cpu_ms=0.0, process_gpu_ms=0.0 if timing else None, compute_ms=compute_ms,
+                   execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                   execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                   nnz_tile_count=triton.cdiv(prepared.data.numel(), cfg["block_nnz"]),
+                   plan_strategy="none", descriptor_peak_bytes=0,
+                   workspace_peak_bytes=0 if direct else prepared.n_rows * (16 if dtype == torch.complex128 else 8 if dtype in (torch.float64, torch.complex64) else 4),
+                   output_buffer_identity="output" if direct else "compute_precision_buffer",
+                   initialization="compute_target_zero", output_conversion="none" if direct else "final_copy_cast",
+                   x_stride=tuple(x.stride()), y_stride=tuple(y.stride()))
+
+
+@triton.jit
+def longrow_grid_consumer_kernel(A, I, X, COUNTERS, JOB_SLOT, JOB_START, JOB_END,
+                                 PARTIAL, XS, K: tl.constexpr, COMPLEX: tl.constexpr,
+                                 ACC: tl.constexpr):
+    job = tl.program_id(0).to(tl.int64)
+    count = tl.load(COUNTERS + 1).to(tl.int64)
+    if job < count:
+        slot = tl.load(JOB_SLOT + job)
+        start, end = tl.load(JOB_START + job), tl.load(JOB_END + job)
+        lane = tl.arange(0, K).to(tl.int64)
+        re, im = tl.zeros((K,), ACC), tl.zeros((K,), ACC)
+        for base in range(start, end, K):
+            pos = base + lane
+            pr, pi = _short_row_product(A, I, X, pos, pos < end, XS, COMPLEX, ACC)
+            re += pr
+            if COMPLEX:
+                im += pi
+        if COMPLEX:
+            tl.atomic_add(PARTIAL + 2 * slot, tl.sum(re, 0), sem="relaxed")
+            tl.atomic_add(PARTIAL + 2 * slot + 1, tl.sum(im, 0), sem="relaxed")
+        else:
+            tl.atomic_add(PARTIAL + slot, tl.sum(re, 0), sem="relaxed")
+
+
+def run_longrow_grid(prepared, x, out, timing, phase):
+    from ._spmv_csr_config import longrow_queue_capacity
+
+    cfg = prepared.config
+    complex_input = prepared.data.is_complex()
+    dtype = torch.float64 if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128) else torch.float32
+    channels = 2 if complex_input else 1
+    # Reuse the queue's conservative capacity validation, without a worker knob.
+    stats = longrow_queue_capacity(prepared.n_rows, prepared.data.numel(), dict(cfg, worker_programs=1),
+                                  8 if dtype == torch.float64 else 4, channels)
+    capacity, jobs = stats["long_row_capacity"], stats["job_capacity"]
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    def initialize():
+        counters = torch.zeros(3, dtype=torch.int32, device=x.device)
+        owners = torch.empty(capacity, dtype=torch.int64, device=x.device)
+        descriptors = tuple(torch.empty(jobs, dtype=torch.int64, device=x.device) for _ in range(3))
+        partial = torch.zeros(capacity * channels, dtype=dtype, device=x.device)
+        return prepared.data.resolve_conj().resolve_neg(), x.resolve_conj().resolve_neg(), counters, owners, descriptors, partial
+    (data, vector, counters, owners, descriptors, partial), init_ms = phase(initialize, timing)
+    view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+    common = dict(COMPLEX=complex_input, ACC=tl.float64 if dtype == torch.float64 else tl.float32,
+                  num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    def produce():
+        if prepared.n_rows:
+            longrow_producer_kernel[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                counters, owners, *descriptors, prepared.n_rows, vector.stride(0), y.stride(0),
+                R=cfg["rows_per_program"], K=cfg["short_block_nnz"], L=cfg["long_row_threshold"],
+                S=cfg["segment_nnz"], num_warps=cfg["producer_num_warps"], **common)
+    _, producer_ms = phase(produce, timing)
+    def consume():
+        if jobs:
+            longrow_grid_consumer_kernel[(jobs,)](
+                view(data), prepared.kernel_indices, view(vector), counters, *descriptors, partial,
+                vector.stride(0), K=cfg["block_nnz"], num_warps=cfg["num_warps"], **common)
+    _, consumer_ms = phase(consume, timing)
+    def finish():
+        if capacity:
+            longrow_finish_kernel[(triton.cdiv(capacity, 128),)](
+                counters, owners, partial, view(y), y.stride(0), B=128, COMPLEX=complex_input,
+                num_warps=cfg["num_warps"], num_stages=1)
+    _, finish_ms = phase(finish, timing)
+    return y, dict(stats, process_cpu_ms=0.0, process_gpu_ms=init_ms,
+                   compute_ms=producer_ms + consumer_ms + finish_ms if timing else None,
+                   init_ms=init_ms, producer_ms=producer_ms, consumer_ms=consumer_ms, finish_ms=finish_ms,
+                   fused_plan_compute_ms=producer_ms, queue_count_readback=False,
+                   grid_capacity=jobs, task_acquisition="static_program_id", plan_strategy="per_run_gpu_longrow_descriptors",
+                   execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                   execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                   x_stride=tuple(x.stride()), y_stride=tuple(y.stride()), output_buffer_identity="output")
+
 from . import _common
+
+
+@triton.jit
+def row_scalar_tail_reduce_kernel(A, I, P, X, Y, M, XS, YS,
+                                  R: tl.constexpr, K: tl.constexpr, S: tl.constexpr,
+                                  COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    # One program owns all outputs. Prefix and tail partition each row's NNZ.
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    valid = row < M
+    start = tl.load(P + row, valid, 0).to(tl.int64)
+    end = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    longest = tl.max(end - start, 0)
+    re = tl.zeros((R,), ACC)
+    im = tl.zeros((R,), ACC)
+    for step in range(tl.minimum(longest, S)):
+        pos = start + step
+        pr, pi = _short_row_product(A, I, X, pos, valid & (pos < end), XS, COMPLEX, ACC)
+        re += pr
+        if COMPLEX:
+            im += pi
+    if longest > S:
+        lane = tl.arange(0, K).to(tl.int64)
+        tail_re = tl.zeros((R, K), ACC)
+        tail_im = tl.zeros((R, K), ACC)
+        for base in range(S, longest, K):
+            pos = start[:, None] + base + lane[None, :]
+            active = valid[:, None] & (pos < end[:, None])
+            pr, pi = _short_row_product(A, I, X, pos, active, XS, COMPLEX, ACC)
+            tail_re += pr
+            if COMPLEX:
+                tail_im += pi
+        re += tl.sum(tail_re, 1)
+        if COMPLEX:
+            im += tl.sum(tail_im, 1)
+    yp = row * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * yp, re, valid)
+        tl.store(Y + 2 * yp + 1, im, valid)
+    else:
+        tl.store(Y + yp, re, valid)
 
 
 @triton.jit
@@ -823,13 +1045,16 @@ def compute(prepared, x, y, alg, config, plan=None):
     m = prepared.n_rows
     if not m:
         return y
-    if alg in ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound"):
+    if alg in ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_row_scalar_tail_reduce"):
         complex_input = prepared.data.is_complex()
         view = lambda t: torch.view_as_real(t) if complex_input else t
         acc = tl.float64 if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128) else tl.float32
         kernel = {"csr_row_scalar_strip": row_scalar_strip_kernel, "csr_row_static_tile": row_static_tile_kernel,
-                  "csr_row_scalar_bound": row_scalar_bound_kernel}[alg]
+                  "csr_row_scalar_bound": row_scalar_bound_kernel,
+                  "csr_row_scalar_tail_reduce": row_scalar_tail_reduce_kernel}[alg]
         extra = {"K": config["block_nnz"]} if alg == "csr_row_static_tile" else {}
+        if alg == "csr_row_scalar_tail_reduce":
+            extra = dict(K=config["block_nnz"], S=config["scalar_steps"])
         kernel[(triton.cdiv(m, config["rows_per_program"]),)](
             view(prepared.data), prepared.kernel_indices, prepared.kernel_indptr,
             view(x), view(y), m, x.stride(0), y.stride(0),

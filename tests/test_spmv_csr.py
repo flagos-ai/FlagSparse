@@ -81,6 +81,9 @@ FIELDS = [
     "x_stride",
     "y_stride",
     "validation",
+    "sample_rule",
+    "owner_search", "single_row_fastpath", "atomic_mode", "nnz_tile_count",
+    "grid_capacity", "task_acquisition", "csr_structure",
 ]
 
 
@@ -290,13 +293,20 @@ def main(argv=None):
             p.error("no registered algorithms support the selected combinations")
     else:
         explicit_algorithms = choices(args.alg, ("auto",) + registered)
-    fields = FIELDS + (["process_gpu_ms", "compute_ms", "fused_plan_compute_ms"] if args.timing else [])
+    fields = FIELDS + (["process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms"] if args.timing else [])
+    if args.perf_metrics:
+        fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
+                   "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",
+                   "useful_gflops", "logical_gbs", "gnnz_s", "gpu_useful_gflops", "gpu_logical_gbs",
+                   "metrics_reason", "prepared_run_ms", "prepared_run_time_basis",
+                   "prepared_useful_gflops", "prepared_logical_gbs", "cpu_gpu_overlap_risk"]
     if common._is_rocm_runtime():
         fields += ["execution_kernel", "nnz_prepare_ms", "nnz_metadata_bytes"]
     csv_file = None
     writer = None
     failures = 0
     if args.csv_csr:
+        Path(args.csv_csr).parent.mkdir(parents=True, exist_ok=True)
         csv_file = open(args.csv_csr, "w", newline="", encoding="utf-8")
         writer = csv.DictWriter(csv_file, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -337,6 +347,7 @@ def main(argv=None):
                         yield str(path), exc
 
             for name, source in inputs():
+                structure_cache = {}
                 for index_name in indices:
                     for ptr_name in ptrtypes or (index_name,):
                         for op in ops:
@@ -347,6 +358,7 @@ def main(argv=None):
                                 index_dtype=index_name,
                                 indptr_dtype=ptr_name,
                                 op=op,
+                                sample_rule="median +/-10% filtered mean",
                                 ref="CPU FP64/complex128 scatter (correctness only)",
                             )
                             algorithms = (
@@ -468,6 +480,45 @@ def main(argv=None):
                                             None if ok else "correctness check failed"
                                         ),
                                     )
+                                    if args.perf_metrics:
+                                        import numpy as np
+                                        import time
+                                        from benchmark_utils import csr_tile_structure
+                                        from tests.utils import sparse_work_metrics, filtered_avg_ms
+
+                                        key = (op, json.dumps(prepared.config, sort_keys=True))
+                                        if key not in structure_cache:
+                                            # Reference-only structure work, outside all measurements.
+                                            if op == "non":
+                                                cpu_ptr = rp.cpu().numpy()
+                                            else:
+                                                counts = np.bincount(ci.cpu().numpy().astype(np.int64), minlength=shape[1])
+                                                cpu_ptr = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
+                                            structure_cache[key] = csr_tile_structure(cpu_ptr, config=prepared.config)
+                                        row["csr_structure"] = structure_cache[key]
+                                        if dtype.is_complex:
+                                            row.update(metrics_model="not_applicable",
+                                                       metrics_reason="logical-access v1 supports real values only; timing and structure remain available")
+                                        else:
+                                            row.update(sparse_work_metrics(
+                                                operator="spmv_csr", shape=tuple(shape), nnz=data.numel(), dense_cols=1,
+                                                a_dtype=dtype_name, rhs_dtype=dtype_name, output_dtype=dtype_name,
+                                                index_dtype=index_name, indptr_dtype=ptr_name, op=op,
+                                                ms=row["ms"], gpu_ms=row["gpu_ms"]))
+                                        wall_samples = []
+                                        for _ in range(args.iters):
+                                            common._ACCEL.synchronize()
+                                            start = time.perf_counter()
+                                            wall_result = fs.flagsparse_spmv_csr_run(prepared, x, out=value)
+                                            common._ACCEL.synchronize()
+                                            wall_samples.append((time.perf_counter() - start) * 1000)
+                                            del wall_result
+                                        wall = filtered_avg_ms(wall_samples)
+                                        row.update(prepared_run_ms=wall,
+                                                   prepared_run_time_basis="synchronized_wall_run_without_internal_timing",
+                                                   prepared_useful_gflops=row["useful_flops"] / (wall * 1e6) if wall > 0 and row.get("useful_flops") is not None else None,
+                                                   prepared_logical_gbs=row["logical_bytes"] / (wall * 1e6) if wall > 0 and row.get("logical_bytes") is not None else None,
+                                                   cpu_gpu_overlap_risk=row["process_cpu_ms"] > 0)
                                     row["speedup_vs_vendor"] = (
                                         row["vendor_ms"] / row["ms"]
                                         if isinstance(row.get("vendor_ms"), (int, float))

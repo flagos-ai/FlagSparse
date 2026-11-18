@@ -7,9 +7,10 @@ IMPLEMENTATION_VERSION = 9
 NEW_ALGORITHMS = ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split", "row_subgroup_stream", "csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_rowgroup_stream_reduce")
 TARGETED_ALGORITHMS = ("csr_row_refill_reduce", "csr_transpose_sharded_atomic")
 NEW_ALGORITHMS += TARGETED_ALGORITHMS
-SHORT_ROW_ALGORITHMS = ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound")
-NEW_ALGORITHMS += SHORT_ROW_ALGORITHMS + ("csr_longrow_queue_atomic",)
-NON_ONLY_ALGORITHMS = SHORT_ROW_ALGORITHMS + ("csr_longrow_queue_atomic",)
+SHORT_ROW_ALGORITHMS = ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_row_scalar_tail_reduce")
+LONGROW_ALGORITHMS = ("csr_longrow_queue_atomic", "csr_longrow_grid_atomic")
+NEW_ALGORITHMS += SHORT_ROW_ALGORITHMS + LONGROW_ALGORITHMS + ("csr_nnz_local_reduce_atomic",)
+NON_ONLY_ALGORITHMS = SHORT_ROW_ALGORITHMS + LONGROW_ALGORITHMS
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend")
@@ -76,7 +77,7 @@ def algorithm_spec(alg):
     new = name in NEW_ALGORITHMS
     return {
         "name": name,
-        "implementation_version": 1 if name in NON_ONLY_ALGORITHMS else IMPLEMENTATION_VERSION,
+        "implementation_version": 1 if name in NON_ONLY_ALGORITHMS + ("csr_nnz_local_reduce_atomic",) else IMPLEMENTATION_VERSION,
         "ops": ("non",) if name in NON_ONLY_ALGORITHMS else ("trans", "conj") if name == "csr_transpose_sharded_atomic" else ("non", "trans", "conj"),
         "value_dtypes": ("float16", "bfloat16") if name in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else VALUE_DTYPES,
         "index_dtypes": (
@@ -85,7 +86,7 @@ def algorithm_spec(alg):
         "indptr_dtypes": ("int32", "int64"),
         "backends": ("cuda", "rocm") if new else BACKENDS,
         "runtime_process": name not in SHORT_ROW_ALGORITHMS + ("csr_transpose_sharded_atomic",),
-        "runtime_process_ops": ("non",) if name == "csr_longrow_queue_atomic" else () if name in SHORT_ROW_ALGORITHMS + ("csr_transpose_sharded_atomic",) else (
+        "runtime_process_ops": ("non",) if name in LONGROW_ALGORITHMS else () if name in SHORT_ROW_ALGORITHMS + ("csr_transpose_sharded_atomic",) else (
             ("non", "trans", "conj")
             if name
             in ("row_split_reduce", "row_adaptive_split", "legacy_bucket_vector", "csr_nnz_tile_reduce")
@@ -93,14 +94,18 @@ def algorithm_spec(alg):
         ),
         "transpose_strategy": "unsupported" if name in NON_ONLY_ALGORITHMS else "native_csr_sharded_scatter" if name == "csr_transpose_sharded_atomic" else "per_run_csr_rebuild",
         "cross_call_plan_cache": False,
-        "capability_requirements": ("int64", "reduction", "scan", "int32_atomic", "atomic_by_compute_dtype") if name == "csr_longrow_queue_atomic" else ("int64", "reduction", "atomic_by_compute_dtype") if name == "csr_transpose_sharded_atomic" else ("int64", "reduction", "scan") if name in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce") else ("int64", "reduction") if new else (),
+        "capability_requirements": ("int64", "reduction", "scan", "int32_atomic", "atomic_by_compute_dtype") if name in LONGROW_ALGORITHMS else ("int64", "reduction", "scan", "atomic_by_compute_dtype") if name == "csr_nnz_local_reduce_atomic" else ("int64", "reduction", "atomic_by_compute_dtype") if name == "csr_transpose_sharded_atomic" else ("int64", "reduction", "scan") if name in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce") else ("int64", "reduction") if new else (),
         "compute_dtype": "input_dependent",
         "compute_dtype_by_input": {dt: compute_dtype(name, dt) for dt in VALUE_DTYPES},
         "half_output_dtypes": {
             dt: (dt, "float32")
             for dt in ("float16", "bfloat16")
         },
-        "config_candidates": ({"rows_per_program": (32, 64, 128)} if name in ("csr_row_scalar_strip", "csr_row_scalar_bound") else
+        "config_candidates": ({"block_nnz": (128, 256, 512, 1024), "owner_search": ("bounded", "full"),
+                               "single_row_fastpath": (True, False), "atomic_mode": ("boundary", "all")}
+                              if name == "csr_nnz_local_reduce_atomic" else {"rows_per_program": (32, 64, 128), "scalar_steps": (0, 4, 8, 16, 32),
+                               "block_nnz": (8, 16, 32, 64)} if name == "csr_row_scalar_tail_reduce" else
+                              {"rows_per_program": (32, 64, 128)} if name in ("csr_row_scalar_strip", "csr_row_scalar_bound") else
                               {"rows_per_program": (4, 8, 16), "block_nnz": (8, 16, 32, 64)} if name == "csr_row_static_tile" else
                               {"rows_per_program": (8, 16, 32), "block_nnz": (64, 128, 256)}
                               if name == "csr_rowgroup_stream_reduce" else {"prefetch_chunks": (1, 2), "lanes_per_row": (2, 4, 8, 16, 32, 64), "row_tiles_per_program": (1, 2, 4, 8)}
@@ -129,13 +134,13 @@ def list_algorithms(op=None, dtype=None, backend=None):
 
 def validate_support(alg, op, dtype, indices_dtype, indptr_dtype, caps):
     spec = algorithm_spec(alg)
-    if alg in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce") and not caps.scan:
+    if alg in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_nnz_local_reduce_atomic") and not caps.scan:
         raise BackendCapabilityUnavailable("rowgroup reduction requires scan capability")
-    if alg in ("csr_transpose_sharded_atomic", "csr_longrow_queue_atomic"):
+    if alg in ("csr_transpose_sharded_atomic", "csr_nnz_local_reduce_atomic") + LONGROW_ALGORITHMS:
         feature = "fp64_atomic" if compute_dtype(alg, dtype) in ("float64", "complex128") else "fp32_atomic"
         if getattr(caps, feature) is not True:
             raise BackendCapabilityUnavailable(f"{alg} requires known {feature} capability")
-    if alg == "csr_longrow_queue_atomic" and (caps.int32_atomic is not True or not caps.scan):
+    if alg in LONGROW_ALGORITHMS and (caps.int32_atomic is not True or not caps.scan):
         raise BackendCapabilityUnavailable("long-row queue requires known integer atomic and scan capabilities")
     for value, key in (
         (op, "ops"),
@@ -282,17 +287,46 @@ def _validate_config(resolved, caps):
 def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_nnz=0):
     if config is not None and not isinstance(config, dict):
         raise TypeError("CSR SpMV config must be a dictionary")
+    if alg == "csr_longrow_grid_atomic":
+        if config and "worker_programs" in config:
+            raise ValueError("worker_programs is unused by the static long-row grid")
+        cfg, source, rejected = resolve_config("csr_longrow_queue_atomic", caps, config, return_rejections=True)
+        cfg.pop("worker_programs")
+        result = (cfg, "explicit" if config else "long-row-grid-conservative-v1")
+        return result + (rejected,) if return_rejections else result
+    if alg == "csr_nnz_local_reduce_atomic":
+        if caps.backend not in ("cuda", "rocm") or caps.subgroup_width not in (32, 64) or not caps.scan:
+            raise BackendCapabilityUnavailable("NNZ local reduction requires known scan/launch capabilities")
+        warps = [w for w in (1, 2, 4, 8) if w * caps.subgroup_width <= caps.max_threads_per_block]
+        if not warps:
+            raise BackendCapabilityUnavailable("no legal NNZ local reduction launch")
+        cfg = dict(block_nnz=256, owner_search="bounded", single_row_fastpath=True,
+                   atomic_mode="boundary", num_warps=max((w for w in warps if w <= 4), default=min(warps)), num_stages=1)
+        supplied = config or {}
+        if set(supplied) - set(cfg):
+            raise ValueError(f"unused NNZ local config fields: {sorted(set(supplied) - set(cfg))}")
+        cfg.update(supplied)
+        if (any(type(cfg[k]) is not int for k in ("block_nnz", "num_warps", "num_stages")) or
+                cfg["block_nnz"] not in (128, 256, 512, 1024) or cfg["num_warps"] not in warps or
+                cfg["num_stages"] != 1 or type(cfg["single_row_fastpath"]) is not bool or
+                cfg["owner_search"] not in ("bounded", "full") or cfg["atomic_mode"] not in ("boundary", "all")):
+            raise ValueError("invalid NNZ local reduction configuration")
+        result = (cfg, "explicit" if supplied else "nnz-local-conservative-v1")
+        return result + ([],) if return_rejections else result
     if alg in SHORT_ROW_ALGORITHMS:
         if caps.backend not in ("cuda", "rocm") or caps.subgroup_width not in (32, 64):
             raise BackendCapabilityUnavailable("short-row launch capabilities unknown")
         warps = [w for w in (1, 2, 4, 8) if w * caps.subgroup_width <= caps.max_threads_per_block]
         if not warps:
             raise BackendCapabilityUnavailable("no legal short-row launch")
-        scalar = alg in ("csr_row_scalar_strip", "csr_row_scalar_bound")
+        tail = alg == "csr_row_scalar_tail_reduce"
+        scalar = alg in ("csr_row_scalar_strip", "csr_row_scalar_bound") or tail
         cfg = dict(rows_per_program=64 if scalar else 8,
                    num_warps=max((w for w in warps if w <= 2), default=min(warps)), num_stages=1)
         if not scalar:
             cfg["block_nnz"] = 16
+        if tail:
+            cfg.update(scalar_steps=8, block_nnz=32)
         supplied = config or {}
         if set(supplied) - set(cfg):
             raise ValueError(f"unused {alg} config fields: {sorted(set(supplied) - set(cfg))}")
@@ -301,9 +335,10 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
             raise ValueError("short-row configuration values must be integers")
         if (cfg["num_warps"] not in warps or cfg["num_stages"] != 1 or
                 cfg["rows_per_program"] not in ((32, 64, 128) if scalar else (4, 8, 16)) or
-                (not scalar and cfg["block_nnz"] not in (8, 16, 32, 64))):
+                ((not scalar or tail) and cfg["block_nnz"] not in (8, 16, 32, 64)) or
+                (tail and cfg["scalar_steps"] not in (0, 4, 8, 16, 32))):
             raise ValueError("invalid short-row tile or launch configuration")
-        result = (cfg, "explicit" if supplied else "short-row-conservative-v1")
+        result = (cfg, "explicit" if supplied else "scalar-tail-conservative-v1" if tail else "short-row-conservative-v1")
         return result + ([],) if return_rejections else result
     if alg == "csr_longrow_queue_atomic":
         if caps.backend not in ("cuda", "rocm") or caps.subgroup_width not in (32, 64):

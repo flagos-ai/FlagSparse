@@ -15,6 +15,73 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "src/flagsparse/sparse_operations"
 
 
+def test_irregular_spmv_profiles_and_capabilities():
+    from dataclasses import replace
+    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True,
+                              scan=True, fp32_atomic=True, fp64_atomic=True, int32_atomic=True)
+    local, grid = "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic"
+    for alg in (local, grid):
+        for dtype in policy.VALUE_DTYPES:
+            for op in policy.algorithm_spec(alg)["ops"]:
+                policy.validate_support(alg, op, dtype, "int64", "int32", caps)
+        assert policy.algorithm_spec(alg)["half_output_dtypes"]["bfloat16"] == ("bfloat16", "float32")
+        for field in ("scan", "fp32_atomic"):
+            with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+                policy.validate_support(alg, "non", "float16", "int32", "int64", replace(caps, **{field: None}))
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.validate_support(alg, "non", "float32", "int32", "int32", replace(caps, fp64_atomic=None))
+    with unittest.TestCase().assertRaises(NotImplementedError):
+        policy.validate_support(grid, "trans", "float16", "int32", "int32", caps)
+    for invalid in ({"single_row_fastpath": 1}, {"block_nnz": True}, {"block_nnz": 64},
+                    {"owner_search": "guess"}, {"atomic_mode": "invalid"}, {"num_stages": 2},
+                    {"worker_programs": 128}):
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config(local, caps, invalid)
+    with unittest.TestCase().assertRaises(ValueError):
+        policy.resolve_config(grid, caps, {"worker_programs": 128})
+    cfg, _ = policy.resolve_config(grid, caps)
+    original, _ = policy.resolve_config("csr_longrow_queue_atomic", caps)
+    assert cfg == {k: v for k, v in original.items() if k != "worker_programs"}
+    with unittest.TestCase().assertRaises(ValueError):
+        policy.assert_route_match(local, policy.resolve_config(local, caps)[0], grid, None, caps)
+
+
+def test_irregular_spmv_execution_has_no_host_plan_reads():
+    tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    for name in ("run_nnz_local_reduce", "run_longrow_grid"):
+        calls = {n.func.attr for n in ast.walk(functions[name]) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        assert not calls & {"item", "tolist", "nonzero", "cumsum", "repeat_interleave", "unique_consecutive"}
+    owner = functions["_nnz_local_owner"]
+    assert owner.args.args[-1].arg == "WIDTH"
+    assert not any(isinstance(n, ast.Attribute) and n.attr == "shape" for n in ast.walk(owner))
+    consumer = ast.unparse(functions["longrow_grid_consumer_kernel"])
+    assert "program_id" in consumer and "COUNTERS + 2" not in consumer
+    assert "while" not in consumer and "PARTIAL" in consumer
+
+
+def test_csr_tile_structure_counts_without_device_imports():
+    # Extract only the CPU helper: this policy test must not initialize a device.
+    tree = ast.parse((ROOT / "tests/benchmark_utils.py").read_text(encoding="utf-8"))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "csr_tile_structure")
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "csr_structure_policy", "exec"), namespace)
+    analyze = namespace["csr_tile_structure"]
+    result = analyze([0, 0, 8, 8, 9, 10], tiles=(4,), config={"long_row_threshold": 4, "segment_nnz": 4})
+    tile = result["tiles"]["4"]
+    assert tile["tile_count"] == 3 and tile["single_owner_tile_count"] == 2
+    assert tile["crossing_row_count"] == 1 and tile["full_row_count"] == 2
+    assert tile["predicted_boundary_atomic_updates"] == 2
+    assert tile["mixed_tile_row_span_p50"] == 2
+    assert result["queue"]["expected_jobs"] == 2 and result["queue"]["job_capacity"] == 4
+    assert result["row_lengths"]["empty_rows"] == 2 and result["row_lengths"]["maximum"] == 8
+    assert result["atomic_count_basis"] == "per_real_component_logical_updates"
+    empty = analyze([0, 0], tiles=(4,))["tiles"]["4"]
+    assert empty["single_owner_tile_ratio"] is None and empty["ratio_reason"] == "no_nonzeros"
+    with unittest.TestCase().assertRaises(ValueError):
+        analyze([0, 2, 1])
+
+
 def test_fixed_nnz_plan_has_no_dynamic_boundary_compaction():
     tree = ast.parse((SOURCE / "_spmv_csr_nnz.py").read_text(encoding="utf-8"))
     function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
@@ -601,7 +668,7 @@ def test_migrated_policies_validate_capabilities_and_workspace():
         assert cfg["num_warps"] in caps.legal_num_warps
     for alg, ops in column.CSC_ALGORITHMS.items():
         cfg, _ = column.resolve_csc_config(alg, "bfloat16" if alg in column.CSC_MIXED_ALGORITHMS else "complex128", 7, caps, op=ops[0],
-                                             kind="spmv" if alg == "csc_col_scalar_bound" else "spmm")
+                                             kind="spmv" if alg in ("csc_col_scalar_bound", "csc_col_scalar_tail_reduce") else "spmm")
         assert cfg["num_warps"] in caps.legal_num_warps
     with unittest.TestCase().assertRaises(NotImplementedError):
         csr.resolve_config("csr_row_panel", "float32", 7, "row", csr.BackendCaps("unknown"))
@@ -772,7 +839,7 @@ def test_csr_scalar_arguments_use_specialization_safe_casts():
 
 def test_short_row_specs_and_configuration_isolation():
     caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True)
-    for alg, rows in (("csr_row_scalar_strip", 64), ("csr_row_static_tile", 8), ("csr_row_scalar_bound", 64)):
+    for alg, rows in (("csr_row_scalar_strip", 64), ("csr_row_static_tile", 8), ("csr_row_scalar_bound", 64), ("csr_row_scalar_tail_reduce", 64)):
         cfg, _ = policy.resolve_config(alg, caps)
         assert cfg["rows_per_program"] == rows
         assert cfg["num_warps"] == 2 and cfg["num_stages"] == 1
@@ -856,6 +923,47 @@ def test_queue_has_ordered_launches_and_no_host_count_readback():
     consumer = functions["longrow_consumer_kernel"]
     assert "OWNERS" not in {arg.arg for arg in consumer.args.args}
     assert "row_scalar_bound_kernel" in functions
+
+
+def test_scalar_tail_configuration_contract():
+    caps = policy.BackendCaps("rocm", "gfx936", "hip", 64, 1024, True, True, True)
+    for steps in (0, 4, 8, 16, 32):
+        for width in (8, 16, 32, 64):
+            cfg, _ = policy.resolve_config("csr_row_scalar_tail_reduce", caps,
+                                           {"scalar_steps": steps, "block_nnz": width})
+            assert cfg["scalar_steps"] == steps and cfg["block_nnz"] == width
+    for invalid in ({"scalar_steps": -1}, {"scalar_steps": True}, {"scalar_steps": 3},
+                    {"block_nnz": 128}, {"segment_nnz": 1024}):
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config("csr_row_scalar_tail_reduce", caps, invalid)
+    with unittest.TestCase().assertRaises(ValueError):
+        policy.resolve_config("csr_row_scalar_bound", caps, {"scalar_steps": 8})
+    csr, column = _extension_policies()
+    csc_caps = csr.BackendCaps("cuda", "cuda", "80", 32, 1024, (1, 2, 4, 8),
+                              True, True, True, True, True, True, True)
+    for dtype in csr.DTYPES:
+        for op in ("trans", "conj"):
+            cfg, _ = column.resolve_csc_config("csc_col_scalar_tail_reduce", dtype, 1, csc_caps,
+                                               {"scalar_steps": 0}, op=op, kind="spmv")
+            assert cfg["scalar_steps"] == 0 and cfg["columns_per_program"] == 64
+    for invalid in ({"scalar_steps": True}, {"scalar_steps": 3}, {"block_nnz": 128}):
+        with unittest.TestCase().assertRaises(ValueError):
+            column.resolve_csc_config("csc_col_scalar_tail_reduce", "float32", 1, csc_caps,
+                                      invalid, op="trans", kind="spmv")
+    for op, kind in (("non", "spmv"), ("trans", "spmm")):
+        with unittest.TestCase().assertRaises(ValueError):
+            column.resolve_csc_config("csc_col_scalar_tail_reduce", "float32", 1, csc_caps, op=op, kind=kind)
+
+
+def test_scalar_tail_kernels_keep_native_single_program_ownership():
+    for filename, name in (("_spmv_csr_kernels.py", "row_scalar_tail_reduce_kernel"),
+                           ("spmv_csc.py", "_csc_col_scalar_tail_reduce_kernel")):
+        tree = ast.parse((SOURCE / filename).read_text(encoding="utf-8"))
+        kernel = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+        calls = [n.func.attr for n in ast.walk(kernel) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+        assert "atomic_add" not in calls and "cumsum" not in calls
+        assert calls.count("max") == 1
+        assert "sum" in calls
 
 
 def test_column_partition_policy_and_workspace():

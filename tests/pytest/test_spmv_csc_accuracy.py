@@ -267,6 +267,7 @@ def test_spmv_csc_int64_strict_no_fallback(monkeypatch):
 
 # Explicit migrated algorithms share this operator's marker, golden and tolerance.
 _MIGRATED_ROUTES = (('csc_col_scalar_bound', 'trans'), ('csc_col_scalar_bound', 'conj'), ('csc_col_subgroup', 'trans'), ('csc_col_subgroup', 'conj'), ('csc_col_vector', 'trans'), ('csc_col_vector', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('csc_col_tile_atomic', 'non'))
+_MIGRATED_ROUTES += (('csc_col_scalar_tail_reduce', 'trans'), ('csc_col_scalar_tail_reduce', 'conj'))
 
 
 @pytest.mark.spmv_csc
@@ -278,14 +279,22 @@ _MIGRATED_ROUTES = (('csc_col_scalar_bound', 'trans'), ('csc_col_scalar_bound', 
 ], ids=lambda dtype: str(dtype).removeprefix("torch."))
 @pytest.mark.parametrize("op", ["trans", "conj"])
 @pytest.mark.parametrize("columns_per_program", [32, 128])
-def test_spmv_csc_scalar_bound_native(dtype, output_dtype, op, columns_per_program, monkeypatch):
+@pytest.mark.parametrize("alg,tail_config", [
+    ("csc_col_scalar_bound", {}), ("csc_col_scalar_tail_reduce", {}),
+    ("csc_col_scalar_tail_reduce", {"scalar_steps": 0, "block_nnz": 8}),
+    ("csc_col_scalar_tail_reduce", {"scalar_steps": 4, "block_nnz": 16}),
+    ("csc_col_scalar_tail_reduce", {"scalar_steps": 32, "block_nnz": 64}),
+])
+def test_spmv_csc_scalar_bound_native(dtype, output_dtype, op, columns_per_program, alg, tail_config, monkeypatch):
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     module = spmv_csc_mod
     def forbidden(*args, **kwargs):
         raise AssertionError("scalar CSC must not generate an owner-map or split plan")
     monkeypatch.setattr(module, "_run_csc_split", forbidden)
     device = accelerator_device()
-    lengths = [0] * 128 + [1, 7, 8, 9, 31, 32, 33, 257, 0, 3]
+    lengths = [0] * 128 + [1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257, 0, 3]
+    if not _MIXED_QUICK_MODE:
+        lengths += [8193, 0, 1, 0, 1025]
     owners = torch.repeat_interleave(torch.arange(len(lengths)), torch.tensor(lengths))
     index = (torch.arange(owners.numel()) * 7) % 19
     values = (torch.arange(owners.numel()) % 7 - 3).double() / 16
@@ -305,19 +314,22 @@ def test_spmv_csc_scalar_bound_native(dtype, output_dtype, op, columns_per_progr
     storage = torch.full((len(lengths) * 2,), float("nan"), dtype=output_dtype, device=device)
     out = storage[::2]
     originals = [t.clone() for t in (a, i, p, x)]
-    cfg = dict(columns_per_program=columns_per_program)
+    cfg = dict(columns_per_program=columns_per_program, **tail_config)
     try:
-        prepared = module.prepare_spmv_csc(a, i, p, matrix.shape, op=op, alg="csc_col_scalar_bound", config=cfg)
+        prepared = module.prepare_spmv_csc(a, i, p, matrix.shape, op=op, alg=alg, config=cfg)
         actual, elapsed, meta = module.flagsparse_spmv_csc_run(prepared, x, out=out,
                                                 timing=True, return_meta=True, return_time=True)
         direct = module.flagsparse_spmv_csc(a, i, p, x, matrix.shape, op=op,
-                                    alg="csc_col_scalar_bound", config=cfg, out_dtype=output_dtype)
+                                    alg=alg, config=cfg, out_dtype=output_dtype)
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
     rtol, atol = close_tolerances(output_dtype)
     torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
     torch.testing.assert_close(direct, actual, rtol=rtol, atol=atol)
-    assert actual is out and meta["alg_resolved"] == "csc_col_scalar_bound"
+    assert actual is out and meta["alg_resolved"] == alg
+    if alg == "csc_col_scalar_tail_reduce":
+        assert meta["plan_strategy"] == "none" and meta["workspace_peak_bytes"] == 0
+        assert meta["scalar_steps"] == cfg.get("scalar_steps", 8)
     assert elapsed == meta["gpu_ms"] + meta["process_cpu_ms"]
     assert meta["transpose_strategy"] == "native_column_reduce"
     assert torch.isnan(storage[1::2]).all()
@@ -330,7 +342,8 @@ def test_spmv_csc_scalar_bound_native(dtype, output_dtype, op, columns_per_progr
 
 
 @pytest.mark.spmv_csc
-def test_spmv_csc_scalar_bound_fallback_preserves_wide_output(monkeypatch):
+@pytest.mark.parametrize("alg", ["csc_col_scalar_bound", "csc_col_scalar_tail_reduce"])
+def test_spmv_csc_scalar_bound_fallback_preserves_wide_output(alg, monkeypatch):
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
     module = spmv_csc_mod
     device = accelerator_device()
@@ -340,16 +353,20 @@ def test_spmv_csc_scalar_bound_fallback_preserves_wide_output(monkeypatch):
     x = torch.ones(2, dtype=a.dtype, device=device)
     out = torch.full((6,), float("nan"), device=device)[::2]
     original = module._launch_csc_columns
+    selected = alg
     def inject(data, index, ptr, dense, shape, op, alg, cfg, **kwargs):
         if index.dtype == torch.int64:
             raise RuntimeError("unsupported int64 kernel indices")
-        assert alg == "csc_col_scalar_bound" and op == "conj"
+        assert alg == selected and op == "conj"
         assert cfg["columns_per_program"] == 32
         assert kwargs["out"] is out and kwargs["out_dtype"] == torch.float32
         return original(data, index, ptr, dense, shape, op, alg, cfg, **kwargs)
     monkeypatch.setattr(module, "_launch_csc_columns", inject)
+    config = {"columns_per_program": 32}
+    if alg == "csc_col_scalar_tail_reduce":
+        config["scalar_steps"] = 0
     prepared = module.prepare_spmv_csc(a, i, p, (2, 3), op="conj",
-                                alg="csc_col_scalar_bound", config={"columns_per_program": 32})
+                                alg=alg, config=config)
     try:
         actual, meta = module.flagsparse_spmv_csc_run(prepared, x, out=out, return_meta=True)
     except BackendCapabilityUnavailable as exc:
@@ -492,7 +509,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
     (torch.int64, torch.int32), (torch.int64, torch.int64),
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmv_csc
-@pytest.mark.parametrize("alg,op", [('csc_col_scalar_bound', 'trans'), ('csc_col_scalar_bound', 'conj'), ('csc_subgroup_pair_mixed', 'trans'), ('csc_subgroup_pair_mixed', 'conj'), ('csc_col_tile_atomic', 'non'), ('csc_col_subgroup', 'trans'), ('csc_col_subgroup', 'conj'), ('csc_col_vector', 'trans'), ('csc_col_vector', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('spmv_csc_base', 'non'), ('spmv_csc_base', 'trans'), ('spmv_csc_base', 'conj')])
+@pytest.mark.parametrize("alg,op", [('csc_col_scalar_tail_reduce', 'trans'), ('csc_col_scalar_tail_reduce', 'conj'), ('csc_col_scalar_bound', 'trans'), ('csc_col_scalar_bound', 'conj'), ('csc_subgroup_pair_mixed', 'trans'), ('csc_subgroup_pair_mixed', 'conj'), ('csc_col_tile_atomic', 'non'), ('csc_col_subgroup', 'trans'), ('csc_col_subgroup', 'conj'), ('csc_col_vector', 'trans'), ('csc_col_vector', 'conj'), ('csc_col_split_reduce', 'trans'), ('csc_col_split_reduce', 'conj'), ('spmv_csc_base', 'non'), ('spmv_csc_base', 'trans'), ('spmv_csc_base', 'conj')])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["f16", "bf16"])
 @pytest.mark.parametrize("wide", [False, True], ids=["same_out", "f32_out"])
 def test_spmv_csc_registered_half_combinations(alg, op, dtype, wide, index_pair):
@@ -526,7 +543,9 @@ def test_spmv_csc_registered_half_combinations(alg, op, dtype, wide, index_pair)
             op=op, dtype=dtype, rhs_dtype=dtype, out_dtype=output_dtype, backend=_backend_name()
         ):
             pytest.skip("algorithm does not declare this type/op/backend combination")
-        prepared = module.prepare_spmv_csc(values, first, second, (3, 4), op=op, alg=alg)
+        if alg == "csc_col_scalar_tail_reduce":
+            extra["config"] = {"scalar_steps": 0}
+        prepared = module.prepare_spmv_csc(values, first, second, (3, 4), op=op, alg=alg, **extra)
         result = module.flagsparse_spmv_csc_run(
             prepared, operand, out=out, out_dtype=output_dtype, **extra
         )

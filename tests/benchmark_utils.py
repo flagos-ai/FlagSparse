@@ -51,6 +51,82 @@ def accelerator_device() -> torch.device:
     return torch.device(_ACCEL_DEVICE_TYPE)
 
 
+def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
+    """CPU-only execution-CSR geometry; never kernel-consumed preparation.
+
+    Counts model logical updates, not hardware transactions. Chunking bounds
+    temporary memory even for very large input matrices.
+    """
+    import numpy as np
+
+    p = np.asarray(indptr, dtype=np.int64)
+    if p.ndim != 1 or not len(p) or p[0] != 0 or np.any(p[1:] < p[:-1]):
+        raise ValueError("expected a monotone, zero-based CPU CSR indptr")
+    nnz, rows = int(p[-1]), len(p) - 1
+    lengths = np.diff(p)
+    nonempty = lengths > 0
+    result = dict(model="csr_tile_geometry_v1", source="cpu_execution_csr", rows=rows, nnz=nnz, tiles={})
+    result["row_lengths"] = dict(empty_rows=int(np.count_nonzero(~nonempty)),
+                                 mean=nnz / rows if rows else 0.0,
+                                 maximum=int(lengths.max()) if rows else 0,
+                                 p50=float(np.percentile(lengths, 50)) if rows else None,
+                                 p90=float(np.percentile(lengths, 90)) if rows else None,
+                                 p99=float(np.percentile(lengths, 99)) if rows else None)
+    result["long_row_nnz_fraction"] = {
+        str(limit): int(lengths[lengths > limit].sum()) / nnz if nnz else None
+        for limit in (128, 256, 512, 1024, 4096)}
+    result["atomic_count_basis"] = "per_real_component_logical_updates"
+
+    for tile in tiles:
+        if type(tile) is not int or tile <= 0:
+            raise ValueError("tile sizes must be positive integers")
+        count = (nnz + tile - 1) // tile
+        homogeneous = 0
+        # Histogram avoids retaining one span per NNZ tile.
+        histogram = {}
+        for first in range(0, count, 65536):
+            starts = np.arange(first, min(count, first + 65536), dtype=np.int64) * tile
+            ends = np.minimum(starts + tile, nnz) - 1
+            lo = np.searchsorted(p, starts, side="right") - 1
+            hi = np.searchsorted(p, ends, side="right") - 1
+            homogeneous += int(np.count_nonzero(lo == hi))
+            spans, frequencies = np.unique((hi - lo + 1)[hi != lo], return_counts=True)
+            for span, frequency in zip(spans, frequencies):
+                histogram[int(span)] = histogram.get(int(span), 0) + int(frequency)
+        mixed = count - homogeneous
+        def percentile(q):
+            if not mixed:
+                return None
+            rank, cumulative = max(1, int(np.ceil(q * mixed))), 0
+            for span, frequency in sorted(histogram.items()):
+                cumulative += frequency
+                if cumulative >= rank:
+                    return span
+        parts = (p[1:][nonempty] - 1) // tile - p[:-1][nonempty] // tile + 1
+        result["tiles"][str(tile)] = dict(
+            tile_count=count, single_owner_tile_count=homogeneous,
+            single_owner_tile_ratio=homogeneous / count if count else None,
+            ratio_reason=None if count else "no_nonzeros", mixed_tile_count=mixed,
+            mixed_tile_row_span_p50=percentile(.5), mixed_tile_row_span_p90=percentile(.9),
+            mixed_tile_row_span_max=max(histogram, default=None),
+            full_row_count=int(np.count_nonzero(parts == 1)),
+            crossing_row_count=int(np.count_nonzero(parts > 1)),
+            predicted_boundary_atomic_updates=int(parts[parts > 1].sum()))
+    cfg = config or {}
+    if "long_row_threshold" in cfg and "segment_nnz" in cfg:
+        threshold, segment = cfg["long_row_threshold"], cfg["segment_nnz"]
+        if threshold <= 0 or segment <= 0:
+            raise ValueError("queue threshold and segment must be positive")
+        long_lengths = lengths[lengths > threshold]
+        capacity = min(rows, nnz // (threshold + 1))
+        jobs = nnz // segment + capacity if capacity else 0
+        expected = int(((long_lengths + segment - 1) // segment).sum())
+        result["queue"] = dict(expected_long_rows=int(long_lengths.size), expected_jobs=expected,
+                               job_capacity=jobs, expected_active_job_ratio=expected / jobs if jobs else None,
+                               ratio_reason=None if jobs else "zero_capacity")
+    return result
+
+
 def add_type_combo_arguments(parser, *, spmm=False):
     """Extend the existing CLIs without changing their legacy defaults."""
     parser.add_argument("--type-combos", help="A:RHS:output triples, comma-separated")
@@ -70,7 +146,7 @@ def add_type_combo_arguments(parser, *, spmm=False):
         ("--reference-bandwidth-source", dict(default=None)),
         ("--reference-peak-gflops", dict(type=float, default=None)),
         ("--reference-peak-source", dict(default=None)),
-        ("--perf-metrics", dict(action="store_true", help="Useful throughput and modeled logical bandwidth (requires --type-combos; not hardware counters)")),
+        ("--perf-metrics", dict(action="store_true", help="Useful real-value throughput and modeled logical bandwidth (type combos or regular SpMV CSR; not hardware counters)")),
     ):
         if option not in parser._option_string_actions:
             parser.add_argument(option, **kwargs)
@@ -155,7 +231,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     if any(value is not None for value in reference_options.values()) and not args.perf_metrics:
         parser.error("reference bandwidth/peak options require --perf-metrics")
     if not args.type_combos:
-        if getattr(args, "perf_metrics", False):
+        if getattr(args, "perf_metrics", False) and operator != "spmv_csr":
             parser.error("--perf-metrics currently requires --type-combos")
         if getattr(args, "op_b", "non") != "non":
             parser.error("--op-b currently requires --type-combos")
@@ -248,6 +324,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
               "op", "op_a", "op_b", "layout", "dense_cols", "index_dtype", "indptr_dtype",
               "alg", "alg_requested", "alg_resolved", "backend", "m", "n", "nnz", "status", "reason", "max_error",
               "ms", "gpu_ms", "process_cpu_ms", "process_gpu_ms", "compute_ms", "fused_plan_compute_ms",
+              "init_ms", "producer_ms", "consumer_ms", "finish_ms",
               "vendor_ms", "vendor_backend", "vendor_version", "vendor_alg", "vendor_preprocessed", "vendor_status",
               "vendor_op_a_requested", "vendor_op_b_requested", "vendor_op_a_executed", "vendor_op_b_executed",
               "vendor_operation_mapping", "vendor_reason", "vendor_max_error", "vendor_exit_code", "vendor_error_stage", "vendor_stdout", "vendor_stderr",
@@ -271,7 +348,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                    "prepared_run_ms", "prepared_run_time_basis", "prepared_useful_gflops", "prepared_logical_gbs",
                    "cpu_gpu_overlap_risk", "reference_bandwidth_gbs", "reference_bandwidth_source",
                    "reference_peak_gflops", "reference_peak_source", "logical_bw_ratio", "gpu_logical_bw_ratio",
-                   "logical_roofline_gflops", "gpu_logical_roofline_ratio"]
+                   "logical_roofline_gflops", "gpu_logical_roofline_ratio", "csr_structure"]
     if csv_path:
         Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
     stream = open(csv_path, "w", newline="", encoding="utf-8") if csv_path else None
@@ -374,6 +451,9 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
             host = (sparse.coo_matrix((values, (first.numpy(), second.numpy())), shape=shape)
                     if fmt == "coo" else getattr(sparse, fmt + "_matrix")((values, first.numpy(), second.numpy()), shape=shape))
             for op, op_b, layout, ncols in itertools.product(ops, op_bs, layouts, ns):
+                structure_cache = {}
+                execution_ptr = ((host if op == "non" else host.T).tocsr().indptr
+                                 if metrics_enabled and operator == "spmv_csr" else None)
                 context.update(op_a=op, op_b=op_b, layout=layout, dense_cols=ncols)
                 progress("reference_and_rhs", context)
                 inner = shape[1] if op == "non" else shape[0]
@@ -431,6 +511,11 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                     raise ValueError(f"{alg} does not support column indices {index}")
                             progress("prepare", row)
                             prepared = prepare(*arrays, shape, op=op, alg=alg, config=config)
+                            if execution_ptr is not None:
+                                structure_key = json.dumps(prepared.config, sort_keys=True)
+                                if structure_key not in structure_cache:
+                                    structure_cache[structure_key] = csr_tile_structure(execution_ptr, config=prepared.config)
+                                row["csr_structure"] = structure_cache[structure_key]
                             kwargs = dict(out_dtype=output_dtype, return_time=True, return_meta=True)
                             if matrix:
                                 kwargs["op_b"] = op_b
@@ -498,7 +583,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                             if args.timing:
                                 progress("phase_diagnostics", row)
                                 _, _, diagnostics = run(prepared, rhs, timing=True, **kwargs)
-                                row.update({key: diagnostics.get(key) for key in ("process_gpu_ms", "compute_ms", "fused_plan_compute_ms")})
+                                row.update({key: diagnostics.get(key) for key in ("process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms")})
                             row["metadata"] = meta
                             row["alg_resolved"] = meta.get("alg_resolved", meta.get("alg", alg))
                             row["vendor_status"] = "SKIP"

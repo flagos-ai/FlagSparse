@@ -1437,6 +1437,63 @@ def _launch_csc_partition_panel(data, indices, indptr, dense, shape, cfg, stats,
 
 
 @triton.jit
+def _csc_scalar_tail_product(A, I, X, pos, active, XS,
+                             COMPLEX: tl.constexpr, ACC: tl.constexpr, CONJ: tl.constexpr):
+    row = tl.load(I + pos, active, 0).to(tl.int64)
+    xp = row * tl.cast(XS, tl.int64)
+    if COMPLEX:
+        ar = tl.load(A + 2 * pos, active, 0).to(ACC)
+        ai = tl.load(A + 2 * pos + 1, active, 0).to(ACC)
+        if CONJ:
+            ai = -ai
+        xr = tl.load(X + 2 * xp, active, 0).to(ACC)
+        xi = tl.load(X + 2 * xp + 1, active, 0).to(ACC)
+        return ar * xr - ai * xi, ar * xi + ai * xr
+    a = tl.load(A + pos, active, 0).to(ACC)
+    x = tl.load(X + xp, active, 0).to(ACC)
+    return a * x, tl.full(pos.shape, 0, ACC)
+
+
+@triton.jit
+def _csc_col_scalar_tail_reduce_kernel(A, I, P, X, Y, C, XS, YS,
+                                       R: tl.constexpr, K: tl.constexpr, S: tl.constexpr,
+                                       COMPLEX: tl.constexpr, ACC: tl.constexpr, CONJ: tl.constexpr):
+    col = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    valid = col < C
+    start = tl.load(P + col, valid, 0).to(tl.int64)
+    end = tl.load(P + col + 1, valid, 0).to(tl.int64)
+    longest = tl.max(end - start, 0)
+    re = tl.zeros((R,), ACC)
+    im = tl.zeros((R,), ACC)
+    for step in range(tl.minimum(longest, S)):
+        pos = start + step
+        pr, pi = _csc_scalar_tail_product(A, I, X, pos, valid & (pos < end), XS, COMPLEX, ACC, CONJ)
+        re += pr
+        if COMPLEX:
+            im += pi
+    if longest > S:
+        lane = tl.arange(0, K).to(tl.int64)
+        tail_re = tl.zeros((R, K), ACC)
+        tail_im = tl.zeros((R, K), ACC)
+        for base in range(S, longest, K):
+            pos = start[:, None] + base + lane[None, :]
+            pr, pi = _csc_scalar_tail_product(
+                A, I, X, pos, valid[:, None] & (pos < end[:, None]), XS, COMPLEX, ACC, CONJ)
+            tail_re += pr
+            if COMPLEX:
+                tail_im += pi
+        re += tl.sum(tail_re, 1)
+        if COMPLEX:
+            im += tl.sum(tail_im, 1)
+    yp = col * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * yp, re, valid)
+        tl.store(Y + 2 * yp + 1, im, valid)
+    else:
+        tl.store(Y + yp, re, valid)
+
+
+@triton.jit
 def _csc_col_scalar_bound_kernel(A, I, P, X, Y, C, XS, YS,
                                  R: tl.constexpr, COMPLEX: tl.constexpr,
                                  ACC: tl.constexpr, CONJ: tl.constexpr):
@@ -1490,6 +1547,14 @@ def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg, *, ou
     a = torch.view_as_real(data) if complex_values else data
     b = torch.view_as_real(dense) if complex_values else dense
     y = torch.view_as_real(result) if complex_values else result
+    if alg == "csc_col_scalar_tail_reduce":
+        _csc_col_scalar_tail_reduce_kernel[(triton.cdiv(shape[1], cfg["columns_per_program"]),)](
+            a, indices, indptr, b, y, shape[1], dense.stride(0), result.stride(0),
+            R=cfg["columns_per_program"], K=cfg["block_nnz"], S=cfg["scalar_steps"],
+            COMPLEX=complex_values,
+            ACC=tl.float64 if data.dtype in (torch.float64, torch.complex128) else tl.float32,
+            CONJ=op == "conj", num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+        return result
     if alg == "csc_col_scalar_bound":
         _csc_col_scalar_bound_kernel[(triton.cdiv(shape[1], cfg["columns_per_program"]),)](
             a, indices, indptr, b, y, shape[1], dense.stride(0), result.stride(0),
@@ -1537,7 +1602,7 @@ def _launch_csc_columns(data, indices, indptr, dense, shape, op, alg, cfg, *, ou
 
 
 SPMV_CSC_NEW_ALGORITHMS = ("csc_col_subgroup", "csc_col_tile_atomic",
-                           "csc_col_vector", "csc_col_split_reduce", "csc_subgroup_pair_mixed", "csc_col_scalar_bound")
+                           "csc_col_vector", "csc_col_split_reduce", "csc_subgroup_pair_mixed", "csc_col_scalar_bound", "csc_col_scalar_tail_reduce")
 
 
 class PreparedCscRoute:
@@ -1556,7 +1621,7 @@ def _csc_spec(alg, kind):
     from ._spmx_column_config import CSC_ALGORITHMS
     from ._spmm_csr_config import BACKENDS
     base = "spmv_csc_base" if kind == "spmv" else "spmm_csc_base"
-    names = (("csc_col_subgroup", "csc_col_tile_atomic", "csc_col_vector", "csc_col_split_reduce", "csc_subgroup_pair_mixed", "csc_col_scalar_bound")
+    names = (("csc_col_subgroup", "csc_col_tile_atomic", "csc_col_vector", "csc_col_split_reduce", "csc_subgroup_pair_mixed", "csc_col_scalar_bound", "csc_col_scalar_tail_reduce")
              if kind == "spmv" else
              ("csc_col_panel", "csc_col_tile_panel_atomic", "csc_col_kparallel", "csc_col_split_reduce", "csc_panel_staged_mixed", "csc_col_partition_panel_atomic"))
     if alg not in (base, *names):
@@ -1565,7 +1630,7 @@ def _csc_spec(alg, kind):
                 value_dtypes=((torch.float16, torch.bfloat16) if alg in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else SUPPORTED_SPMV_CSC_VALUE_DTYPES),
                 backends=BACKENDS,
                 layouts=("row", "col", "strided"),
-                implementation_version=(1 if alg in ("csc_col_partition_panel_atomic", "csc_col_scalar_bound") else
+                implementation_version=(1 if alg in ("csc_col_partition_panel_atomic", "csc_col_scalar_bound", "csc_col_scalar_tail_reduce") else
                                         4 if alg in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else 3),
                 half_output_dtypes={dtype: (dtype, torch.float32)
                                     for dtype in (torch.float16, torch.bfloat16)},
@@ -1649,7 +1714,7 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
         from ._spmm_csr_runtime import output_has_internal_overlap
         if output_has_internal_overlap(out):
             raise ValueError("out must have non-overlapping storage")
-        if selected in ("csc_col_partition_panel_atomic", "csc_col_scalar_bound") and (out.is_conj() or out.is_neg()):
+        if selected in ("csc_col_partition_panel_atomic", "csc_col_scalar_bound", "csc_col_scalar_tail_reduce") and (out.is_conj() or out.is_neg()):
             raise ValueError("out must not be a lazy conjugate or negative view")
     cfg, info = {}, dict(backend=_backend_name())
     if selected in CSC_ALGORITHMS:
@@ -1665,7 +1730,7 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
             a = data.resolve_conj().contiguous()
             i, p = indices.contiguous(), ptr.contiguous()
             b = dense.resolve_conj()
-            if selected in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed", "csc_col_partition_panel_atomic", "csc_col_scalar_bound"):
+            if selected in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed", "csc_col_partition_panel_atomic", "csc_col_scalar_bound", "csc_col_scalar_tail_reduce"):
                 a = data.resolve_conj().resolve_neg().contiguous()
                 b = dense.resolve_conj().resolve_neg()
             if selected == "csc_col_split_reduce" and data.dtype in (torch.float16, torch.bfloat16):
@@ -1699,7 +1764,7 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
                 result = out
         meta = dict(info, alg=selected, alg_requested=alg or prepared.alg, alg_resolved=selected,
                     a_dtype=str(data.dtype), rhs_dtype=str(dense.dtype), output_dtype=str(output_dtype),
-                    config=cfg, op=prepared.op, implementation_version=1 if selected == "csc_col_scalar_bound" else 4 if selected in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else 3, timing_contract_version=2,
+                    config=cfg, op=prepared.op, implementation_version=1 if selected in ("csc_col_scalar_bound", "csc_col_scalar_tail_reduce") else 4 if selected in ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed") else 3, timing_contract_version=2,
                     conversion_mode="materialize" if selected == "csc_col_split_reduce" else "load",
                     compute_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
                     input_indices_dtype=str(indices.dtype), input_indptr_dtype=str(ptr.dtype),
@@ -1710,6 +1775,10 @@ def _run_csc_registered(prepared, dense, *, alg=None, config=None, op=None, out=
                     component_dtype="float64" if data.dtype in (torch.float64, torch.complex128) else "float32",
                     dense_stride=tuple(dense.stride()), output_stride=tuple(result.stride()))
         meta.update(stats)
+        if selected == "csc_col_scalar_tail_reduce":
+            meta.update(execution_path="native_csc_scalar_tail_reduce", scalar_steps=cfg["scalar_steps"],
+                        tail_block_nnz=cfg["block_nnz"], workspace_peak_bytes=0,
+                        plan_strategy="none", validation="unverified")
         return result, meta
     measured = return_time or return_meta or timing
     if measured:

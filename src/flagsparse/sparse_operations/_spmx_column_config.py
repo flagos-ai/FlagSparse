@@ -163,6 +163,7 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
 
 CSC_MIXED_ALGORITHMS = ("csc_subgroup_pair_mixed", "csc_panel_staged_mixed")
 CSC_ALGORITHMS = {
+    "csc_col_scalar_tail_reduce": ("trans", "conj"),
     "csc_col_scalar_bound": ("trans", "conj"),
     "csc_subgroup_pair_mixed": ("trans", "conj"),
     "csc_panel_staged_mixed": ("trans", "conj"),
@@ -187,8 +188,8 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
         raise ValueError(f"unknown CSC algorithm {algorithm!r}")
     if op not in CSC_ALGORITHMS[algorithm]:
         raise ValueError(f"{algorithm} does not support op={op}")
-    if algorithm == "csc_col_scalar_bound" and kind != "spmv":
-        raise ValueError("csc_col_scalar_bound requires SpMV")
+    if algorithm in ("csc_col_scalar_bound", "csc_col_scalar_tail_reduce") and kind != "spmv":
+        raise ValueError(f"{algorithm} requires SpMV")
     if algorithm == "csc_col_partition_panel_atomic" and kind != "spmm":
         raise ValueError("csc_col_partition_panel_atomic requires SpMM")
     if algorithm in CSC_MIXED_ALGORITHMS and dtype not in ("float16", "bfloat16"):
@@ -229,6 +230,8 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
             cfg.update(segment_nnz=1024, reduce_block_size=256, workspace_bytes=256 * 1024 * 1024)
     elif algorithm == "csc_col_scalar_bound":
         cfg.update(columns_per_program=64)
+    elif algorithm == "csc_col_scalar_tail_reduce":
+        cfg.update(columns_per_program=64, scalar_steps=8, block_nnz=32)
     elif algorithm == "csc_col_subgroup":
         cfg.update(lanes_per_column=8, columns_per_program=warps * caps.subgroup_width // 8)
     elif algorithm == "csc_col_tile_atomic":
@@ -250,6 +253,10 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
         if set(candidate) != allowed:
             raise ValueError(f"unsupported CSC config fields: {sorted(set(candidate)-allowed)}")
         for key, value in candidate.items():
+            if key == "scalar_steps" and algorithm == "csc_col_scalar_tail_reduce":
+                if type(value) is not int or value not in (0, 4, 8, 16, 32):
+                    raise ValueError("scalar_steps must be 0/4/8/16/32")
+                continue
             if key == "value_stage":
                 if value not in ("storage", "compute"):
                     raise ValueError("value_stage must be storage or compute")
@@ -258,8 +265,10 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
                 raise ValueError(f"{key} must be a positive integer")
             if key not in ("num_stages", "workspace_bytes") and value & (value-1):
                 raise ValueError(f"{key} must be a power of two")
-        if algorithm == "csc_col_scalar_bound" and candidate["columns_per_program"] not in (32, 64, 128):
+        if algorithm in ("csc_col_scalar_bound", "csc_col_scalar_tail_reduce") and candidate["columns_per_program"] not in (32, 64, 128):
             raise ValueError("columns_per_program must be 32/64/128")
+        if algorithm == "csc_col_scalar_tail_reduce" and candidate["block_nnz"] not in (8, 16, 32, 64):
+            raise ValueError("scalar tail block_nnz must be 8/16/32/64")
         if candidate["num_stages"] != 1:
             raise ValueError("CSC num_stages must be 1")
         if algorithm == "csc_col_partition_panel_atomic" and (
@@ -298,6 +307,10 @@ def resolve_csc_config(algorithm, dtype, n, caps, overrides=None, *, op="non", k
                 cfg, source = candidate, str(key)
     explicit = dict(overrides or {})
     for key, value in explicit.items():
+        if key == "scalar_steps" and algorithm == "csc_col_scalar_tail_reduce":
+            if type(value) is not int or value not in (0, 4, 8, 16, 32):
+                raise ValueError("scalar_steps must be 0/4/8/16/32")
+            continue
         if key == "value_stage" and key in allowed:
             if value not in ("storage", "compute"):
                 raise ValueError("value_stage must be storage or compute")

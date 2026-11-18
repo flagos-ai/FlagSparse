@@ -83,6 +83,9 @@ ops:
       Explicit csr_rowgroup_stream_reduce: six floating/complex dtypes, non/trans/conj, four half mixed combinations; scan required; hardware unverified.
       Explicit csr_row_refill_reduce: six floating/complex dtypes, non/trans/conj; local row-slot refill with no runtime partition plan; hardware unverified.
       Explicit csr_row_scalar_bound and csr_longrow_queue_atomic: six dtypes, non only; half/bfloat16 same-type or FP32 output; independent bound-loop and GPU long-row queue, hardware unverified.
+      Explicit csr_row_scalar_tail_reduce: native non, scalar prefix followed by local parallel tail reduction; six dtypes and half/bfloat16 same-type or FP32 output; no plan or atomic, hardware unverified.
+      Explicit csr_nnz_local_reduce_atomic: six dtypes and half/bfloat16 wide output; non/trans/conj; fused owner lookup, single-row sum and boundary atomics; hardware unverified.
+      Explicit csr_longrow_grid_atomic: six dtypes, non only; same producer and finish as queue, static-capacity GPU consumers; hardware unverified.
       Explicit csr_row_scalar_strip and csr_row_static_tile: six floating/complex dtypes, non only; independent short-row candidates, no runtime plan; half/bfloat16 support same-type or FP32 output; hardware unverified.
       Explicit csr_transpose_sharded_atomic: six floating/complex dtypes, trans/conj only; native CSR output shards with compute-precision atomics; hardware unverified.
     for:
@@ -127,6 +130,7 @@ ops:
     description: |
       Computes sparse matrix-vector multiplication for a CSC matrix.
       Explicit csc_col_scalar_bound: six dtypes, native trans/conj; half/bfloat16 same-type or FP32 output, hardware unverified.
+      Explicit csc_col_scalar_tail_reduce: native trans/conj, scalar prefix with local parallel tail reduction; six dtypes and half/bfloat16 same-type or FP32 output; no format conversion, hardware unverified.
       Explicit csc_subgroup_pair_mixed: FP16/BF16 inputs, FP32 compute, same-type/FP32 output; hardware unverified.
     for:
       - flagsparse_spmv_csc
