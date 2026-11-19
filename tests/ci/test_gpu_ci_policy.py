@@ -114,6 +114,32 @@ def test_independent_mixed_cases_use_existing_gpu_delivery_files():
     assert 'row["metadata"] = meta' in benchmark
 
 
+def test_coo_runclass_candidates_use_existing_delivery():
+    for op, algorithm in (("spmv_coo", "coo_runclass_atomic"),
+                          ("spmm_coo", "coo_runclass_panel_atomic")):
+        accuracy = PROJECT_ROOT / "tests" / "pytest" / f"test_{op}_accuracy.py"
+        assert list((PROJECT_ROOT / "tests").rglob(accuracy.name)) == [accuracy]
+        text = _read(accuracy)
+        assert algorithm in text and f"@pytest.mark.{op}" in text
+        assert f"def test_{op}_runclass_native" in text
+        benchmark = _read(PROJECT_ROOT / "tests" / f"test_{op}.py")
+        assert "run_type_combo_benchmark" in benchmark
+        assert f"list_{op}_algorithms" in benchmark
+    import ast
+    tree = ast.parse(_read(PROJECT_ROOT / "tests" / "test_spmm_coo.py"))
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    case = functions["run_one_alg_case"]
+    assert "config" in {arg.arg for arg in case.args.args}
+    prepare = [node for node in ast.walk(case) if isinstance(node, ast.Call)
+               and isinstance(node.func, ast.Attribute) and node.func.attr == "prepare_spmm_coo_route"
+               and any(kw.arg == "config" for kw in node.keywords)]
+    assert len(prepare) == 1
+    for caller in ("run_all_dtypes_export_csv", "main"):
+        calls = [node for node in ast.walk(functions[caller]) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "run_one_alg_case"]
+        assert calls and all(any(kw.arg == "config" for kw in node.keywords) for node in calls)
+
+
 def test_short_csr_and_partition_csc_use_original_delivery():
     for op, names in {
         "spmv_csr": ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_longrow_queue_atomic", "csr_row_scalar_tail_reduce", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic"),

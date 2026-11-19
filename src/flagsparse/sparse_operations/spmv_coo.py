@@ -1386,6 +1386,73 @@ def _coo_rowrun_group_kernel(A, Row, Col, Starts, B, C, RUNS, N,
         tl.store(C + dst, real, mask_out)
 
 
+@triton.jit
+def _coo_runclass_panel_kernel(A, Row, Col, B, C, NNZ, N,
+                              BS0, BS1, CS0, CS1,
+                              T: tl.constexpr, BN: tl.constexpr,
+                              MODE: tl.constexpr, COMPLEX: tl.constexpr,
+                              CONJ: tl.constexpr, FP64: tl.constexpr):
+    """One NNZ tile: reduce a single run, bypass scan, or scan local runs.
+
+    Classification is over valid owners only, independent of panel width.
+    Non-adjacent duplicates need no special handling: every emitted run is atomic.
+    """
+    lane = tl.arange(0, T)
+    k = tl.program_id(0).to(tl.int64) * T + lane
+    n = tl.program_id(1).to(tl.int64) * BN + tl.arange(0, BN)
+    valid = k < NNZ
+    owner = tl.load(Row + k, valid, other=-1).to(tl.int64)
+    col = tl.load(Col + k, valid, other=0).to(tl.int64)
+    mask = valid[:, None] & (n[None, :] < N)
+    real, imag = _coo_product(A, B, k[:, None], col[:, None], n[None, :],
+                              BS0, BS1, mask, COMPLEX, CONJ, FP64)
+    dst = owner[:, None] * CS0 + n[None, :] * CS1
+    if MODE == "none":
+        if COMPLEX:
+            tl.atomic_add(C + 2 * dst, real, mask, sem="relaxed")
+            tl.atomic_add(C + 2 * dst + 1, imag, mask, sem="relaxed")
+        else:
+            tl.atomic_add(C + dst, real, mask, sem="relaxed")
+    else:
+        prev = tl.load(Row + k - 1, valid & (lane > 0), other=-1).to(tl.int64)
+        head = (lane == 0) | (owner != prev)
+        single = tl.full((), False, tl.int1)
+        no_adjacent = tl.full((), False, tl.int1)
+        if MODE == "classify":
+            first = tl.load(Row + tl.program_id(0).to(tl.int64) * T).to(tl.int64)
+            single = tl.sum((valid & (owner != first)).to(tl.int32), 0) == 0
+            no_adjacent = tl.sum((valid & (lane > 0) & (owner == prev)).to(tl.int32), 0) == 0
+        if single:
+            target = tl.load(Row + tl.program_id(0).to(tl.int64) * T).to(tl.int64) * CS0 + n * CS1
+            real_sum = tl.sum(real, 0)
+            if COMPLEX:
+                imag_sum = tl.sum(imag, 0)
+                tl.atomic_add(C + 2 * target, real_sum, n < N, sem="relaxed")
+                tl.atomic_add(C + 2 * target + 1, imag_sum, n < N, sem="relaxed")
+            else:
+                tl.atomic_add(C + target, real_sum, n < N, sem="relaxed")
+        elif no_adjacent:
+            if COMPLEX:
+                tl.atomic_add(C + 2 * dst, real, mask, sem="relaxed")
+                tl.atomic_add(C + 2 * dst + 1, imag, mask, sem="relaxed")
+            else:
+                tl.atomic_add(C + dst, real, mask, sem="relaxed")
+        else:
+            flags = tl.broadcast_to(head[:, None], (T, BN))
+            real, _ = tl.associative_scan((real, flags), 0, _coo_scan_pair)
+            if COMPLEX:
+                imag, _ = tl.associative_scan((imag, flags), 0, _coo_scan_pair)
+            nxt = tl.load(Row + k + 1, (k + 1 < NNZ) & (lane + 1 < T), other=-1).to(tl.int64)
+            tail = valid & ((lane + 1 == T) | (k + 1 == NNZ) | (owner != nxt))
+            emit = tail[:, None] & (n[None, :] < N)
+            if COMPLEX:
+                tl.atomic_add(C + 2 * dst, real, emit, sem="relaxed")
+                tl.atomic_add(C + 2 * dst + 1, imag, emit, sem="relaxed")
+            else:
+                tl.atomic_add(C + dst, real, emit, sem="relaxed")
+
+
+_COO_RUNCLASS_ALGORITHMS = ("coo_runclass_atomic", "coo_runclass_panel_atomic")
 _COO_MIXED_ALGORITHMS = ("coo_stream_prefetch_mixed", "coo_stream_panel_prefetch_mixed")
 
 _COO_NEW_ALGORITHMS = (
@@ -1393,11 +1460,14 @@ _COO_NEW_ALGORITHMS = (
     "coo_segmented_panel_atomic", "coo_rowrun_panel",
     "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic",
     *_COO_MIXED_ALGORITHMS,
+    *_COO_RUNCLASS_ALGORITHMS,
 )
 _COO_ATOMIC_ALGORITHMS = ("coo_atomic", "coo_segmented_atomic", "coo_segmented_panel_atomic",
-                          "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic", *_COO_MIXED_ALGORITHMS)
+                          "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic", *_COO_MIXED_ALGORITHMS,
+                          *_COO_RUNCLASS_ALGORITHMS)
 SPMV_COO_ALGORITHMS = ("coo_rowrun", "coo_atomic", "coo_segmented_atomic",
-                       "coo_rowrun_subgroup", "coo_segmented_stream_atomic", "coo_stream_prefetch_mixed")
+                       "coo_rowrun_subgroup", "coo_segmented_stream_atomic", "coo_stream_prefetch_mixed",
+                       "coo_runclass_atomic")
 
 
 def _resolve_coo_config(alg, dtype, device, config=None, n=1):
@@ -1428,6 +1498,13 @@ def _launch_coo_extension(data, row, col, starts, B, shape, alg, cfg, conj=False
     common = dict(COMPLEX=complex_, CONJ=conj,
                   FP64=compute_dtype in (torch.float64, torch.complex128),
                   num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+    if alg in _COO_RUNCLASS_ALGORITHMS:
+        bn = cfg.get("block_n", 1)
+        _coo_runclass_panel_kernel[(triton.cdiv(data.numel(), cfg["block_nnz"]),
+                                   triton.cdiv(B.shape[1], bn))](
+            *args, b, c, data.numel(), B.shape[1], *B.stride(), *C.stride(),
+            T=cfg["block_nnz"], BN=bn, MODE=cfg["local_reduce"], **common)
+        return C
     if alg in _COO_MIXED_ALGORITHMS:
         bn = cfg.get("block_n", 1)
         _coo_prefetch_mixed_kernel[(triton.cdiv(data.numel(), cfg["block_nnz"] * cfg["blocks_per_program"]),
@@ -1481,13 +1558,19 @@ class PreparedCooRoute:
 def get_spmv_coo_algorithm_spec(alg):
     if alg not in SPMV_COO_ALGORITHMS:
         raise ValueError(f"unknown COO SpMV algorithm {alg!r}")
-    return dict(name=alg, supported_ops=("non", "trans", "conj"),
+    spec = dict(name=alg, supported_ops=("non", "trans", "conj"),
                 supported_dtypes=((torch.float16, torch.bfloat16) if alg in _COO_MIXED_ALGORITHMS else
                                   (torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128)),
                 half_output_dtypes={dtype: (dtype, torch.float32)
                                     for dtype in (torch.float16, torch.bfloat16)},
-                implementation_version=4 if alg in _COO_MIXED_ALGORITHMS else 3, timing_contract_version=2,
+                implementation_version=5 if alg in _COO_RUNCLASS_ALGORITHMS else 4 if alg in _COO_MIXED_ALGORITHMS else 3, timing_contract_version=2,
                 requires_sort=alg not in _COO_ATOMIC_ALGORITHMS)
+    if alg in _COO_RUNCLASS_ALGORITHMS:
+        spec.update(kernel="_coo_runclass_panel_kernel", validation="unverified",
+                    compute_policy="half_fp32_other_native_component",
+                    config_candidates=dict(block_nnz=(128, 256, 512, 1024),
+                                           local_reduce=("classify", "segment", "none")))
+    return spec
 
 
 def list_spmv_coo_algorithms(op=None, dtype=None, backend=None, *, rhs_dtype=None, out_dtype=None):
@@ -1595,7 +1678,7 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
                     return _launch_coo_extension(a, rr, cc, ss, vector[:, None], shape,
                                                  selected, cfg, prepared.op == "conj",
                                                  compute_dtype=torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype,
-                                                 out=out[:, None] if out is not None and out.dtype == (torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype) and (selected in _COO_MIXED_ALGORITHMS or out.is_contiguous()) else None)[:, 0]
+                                                 out=out[:, None] if out is not None and out.dtype == (torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype) and (selected in (*_COO_MIXED_ALGORITHMS, *_COO_RUNCLASS_ALGORITHMS) or out.is_contiguous()) else None)[:, 0]
                 try:
                     y = launch(r, c, starts)
                 except Exception as exc:
@@ -1626,10 +1709,12 @@ def flagsparse_spmv_coo_run(prepared, x, *, alg=None, config=None, op=None,
                        backend=_backend_name(),
                        input_indices=(str(row.dtype), str(col.dtype)),
                        execution_indices=(str(r.dtype), str(c.dtype)), fallback_reason=reason,
-                       transpose_strategy="index_roles", implementation_version=4 if selected in _COO_MIXED_ALGORITHMS else 3,
+                       transpose_strategy="index_roles", implementation_version=5 if selected in _COO_RUNCLASS_ALGORITHMS else 4 if selected in _COO_MIXED_ALGORITHMS else 3,
+                       local_reduce=cfg.get("local_reduce"),
+                       x_stride=tuple(x.stride()), output_stride=tuple(y.stride()),
                        prefetch_blocks=cfg.get("prefetch_blocks"),
                        input_materialized=(a.data_ptr() != data.data_ptr() or vector.data_ptr() != x.data_ptr()),
-                       output_buffer="user_out" if out is not None and out.dtype == torch.float32 else "compute_buffer",
+                       output_buffer=("user_out" if out is not None and out.dtype == (torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype) else "compute_buffer") if selected in _COO_RUNCLASS_ALGORITHMS else ("user_out" if out is not None and out.dtype == torch.float32 else "compute_buffer"),
                        blocks_per_program=cfg.get("blocks_per_program", 1),
                        timing_contract_version=2)
     return _coo_measure_run(execute, return_time, return_meta, timing)

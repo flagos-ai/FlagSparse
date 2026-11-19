@@ -129,6 +129,9 @@ def _command_specs(
         "spmv-coo": [
             "tests/test_spmv_coo.py",
             "--synthetic",
+            "--alg", "compare", "--ops", "non,trans,conj",
+            "--warmup", str(args.warmup), "--iters", str(args.iters),
+            *no_cusparse,
         ],
         "spmv-csc": [
             "tests/test_spmv_csc.py",
@@ -165,6 +168,7 @@ def _command_specs(
         "spmm-coo": [
             "tests/test_spmm_coo.py",
             "--synthetic",
+            "--alg", "compare", "--ops", "non,trans,conj",
             "--warmup",
             str(args.warmup),
             "--iters",

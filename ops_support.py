@@ -543,6 +543,17 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
                 values=("float16", "bfloat16", "float32", "float64", "complex64", "complex128"),
                 indices=("int32", "int64"), ops=("non", "trans", "conj"),
                 notes="Native NNZ panel; FP32/FP64 component atomic required; hardware unverified"),
+        *(
+            ApiSpec(kind, "flagsparse_" + module, module, "COO", algorithm,
+                    values=("float16", "bfloat16", "float32", "float64", "complex64", "complex128"),
+                    indices=("int32", "int64"), ops=("non", "trans", "conj"),
+                    notes="Native run-class tile atomic; half FP32 compute and same-type/FP32 output; "
+                          + precision + "; scan/atomic capabilities required; hardware unverified")
+            for kind, module, algorithm, precision in (
+                ("spmv", "spmv_coo", "coo_runclass_atomic", "regular uses native component precision"),
+                ("spmm", "spmm_coo", "coo_runclass_panel_atomic", "FP32/complex64 use FP64 components"),
+            )
+        ),
         ApiSpec(
             "spgemm",
             "flagsparse_spgemm_csr",

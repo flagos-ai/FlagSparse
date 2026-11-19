@@ -295,6 +295,150 @@ def test_spmv_coo_tocsr_prepared_path_matches_torch():
 
 
 # Explicit migrated algorithms share this operator's marker, golden and tolerance.
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("dtype,output_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
+    (torch.float32, torch.float32), (torch.float64, torch.float64),
+    (torch.complex64, torch.complex64), (torch.complex128, torch.complex128),
+], ids=["f16", "f16_f32", "bf16", "bf16_f32", "f32", "f64", "c64", "c128"])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("mode", ["classify", "segment", "none"])
+def test_spmv_coo_runclass_native(dtype, output_dtype, op, mode, record_property):
+    import importlib
+    from flagsparse.sparse_operations._spmm_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmv_coo")
+    device = accelerator_device()
+    tile = 128
+    # Single-owner block, nonadjacent duplicates, mixed runs, deceptive tail.
+    owner = torch.cat((torch.ones(tile, dtype=torch.int64),
+                       (torch.arange(tile) % 2) * 4 + 3,
+                       (torch.arange(tile) // 2 % 2) * 4 + 3,
+                       torch.tensor([3, 7, 3])))
+    other = torch.arange(owner.numel()) % 11
+    row, col = (owner, other) if op == "non" else (other, owner)
+    shape = (9, 13) if op == "non" else (13, 9)
+    values = (torch.arange(owner.numel(), dtype=torch.float64) % 9 - 4) / 64
+    if dtype.is_complex:
+        values = torch.complex(values, values.flip(0) / 2)
+    values = values.to(dtype)
+    golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    matrix = torch.zeros(shape, dtype=golden_dtype)
+    matrix.index_put_((row, col), values.to(golden_dtype), accumulate=True)
+    effective = matrix if op == "non" else matrix.T.conj() if op == "conj" else matrix.T
+    x = ((torch.arange(13, dtype=torch.float64) % 5 - 2) / 8).to(dtype)
+    if dtype.is_complex:
+        x = torch.complex(x.real, x.real.flip(0) / 2)
+    expected = (effective @ x.to(golden_dtype)).to(output_dtype)
+    from tests.pytest.conftest import QUICK_MODE
+    index_pairs = [(torch.int32, torch.int64)] if QUICK_MODE else [
+        (torch.int32, torch.int32), (torch.int32, torch.int64),
+        (torch.int64, torch.int32), (torch.int64, torch.int64)]
+    record_property("algorithm", "coo_runclass_atomic")
+    record_property("compute_dtype", str(torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype))
+    for key, value in dict(a_dtype=str(dtype), rhs_dtype=str(dtype), output_dtype=str(output_dtype),
+                           op_a=op, op_b="non").items():
+        record_property(key, value)
+    for ri, ci in index_pairs:
+        args = values.to(device), row.to(device=device, dtype=ri), col.to(device=device, dtype=ci)
+        rhs = torch.empty(26, device=device, dtype=dtype)[::2]
+        rhs.copy_(x.to(device))
+        snapshots = [t.clone() for t in (*args, rhs)]
+        out = torch.full((18,), float("nan"), device=device, dtype=output_dtype)[::2]
+        try:
+            prepared = module.prepare_spmv_coo(*args, shape, op=op,
+                alg="coo_runclass_atomic", config={"local_reduce": mode})
+            result, meta = module.flagsparse_spmv_coo_run(prepared, rhs, out=out,
+                out_dtype=output_dtype, return_meta=True, timing=True)
+        except BackendCapabilityUnavailable as exc:
+            pytest.skip(str(exc))
+        assert result is out
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+        assert meta["alg_resolved"] == "coo_runclass_atomic"
+        assert meta["local_reduce"] == mode
+        assert meta["operator_ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+        for current, saved in zip((*args, rhs), snapshots):
+            torch.testing.assert_close(current, saved, rtol=0, atol=0)
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("shape,count", [((9, 11), 257), ((9, 11), 0), ((0, 0), 0), ((0, 11), 0)])
+def test_spmv_coo_runclass_empty_and_single_tail(op, shape, count):
+    import importlib
+    from flagsparse.sparse_operations._spmm_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmv_coo")
+    device = accelerator_device()
+    values = torch.ones(count, device=device)
+    indices = torch.zeros(count, dtype=torch.int32, device=device)
+    inner, outer = (shape[1], shape[0]) if op == "non" else (shape[0], shape[1])
+    out = torch.full((outer,), float("nan"), device=device)
+    try:
+        result = module.flagsparse_spmv_coo(values, indices, indices, torch.ones(inner, device=device),
+            shape, alg="coo_runclass_atomic", op=op, out=out)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    expected = torch.zeros(outer)
+    if count:
+        expected[0] = count
+    assert result is out
+    torch.testing.assert_close(result.cpu(), expected)
+
+
+@pytest.mark.spmv_coo
+@pytest.mark.parametrize("policy", ["auto", "strict"])
+def test_spmv_coo_runclass_fallback_and_isolation(policy, monkeypatch):
+    import importlib
+    from flagsparse.sparse_operations._spmm_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmv_coo")
+    device = accelerator_device()
+    data = torch.tensor([1, .00390625], dtype=torch.float16, device=device)
+    row = torch.zeros(2, dtype=torch.int64, device=device)
+    col = row.clone()
+    x = torch.tensor([1.0078125], dtype=data.dtype, device=device)
+    out = torch.full((2,), float("nan"), device=device)[::2]
+    def forbidden(*args, **kwargs):
+        raise AssertionError("runclass must not sort/build a row-run plan")
+    monkeypatch.setattr(module, "_coo_sorted_runs", forbidden)
+    original = module._launch_coo_extension
+    calls = []
+    def inject(a, r, c, starts, rhs, shape, alg, cfg, conj=False, compute_dtype=None, out=None):
+        calls.append((r.dtype, alg, dict(cfg), compute_dtype))
+        assert starts is None and alg == "coo_runclass_atomic"
+        assert "blocks_per_program" not in cfg
+        if r.dtype == torch.int64:
+            raise RuntimeError("int64 indices unsupported (injected compatibility failure)")
+        return original(a, r, c, starts, rhs, shape, alg, cfg, conj, compute_dtype, out)
+    monkeypatch.setattr(module, "_launch_coo_extension", inject)
+    try:
+        # Deliberately bind stream-only config to the prepared object. Selecting
+        # runclass without config must resolve its own defaults.
+        prepared = module.prepare_spmv_coo(data, row, col, (1, 1),
+            alg="coo_segmented_stream_atomic", config={"blocks_per_program": 4},
+            index_fallback_policy=policy)
+        if policy == "strict":
+            with pytest.raises(RuntimeError, match="int64 indices unsupported"):
+                module.flagsparse_spmv_coo_run(prepared, x, alg="coo_runclass_atomic", out=out)
+            assert len(calls) == 1
+            return
+        result, meta = module.flagsparse_spmv_coo_run(prepared, x, alg="coo_runclass_atomic",
+                                                    out=out, out_dtype=torch.float32, return_meta=True)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    assert result is out
+    assert [call[0] for call in calls] == [torch.int64, torch.int32]
+    assert all(call[3] == torch.float32 for call in calls)
+    assert meta["fallback_reason"] and meta["alg_resolved"] == "coo_runclass_atomic"
+    expected = (data.cpu().double().sum() * x.cpu().double()).float()
+    rtol, atol = close_tolerances(torch.float32)
+    torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+    assert not torch.equal(expected, expected.half().float())
+
+
 _MIGRATED_ROUTES = (('coo_segmented_atomic', 'non'), ('coo_segmented_atomic', 'trans'), ('coo_segmented_atomic', 'conj'), ('coo_rowrun_subgroup', 'non'), ('coo_rowrun_subgroup', 'trans'), ('coo_rowrun_subgroup', 'conj'), ('coo_segmented_stream_atomic', 'non'), ('coo_segmented_stream_atomic', 'trans'), ('coo_segmented_stream_atomic', 'conj'))
 
 
@@ -429,6 +573,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmv_coo
 @pytest.mark.parametrize("alg,op", [('coo_stream_prefetch_mixed', 'non'), ('coo_stream_prefetch_mixed', 'trans'), ('coo_stream_prefetch_mixed', 'conj'),
+    ('coo_runclass_atomic', 'non'), ('coo_runclass_atomic', 'trans'), ('coo_runclass_atomic', 'conj'),
     ('coo_segmented_atomic', 'non'),
     ('coo_segmented_atomic', 'trans'),
     ('coo_segmented_atomic', 'conj'),

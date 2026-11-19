@@ -25,6 +25,7 @@ atomic COO route is retained for internal parity checks and debug.
 import argparse
 import csv
 import glob
+import json
 import os
 import sys
 import time
@@ -48,6 +49,7 @@ else:
 import flagsparse as ast
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmm_coo as ast_ops
+from flagsparse.sparse_operations._spmm_csr_config import BackendCapabilityUnavailable
 
 VALUE_DTYPES = [
     torch.float16,
@@ -87,6 +89,7 @@ PERF_FIELDS = [
     "status",
     "reason",
     "cusparse_reason",
+    "metadata",
 ]
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
 DIAG_FIELDS = [
@@ -691,6 +694,7 @@ def _time_coo_algorithm(
         "c_stride": meta.get("c_stride"),
         "output_layout": meta.get("output_layout"),
         "diagnostics": meta.get("diagnostics", {}),
+        "metadata": meta,
         "out": out,
     }
     if timing:
@@ -843,6 +847,7 @@ def run_one_alg_case(
     diagnose,
     progress=False,
     input_arrays=None,
+    config=None,
 ):
     matrix_name = os.path.basename(path)
 
@@ -961,7 +966,7 @@ def run_one_alg_case(
             stage_t0 = _start(f"run {alg}")
             # Canonical legacy preparation discards duplicates. Explicit native
             # extensions must prepare from the original COO, outside sampling.
-            route_prepared = (ast.prepare_spmm_coo_route(data, row, col, shape, op=op, alg=alg)
+            route_prepared = (ast.prepare_spmm_coo_route(data, row, col, shape, op=op, alg=alg, config=config)
                               if alg in ast_ops.SPMM_COO_NEW_ALGORITHMS else prepared)
             result = _time_coo_algorithm(
                 route_prepared,
@@ -974,7 +979,11 @@ def run_one_alg_case(
                 layout=layout,
             )
             _done(f"run {alg}", stage_t0, f"ms={_fmt_ms(result['ms'])}")
-        except (ast.SpmmCooAlgorithmUnavailable, ValueError, TypeError) as exc:
+        except (ast.SpmmCooAlgorithmUnavailable, BackendCapabilityUnavailable, ValueError, TypeError) as exc:
+            # Explicit extension configuration/runtime failures are not capability
+            # exclusions. Preserve their traceback rather than label them SKIP.
+            if alg in ast_ops.SPMM_COO_NEW_ALGORITHMS and not isinstance(exc, BackendCapabilityUnavailable):
+                raise
             if stage_t0 is not None:
                 _done(f"run {alg}", stage_t0, f"skip={exc}")
             rows.append(
@@ -1026,6 +1035,7 @@ def run_one_alg_case(
             "status": torch_profile["status"],
             "reason": pytorch_reason or "",
             "cusparse_reason": cusparse_reason or "",
+            "metadata": json.dumps(result.get("metadata", {}), default=str, sort_keys=True),
         }
         if timing:
             row_out["process_gpu_ms"] = result["process_gpu_ms"]
@@ -2353,6 +2363,7 @@ def run_all_dtypes_export_csv(
     timing=False,
     alg_names=None,
     diagnose=False,
+    config=None,
 ):
     alg_names = _parse_algs(None, route=route) if alg_names is None else alg_names
     csv_path = _normalize_csv_path(csv_path)
@@ -2397,6 +2408,7 @@ def run_all_dtypes_export_csv(
                             timing,
                             diagnose,
                             progress=True,
+                            config=config,
                         )
                         rows.extend(case_rows)
                         diag_rows.extend(case_diag_rows)
@@ -3109,6 +3121,14 @@ def main():
     args = parser.parse_args()
     if run_type_combo_benchmark("spmm_coo", args, parser):
         return
+    config = None
+    if args.config is not None:
+        try:
+            config = json.loads(args.config)
+        except (TypeError, ValueError) as exc:
+            parser.error(f"invalid --config JSON: {exc}")
+        if not isinstance(config, dict) or args.alg not in ast_ops.SPMM_COO_NEW_ALGORITHMS:
+            parser.error("--config requires one explicit registered extension algorithm")
 
     if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
@@ -3145,6 +3165,7 @@ def main():
                     op_name, layout_name, alg_names, args.dense_cols, args.warmup,
                     args.iters, not args.no_cusparse, args.timing, args.diagnose,
                     input_arrays=(data, row, col, (7, 5)),
+                    config=config,
                 )
                 rows.extend(result)
                 for item in result:
@@ -3237,6 +3258,7 @@ def main():
             timing=args.timing,
             alg_names=alg_names,
             diagnose=args.diagnose,
+            config=config,
         )
         import q4_variant_bench
 
@@ -3315,6 +3337,7 @@ def main():
                     not args.no_cusparse,
                     args.timing,
                     args.diagnose,
+                    config=config,
                 )
                 for row in rows:
                     print(

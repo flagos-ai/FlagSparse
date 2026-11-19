@@ -1160,6 +1160,9 @@ def test_spmv_csr_targeted_contract(alg, op, dtype, wide, case, index_pair, stri
         actual, ms, meta = spmv_mod.flagsparse_spmv_csr_run(
             prepared, x, out=out, out_dtype=output_dtype, return_time=True, return_meta=True, timing=True)
         assert actual is out and meta["alg_resolved"] == alg
+        if alg == "csr_transpose_sharded_atomic":
+            assert all(meta[key] >= 0 for key in ("init_ms", "scatter_ms", "reduce_ms"))
+            assert ms == meta["gpu_ms"] + meta["process_cpu_ms"]
         assert ms == meta["gpu_ms"] + meta["process_cpu_ms"]
         rtol, atol = close_tolerances(output_dtype)
         torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
@@ -1373,6 +1376,7 @@ def test_spmv_csr_longrow_queue_native(dtype, output_dtype, case, index_pair, mo
             assert meta["queue_count_readback"] is False
             assert meta["fused_plan_compute_ms"] >= 0
             assert meta["workspace_peak_bytes"] <= prepared.config["workspace_limit_bytes"]
+            assert all(meta[k] >= 0 for k in ("init_ms", "producer_ms", "consumer_ms", "finish_ms"))
             if alg == "csr_longrow_grid_atomic":
                 assert meta["task_acquisition"] == "static_program_id"
                 assert meta["grid_capacity"] == meta["job_capacity"]

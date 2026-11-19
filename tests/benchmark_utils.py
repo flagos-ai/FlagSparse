@@ -65,7 +65,7 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
     nnz, rows = int(p[-1]), len(p) - 1
     lengths = np.diff(p)
     nonempty = lengths > 0
-    result = dict(model="csr_tile_geometry_v1", source="cpu_execution_csr", rows=rows, nnz=nnz, tiles={})
+    result = dict(model="csr_tile_geometry_v2", source="cpu_execution_csr", rows=rows, nnz=nnz, tiles={})
     result["row_lengths"] = dict(empty_rows=int(np.count_nonzero(~nonempty)),
                                  mean=nnz / rows if rows else 0.0,
                                  maximum=int(lengths.max()) if rows else 0,
@@ -76,6 +76,17 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
         str(limit): int(lengths[lengths > limit].sum()) / nnz if nnz else None
         for limit in (128, 256, 512, 1024, 4096)}
     result["atomic_count_basis"] = "per_real_component_logical_updates"
+    result["scalar_groups"] = {}
+    for width in (32, 64, 128):
+        full = rows // width * width
+        denominator = int(lengths[:full].reshape(-1, width).max(axis=1).sum()) * width if full else 0
+        if full != rows:
+            denominator += int(lengths[full:].max()) * (rows - full)
+        result["scalar_groups"][str(width)] = dict(
+            useful_positions=nnz, scheduled_positions=denominator,
+            utilization=nnz / denominator if denominator else None,
+            ratio_reason=None if denominator else "no_nonzeros",
+            interpretation="logical_position_utilization_not_hardware_occupancy")
 
     for tile in tiles:
         if type(tile) is not int or tile <= 0:
@@ -124,6 +135,79 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
         result["queue"] = dict(expected_long_rows=int(long_lengths.size), expected_jobs=expected,
                                job_capacity=jobs, expected_active_job_ratio=expected / jobs if jobs else None,
                                ratio_reason=None if jobs else "zero_capacity")
+    return result
+
+
+def coo_run_structure(owners, *, tiles=(32, 64, 128, 256, 512, 1024)):
+    """Classify original output-owner order on CPU, with bounded tile batches.
+
+    The single-owner class has priority, including a one-element tail. No-adjacent
+    tiles may still repeat an owner non-contiguously. No input sorting is allowed.
+    """
+    import numpy as np
+
+    owners = np.asarray(owners, dtype=np.int64)
+    if owners.ndim != 1:
+        raise ValueError("expected nonnegative one-dimensional COO output owners")
+    nnz = len(owners)
+    for start in range(0, nnz, 2**20):
+        if np.any(owners[start:start + 2**20] < 0):
+            raise ValueError("expected nonnegative one-dimensional COO output owners")
+    result = dict(model="coo_run_geometry_v1", source="cpu_original_output_owner_order",
+                  nnz=nnz, tiles={})
+    for tile in tiles:
+        if type(tile) is not int or tile <= 0 or tile > 2**20:
+            raise ValueError("tile must be an integer in [1, 2**20]")
+        counts = dict(single_owner=0, no_adjacent_equal=0, segmented=0)
+        weights = dict.fromkeys(counts, 0)
+        chunk = max(1, 2**20 // tile) * tile
+        full = nnz // tile * tile
+        for start in range(0, full, chunk):
+            group = owners[start:min(full, start + chunk)].reshape(-1, tile)
+            single = np.all(group == group[:, :1], axis=1)
+            no_adjacent = ~single & ~np.any(group[:, 1:] == group[:, :-1], axis=1)
+            for name, count in (("single_owner", np.count_nonzero(single)),
+                                ("no_adjacent_equal", np.count_nonzero(no_adjacent)),
+                                ("segmented", np.count_nonzero(~single & ~no_adjacent))):
+                counts[name] += int(count)
+                weights[name] += int(count) * tile
+        tail = owners[full:]
+        if tail.size:
+            name = ("single_owner" if np.all(tail == tail[0]) else
+                    "no_adjacent_equal" if not np.any(tail[1:] == tail[:-1]) else "segmented")
+            counts[name] += 1
+            weights[name] += int(tail.size)
+        total = (nnz + tile - 1) // tile
+        result["tiles"][str(tile)] = dict(
+            tile_count=total, counts=counts, nnz_by_class=weights,
+            tile_fraction={key: value / total if total else None for key, value in counts.items()},
+            nnz_fraction={key: value / nnz if nnz else None for key, value in weights.items()},
+            ratio_reason=None if nnz else "no_nonzeros")
+    return result
+
+
+def csc_column_structure(indptr, indices, n_rows, *, op="non"):
+    """CPU-only column lengths and non-scatter row contribution distribution."""
+    import numpy as np
+
+    p = np.asarray(indptr, dtype=np.int64)
+    idx = np.asarray(indices, dtype=np.int64)
+    if (p.ndim != 1 or not p.size or p[0] != 0 or np.any(p[1:] < p[:-1])
+            or p[-1] != idx.size or idx.ndim != 1 or n_rows < 0
+            or np.any(idx < 0) or np.any(idx >= n_rows)):
+        raise ValueError("invalid CPU CSC structure")
+    def distribution(lengths):
+        total = int(lengths.sum())
+        return dict(count=int(lengths.size), empty=int(np.count_nonzero(lengths == 0)),
+                    maximum=int(lengths.max()) if lengths.size else 0,
+                    percentiles={str(q): float(np.percentile(lengths, q)) if lengths.size else None
+                                 for q in (50, 90, 99)},
+                    long_nnz_fraction={str(limit): int(lengths[lengths > limit].sum()) / total if total else None
+                                       for limit in (32, 128, 256, 1024, 4096)})
+    result = dict(model="csc_column_geometry_v1", source="cpu_original_csc", op=op,
+                  nnz=int(idx.size), columns=distribution(np.diff(p)))
+    if op == "non":
+        result["output_row_contributions"] = distribution(np.bincount(idx, minlength=n_rows))
     return result
 
 
@@ -324,7 +408,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
               "op", "op_a", "op_b", "layout", "dense_cols", "index_dtype", "indptr_dtype",
               "alg", "alg_requested", "alg_resolved", "backend", "m", "n", "nnz", "status", "reason", "max_error",
               "ms", "gpu_ms", "process_cpu_ms", "process_gpu_ms", "compute_ms", "fused_plan_compute_ms",
-              "init_ms", "producer_ms", "consumer_ms", "finish_ms",
+              "init_ms", "producer_ms", "consumer_ms", "finish_ms", "scatter_ms", "reduce_ms",
               "vendor_ms", "vendor_backend", "vendor_version", "vendor_alg", "vendor_preprocessed", "vendor_status",
               "vendor_op_a_requested", "vendor_op_b_requested", "vendor_op_a_executed", "vendor_op_b_executed",
               "vendor_operation_mapping", "vendor_reason", "vendor_max_error", "vendor_exit_code", "vendor_error_stage", "vendor_stdout", "vendor_stderr",
@@ -348,7 +432,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                    "prepared_run_ms", "prepared_run_time_basis", "prepared_useful_gflops", "prepared_logical_gbs",
                    "cpu_gpu_overlap_risk", "reference_bandwidth_gbs", "reference_bandwidth_source",
                    "reference_peak_gflops", "reference_peak_source", "logical_bw_ratio", "gpu_logical_bw_ratio",
-                   "logical_roofline_gflops", "gpu_logical_roofline_ratio", "csr_structure"]
+                   "logical_roofline_gflops", "gpu_logical_roofline_ratio", "csr_structure", "coo_structure", "csc_structure"]
     if csv_path:
         Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
     stream = open(csv_path, "w", newline="", encoding="utf-8") if csv_path else None
@@ -454,6 +538,12 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                 structure_cache = {}
                 execution_ptr = ((host if op == "non" else host.T).tocsr().indptr
                                  if metrics_enabled and operator == "spmv_csr" else None)
+                # Original storage order matters for COO. These CPU models are
+                # outside prepare/run, never consumed by the device algorithm.
+                coo_structure = (coo_run_structure((first if op == "non" else second).numpy())
+                                 if metrics_enabled and fmt == "coo" else None)
+                csc_structure = (csc_column_structure(second.numpy(), first.numpy(), shape[0], op=op)
+                                 if metrics_enabled and fmt == "csc" else None)
                 context.update(op_a=op, op_b=op_b, layout=layout, dense_cols=ncols)
                 progress("reference_and_rhs", context)
                 inner = shape[1] if op == "non" else shape[0]
@@ -500,6 +590,10 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                    atol=close_tolerances(output_dtype)[1])
                         if metrics_enabled:
                             row.update(environment, matrix_fingerprint=matrix_fingerprint, rhs_fingerprint=rhs_fingerprint)
+                            if coo_structure is not None:
+                                row["coo_structure"] = coo_structure
+                            if csc_structure is not None:
+                                row["csc_structure"] = csc_structure
                         try:
                             if operator == "spmv_csr" and alg != "auto":
                                 spec = module.get_spmv_csr_algorithm_spec(alg)
@@ -583,7 +677,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                             if args.timing:
                                 progress("phase_diagnostics", row)
                                 _, _, diagnostics = run(prepared, rhs, timing=True, **kwargs)
-                                row.update({key: diagnostics.get(key) for key in ("process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms")})
+                                row.update({key: diagnostics.get(key) for key in ("process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms", "scatter_ms", "reduce_ms")})
                             row["metadata"] = meta
                             row["alg_resolved"] = meta.get("alg_resolved", meta.get("alg", alg))
                             row["vendor_status"] = "SKIP"

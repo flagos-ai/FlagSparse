@@ -67,6 +67,55 @@ def test_spmm_csc_native_vendor_fanin(dtype, output_dtype, length, tmp_path, rec
     assert result["vendor_ms"] > 0
 
 
+@pytest.mark.spmm_csc
+@pytest.mark.parametrize("dtype,output_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
+], ids=lambda dtype: str(dtype).removeprefix("torch."))
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("op_b", ["non", "trans", "conj"])
+@pytest.mark.parametrize("layout", ["row", "col"])
+def test_spmm_csc_native_vendor_singleton_descriptor(dtype, output_dtype, op, op_b,
+                                                    layout, tmp_path, record_property):
+    """N=1 must reach SpMM with correct RHS and output descriptors for every op."""
+    from flagsparse.sparse_operations._common import _backend_name
+    from tests.cusparse_generic_baseline import benchmark_isolated
+    from tests.pytest.conftest import QUICK_MODE
+
+    if _backend_name() != "cuda":
+        pytest.skip("this regression targets the CUDA dense-matrix descriptor")
+    device = accelerator_device()
+    # Exact, small inputs isolate descriptor failures from long BF16 reductions.
+    values = torch.tensor([0.5, 1.0, 2.0], dtype=dtype)
+    indices = torch.tensor([0, 2, 1], dtype=torch.int32)
+    indptr = torch.tensor([0, 1, 2, 3, 3], dtype=torch.int32)
+    a = torch.tensor([[0.5, 0., 0., 0.], [0., 0., 2., 0.], [0., 1., 0., 0.]],
+                     dtype=torch.float64)
+    a_op = a if op == "non" else a.T
+    rtol, atol = close_tolerances(output_dtype)
+    for n in ([1] if QUICK_MODE else [1, 7]):
+        effective = ((torch.arange(a_op.shape[1] * n).reshape(a_op.shape[1], n) % 9 - 4) / 8).to(dtype)
+        rhs = effective if op_b == "non" else effective.T
+        rhs = rhs.contiguous() if layout == "row" else rhs.T.contiguous().T
+        out_rows = a_op.shape[0]
+        output_stride = (n, 1) if layout == "row" else (1, out_rows)
+        payload = dict(fmt="csc", arrays=(values, indices, indptr), shape=(3, 4), rhs=rhs,
+                       output_shape=(out_rows, n), output_stride=output_stride, output_dtype=output_dtype,
+                       op_a=op, op_b=op_b, backend="cuda", matrix=True,
+                       golden=a_op @ effective.double(), rtol=rtol, atol=atol,
+                       narrow_tolerances=close_tolerances(dtype), warmup=1, iters=2,
+                       device_index=device.index or 0, diagnostic=True,
+                       vendor_alg="default", vendor_preprocess=False)
+        result = benchmark_isolated(payload, log_prefix=tmp_path / f"singleton_n{n}", timeout=120)
+        record_property(f"vendor_singleton_n{n}", dict(result, a_dtype=str(dtype), rhs_dtype=str(dtype),
+                        compute_dtype="torch.float32", output_dtype=str(output_dtype),
+                        op_a=op, op_b=op_b, layout=layout, rhs_stride=tuple(rhs.stride())))
+        if result["vendor_status"] == "SKIP":
+            pytest.skip(result["vendor_reason"])
+        assert result["vendor_status"] == "PASS", result
+        assert result["vendor_ms"] > 0
+
+
 def _value_dtype_cases():
     return [
         ("float32", torch.float32),

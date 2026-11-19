@@ -218,6 +218,133 @@ def test_spmm_coo_rejects_invalid_ops_and_shapes():
 
 
 # Explicit migrated algorithms share this operator's marker, golden and tolerance.
+@pytest.mark.spmm_coo
+@pytest.mark.parametrize("dtype,output_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
+    (torch.float32, torch.float32), (torch.float64, torch.float64),
+    (torch.complex64, torch.complex64), (torch.complex128, torch.complex128),
+], ids=["f16", "f16_f32", "bf16", "bf16_f32", "f32", "f64", "c64", "c128"])
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+@pytest.mark.parametrize("op_b", ["non", "trans", "conj"])
+@pytest.mark.parametrize("layout", ["row", "col"])
+def test_spmm_coo_runclass_native(dtype, output_dtype, op, op_b, layout, record_property, monkeypatch):
+    import importlib
+    from flagsparse.sparse_operations._spmm_csr_config import BackendCapabilityUnavailable
+    from tests.pytest.conftest import QUICK_MODE
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_coo")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("runclass must not sort/build a row-run plan")
+    monkeypatch.setattr(module._coo_native, "_coo_sorted_runs", forbidden)
+    device = accelerator_device()
+    tile, n = 32, 7 if QUICK_MODE else 33
+    owner = torch.cat((torch.ones(tile, dtype=torch.int64),
+                       (torch.arange(tile) % 2) * 4 + 3,
+                       (torch.arange(tile) // 2 % 2) * 4 + 3,
+                       torch.tensor([3, 7, 3])))
+    other = torch.arange(owner.numel()) % 11
+    row, col = (owner, other) if op == "non" else (other, owner)
+    shape = (9, 13) if op == "non" else (13, 9)
+    values = (torch.arange(owner.numel(), dtype=torch.float64) % 9 - 4) / 64
+    if dtype.is_complex:
+        values = torch.complex(values, values.flip(0) / 2)
+    values = values.to(dtype)
+    golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    matrix = torch.zeros(shape, dtype=golden_dtype)
+    matrix.index_put_((row, col), values.to(golden_dtype), accumulate=True)
+    effective = matrix if op == "non" else matrix.T.conj() if op == "conj" else matrix.T
+    dense = ((torch.arange(13 * n).reshape(13, n) % 11 - 5) / 16).to(dtype)
+    if dtype.is_complex:
+        dense = torch.complex(dense.real, dense.real.flip(0) / 2)
+    expected = (effective @ dense.to(golden_dtype)).to(output_dtype)
+    rhs = (dense if op_b == "non" else dense.T.conj().resolve_conj() if op_b == "conj" else dense.T).to(device)
+    rhs = rhs.contiguous() if layout == "row" else rhs.T.contiguous().T
+    values, row, col = values.to(device), row.to(device=device, dtype=torch.int32), col.to(device)
+    snapshots = [t.clone() for t in (values, row, col, rhs)]
+    out = torch.full((9, 2 * n), float("nan"), device=device, dtype=output_dtype)[:, ::2]
+    try:
+        prepared = module.prepare_spmm_coo_route(values, row, col, shape, op=op,
+                                               alg="coo_runclass_panel_atomic")
+        result, meta = module.flagsparse_spmm_coo_run(prepared, rhs, op_b=op_b,
+            dense_layout=layout, out=out, out_dtype=output_dtype, return_meta=True, timing=True)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    record_property("algorithm", "coo_runclass_panel_atomic")
+    record_property("compute_dtype", meta["compute_dtype"])
+    for key, value in dict(a_dtype=str(dtype), rhs_dtype=str(dtype), output_dtype=str(output_dtype),
+                           op_a=op, op_b=op_b).items():
+        record_property(key, value)
+    assert result is out
+    rtol, atol = close_tolerances(output_dtype)
+    torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+    assert meta["alg_resolved"] == "coo_runclass_panel_atomic"
+    assert meta["conversion_mode"] == "load" and meta["local_reduce"] == "classify"
+    assert meta["operator_ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+    for current, saved in zip((values, row, col, rhs), snapshots):
+        torch.testing.assert_close(current, saved, rtol=0, atol=0)
+
+
+@pytest.mark.spmm_coo
+@pytest.mark.parametrize("mode", ["classify", "segment", "none"])
+@pytest.mark.parametrize("conversion", ["load", "materialize"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64, torch.bfloat16])
+@pytest.mark.parametrize("count,n", [(65, 1), (67, 33), (0, 7), (65, 0)])
+def test_spmm_coo_runclass_controls(mode, conversion, dtype, count, n):
+    import importlib
+    from flagsparse.sparse_operations._spmm_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_coo")
+    device = accelerator_device()
+    owner = torch.arange(count, dtype=torch.int64) // 3 % 3
+    col = torch.arange(count, dtype=torch.int64) % 5
+    values = torch.full((count,), 0.125, dtype=dtype)
+    if dtype.is_complex:
+        values += 0.25j
+    dense = torch.full((5, n), 0.5, dtype=dtype)
+    if dtype.is_complex:
+        dense += 0.125j
+    golden_dtype = torch.complex128 if dtype.is_complex else torch.float64
+    matrix = torch.zeros((3, 5), dtype=golden_dtype)
+    matrix.index_put_((owner, col), values.to(golden_dtype), accumulate=True)
+    expected = (matrix @ dense.to(golden_dtype)).to(dtype)
+    try:
+        result = module.flagsparse_spmm_coo(values.to(device), owner.to(device), col.to(device),
+            dense.to(device), (3, 5), alg="coo_runclass_panel_atomic",
+            config={"local_reduce": mode, "conversion_mode": conversion})
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    rtol, atol = close_tolerances(dtype)
+    torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spmm_coo
+def test_spmm_coo_runclass_configuration_isolation():
+    import importlib
+    from flagsparse.sparse_operations._spmm_csr_config import BackendCapabilityUnavailable
+
+    module = importlib.import_module("flagsparse.sparse_operations.spmm_coo")
+    device = accelerator_device()
+    data = torch.tensor([1., 2.], device=device)
+    row = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    col = row.clone()
+    rhs = torch.ones((2, 3), device=device)
+    try:
+        prepared = module.prepare_spmm_coo_route(data, row, col, (2, 2),
+            alg="coo_segmented_stream_panel_atomic", config={"blocks_per_program": 4})
+        result, meta = module.flagsparse_spmm_coo_run(prepared, rhs,
+            alg="coo_runclass_panel_atomic", return_meta=True)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    torch.testing.assert_close(result, data[:, None].expand(2, 3))
+    assert meta["alg_resolved"] == "coo_runclass_panel_atomic"
+    assert "blocks_per_program" not in meta["config"]
+    with pytest.raises(ValueError, match="op"):
+        module.flagsparse_spmm_coo_run(prepared, rhs, alg="coo_runclass_panel_atomic", op="trans")
+    with pytest.raises(ValueError, match="configuration"):
+        module.flagsparse_spmm_coo_run(prepared, rhs, alg="coo_runclass_panel_atomic", config={"blocks_per_program": 4})
+
+
 _MIGRATED_ROUTES = (('coo_segmented_panel_atomic', 'non'), ('coo_segmented_panel_atomic', 'trans'), ('coo_segmented_panel_atomic', 'conj'), ('coo_rowrun_panel', 'non'), ('coo_rowrun_panel', 'trans'), ('coo_rowrun_panel', 'conj'), ('coo_segmented_stream_panel_atomic', 'non'), ('coo_segmented_stream_panel_atomic', 'trans'), ('coo_segmented_stream_panel_atomic', 'conj'))
 
 
@@ -361,6 +488,7 @@ from tests.pytest.conftest import QUICK_MODE as _MIXED_QUICK_MODE
 ], ids=lambda pair: "/".join(str(dtype).removeprefix("torch.") for dtype in pair))
 @pytest.mark.spmm_coo
 @pytest.mark.parametrize("alg,op", [('coo_stream_panel_prefetch_mixed', 'non'), ('coo_stream_panel_prefetch_mixed', 'trans'), ('coo_stream_panel_prefetch_mixed', 'conj'),
+    ('coo_runclass_panel_atomic', 'non'), ('coo_runclass_panel_atomic', 'trans'), ('coo_runclass_panel_atomic', 'conj'),
     ('coo_segmented_panel_atomic', 'non'),
     ('coo_segmented_panel_atomic', 'trans'),
     ('coo_segmented_panel_atomic', 'conj'),

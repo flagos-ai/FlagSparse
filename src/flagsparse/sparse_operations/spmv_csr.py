@@ -1780,10 +1780,18 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
         return run_longrow_queue(prepared, x, out, timing, _spmv_phase)
     if alg == "csr_transpose_sharded_atomic":
         from ._spmv_csr_transpose import compute_sharded
+        from ._spmm_csr_runtime import Phases
 
+        if timing:
+            diagnostic = Phases(True)
+            diagnostic.events.update({key: [] for key in ("init_ms", "scatter_ms", "reduce_ms")})
         (y, stats), compute_ms = _spmv_phase(
-            lambda: compute_sharded(prepared, x, out), timing
+            lambda: compute_sharded(prepared, x, out, measure=diagnostic.measure) if timing
+            else compute_sharded(prepared, x, out), timing
         )
+        if timing:
+            stats.update({key: value for key, value in diagnostic.results().items()
+                          if key in ("init_ms", "scatter_ms", "reduce_ms")})
         return y, dict(process_cpu_ms=0.0, process_gpu_ms=0.0 if timing else None,
                        compute_ms=compute_ms,
                        execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
@@ -2038,6 +2046,7 @@ def flagsparse_spmv_csr_run(
                 meta[key] = phases[key]
             if timing:
                 meta["fused_plan_compute_ms"] = phases["fused_plan_compute_ms"]
+                meta.update({key: phases[key] for key in ("init_ms", "producer_ms", "consumer_ms", "finish_ms")})
         if actual.alg == "csr_longrow_grid_atomic":
             meta.update(grid_capacity=phases["grid_capacity"], task_acquisition=phases["task_acquisition"])
             if timing:
@@ -2054,6 +2063,8 @@ def flagsparse_spmv_csr_run(
             for key in ("output_shards", "workspace_peak_bytes", "descriptor_peak_bytes",
                         "atomic_buffer", "initialization", "output_conversion"):
                 meta[key] = phases[key]
+            if timing:
+                meta.update({key: phases[key] for key in ("init_ms", "scatter_ms", "reduce_ms")})
         if actual.alg == "csr_nnz_tile_reduce":
             # A fixed plan reports allocated slots, not a read-back count of
             # valid records. Preserve that distinction in the public metadata.

@@ -109,6 +109,7 @@ ops:
     description: |
       Computes sparse matrix-vector multiplication for a COO matrix.
       Explicit coo_stream_prefetch_mixed: FP16/BF16 inputs, FP32 compute, same-type/FP32 output; hardware unverified.
+      Explicit coo_runclass_atomic: per-NNZ-tile single-owner/no-adjacent/segmented selection; six numeric types, non/trans/conj; hardware unverified.
     for:
       - flagsparse_spmv_coo
       - prepare_spmv_coo
@@ -228,6 +229,7 @@ ops:
     description: |
       Computes sparse matrix-dense matrix multiplication for a COO matrix.
       Explicit coo_stream_panel_prefetch_mixed: FP16/BF16 inputs, FP32 compute, same-type/FP32 output; hardware unverified.
+      Explicit coo_runclass_panel_atomic: per-NNZ-tile run classification and output panels; six numeric types, non/trans/conj, all opB; hardware unverified.
     for:
       - flagsparse_spmm_coo
       - get_spmm_coo_algorithm_spec

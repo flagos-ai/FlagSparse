@@ -378,17 +378,21 @@ def run_longrow_queue(prepared, x, out, timing, phase):
                 L=cfg["long_row_threshold"], S=cfg["segment_nnz"],
                 num_warps=cfg["producer_num_warps"], **common)
     _, fused_ms = phase(produce, timing)
-    def consume_and_finish():
+    def consume():
         if capacity:
             longrow_consumer_kernel[(cfg["worker_programs"],)](
                 view(data), prepared.kernel_indices, view(vector), counters, *descriptors,
                 partial, vector.stride(0), K=cfg["block_nnz"], num_warps=cfg["num_warps"], **common)
+    def finish():
+        if capacity:
             longrow_finish_kernel[(triton.cdiv(capacity, 128),)](
                 counters, owners, partial, view(y), y.stride(0), B=128, COMPLEX=complex_input,
                 num_warps=cfg["num_warps"], num_stages=1)
-    _, tail_ms = phase(consume_and_finish, timing)
+    _, consumer_ms = phase(consume, timing)
+    _, finish_ms = phase(finish, timing)
     return y, dict(stats, process_cpu_ms=0.0, process_gpu_ms=process_ms,
-                   compute_ms=(fused_ms + tail_ms) if timing else None,
+                   compute_ms=(fused_ms + consumer_ms + finish_ms) if timing else None,
+                   init_ms=process_ms, producer_ms=fused_ms, consumer_ms=consumer_ms, finish_ms=finish_ms,
                    fused_plan_compute_ms=fused_ms, queue_count_readback=False,
                    execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
                    execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),

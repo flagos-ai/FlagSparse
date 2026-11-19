@@ -78,3 +78,69 @@ def test_the_csr_script_reports_why_a_baseline_is_missing():
     source = (ROOT / "tests/test_spmm.py").read_text(encoding="utf-8")
     assert "if pytorch_op is None:" in source
     assert 'result.setdefault("pytorch_reason"' in source
+
+
+@pytest.mark.parametrize("shape,strides,expected", [
+    ((1, 4), (1, 1), ("row", 4)),
+    ((1, 4), (0, 1), ("row", 4)),
+    ((4, 1), (1, 1), ("row", 1)),
+    ((4, 1), (1, 0), ("col", 4)),
+    ((4, 1), (1, 4), ("col", 4)),
+    ((1, 4), (8, 1), ("row", 8)),
+    ((4, 1), (1, 8), ("col", 8)),
+    ((1, 4), (9, 2), ("col", 2)),
+    ((4, 1), (2, 9), ("row", 2)),
+    ((1, 1), (0, 0), ("row", 1)),
+    ((3, 4), (4, 1), ("row", 4)),
+    ((3, 4), (7, 1), ("row", 7)),
+    ((3, 4), (1, 3), ("col", 3)),
+    ((3, 4), (1, 7), ("col", 7)),
+    ((0, 4), (4, 1), ("row", 4)),
+    ((4, 0), (1, 4), ("col", 4)),
+    ((0, 0), (0, 0), ("row", 1)),
+], ids=["single-row-transposed", "single-row-unused-zero", "single-col",
+        "single-col-unused-zero", "single-col-preserves-order", "single-row-padded", "single-col-padded",
+        "strided-single-row", "strided-single-col",
+        "scalar", "row", "padded-row", "col", "padded-col",
+        "zero-rows", "zero-cols", "empty"])
+def test_native_dnmat_layout_preserves_element_addresses(shape, strides, expected):
+    """Exercise the pure descriptor policy without importing torch or a GPU runtime."""
+    from types import SimpleNamespace
+
+    function = _function("tests/cusparse_generic_baseline.py", "_dense_matrix_layout")
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "<dnmat-policy>", "exec"), namespace)
+    tensor = SimpleNamespace(ndim=2, shape=shape, stride=lambda axis: strides[axis])
+    order, ld = namespace["_dense_matrix_layout"](tensor)
+    assert (order, ld) == expected
+    assert ld >= max(1, shape[1] if order == "row" else shape[0])
+    for row in range(shape[0]):
+        for col in range(shape[1]):
+            actual_offset = row * strides[0] + col * strides[1]
+            native_offset = row * ld + col if order == "row" else col * ld + row
+            assert native_offset == actual_offset
+
+
+@pytest.mark.parametrize("shape,strides", [
+    ((3, 4), (1, 1)), ((3, 4), (3, 1)), ((3, 4), (1, 2)),
+    ((3, 4), (0, 1)), ((3, 4), (1, 0)), ((3, 4), (8, 2)),
+    ((1, 4), (1, 0)), ((4, 1), (0, 1)), ((4,), (1,)),
+], ids=["overlap", "short-row-ld", "short-col-ld", "broadcast-row",
+        "broadcast-col", "non-unit-minor", "broadcast-single-row",
+        "broadcast-single-col", "not-a-matrix"])
+def test_native_dnmat_rejects_unrepresentable_layout(shape, strides):
+    from types import SimpleNamespace
+
+    function = _function("tests/cusparse_generic_baseline.py", "_dense_matrix_layout")
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "<dnmat-policy>", "exec"), namespace)
+    tensor = SimpleNamespace(ndim=len(shape), shape=shape, stride=lambda axis: strides[axis])
+    with pytest.raises(ValueError, match="native DnMat"):
+        namespace["_dense_matrix_layout"](tensor)
+
+
+@pytest.mark.parametrize("entry", ["_dnmat", "_prepare_registered_generic"])
+def test_native_dnmat_entries_share_layout_policy(entry):
+    function = _function("tests/cusparse_generic_baseline.py", entry)
+    assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+               and n.func.id == "_dense_matrix_layout" for n in ast.walk(function))

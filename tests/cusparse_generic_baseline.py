@@ -348,15 +348,39 @@ def _spmat(fmt, arrays, shape, value_dtype):
     return h
 
 
+def _dense_matrix_layout(t):
+    """Return a native order/ld without copying or changing any element address.
+
+    A singleton dimension's stride is unused: (1, K) may have strides (1, 1),
+    although a row-major descriptor still requires ld >= K. Only unused strides
+    may be replaced. Non-singleton padding must be preserved, not clamped to
+    disguise overlapping storage. Empty matrices have no addresses to preserve.
+    """
+    if t.ndim != 2:
+        raise ValueError("native DnMat requires a two-dimensional tensor")
+    rows, cols = map(int, t.shape)
+    s0, s1 = int(t.stride(0)), int(t.stride(1))
+    if rows == 0 or cols == 0:
+        if s0 == 1 and s1 != 1:
+            return "col", max(1, rows, s1)
+        return "row", max(1, cols, s0)
+    # Preserve the previous order for already representable tensors, including
+    # (M, 1) column-major outputs whose unused column stride is greater than one.
+    layouts = ("col", "row") if s0 == 1 and s1 != 1 else ("row", "col")
+    for layout in layouts:
+        if layout == "row" and (cols == 1 or s1 == 1) and (rows == 1 or s0 >= cols):
+            return "row", max(1, cols, s0) if rows == 1 else s0
+        if layout == "col" and (rows == 1 or s0 == 1) and (cols == 1 or s1 >= rows):
+            return "col", max(1, rows, s1) if cols == 1 else s1
+    raise ValueError(f"native DnMat requires non-overlapping row/column-major storage; "
+                     f"shape={tuple(t.shape)}, stride={(s0, s1)}")
+
+
 def _dnmat(t):
     """Descriptor for a 2D tensor stored row- or column-major (any leading dimension)."""
-    rows, cols = int(t.shape[0]), int(t.shape[1])
-    if t.stride(1) == 1:
-        order, ld = _ORDER_ROW, max(1, t.stride(0))
-    elif t.stride(0) == 1:
-        order, ld = _ORDER_COL, max(1, t.stride(1))
-    else:
-        raise ValueError("dense operand must be row- or column-major")
+    layout, ld = _dense_matrix_layout(t)
+    rows, cols = map(int, t.shape)
+    order = _ORDER_ROW if layout == "row" else _ORDER_COL
     h = _P()
     _check(
         _lib().cusparseCreateDnMat(ctypes.byref(h), rows, cols, ld, _P(t.data_ptr()), _CUDA_TYPES[t.dtype], order),
@@ -463,13 +487,8 @@ def _prepare_registered_generic(fmt, arrays, shape, rhs, out, op_a, op_b,
             if t.ndim != 1 or t.stride(0) != 1:
                 raise ValueError("native DnVec requires a contiguous vector")
             return create("CreateDnVec", "DestroyDnVec", t.numel(), _P(t.data_ptr()), types[t.dtype])
-        if t.stride(1) == 1:
-            order, ld = orders["row"], max(1, t.stride(0))
-        elif t.stride(0) == 1:
-            order, ld = orders["col"], max(1, t.stride(1))
-        else:
-            raise ValueError("native DnMat requires row/column-major storage")
-        return create("CreateDnMat", "DestroyDnMat", *t.shape, ld, _P(t.data_ptr()), types[t.dtype], order)
+        layout, ld = _dense_matrix_layout(t)
+        return create("CreateDnMat", "DestroyDnMat", *t.shape, ld, _P(t.data_ptr()), types[t.dtype], orders[layout])
 
     try:
         with torch.cuda.device(rhs.device):

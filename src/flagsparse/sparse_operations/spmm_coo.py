@@ -2380,7 +2380,8 @@ SPMM_COO_ALGORITHMS = {
 
 
 SPMM_COO_NEW_ALGORITHMS = ("coo_segmented_panel_atomic", "coo_rowrun_panel",
-                           "coo_segmented_stream_panel_atomic", "coo_stream_panel_prefetch_mixed")
+                           "coo_segmented_stream_panel_atomic", "coo_stream_panel_prefetch_mixed",
+                           "coo_runclass_panel_atomic")
 
 
 class _PreparedCooSpmmExtension(_coo_native.PreparedCooRoute):
@@ -2430,7 +2431,7 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
             a = prepared.data.resolve_conj().resolve_neg().to(storage).contiguous()
             r, c = (prepared.row, prepared.col) if prepared.op == "non" else (prepared.col, prepared.row)
             r, c = r.to(torch.int32).contiguous(), c.to(torch.int32).contiguous()
-            if selected in _coo_native._COO_MIXED_ALGORITHMS and cfg["conversion_mode"] == "load":
+            if selected in (*_coo_native._COO_MIXED_ALGORITHMS, *_coo_native._COO_RUNCLASS_ALGORITHMS) and cfg["conversion_mode"] == "load":
                 bc = B.resolve_conj().resolve_neg()
             else:
                 bc = _materialize_dense_layout(B.resolve_conj().resolve_neg().to(storage), dense_layout)
@@ -2453,7 +2454,8 @@ def _run_spmm_coo_extension(prepared, B, *, alg=None, config=None, op=None,
                        prefetch_blocks=cfg.get("prefetch_blocks"),
                        input_materialized=(a.data_ptr() != prepared.data.data_ptr() or bc.data_ptr() != B.data_ptr()),
                        output_buffer="user_out" if out is not None and out.dtype == compute_dtype else "compute_buffer",
-                       implementation_version=4 if selected in _coo_native._COO_MIXED_ALGORITHMS else 3,
+                       implementation_version=5 if selected in _coo_native._COO_RUNCLASS_ALGORITHMS else 4 if selected in _coo_native._COO_MIXED_ALGORITHMS else 3,
+                       local_reduce=cfg.get("local_reduce"),
                        dense_layout=dense_layout, b_stride=tuple(B.stride()), c_stride=tuple(C.stride()),
                        input_indices=(str(prepared.row.dtype), str(prepared.col.dtype)),
                        execution_indices=(str(r.dtype), str(c.dtype)),
@@ -2475,12 +2477,19 @@ def get_spmm_coo_algorithm_spec(alg):
     if name not in SPMM_COO_ALGORITHMS:
         raise ValueError(f"unknown COO SpMM algorithm {alg!r}")
     spec = SPMM_COO_ALGORITHMS[name]
-    return dict(name=name, supported_ops=spec.supported_ops,
+    result = dict(name=name, supported_ops=spec.supported_ops,
                 supported_dtypes=spec.supported_dtypes, layouts=("row", "col"),
                 half_output_dtypes={dtype: (dtype, torch.float32)
                                     for dtype in (torch.float16, torch.bfloat16)
                                     if dtype in spec.supported_dtypes},
                 requires_sort=name not in _coo_native._COO_ATOMIC_ALGORITHMS)
+    if name in _coo_native._COO_RUNCLASS_ALGORITHMS:
+        result.update(kernel="_coo_runclass_panel_kernel", implementation_version=5,
+                      validation="unverified", compute_policy="half_fp32_other_fp64_component",
+                      config_candidates=dict(block_nnz=(32, 64, 128), block_n=(1, 2, 4, 8, 16, 32),
+                                             local_reduce=("classify", "segment", "none"),
+                                             conversion_mode=("load", "materialize")))
+    return result
 
 
 def resolve_spmm_coo_algorithm(alg, op, dtype):

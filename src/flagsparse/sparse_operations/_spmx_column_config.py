@@ -19,9 +19,11 @@ from . import _spmm_csr_config as _csr_policy
 DTYPES = _csr_policy.DTYPES
 # COO shares backend capability contracts; kernels remain in the COO modules.
 COO_MIXED_ALGORITHMS = ("coo_stream_prefetch_mixed", "coo_stream_panel_prefetch_mixed")
+COO_RUNCLASS_ALGORITHMS = ("coo_runclass_atomic", "coo_runclass_panel_atomic")
 COO_ALGORITHMS = ("coo_segmented_atomic", "coo_rowrun_subgroup",
                   "coo_segmented_panel_atomic", "coo_rowrun_panel",
-                  "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic", *COO_MIXED_ALGORITHMS)
+                  "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic", *COO_MIXED_ALGORITHMS,
+                  *COO_RUNCLASS_ALGORITHMS)
 COO_ARCH_PROFILES = {}
 COO_BACKEND_PROFILES = {name: {} for name in _csr_policy.BACKENDS}
 
@@ -53,10 +55,15 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
         raise ValueError(f"unknown COO extension {alg!r}")
     if config is not None and not isinstance(config, dict):
         raise TypeError("config must be a dictionary")
+    if alg in COO_RUNCLASS_ALGORITHMS and dtype not in DTYPES:
+        raise TypeError(f"{alg} does not support {dtype}")
     if caps.backend not in _csr_policy.BACKENDS or not caps.legal_num_warps or not caps.subgroup_width or caps.int64 is not True:
         raise _csr_policy.BackendCapabilityUnavailable(f"COO launch/index capabilities unknown: {caps}")
+    if alg in COO_RUNCLASS_ALGORITHMS and not caps.max_threads_per_block:
+        raise _csr_policy.BackendCapabilityUnavailable("COO runclass launch thread limit unknown")
     atomic = alg in ("coo_segmented_atomic", "coo_segmented_panel_atomic",
-                     "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic", *COO_MIXED_ALGORITHMS)
+                     "coo_segmented_stream_atomic", "coo_segmented_stream_panel_atomic", *COO_MIXED_ALGORITHMS,
+                     *COO_RUNCLASS_ALGORITHMS)
     if alg in COO_MIXED_ALGORITHMS and dtype not in ("float16", "bfloat16"):
         raise TypeError(f"{alg} requires float16/bfloat16 inputs")
     overrides = dict(config or {})
@@ -79,17 +86,31 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
                    blocks_per_program=2, prefetch_blocks=2)
         if alg == "coo_stream_panel_prefetch_mixed":
             cfg.update(block_n=min(16, 1 << (max(1, n) - 1).bit_length()), conversion_mode="load")
+    if alg in COO_RUNCLASS_ALGORITHMS:
+        cfg.update(block_nnz=128 if alg == "coo_runclass_atomic" else 32,
+                   local_reduce="classify")
+        if alg == "coo_runclass_panel_atomic":
+            cfg.update(block_n=min(16, 1 << (max(1, n) - 1).bit_length()), conversion_mode="load")
+    reduce_modes = ("classify", "segment", "none") if alg in COO_RUNCLASS_ALGORITHMS else ("segment", "none")
+    tile_choices = (128, 256, 512, 1024) if alg == "coo_runclass_atomic" else (32, 64, 128)
     unknown = set(overrides) - set(cfg)
     if unknown:
         raise ValueError(f"unsupported {alg} configuration fields: {sorted(unknown)}")
     if cfg["num_warps"] not in caps.legal_num_warps:
         cfg["num_warps"] = max((w for w in caps.legal_num_warps if w <= cfg["num_warps"]),
                                default=min(caps.legal_num_warps))
+    if alg in COO_RUNCLASS_ALGORITHMS:
+        legal = tuple(w for w in caps.legal_num_warps if w * caps.subgroup_width <= caps.max_threads_per_block)
+        if not legal:
+            raise _csr_policy.BackendCapabilityUnavailable("no legal COO runclass launch within thread limit")
+        if cfg["num_warps"] not in legal:
+            cfg["num_warps"] = max((w for w in legal if w <= cfg["num_warps"]), default=min(legal))
     profile = COO_BACKEND_PROFILES.get(caps.backend, {}).get(alg, {})
     arch_profile = COO_ARCH_PROFILES.get((caps.backend, caps.arch), {}).get(alg, {})
     rejected = []
     accepted_keys = set()
     mixed_source = "conservative"
+    runclass_source = "conservative"
     for source, candidate in (("backend", profile), ("architecture", arch_profile)):
         if alg in COO_MIXED_ALGORITHMS:
             merged = dict(cfg, **candidate)
@@ -105,16 +126,22 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
             continue
         for key, value in candidate.items():
             valid = key in cfg and (
-                value in ("segment", "none") if key == "local_reduce" else
+                value in reduce_modes if key == "local_reduce" else
                 value in ("load", "materialize") if key == "conversion_mode" else
                 type(value) is int and value > 0 and not value & (value - 1))
             valid = valid and (key != "blocks_per_program" or value in (1, 2, 4, 8))
             valid = valid and (key != "num_warps" or value in caps.legal_num_warps)
             valid = valid and (key != "num_stages" or value == 1)
             valid = valid and (key != "lanes_per_row" or value <= caps.subgroup_width)
+            if alg in COO_RUNCLASS_ALGORITHMS:
+                valid = valid and (key != "block_nnz" or value in tile_choices)
+                valid = valid and (key != "block_n" or value in (1, 2, 4, 8, 16, 32))
+                valid = valid and (key != "num_warps" or value * caps.subgroup_width <= caps.max_threads_per_block)
             if valid:
                 cfg[key] = value
                 accepted_keys.add(key)
+                if alg in COO_RUNCLASS_ALGORITHMS:
+                    runclass_source = source
             else:
                 rejected.append(f"{source}: illegal {key}={value!r}")
     mixed_fields = set(cfg)
@@ -126,10 +153,13 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
             if value not in ("load", "materialize"):
                 raise ValueError("conversion_mode must be load or materialize")
         elif key == "local_reduce":
-            if value not in ("segment", "none"):
-                raise ValueError("local_reduce must be segment or none")
+            if value not in reduce_modes:
+                raise ValueError(f"local_reduce must be one of {reduce_modes}")
         elif type(value) is not int or value <= 0 or value & (value - 1):
             raise ValueError(f"{key} must be a positive power of two")
+    if alg in COO_RUNCLASS_ALGORITHMS:
+        if cfg["block_nnz"] not in tile_choices or cfg.get("block_n", 1) not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("unsupported runclass NNZ/panel tile size")
     if alg in COO_MIXED_ALGORITHMS:
         if cfg["prefetch_blocks"] not in (1, 2) or cfg["blocks_per_program"] % cfg["prefetch_blocks"]:
             raise ValueError("prefetch_blocks must be 1/2 and divide blocks_per_program")
@@ -151,13 +181,15 @@ def resolve_coo_config(alg, dtype, caps, config=None, n=1):
         supported = getattr(caps, feature)
         if supported is not True:
             raise _csr_policy.BackendCapabilityUnavailable(f"{feature} unavailable or unknown on {caps.backend}")
-        if cfg["local_reduce"] == "segment" and caps.scan is not True:
+        if cfg["local_reduce"] in ("segment", "classify") and caps.scan is not True:
             raise _csr_policy.BackendCapabilityUnavailable("COO segmented scan capability unknown")
+        if alg in COO_RUNCLASS_ALGORITHMS and cfg["local_reduce"] == "classify" and caps.reduction is not True:
+            raise _csr_policy.BackendCapabilityUnavailable("COO run classification reduction capability unknown")
     elif caps.stable_sort is not True or caps.reduction is not True:
         raise _csr_policy.BackendCapabilityUnavailable("COO stable sort/reduction capability unknown")
     return cfg, dict(backend=caps.backend, target=caps.target, arch=caps.arch,
-                     config_source="explicit" if overrides else (mixed_source if alg in COO_MIXED_ALGORITHMS else "architecture" if arch_profile else "backend" if profile else "conservative"),
-                     validation="unverified", config=cfg, rejected_profiles=rejected, implementation_version=2,
+                     config_source="explicit" if overrides else (runclass_source if alg in COO_RUNCLASS_ALGORITHMS else mixed_source if alg in COO_MIXED_ALGORITHMS else "architecture" if arch_profile else "backend" if profile else "conservative"),
+                     validation="unverified", config=cfg, rejected_profiles=rejected, implementation_version=5 if alg in COO_RUNCLASS_ALGORITHMS else 2,
                      timing_contract_version=2)
 
 

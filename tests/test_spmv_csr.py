@@ -293,7 +293,7 @@ def main(argv=None):
             p.error("no registered algorithms support the selected combinations")
     else:
         explicit_algorithms = choices(args.alg, ("auto",) + registered)
-    fields = FIELDS + (["process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms"] if args.timing else [])
+    fields = FIELDS + (["process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms", "scatter_ms", "reduce_ms"] if args.timing else [])
     if args.perf_metrics:
         fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
                    "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",

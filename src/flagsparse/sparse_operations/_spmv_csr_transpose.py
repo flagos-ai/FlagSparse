@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepared transpose gather with version-aware values and a scatter fallback."""
 
+from contextlib import nullcontext
+
 import torch
 import triton
 import triton.language as tl
@@ -62,42 +64,47 @@ def _sharded_finish(Z, Y, N, YS, H: tl.constexpr, B: tl.constexpr,
         tl.store(Y + yp, tl.sum(value, 0), col < N)
 
 
-def compute_sharded(prepared, x, out=None):
+def compute_sharded(prepared, x, out=None, *, measure=None):
     """Per-run native CSR scatter; no transpose plan or persistent workspace."""
     cfg = prepared.config
-    a = prepared.data.resolve_conj().resolve_neg().contiguous()
-    x = x.resolve_conj().resolve_neg()
-    n = prepared.n_cols
-    y = out if out is not None else torch.empty(n, dtype=a.dtype, device=a.device)
-    dtype = (torch.float32 if a.dtype in (torch.float16, torch.bfloat16)
-             else torch.float64 if a.dtype == torch.float32 else a.dtype)
-    h = cfg["output_shards"]
-    direct = h == 1 and y.dtype == dtype
-    element_bytes = {torch.float32: 4, torch.float64: 8, torch.complex64: 8, torch.complex128: 16}[dtype]
-    workspace = 0 if direct else h * n * element_bytes
-    if workspace > cfg["workspace_limit_bytes"]:
-        raise MemoryError(f"CSR sharded scatter needs {workspace} numerical workspace bytes; limit={cfg['workspace_limit_bytes']}")
+    # Called with an event context only by the separate diagnostic run.
+    with measure("init_ms") if measure is not None else nullcontext():
+        a = prepared.data.resolve_conj().resolve_neg().contiguous()
+        x = x.resolve_conj().resolve_neg()
+        n = prepared.n_cols
+        y = out if out is not None else torch.empty(n, dtype=a.dtype, device=a.device)
+        dtype = (torch.float32 if a.dtype in (torch.float16, torch.bfloat16)
+                 else torch.float64 if a.dtype == torch.float32 else a.dtype)
+        h = cfg["output_shards"]
+        direct = h == 1 and y.dtype == dtype
+        element_bytes = {torch.float32: 4, torch.float64: 8, torch.complex64: 8, torch.complex128: 16}[dtype]
+        workspace = 0 if direct else h * n * element_bytes
+        if workspace > cfg["workspace_limit_bytes"]:
+            raise MemoryError(f"CSR sharded scatter needs {workspace} numerical workspace bytes; limit={cfg['workspace_limit_bytes']}")
+        if n:
+            z = y if direct else torch.empty((h, n), dtype=dtype, device=a.device)
+            z.zero_()
     stats = dict(output_shards=h, workspace_peak_bytes=workspace, descriptor_peak_bytes=0,
                  atomic_buffer="out" if direct else "compute_workspace",
                  initialization="zero_compute_buffer", output_conversion="none" if direct else "final_store",
                  x_stride=tuple(x.stride()), y_stride=tuple(y.stride()))
     if n == 0:
         return y, stats
-    z = y if direct else torch.empty((h, n), dtype=dtype, device=a.device)
-    z.zero_()
     complex_input = a.is_complex()
     view = lambda t: torch.view_as_real(t) if complex_input else t
-    if a.numel() and prepared.n_rows:
-        _sharded_scatter[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
-            view(a), prepared.kernel_indices, prepared.kernel_indptr, view(x), view(z),
-            prepared.n_rows, n, x.stride(0), y.stride(0) if direct else 1,
-            h, cfg["rows_per_program"], cfg["block_nnz"], complex_input, prepared.op == 2,
-            tl.float64 if dtype in (torch.float64, torch.complex128) else tl.float32,
-            num_warps=cfg["num_warps"], num_stages=cfg["num_stages"], enable_fp_fusion=False)
-    if not direct:
-        _sharded_finish[(triton.cdiv(n, 128),)](
-            view(z), view(y), n, y.stride(0), h, 128, complex_input,
-            num_warps=cfg["num_warps"], num_stages=1)
+    with measure("scatter_ms") if measure is not None else nullcontext():
+        if a.numel() and prepared.n_rows:
+            _sharded_scatter[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+                view(a), prepared.kernel_indices, prepared.kernel_indptr, view(x), view(z),
+                prepared.n_rows, n, x.stride(0), y.stride(0) if direct else 1,
+                h, cfg["rows_per_program"], cfg["block_nnz"], complex_input, prepared.op == 2,
+                tl.float64 if dtype in (torch.float64, torch.complex128) else tl.float32,
+                num_warps=cfg["num_warps"], num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    with measure("reduce_ms") if measure is not None else nullcontext():
+        if not direct:
+            _sharded_finish[(triton.cdiv(n, 128),)](
+                view(z), view(y), n, y.stride(0), h, 128, complex_input,
+                num_warps=cfg["num_warps"], num_stages=1)
     return y, stats
 
 

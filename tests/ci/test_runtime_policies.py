@@ -703,17 +703,26 @@ def test_vendor_diagnostic_cli_and_accuracy_metrics():
     ("default", 0, False), ("csr_alg1", 4, False), ("csr_alg1", 4, True),
     ("csr_alg2", 6, False), ("csr_alg3", 12, False), ("csr_alg3", 12, True),
 ])
-def test_cuda_vendor_algorithm_and_preprocess_reach_c_api(monkeypatch, algorithm, number, preprocess):
+@pytest.mark.parametrize("dense_shape,dense_stride,layout,ld", [
+    ((2, 2), (2, 1), "row", 2),
+    ((1, 4), (1, 1), "row", 4),
+    ((4, 1), (1, 1), "row", 1),
+    ((2, 2), (1, 3), "col", 3),
+], ids=["ordinary", "singleton-row", "singleton-col", "padded-col"])
+def test_cuda_vendor_algorithm_and_preprocess_reach_c_api(monkeypatch, algorithm, number, preprocess,
+                                                        dense_shape, dense_stride, layout, ld):
     import ctypes
     from contextlib import nullcontext
     from types import SimpleNamespace
     from tests import cusparse_generic_baseline as baseline
 
-    calls, released = [], []
+    calls, released, descriptors = [], [], []
     class Function:
         def __init__(self, name):
             self.name = name
         def __call__(self, *args):
+            if self.name == "CreateDnMat":
+                descriptors.append((args[1:4], args[4].value, args[6]))
             if self.name.startswith("Create"):
                 ctypes.cast(args[0], ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(17)
             if self.name == "GetVersion":
@@ -734,7 +743,7 @@ def test_cuda_vendor_algorithm_and_preprocess_reach_c_api(monkeypatch, algorithm
     monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: SimpleNamespace(data_ptr=lambda: 999))
     def tensor(dtype, dense=False):
         return SimpleNamespace(dtype=dtype, device=torch.device("cuda:0"), ndim=2 if dense else 1,
-            shape=(2, 2), stride=lambda axis: 2 if axis == 0 else 1,
+            shape=dense_shape if dense else (4,), stride=lambda axis: dense_stride[axis],
             is_contiguous=lambda: True, numel=lambda: 4, data_ptr=lambda: 19)
     arrays = (tensor(torch.bfloat16), tensor(torch.int32), tensor(torch.int64))
     out = tensor(torch.float32, True)
@@ -745,9 +754,17 @@ def test_cuda_vendor_algorithm_and_preprocess_reach_c_api(monkeypatch, algorithm
     assert calls == [("SpMM_bufferSize", number)] + ([("SpMM_preprocess", number)] if preprocess else []) + [("SpMM", number)]
     assert plan.metadata["vendor_preprocessed"] is preprocess
     assert plan.metadata["vendor_alg"] == algorithm
+    order = baseline._ORDER_ROW if layout == "row" else baseline._ORDER_COL
+    expected_descriptor = ((*dense_shape, ld), 19, order)
+    assert descriptors == [expected_descriptor, expected_descriptor]
     plan.close()
     plan.close()
     assert len(released) == 4
+
+    # The historical q4 entry uses the same descriptor policy and data pointer.
+    monkeypatch.setattr(baseline, "_lib", lambda: library)
+    baseline._dnmat(tensor(torch.float32, True))
+    assert descriptors[-1] == expected_descriptor
 
 
 def test_vendor_scan_reuses_native_measurements_outside_timing():

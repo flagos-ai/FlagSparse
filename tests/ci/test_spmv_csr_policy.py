@@ -76,10 +76,95 @@ def test_csr_tile_structure_counts_without_device_imports():
     assert result["queue"]["expected_jobs"] == 2 and result["queue"]["job_capacity"] == 4
     assert result["row_lengths"]["empty_rows"] == 2 and result["row_lengths"]["maximum"] == 8
     assert result["atomic_count_basis"] == "per_real_component_logical_updates"
+    assert result["scalar_groups"]["32"]["scheduled_positions"] == 40
+    assert result["scalar_groups"]["32"]["utilization"] == 0.25
     empty = analyze([0, 0], tiles=(4,))["tiles"]["4"]
     assert empty["single_owner_tile_ratio"] is None and empty["ratio_reason"] == "no_nonzeros"
     with unittest.TestCase().assertRaises(ValueError):
         analyze([0, 2, 1])
+
+
+def test_coo_csc_structure_models_without_device_imports():
+    import numpy as np
+    tree = ast.parse((ROOT / "tests/benchmark_utils.py").read_text(encoding="utf-8"))
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ("coo_run_structure", "csc_column_structure")]
+    namespace = {}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "column_structure_policy", "exec"), namespace)
+    analyze = namespace["coo_run_structure"]
+    # Includes the first==last trap, mixed runs and one-valid-lane padding.
+    owners = [1, 1, 1, 3, 7, 3, 2, 2, 3, 4]
+    tile = analyze(owners, tiles=(3,))["tiles"]["3"]
+    assert tile["counts"] == dict(single_owner=2, no_adjacent_equal=1, segmented=1)
+    assert tile["nnz_by_class"] == dict(single_owner=4, no_adjacent_equal=3, segmented=3)
+    assert sum(tile["nnz_by_class"].values()) == len(owners)
+    assert analyze([], tiles=(3,))["tiles"]["3"]["tile_fraction"]["single_owner"] is None
+    # Force multiple bounded chunks and a partial final tile.
+    large = analyze(np.ones(2**20 + 1, dtype=np.int64), tiles=(128,))["tiles"]["128"]
+    assert large["counts"]["single_owner"] == 8193
+    assert large["nnz_by_class"]["single_owner"] == 2**20 + 1
+    csc = namespace["csc_column_structure"]([0, 0, 3, 4], [1, 1, 2, 0], 4)
+    assert csc["columns"]["empty"] == 1 and csc["columns"]["maximum"] == 3
+    assert csc["output_row_contributions"]["maximum"] == 2
+    assert "output_row_contributions" not in namespace["csc_column_structure"]([0], [], 0, op="trans")
+
+
+def test_runclass_configuration_and_capability_contracts():
+    from dataclasses import replace
+    csr, column = _extension_policies()
+    caps = csr.BackendCaps("cuda", "cuda", "80", 32, 1024, (1, 2, 4, 8),
+                          True, True, True, True, True, True, True)
+    for alg in column.COO_RUNCLASS_ALGORITHMS:
+        for dtype in column.DTYPES:
+            cfg, _ = column.resolve_coo_config(alg, dtype, caps, n=7)
+            assert cfg["local_reduce"] == "classify"
+            assert cfg["num_warps"] == 4
+            for mode in ("classify", "segment", "none"):
+                cfg, _ = column.resolve_coo_config(alg, dtype, caps, {"local_reduce": mode})
+                assert cfg["local_reduce"] == mode
+        for bad in ({"local_reduce": "auto"}, {"blocks_per_program": 2},
+                    {"block_nnz": 16}, {"block_nnz": True}, {"prefetch_blocks": 2},
+                    {"num_stages": 2}, {"num_warps": 3}):
+            with unittest.TestCase().assertRaises(ValueError):
+                column.resolve_coo_config(alg, "float32", caps, bad)
+        for capability in ("scan", "reduction", "int64", "fp32_atomic"):
+            with unittest.TestCase().assertRaises(csr.BackendCapabilityUnavailable):
+                column.resolve_coo_config(alg, "float16", replace(caps, **{capability: None}))
+        for capability in ("fp64", "fp64_atomic"):
+            with unittest.TestCase().assertRaises(csr.BackendCapabilityUnavailable):
+                column.resolve_coo_config(alg, "float64", replace(caps, **{capability: None}))
+        column.resolve_coo_config(alg, "float32", replace(caps, scan=None, reduction=None), {"local_reduce": "none"})
+        cfg, _ = column.resolve_coo_config(alg, "float32", replace(caps, legal_num_warps=(1, 2)))
+        assert cfg["num_warps"] == 2
+        cfg, _ = column.resolve_coo_config(alg, "float32", replace(caps, max_threads_per_block=64))
+        assert cfg["num_warps"] == 2
+        with unittest.TestCase().assertRaises(csr.BackendCapabilityUnavailable):
+            column.resolve_coo_config(alg, "float32", replace(caps, max_threads_per_block=0))
+    cfg, _ = column.resolve_coo_config("coo_runclass_panel_atomic", "float64", caps, n=7)
+    assert cfg["block_n"] == 8 and cfg["conversion_mode"] == "load"
+    with unittest.TestCase().assertRaises(ValueError):
+        column.resolve_coo_config("coo_runclass_atomic", "float32", caps, {"conversion_mode": "load"})
+    with unittest.TestCase().assertRaises(ValueError):
+        column.resolve_coo_config("coo_runclass_panel_atomic", "float64", caps, {"block_n": 64})
+    with unittest.TestCase().assertRaises(ValueError):
+        column.resolve_coo_config("coo_segmented_atomic", "float32", caps, {"local_reduce": "classify"})
+    with patch.dict(column.COO_ARCH_PROFILES, {("cuda", "80"): {
+            "coo_runclass_panel_atomic": {"block_nnz": 16, "local_reduce": "invalid"}}}):
+        cfg, info = column.resolve_coo_config("coo_runclass_panel_atomic", "float64", caps)
+        assert cfg["block_nnz"] == 32 and cfg["local_reduce"] == "classify"
+        assert len(info["rejected_profiles"]) == 2
+
+
+def test_runclass_kernel_is_independent_and_has_no_device_plan():
+    tree = ast.parse((SOURCE / "spmv_coo.py").read_text(encoding="utf-8"))
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    kernel = functions["_coo_runclass_panel_kernel"]
+    calls = {n.func.attr for n in ast.walk(kernel) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert {"sum", "associative_scan", "atomic_add"} <= calls
+    assert not calls & {"argsort", "sort", "unique", "nonzero", "cumsum"}
+    launch = ast.unparse(functions["_launch_coo_extension"])
+    assert "_coo_runclass_panel_kernel[" in launch
+    assert launch.index("_COO_RUNCLASS_ALGORITHMS") < launch.index("_COO_ATOMIC_ALGORITHMS")
 
 
 def test_fixed_nnz_plan_has_no_dynamic_boundary_compaction():
