@@ -219,6 +219,233 @@ def run_short_rowqueue(prepared, x, out, timing, phase):
 
 
 @triton.jit
+def short_rowqueue_strided_vector_kernel(A, I, P, X, Y, COUNT, ROWS, XS, YS,
+                                         K: tl.constexpr, COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    # Producer completion on the same stream makes COUNT and every queued row
+    # visible. Each slot belongs to exactly one program modulo grid_stride.
+    slot = tl.program_id(0).to(tl.int64)
+    grid_stride = tl.num_programs(0).to(tl.int64)
+    count = tl.load(COUNT).to(tl.int64)
+    lane = tl.arange(0, K).to(tl.int64)
+    while slot < count:
+        row = tl.load(ROWS + slot).to(tl.int64)
+        start = tl.load(P + row).to(tl.int64)
+        stop = tl.load(P + row + 1).to(tl.int64)
+        # Reset both accumulators for every whole row, including later rounds.
+        re = tl.zeros((K,), ACC)
+        im = tl.zeros((K,), ACC)
+        for base in range(start, stop, K):
+            pos = base + lane
+            pr, pi = _short_row_product(A, I, X, pos, pos < stop, XS, COMPLEX, ACC)
+            re += pr
+            if COMPLEX:
+                im += pi
+        target = row * tl.cast(YS, tl.int64)
+        if COMPLEX:
+            tl.store(Y + 2 * target, tl.sum(re, 0))
+            tl.store(Y + 2 * target + 1, tl.sum(im, 0))
+        else:
+            tl.store(Y + target, tl.sum(re, 0))
+        slot += grid_stride
+
+
+def run_short_rowqueue_strided(prepared, x, out, timing, phase):
+    from ._spmv_csr_config import short_rowqueue_capacity
+
+    cfg = prepared.config
+    stats = short_rowqueue_capacity(prepared.n_rows, prepared.data.numel(), cfg)
+    capacity = stats["row_queue_capacity"]
+    grid = min(capacity, cfg["grid_blocks"])
+    complex_input = prepared.data.is_complex()
+    fp64 = prepared.data.dtype in (torch.float32, torch.float64, torch.complex128)
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    def initialize():
+        return (prepared.data.resolve_conj().resolve_neg(), x.resolve_conj().resolve_neg(),
+                torch.zeros(1, dtype=torch.int32, device=x.device),
+                torch.empty(capacity, dtype=torch.int64, device=x.device))
+    (data, vector, count, rows), init_ms = phase(initialize, timing)
+    view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+    common = dict(COMPLEX=complex_input, ACC=tl.float64 if fp64 else tl.float32,
+                  num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    def produce():
+        if prepared.n_rows:
+            short_rowqueue_producer_kernel[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                count, rows, prepared.n_rows, vector.stride(0), y.stride(0),
+                R=cfg["rows_per_program"], S=cfg["short_row_threshold"],
+                num_warps=cfg["producer_num_warps"], **common)
+    _, producer_ms = phase(produce, timing)
+    def consume():
+        if grid:
+            short_rowqueue_strided_vector_kernel[(grid,)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                count, rows, vector.stride(0), y.stride(0),
+                K=cfg["block_nnz"], num_warps=cfg["num_warps"], **common)
+    _, consumer_ms = phase(consume, timing)
+    return y, dict(stats, process_cpu_ms=0.0, process_gpu_ms=init_ms,
+                   compute_ms=producer_ms + consumer_ms if timing else None,
+                   init_ms=init_ms, producer_ms=producer_ms, consumer_ms=consumer_ms,
+                   finish_ms=0.0 if timing else None, fused_plan_compute_ms=producer_ms,
+                   queue_count_readback=False, plan_strategy="per_run_row_ids_only",
+                   task_acquisition="static_grid_stride", floating_point_atomic=False,
+                   consumer_grid_blocks=grid, consumer_grid_limit=cfg["grid_blocks"],
+                   consumer_rounds_capacity=triton.cdiv(capacity, grid) if grid else 0,
+                   initialization="queue_counter_only", output_conversion="final_store",
+                   execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                   execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                   x_stride=tuple(x.stride()), y_stride=tuple(y.stride()),
+                   output_buffer_identity="out" if out is not None else "allocated")
+
+
+@triton.jit
+def cooperative_row_producer_kernel(A, I, P, X, Y, COUNT, ROWS, M, XS, YS,
+                                     R: tl.constexpr, V: tl.constexpr, L: tl.constexpr,
+                                     COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    valid = row < M
+    start = tl.load(P + row, valid, 0).to(tl.int64)
+    stop = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    queued = valid & (stop - start > L)
+    flags = queued.to(tl.int32)
+    count = tl.sum(flags, 0)
+    if count > 0:
+        first = tl.atomic_add(COUNT, count, sem="relaxed").to(tl.int64)
+        slots = first + tl.cumsum(flags, 0).to(tl.int64) - 1
+        tl.store(ROWS + slots, row, queued)
+    ordinary = valid & ~queued
+    length = tl.max(tl.where(ordinary, stop - start, 0), 0)
+    lane = tl.arange(0, V).to(tl.int64)
+    re = tl.zeros((R, V), ACC)
+    im = tl.zeros((R, V), ACC)
+    for base in range(0, length, V):
+        pos = start[:, None] + base + lane[None, :]
+        pr, pi = _short_row_product(A, I, X, pos, ordinary[:, None] & (pos < stop[:, None]),
+                                     XS, COMPLEX, ACC)
+        re += pr
+        if COMPLEX:
+            im += pi
+    target = row * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * target, tl.sum(re, 1), ordinary)
+        tl.store(Y + 2 * target + 1, tl.sum(im, 1), ordinary)
+    else:
+        tl.store(Y + target, tl.sum(re, 1), ordinary)
+
+
+@triton.jit
+def cooperative_row_consumer_kernel(A, I, P, X, COUNT, ROWS, PARTIAL, XS,
+                                     K: tl.constexpr, PARTS: tl.constexpr,
+                                     COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    slot = tl.program_id(0).to(tl.int64)
+    stride = tl.num_programs(0).to(tl.int64)
+    part = tl.program_id(1).to(tl.int64)
+    count = tl.load(COUNT).to(tl.int64)
+    lane = tl.arange(0, K).to(tl.int64)
+    while slot < count:
+        row = tl.load(ROWS + slot).to(tl.int64)
+        start = tl.load(P + row).to(tl.int64)
+        stop = tl.load(P + row + 1).to(tl.int64)
+        # Divide K-sized chunks into balanced, contiguous ranges. Even empty
+        # ranges write zero to their exclusive slot before the finish launch.
+        chunks = (stop - start + K - 1) // K
+        begin = start + ((chunks * part) // PARTS) * K
+        end = tl.minimum(stop, start + ((chunks * (part + 1)) // PARTS) * K)
+        re = tl.zeros((K,), ACC)
+        im = tl.zeros((K,), ACC)
+        for base in range(begin, end, K):
+            pos = base + lane
+            pr, pi = _short_row_product(A, I, X, pos, pos < end, XS, COMPLEX, ACC)
+            re += pr
+            if COMPLEX:
+                im += pi
+        target = slot * PARTS + part
+        if COMPLEX:
+            tl.store(PARTIAL + 2 * target, tl.sum(re, 0))
+            tl.store(PARTIAL + 2 * target + 1, tl.sum(im, 0))
+        else:
+            tl.store(PARTIAL + target, tl.sum(re, 0))
+        slot += stride
+
+
+@triton.jit
+def cooperative_row_finish_kernel(COUNT, ROWS, PARTIAL, Y, YS,
+                                   PARTS: tl.constexpr, COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    slot = tl.program_id(0).to(tl.int64)
+    stride = tl.num_programs(0).to(tl.int64)
+    count = tl.load(COUNT).to(tl.int64)
+    part = tl.arange(0, PARTS).to(tl.int64)
+    while slot < count:
+        row = tl.load(ROWS + slot).to(tl.int64)
+        source = slot * PARTS + part
+        target = row * tl.cast(YS, tl.int64)
+        if COMPLEX:
+            re = tl.load(PARTIAL + 2 * source).to(ACC)
+            im = tl.load(PARTIAL + 2 * source + 1).to(ACC)
+            tl.store(Y + 2 * target, tl.sum(re, 0))
+            tl.store(Y + 2 * target + 1, tl.sum(im, 0))
+        else:
+            re = tl.load(PARTIAL + source).to(ACC)
+            tl.store(Y + target, tl.sum(re, 0))
+        slot += stride
+
+
+def run_longrow_cooperative(prepared, x, out, timing, phase):
+    from ._spmv_csr_config import cooperative_queue_capacity
+
+    cfg = prepared.config
+    stats = cooperative_queue_capacity(prepared.n_rows, prepared.data.numel(), cfg, prepared.data.dtype)
+    capacity, parts = stats["row_queue_capacity"], cfg["cooperative_parts"]
+    grid = min(capacity, cfg["grid_blocks"])
+    complex_input = prepared.data.is_complex()
+    fp64 = prepared.data.dtype in (torch.float32, torch.float64, torch.complex128)
+    component = torch.float64 if fp64 else torch.float32
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    def initialize():
+        return (prepared.data.resolve_conj().resolve_neg(), x.resolve_conj().resolve_neg(),
+                torch.zeros(1, dtype=torch.int32, device=x.device),
+                torch.empty(capacity, dtype=torch.int64, device=x.device),
+                torch.empty(capacity * parts * (2 if complex_input else 1), dtype=component, device=x.device))
+    (data, vector, count, rows, partial), init_ms = phase(initialize, timing)
+    view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+    common = dict(COMPLEX=complex_input, ACC=tl.float64 if fp64 else tl.float32,
+                  num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    def produce():
+        if prepared.n_rows:
+            cooperative_row_producer_kernel[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                count, rows, prepared.n_rows, vector.stride(0), y.stride(0),
+                R=cfg["rows_per_program"], V=cfg["lanes_per_row"], L=cfg["long_row_threshold"],
+                num_warps=cfg["producer_num_warps"], **common)
+    _, producer_ms = phase(produce, timing)
+    def consume():
+        if grid:
+            cooperative_row_consumer_kernel[(grid, parts)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), count, rows,
+                partial, vector.stride(0), K=cfg["block_nnz"], PARTS=parts,
+                num_warps=cfg["num_warps"], **common)
+    _, consumer_ms = phase(consume, timing)
+    def finish():
+        if grid:
+            cooperative_row_finish_kernel[(grid,)](
+                count, rows, partial, view(y), y.stride(0), PARTS=parts,
+                num_warps=cfg["producer_num_warps"], **common)
+    _, finish_ms = phase(finish, timing)
+    return y, dict(stats, process_cpu_ms=0.0, process_gpu_ms=init_ms,
+                   compute_ms=producer_ms + consumer_ms + finish_ms if timing else None,
+                   init_ms=init_ms, producer_ms=producer_ms, consumer_ms=consumer_ms, finish_ms=finish_ms,
+                   fused_plan_compute_ms=producer_ms, queue_count_readback=False,
+                   plan_strategy="per_run_row_ids_fixed_parts", task_acquisition="static_grid_stride_parts",
+                   floating_point_atomic=False, cooperative_parts=parts, row_grid_blocks=grid,
+                   consumer_grid_blocks=grid * parts, consumer_grid_limit=cfg["grid_blocks"] * parts,
+                   consumer_rounds_capacity=triton.cdiv(capacity, grid) if grid else 0,
+                   initialization="queue_counter_only", output_conversion="final_store",
+                   execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                   execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                   x_stride=tuple(x.stride()), y_stride=tuple(y.stride()),
+                   output_buffer_identity="out" if out is not None else "allocated")
+
+
+@triton.jit
 def longrow_grid_consumer_kernel(A, I, X, COUNTERS, JOB_SLOT, JOB_START, JOB_END,
                                  PARTIAL, XS, K: tl.constexpr, COMPLEX: tl.constexpr,
                                  ACC: tl.constexpr):

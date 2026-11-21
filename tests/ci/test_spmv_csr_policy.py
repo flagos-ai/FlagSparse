@@ -98,10 +98,111 @@ def test_short_rowqueue_policy_capacity_and_no_fp_atomic_requirement():
         policy.assert_route_match(alg, cfg, "csr_longrow_queue_atomic", None, caps)
 
 
+def test_bounded_rowqueue_profile_isolation_and_capabilities():
+    from dataclasses import replace
+    alg = "csr_short_rowqueue_strided_vector"
+    old = "csr_short_rowqueue_vector"
+    for caps in (policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True,
+                                  scan=True, int32_atomic=True, fp32_atomic=False, fp64_atomic=False),
+                 policy.BackendCaps("rocm", "gfx90a", "hip", 64, 1024, True, True, True,
+                                  scan=True, int32_atomic=True, fp32_atomic=False, fp64_atomic=False)):
+        cfg, source = policy.resolve_config(alg, caps)
+        original, _ = policy.resolve_config(old, caps)
+        assert cfg == dict(original, short_row_threshold=128, grid_blocks=256)
+        assert source == "bounded-rowqueue-conservative-v1"
+        assert original["short_row_threshold"] == 32 and "grid_blocks" not in original
+        assert policy.algorithm_spec(alg)["ops"] == ("non",)
+        assert policy.algorithm_spec(alg)["config_candidates"]["grid_blocks"] == (128, 256, 512, 1024)
+        for dtype in policy.VALUE_DTYPES:
+            policy.validate_support(alg, "non", dtype, "int64", "int32", caps)
+        for op in ("trans", "conj"):
+            assert alg not in policy.list_algorithms(op, "float32", caps.backend)
+            with unittest.TestCase().assertRaises(NotImplementedError):
+                policy.validate_support(alg, op, "float32", "int32", "int32", caps)
+        for grid in (1, 3, 128, 256, 512, 1024):
+            override = dict(grid_blocks=grid, short_row_threshold=32)
+            snapshot = dict(override)
+            resolved, origin = policy.resolve_config(alg, caps, override)
+            assert resolved == dict(original, **override) and origin == "explicit"
+            assert override == snapshot
+            for rows, nnz in ((0, 0), (100, 0), (1, 129), (10000, 330000)):
+                bounded = policy.short_rowqueue_capacity(rows, nnz, resolved)
+                assert bounded == policy.short_rowqueue_capacity(rows, nnz, original)
+        for override in ({"grid_blocks": False}, {"grid_blocks": 0}, {"grid_blocks": -1},
+                         {"grid_blocks": 1.5}, {"grid_blocks": 1025}, {"grid_blocks": "256"},
+                         {"worker_programs": 128}, {"segment_nnz": 128}):
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.resolve_config(alg, caps, override)
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config(old, caps, {"grid_blocks": 256})
+        for target in (old, "row_vector"):
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.assert_route_match(alg, cfg, target, None, caps)
+        for feature in ("scan", "int32_atomic"):
+            with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+                policy.resolve_config(alg, replace(caps, **{feature: None}))
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.validate_support(alg, "non", "float32", "int32", "int32", replace(caps, fp64=False))
+
+
+def test_cooperative_queue_contract_and_workspace():
+    from dataclasses import replace
+    alg = "csr_longrow_cooperative_reduce"
+    for backend, subgroup in (("cuda", 32), ("rocm", 64)):
+        caps = policy.BackendCaps(backend, "unknown", backend, subgroup, 1024, True, True, True,
+                                 scan=True, int32_atomic=True, fp32_atomic=False, fp64_atomic=False)
+        cfg, source = policy.resolve_config(alg, caps)
+        assert cfg["cooperative_parts"] == 8 and cfg["long_row_threshold"] == 1024
+        assert source == "longrow-cooperative-conservative-v1"
+        spec = policy.algorithm_spec(alg)
+        assert spec["ops"] == ("non",) and spec["value_dtypes"] == policy.VALUE_DTYPES
+        assert "atomic_by_compute_dtype" not in spec["capability_requirements"]
+        for dtype in policy.VALUE_DTYPES:
+            policy.validate_support(alg, "non", dtype, "int64", "int32", caps)
+            stats = policy.cooperative_queue_capacity(100, 2050, cfg, dtype)
+            width = {"float16": 4, "bfloat16": 4, "float32": 8, "float64": 8,
+                     "complex64": 8, "complex128": 16}[dtype]
+            assert stats["row_queue_capacity"] == 2 and stats["partial_slot_capacity"] == 16
+            assert stats["numeric_workspace_bytes"] == 16 * width
+            assert stats["descriptor_peak_bytes"] == 20
+            assert stats["workspace_peak_bytes"] == 20 + 16 * width
+            exact = dict(cfg, workspace_limit_bytes=stats["workspace_peak_bytes"])
+            assert policy.cooperative_queue_capacity(100, 2050, exact, dtype) == stats
+            with unittest.TestCase().assertRaisesRegex(ValueError, "workspace"):
+                policy.cooperative_queue_capacity(100, 2050, dict(exact, workspace_limit_bytes=exact["workspace_limit_bytes"] - 1), dtype)
+            for op in ("trans", "conj"):
+                assert alg not in policy.list_algorithms(op=op, dtype=dtype, backend=backend)
+                with unittest.TestCase().assertRaises(NotImplementedError):
+                    policy.validate_support(alg, op, dtype, "int32", "int32", caps)
+        assert policy.cooperative_queue_capacity(19, 0, cfg, "float16")["workspace_peak_bytes"] == 4
+        with unittest.TestCase().assertRaisesRegex(ValueError, "int32"):
+            policy.cooperative_queue_capacity(2**31, 2**31 * 1025, cfg, "float16")
+        for bad in ({"cooperative_parts": 3}, {"cooperative_parts": True}, {"grid_blocks": 0},
+                    {"grid_blocks": 1025}, {"long_row_threshold": -1}, {"long_row_threshold": 2.5},
+                    {"block_nnz": 16}, {"num_stages": 2}, {"rows_per_program": 3},
+                    {"workspace_limit_bytes": 0}, {"num_warps": 1024}, {"segment_nnz": 128},
+                    {"short_row_threshold": 32}, {"worker_programs": 128}):
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.resolve_config(alg, caps, bad)
+        for feature in ("scan", "int32_atomic"):
+            with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+                policy.resolve_config(alg, replace(caps, **{feature: None}))
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.validate_support(alg, "non", "float32", "int32", "int32", replace(caps, fp64=False))
+        for other in policy.ROWQUEUE_ALGORITHMS + policy.LONGROW_ALGORITHMS:
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.resolve_config(other, caps, {"cooperative_parts": 8})
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.assert_route_match(alg, cfg, other, None, caps)
+        supplied = {"cooperative_parts": 1, "long_row_threshold": 0, "grid_blocks": 3}
+        resolved, _ = policy.resolve_config(alg, caps, supplied)
+        assert resolved == dict(cfg, **supplied) and supplied == {"cooperative_parts": 1, "long_row_threshold": 0, "grid_blocks": 3}
+
+
 def test_irregular_spmv_execution_has_no_host_plan_reads():
     tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    for name in ("run_nnz_local_reduce", "run_longrow_grid", "run_short_rowqueue"):
+    for name in ("run_nnz_local_reduce", "run_longrow_grid", "run_short_rowqueue", "run_short_rowqueue_strided", "run_longrow_cooperative"):
         calls = {n.func.attr for n in ast.walk(functions[name]) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
         assert not calls & {"item", "tolist", "nonzero", "cumsum", "repeat_interleave", "unique_consecutive"}
     owner = functions["_nnz_local_owner"]
@@ -116,6 +217,32 @@ def test_irregular_spmv_execution_has_no_host_plan_reads():
     launch = ast.unparse(functions["run_short_rowqueue"])
     assert "torch.zeros(1, dtype=torch.int32" in launch
     assert "y.zero_" not in launch and "y.copy_" not in launch
+    bounded = functions["short_rowqueue_strided_vector_kernel"]
+    body = ast.unparse(bounded)
+    assert "atomic" not in body and "tl.num_programs(0).to(tl.int64)" in body
+    loop = next(node for node in bounded.body if isinstance(node, ast.While))
+    assert ast.unparse(loop.test) == "slot < count"
+    assert any(isinstance(node, ast.AugAssign) and ast.unparse(node) == "slot += grid_stride" for node in loop.body)
+    for accumulator in ("re", "im"):
+        assert any(isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == accumulator for t in node.targets)
+                   and "tl.zeros" in ast.unparse(node.value) for node in loop.body)
+    launch = ast.unparse(functions["run_short_rowqueue_strided"])
+    assert "min(capacity, cfg['grid_blocks'])" in launch
+    consumer_launch = next(node for node in ast.walk(functions["run_short_rowqueue_strided"])
+                           if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                           and node.value.id == "short_rowqueue_strided_vector_kernel")
+    assert isinstance(consumer_launch.slice, ast.Tuple)
+    assert [ast.unparse(node) for node in consumer_launch.slice.elts] == ["grid"]
+    assert "short_rowqueue_producer_kernel" in launch and "PARTIAL" not in launch
+    for name in ("cooperative_row_consumer_kernel", "cooperative_row_finish_kernel"):
+        body = ast.unparse(functions[name])
+        assert "atomic" not in body and "tl.num_programs(0).to(tl.int64)" in body
+        assert "slot < count" in body and "slot += stride" in body
+    launch = ast.unparse(functions["run_longrow_cooperative"])
+    assert "torch.empty(capacity * parts" in launch
+    assert "y.zero_" not in launch and "y.copy_" not in launch
+    assert "cooperative_row_producer_kernel" in launch
+    assert "cooperative_row_consumer_kernel" in launch and "cooperative_row_finish_kernel" in launch
 
 
 def test_csr_tile_structure_counts_without_device_imports():
@@ -145,6 +272,23 @@ def test_csr_tile_structure_counts_without_device_imports():
     assert row_queue["expected_queued_rows"] == 1 and row_queue["row_queue_capacity"] == 2
     assert row_queue["queued_nnz_fraction"] == 0.8
     assert row_queue["expected_active_program_ratio"] == 0.5
+    bounded = analyze([0, 0, 8, 8, 9, 10], config={"short_row_threshold": 4,
+                       "producer_num_warps": 2, "rows_per_program": 64, "grid_blocks": 1})["row_queue"]
+    assert bounded["row_queue_capacity"] == 2 and bounded["consumer_grid_blocks"] == 1
+    assert bounded["expected_active_program_ratio"] == 1 and bounded["expected_max_rounds"] == 1
+    assert bounded["consumer_rounds_capacity"] == 2
+    rounds = analyze([0, 8, 16, 24], config={"short_row_threshold": 4,
+                      "producer_num_warps": 2, "rows_per_program": 64, "grid_blocks": 2})["row_queue"]
+    assert rounds["expected_max_rounds"] == 2 and rounds["expected_tasks_per_program"] == 1.5
+    with unittest.TestCase().assertRaises(ValueError):
+        analyze([0, 1], config={"short_row_threshold": 4, "producer_num_warps": 2,
+                              "rows_per_program": 64, "grid_blocks": True})
+    cooperative = analyze([0, 0, 8, 8, 9, 10], config={"long_row_threshold": 4,
+                           "cooperative_parts": 4, "block_nnz": 4, "grid_blocks": 1})["cooperative_queue"]
+    assert cooperative["expected_queued_rows"] == 1 and cooperative["row_queue_capacity"] == 2
+    assert cooperative["partial_slot_capacity"] == 8 and cooperative["consumer_grid_blocks"] == 4
+    assert cooperative["expected_nonempty_part_tasks"] == 2 and cooperative["expected_empty_part_tasks"] == 2
+    assert cooperative["queued_nnz_fraction"] == 0.8 and cooperative["consumer_rounds_capacity"] == 2
 
 
 def test_coo_csc_structure_models_without_device_imports():

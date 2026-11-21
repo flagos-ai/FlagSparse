@@ -150,6 +150,44 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
             expected_active_program_ratio=queued_rows / capacity if capacity else None,
             ratio_reason=None if capacity else "zero_capacity",
             count_source="cpu_structure_model_not_gpu_readback")
+        if "grid_blocks" in cfg:
+            limit = cfg["grid_blocks"]
+            if type(limit) is not int or not 1 <= limit <= 1024:
+                raise ValueError("row-queue grid_blocks must be an integer between 1 and 1024")
+            grid = min(capacity, limit)
+            result["row_queue"].update(
+                consumer_grid_limit=limit, consumer_grid_blocks=grid,
+                expected_active_programs=min(queued_rows, grid),
+                expected_active_program_ratio=min(queued_rows, grid) / grid if grid else None,
+                expected_tasks_per_program=queued_rows / grid if grid else None,
+                expected_max_rounds=(queued_rows + grid - 1) // grid if grid else 0,
+                consumer_rounds_capacity=(capacity + grid - 1) // grid if grid else 0,
+            )
+    if "cooperative_parts" in cfg:
+        threshold, parts = cfg["long_row_threshold"], cfg["cooperative_parts"]
+        block, limit = cfg["block_nnz"], cfg["grid_blocks"]
+        if (any(type(v) is not int for v in (threshold, parts, block, limit)) or threshold < 0
+                or parts not in (1, 2, 4, 8, 16) or block <= 0 or not 1 <= limit <= 1024):
+            raise ValueError("invalid cooperative structure configuration")
+        long_lengths = lengths[lengths > threshold]
+        queued = int(long_lengths.size)
+        capacity = min(rows, nnz // (threshold + 1))
+        grid = min(capacity, limit)
+        chunks = (long_lengths + block - 1) // block
+        useful_parts = int(np.minimum(chunks, parts).sum())
+        result["cooperative_queue"] = dict(
+            long_row_threshold=threshold, cooperative_parts=parts,
+            expected_queued_rows=queued, expected_queued_nnz=int(long_lengths.sum()),
+            queued_nnz_fraction=int(long_lengths.sum()) / nnz if nnz else None,
+            row_queue_capacity=capacity, partial_slot_capacity=capacity * parts,
+            row_grid_blocks=grid, consumer_grid_blocks=grid * parts,
+            expected_partial_slots=queued * parts, expected_nonempty_part_tasks=useful_parts,
+            expected_empty_part_tasks=queued * parts - useful_parts,
+            expected_max_rounds=(queued + grid - 1) // grid if grid else 0,
+            consumer_rounds_capacity=(capacity + grid - 1) // grid if grid else 0,
+            # Queue insertion order depends on GPU scheduling; do not invent
+            # worker makespan or occupancy from the CPU row order.
+            count_source="cpu_structure_model_not_gpu_readback")
     return result
 
 
@@ -436,6 +474,10 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
               "vendor_library_sha256", "vendor_library_identity_reason", "vendor_algorithm_id",
               "vendor_format", "vendor_a_dtype", "vendor_rhs_dtype", "vendor_output_dtype",
               "vendor_alpha", "vendor_beta", "reference", "rtol", "atol"]
+    if operator == "spmv_csr":
+        fields += ["row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
+                   "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
+                   "row_grid_blocks", "partial_slot_capacity"]
     if metrics_enabled:
         fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
                    "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",
@@ -694,6 +736,11 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 _, _, diagnostics = run(prepared, rhs, timing=True, **kwargs)
                                 row.update({key: diagnostics.get(key) for key in ("process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms", "scatter_ms", "reduce_ms")})
                             row["metadata"] = meta
+                            if operator == "spmv_csr":
+                                row.update({key: meta.get(key) for key in
+                                            ("row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
+                                             "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
+                                             "row_grid_blocks", "partial_slot_capacity")})
                             row["alg_resolved"] = meta.get("alg_resolved", meta.get("alg", alg))
                             row["vendor_status"] = "SKIP"
                             row["vendor_reason"] = "disabled"

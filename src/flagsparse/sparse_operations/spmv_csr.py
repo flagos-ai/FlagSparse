@@ -47,6 +47,8 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "csr_longrow_grid_atomic",
     "csr_nnz_local_reduce_atomic",
     "csr_short_rowqueue_vector",
+    "csr_short_rowqueue_strided_vector",
+    "csr_longrow_cooperative_reduce",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1670,7 +1672,7 @@ def _spmv_check_output(out, prepared, x, output_dtype=None):
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
-    strided_algorithms = ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_longrow_queue_atomic", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS, *_csr_config.ROWQUEUE_ALGORITHMS)
+    strided_algorithms = ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_longrow_queue_atomic", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS, *_csr_config.ROWQUEUE_ALGORITHMS, *_csr_config.COOPERATIVE_ALGORITHMS)
     if not out.is_contiguous() and prepared.alg not in strided_algorithms:
         raise ValueError("out must be contiguous")
     if prepared.alg in strided_algorithms and out.numel() > 1 and out.stride(0) <= 0:
@@ -1773,6 +1775,12 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
             "execution_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix("torch."),
         }
     alg = prepared.alg
+    if alg == "csr_longrow_cooperative_reduce":
+        from ._spmv_csr_kernels import run_longrow_cooperative
+        return run_longrow_cooperative(prepared, x, out, timing, _spmv_phase)
+    if alg == "csr_short_rowqueue_strided_vector":
+        from ._spmv_csr_kernels import run_short_rowqueue_strided
+        return run_short_rowqueue_strided(prepared, x, out, timing, _spmv_phase)
     if alg in _csr_config.ROWQUEUE_ALGORITHMS:
         from ._spmv_csr_kernels import run_short_rowqueue
         return run_short_rowqueue(prepared, x, out, timing, _spmv_phase)
@@ -2041,7 +2049,7 @@ def flagsparse_spmv_csr_run(
             meta.update(execution_path="native_csr_scalar_tail_reduce", scalar_steps=actual.config["scalar_steps"],
                         tail_block_nnz=actual.config["block_nnz"], workspace_peak_bytes=0,
                         plan_strategy="none", validation="unverified")
-        if actual.alg in _csr_config.ROWQUEUE_ALGORITHMS:
+        if actual.alg in _csr_config.ROWQUEUE_ALGORITHMS + _csr_config.COOPERATIVE_ALGORITHMS:
             meta.update(execution_path="native_" + actual.alg, validation="unverified")
             for key in ("row_queue_capacity", "descriptor_peak_bytes", "numeric_workspace_bytes",
                         "workspace_peak_bytes", "queue_count_readback", "plan_strategy", "task_acquisition",
@@ -2051,6 +2059,12 @@ def flagsparse_spmv_csr_run(
             if timing:
                 meta.update({key: phases[key] for key in
                              ("init_ms", "producer_ms", "consumer_ms", "finish_ms", "fused_plan_compute_ms")})
+            if actual.alg in ("csr_short_rowqueue_strided_vector", "csr_longrow_cooperative_reduce"):
+                meta.update({key: phases[key] for key in
+                             ("consumer_grid_blocks", "consumer_grid_limit", "consumer_rounds_capacity")})
+            if actual.alg == "csr_longrow_cooperative_reduce":
+                meta.update({key: phases[key] for key in
+                             ("cooperative_parts", "row_grid_blocks", "partial_slot_capacity")})
         if actual.alg in _csr_config.LONGROW_ALGORITHMS:
             meta.update(execution_path="native_" + actual.alg, validation="unverified",
                         initialization="queue_counters_and_partial_slots", output_conversion="final_store")

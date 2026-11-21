@@ -554,13 +554,16 @@ def test_spmv_csr_new_fallback_preserves_selection(alg, dtype, op, monkeypatch):
               else {"rows_per_program": 32} if alg in ("csr_row_scalar_strip", "csr_row_scalar_bound", "csr_row_scalar_tail_reduce")
               else {"long_row_threshold": 32, "segment_nnz": 32, "block_nnz": 32} if alg in spmv_mod._csr_config.LONGROW_ALGORITHMS
               else {"short_row_threshold": 8, "block_nnz": 64} if alg in spmv_mod._csr_config.ROWQUEUE_ALGORITHMS
+              else {"long_row_threshold": 32, "cooperative_parts": 4, "block_nnz": 32} if alg in spmv_mod._csr_config.COOPERATIVE_ALGORITHMS
               else {"block_nnz": 128, "atomic_mode": "all"} if alg == "csr_nnz_local_reduce_atomic"
               else {"block_nnz": 16} if alg == "csr_row_static_tile"
               else {"row_vector": {"block_nnz": 64}})
     prepared = _new_prepared(data, col, ptr, shape, alg, config=config, op=op)
-    if alg in spmv_mod._csr_config.LONGROW_ALGORITHMS + spmv_mod._csr_config.ROWQUEUE_ALGORITHMS + ("csr_nnz_local_reduce_atomic",):
+    if alg in spmv_mod._csr_config.LONGROW_ALGORITHMS + spmv_mod._csr_config.ROWQUEUE_ALGORITHMS + spmv_mod._csr_config.COOPERATIVE_ALGORITHMS + ("csr_nnz_local_reduce_atomic",):
         name = {"csr_longrow_queue_atomic": "run_longrow_queue", "csr_longrow_grid_atomic": "run_longrow_grid",
-                "csr_nnz_local_reduce_atomic": "run_nnz_local_reduce", "csr_short_rowqueue_vector": "run_short_rowqueue"}[alg]
+                "csr_nnz_local_reduce_atomic": "run_nnz_local_reduce", "csr_short_rowqueue_vector": "run_short_rowqueue",
+                "csr_short_rowqueue_strided_vector": "run_short_rowqueue_strided",
+                "csr_longrow_cooperative_reduce": "run_longrow_cooperative"}[alg]
         original = getattr(kernels, name)
         def fail_queue_i64(route, vector, output, timing, phase):
             if route.kernel_indices.dtype == torch.int64:
@@ -1275,7 +1278,8 @@ def test_spmv_sharded_workspace_and_fallback(monkeypatch):
 @pytest.mark.spmv_csr
 @pytest.mark.parametrize("alg", ["csr_row_refill_reduce", "csr_transpose_sharded_atomic",
                                   "csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_row_scalar_tail_reduce", "csr_longrow_queue_atomic",
-                                  "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector"])
+                                  "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector",
+                                  "csr_short_rowqueue_strided_vector", "csr_longrow_cooperative_reduce"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_spmv_targeted_wide_output_not_roundtrip(alg, dtype):
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
@@ -1285,7 +1289,7 @@ def test_spmv_targeted_wide_output_not_roundtrip(alg, dtype):
     if alg == "csr_row_scalar_tail_reduce":
         # Place both terms in the parallel tail, beyond the default scalar prefix.
         a = torch.cat((torch.zeros(8, dtype=dtype, device=device), a))
-    if alg in ("csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector"):
+    if alg in ("csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", *spmv_mod._csr_config.ROWQUEUE_ALGORITHMS, *spmv_mod._csr_config.COOPERATIVE_ALGORITHMS):
         # Force the two nonzero contributions into distinct tile/segment jobs.
         a = torch.cat((a[:1], torch.zeros(2047, dtype=dtype, device=device), a[1:]))
     if alg != "csr_transpose_sharded_atomic":
@@ -1390,10 +1394,10 @@ def test_spmv_csr_short_rows_native(alg, config, dtype, output_dtype, index_pair
     (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
 ], ids=lambda d: str(d).removeprefix("torch."))
 @pytest.mark.parametrize("threshold", [0, 8, 128, 256])
-def test_spmv_csr_short_rowqueue_thresholds(dtype, output_dtype, threshold, record_property):
+@pytest.mark.parametrize("alg", spmv_mod._csr_config.ROWQUEUE_ALGORITHMS)
+def test_spmv_csr_short_rowqueue_thresholds(dtype, output_dtype, threshold, alg, record_property):
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
 
-    alg = "csr_short_rowqueue_vector"
     lengths = [0, 1, 8, 9, 32, 33, 128, 129, 256, 257, 602, 713, 0]
     a, i, p, x, shape = _native_case(lengths, dtype, torch.int64, torch.int32, n=19)
     a.copy_(((torch.arange(a.numel(), device=a.device) % 7 - 3).float() / 16).to(dtype))
@@ -1433,7 +1437,7 @@ def test_spmv_csr_short_rowqueue_thresholds(dtype, output_dtype, threshold, reco
     (torch.complex64, torch.complex64), (torch.complex128, torch.complex128),
 ], ids=lambda dtype: str(dtype).removeprefix("torch."))
 @pytest.mark.parametrize("case", ["zero_rows", "empty", "ordinary", "mixed", "single_long", "queue_full", "medium_mix"])
-@pytest.mark.parametrize("alg", ["csr_longrow_queue_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector"])
+@pytest.mark.parametrize("alg", ["csr_longrow_queue_atomic", "csr_longrow_grid_atomic", *spmv_mod._csr_config.ROWQUEUE_ALGORITHMS])
 @pytest.mark.parametrize("index_pair", [(torch.int64, torch.int32)] if _MIXED_QUICK_MODE else [
     (torch.int32, torch.int32), (torch.int32, torch.int64),
     (torch.int64, torch.int32), (torch.int64, torch.int64),
@@ -1462,7 +1466,7 @@ def test_spmv_csr_longrow_queue_native(dtype, output_dtype, case, index_pair, mo
     config = dict(long_row_threshold=32, segment_nnz=64, block_nnz=32, worker_programs=32)
     if alg == "csr_longrow_grid_atomic":
         config.pop("worker_programs")
-    if alg == "csr_short_rowqueue_vector":
+    if alg in spmv_mod._csr_config.ROWQUEUE_ALGORITHMS:
         config = dict(short_row_threshold=32, rows_per_program=32, block_nnz=128)
     for key, value in dict(algorithm=alg, a_dtype=str(dtype), rhs_dtype=str(dtype),
                            output_dtype=str(output_dtype), opA="non", opB="non",
@@ -1485,7 +1489,7 @@ def test_spmv_csr_longrow_queue_native(dtype, output_dtype, case, index_pair, mo
             assert meta["fused_plan_compute_ms"] >= 0
             assert meta["workspace_peak_bytes"] <= prepared.config["workspace_limit_bytes"]
             assert all(meta[k] >= 0 for k in ("init_ms", "producer_ms", "consumer_ms", "finish_ms"))
-            if alg == "csr_short_rowqueue_vector":
+            if alg in spmv_mod._csr_config.ROWQUEUE_ALGORITHMS:
                 assert meta["row_queue_capacity"] == min(shape[0], a.numel() // 33)
                 assert meta["floating_point_atomic"] is False and meta["numeric_workspace_bytes"] == 0
                 assert meta["plan_strategy"] == "per_run_row_ids_only"
@@ -1625,3 +1629,225 @@ def test_spmv_csr_nnz_local_branch_regression(dtype, output_dtype, owner_search,
     except BackendCapabilityUnavailable as exc:
         pytest.skip(str(exc))
     assert torch.isnan(backing[1::2]).all()
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("dtype,output_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
+    (torch.float32, torch.float32), (torch.float64, torch.float64),
+    (torch.complex64, torch.complex64), (torch.complex128, torch.complex128),
+], ids=lambda d: str(d).removeprefix("torch."))
+@pytest.mark.parametrize("grid_blocks", [1, 8, 256] if _MIXED_QUICK_MODE else [1, 8, 256, 1024])
+@pytest.mark.parametrize("case", ["zero", "one", "before", "exact", "after", "rounds"])
+def test_spmv_csr_rowqueue_strided_grid_boundaries(dtype, output_dtype, grid_blocks, case,
+                                                monkeypatch, record_property):
+    from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+
+    alg = "csr_short_rowqueue_strided_vector"
+    queued = {"zero": 0, "one": 1, "before": grid_blocks - 1, "exact": grid_blocks,
+              "after": grid_blocks + 1, "rounds": 2 * grid_blocks + 3}[case]
+    # Even zero queued rows have positive capacity greater than the grid limit.
+    # Varied row lengths/signs expose accumulator leakage across consumer rounds.
+    lengths = [0, 1, 7, 32] * (grid_blocks + 2)
+    lengths += [33 + 64 * (j % 3) for j in range(queued)]
+    a, i, p, x, shape = _native_case(lengths, dtype, torch.int64, torch.int32, n=19)
+    values = (torch.arange(a.numel(), device=a.device) % 7 - 3).float() / 16
+    a.copy_((torch.complex(values, values / 2) if dtype.is_complex else values).to(dtype))
+    x_storage = torch.ones(x.numel() * 3, dtype=dtype, device=x.device)
+    vector = x_storage[::3]
+    vector.fill_(0.5 + 0.25j if dtype.is_complex else 0.5)
+    originals = [v.clone() for v in (a, i, p)]
+    backing = torch.full((shape[0] * 3,), float("nan"), dtype=output_dtype, device=a.device)
+    out = backing[::3]
+    config = dict(grid_blocks=grid_blocks, short_row_threshold=32, block_nnz=64)
+    captures = []
+    consumer = kernels.short_rowqueue_strided_vector_kernel
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            launch = consumer[grid]
+            def call(*args, **kwargs):
+                captures.append((grid, args[5], args[6]))
+                return launch(*args, **kwargs)
+            return call
+    monkeypatch.setattr(kernels, "short_rowqueue_strided_vector_kernel", CaptureLaunch())
+    def forbidden(*args, **kwargs):
+        raise AssertionError("bounded row queue must not enter split/global-plan paths")
+    monkeypatch.setattr(kernels, "build_plan", forbidden)
+    for key, value in dict(algorithm=alg, a_dtype=str(dtype), rhs_dtype=str(dtype), output_dtype=str(output_dtype),
+                           compute_dtype="float64" if dtype in (torch.float32, torch.float64, torch.complex128) else "float32",
+                           opA="non", config=config, expected_queued_rows=queued).items():
+        record_property(key, value)
+    try:
+        prepared = _new_prepared(a, i, p, shape, alg, config=config)
+        for diagnostic in (False, True):
+            launches_before = len(captures)
+            out.fill_(float("nan"))
+            vector.neg_()
+            operand_before = vector.clone()
+            actual, meta = spmv_mod.flagsparse_spmv_csr_run(prepared, vector, out=out,
+                                                          timing=diagnostic, return_meta=True)
+            ref_dtype = torch.complex128 if dtype.is_complex else torch.float64
+            expected = golden_csr(a.to(ref_dtype), i, p, vector.to(ref_dtype), shape).to(output_dtype)
+            rtol, atol = close_tolerances(output_dtype)
+            torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+            assert actual is out and meta["alg_resolved"] == alg
+            assert len(captures) - launches_before == 1 + int(diagnostic)
+            assert meta["ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+            assert meta["consumer_grid_blocks"] == min(meta["row_queue_capacity"], grid_blocks)
+            assert meta["consumer_grid_blocks"] == grid_blocks
+            assert meta["consumer_grid_limit"] == grid_blocks
+            assert meta["consumer_rounds_capacity"] == (meta["row_queue_capacity"] + grid_blocks - 1) // grid_blocks
+            assert meta["task_acquisition"] == "static_grid_stride"
+            assert meta["queue_count_readback"] is False and meta["floating_point_atomic"] is False
+            assert meta["numeric_workspace_bytes"] == 0
+            assert meta["x_stride"] == (3,) and meta["y_stride"] == (3,)
+            torch.testing.assert_close(vector, operand_before, rtol=0, atol=0)
+            # Test-only readback, after run; never part of the runtime or benchmark.
+            grid, count, row_ids = captures[-1]
+            assert grid == (grid_blocks,) and int(count.item()) == queued
+            actual_ids = row_ids[:queued].cpu().sort().values
+            expected_ids = torch.tensor([r for r, length in enumerate(lengths) if length > 32], dtype=torch.int64)
+            torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+        assert len(captures) == 3  # One full run, then full run + separate diagnostic.
+        assert len({id(v[1]) for v in captures}) == 3 and len({id(v[2]) for v in captures}) == 3
+        with pytest.raises(ValueError, match="op"):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, vector, op="trans")
+        with pytest.raises(ValueError, match="overlap"):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, vector, out=a[:shape[0]], out_dtype=dtype)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    for value, original in zip((a, i, p), originals):
+        torch.testing.assert_close(value, original, rtol=0, atol=0)
+    assert torch.isnan(backing[1::3]).all() and torch.isnan(backing[2::3]).all()
+    assert torch.equal(x_storage[1::3], torch.ones_like(x_storage[1::3]))
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("dtype,output_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32),
+    (torch.float32, torch.float32), (torch.float64, torch.float64),
+    (torch.complex64, torch.complex64), (torch.complex128, torch.complex128),
+], ids=lambda d: str(d).removeprefix("torch."))
+@pytest.mark.parametrize("parts", [1, 4, 8] if _MIXED_QUICK_MODE else [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("case", ["empty", "zero_cols", "no_queue", "single", "many", "partition_edges"])
+@pytest.mark.parametrize("index_pair", [(torch.int64, torch.int32)] if _MIXED_QUICK_MODE else [
+    (torch.int32, torch.int32), (torch.int32, torch.int64), (torch.int64, torch.int32), (torch.int64, torch.int64)])
+def test_spmv_csr_longrow_cooperative_native(dtype, output_dtype, parts, case, index_pair,
+                                           monkeypatch, record_property):
+    from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable, cooperative_queue_capacity
+
+    alg = "csr_longrow_cooperative_reduce"
+    lengths = {
+        "empty": [], "zero_cols": [0] * 11, "no_queue": [0, 1, 7, 31, 32] * 3,
+        "single": [0, 1, 32 * (parts * 4 + 1) + 1, 0, 7],
+        "many": [0, 32, 33, 1, 32 * parts + 1] * 7,
+        "partition_edges": [0, 31, 32, 33, 63, 64, 65, 32 * parts - 1, 32 * parts, 32 * parts + 1],
+    }[case]
+    config = dict(long_row_threshold=32, cooperative_parts=parts, block_nnz=32,
+                  grid_blocks=3, rows_per_program=4, lanes_per_row=8)
+    a, i, p, x, shape = _native_case(lengths, dtype, *index_pair, n=0 if case == "zero_cols" else 19)
+    # Binary-exact signed products permit inspection of every independent part,
+    # including empty parts. Existing cancellation tests retain the shared oracle.
+    values = ((torch.arange(a.numel(), device=a.device) % 7) - 3).float() / 16
+    a.copy_((torch.complex(values, -values / 2) if dtype.is_complex else values).to(dtype))
+    storage = torch.ones(x.numel() * 3, dtype=dtype, device=x.device)
+    vector = storage[::3]
+    vector.fill_(0.5 + 0.25j if dtype.is_complex else 0.5)
+    saved = [v.clone() for v in (a, i, p, vector)]
+    backing = torch.full((shape[0] * 3,), float("nan"), device=x.device, dtype=output_dtype)
+    out = backing[::3]
+    captures = []
+    consumer = kernels.cooperative_row_consumer_kernel
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            launch = consumer[grid]
+            def call(*args, **kwargs):
+                # Test-only poisoning: all consumed slots must be explicitly
+                # written by their owner, including parts with no NNZ.
+                args[6].fill_(float("nan"))
+                captures.append((grid, args[4], args[5], args[6]))
+                return launch(*args, **kwargs)
+            return call
+    monkeypatch.setattr(kernels, "cooperative_row_consumer_kernel", CaptureLaunch())
+    def forbidden(*args, **kwargs):
+        raise AssertionError("cooperative rows must not use segment descriptors or another algorithm")
+    for name in ("build_plan", "run_longrow_queue", "run_longrow_grid", "run_short_rowqueue_strided"):
+        monkeypatch.setattr(kernels, name, forbidden)
+    for key, value in dict(algorithm=alg, a_dtype=str(dtype), rhs_dtype=str(dtype), output_dtype=str(output_dtype),
+                           compute_dtype=spmv_mod._csr_config.compute_dtype(alg, dtype),
+                           component_dtype="float64" if dtype in (torch.float32, torch.float64, torch.complex128) else "float32",
+                           opA="non", config=config, implementation_version=1).items():
+        record_property(key, value)
+    try:
+        prepared = _new_prepared(a, i, p, shape, alg, config=config)
+        stats = cooperative_queue_capacity(shape[0], a.numel(), prepared.config, dtype)
+        grid = min(stats["row_queue_capacity"], config["grid_blocks"])
+        ref_dtype = torch.complex128 if dtype.is_complex else torch.float64
+        expected = golden_csr(a.to(ref_dtype), i, p, vector.to(ref_dtype), shape).to(output_dtype)
+        rtol, atol = close_tolerances(output_dtype)
+        for diagnostic in (False, True):
+            before = len(captures)
+            out.fill_(float("nan"))
+            actual, meta = spmv_mod.flagsparse_spmv_csr_run(prepared, vector, out=out,
+                                                          out_dtype=output_dtype, timing=diagnostic, return_meta=True)
+            torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+            assert actual is out and meta["alg_resolved"] == alg
+            assert len(captures) - before == (1 + int(diagnostic)) * bool(grid)
+            assert meta["ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+            assert meta["cooperative_parts"] == parts and meta["row_grid_blocks"] == grid
+            assert meta["consumer_grid_blocks"] == grid * parts
+            assert meta["floating_point_atomic"] is False and meta["queue_count_readback"] is False
+            assert meta["task_acquisition"] == "static_grid_stride_parts"
+            assert meta["plan_strategy"] == "per_run_row_ids_fixed_parts"
+            for key, value in stats.items():
+                assert meta[key] == value
+            if grid:
+                launch_grid, count, row_ids, partial = captures[-1]
+                assert launch_grid == (grid, parts)
+                q = int(count.item())  # Accuracy-only reads after run.
+                expected_ids = [r for r, length in enumerate(lengths) if length > 32]
+                ids = row_ids[:q].cpu().tolist()
+                assert sorted(ids) == expected_ids and q == len(expected_ids)
+                used = partial[:q * parts * (2 if dtype.is_complex else 1)].cpu()
+                assert torch.isfinite(used).all()
+                if dtype.is_complex:
+                    used = torch.view_as_complex(used.reshape(q, parts, 2))
+                else:
+                    used = used.reshape(q, parts)
+                ptr_cpu, values_cpu, col_cpu, rhs_cpu = p.cpu(), a.to(ref_dtype).cpu(), i.long().cpu(), vector.to(ref_dtype).cpu()
+                for slot, row in enumerate(ids):
+                    start, stop = int(ptr_cpu[row]), int(ptr_cpu[row + 1])
+                    chunks = (stop - start + 31) // 32
+                    for part in range(parts):
+                        begin = min(stop, start + (chunks * part // parts) * 32)
+                        end = min(stop, start + (chunks * (part + 1) // parts) * 32)
+                        reference = (values_cpu[begin:end] * rhs_cpu[col_cpu[begin:end]]).sum().to(used.dtype)
+                        torch.testing.assert_close(used[slot, part], reference, rtol=0, atol=0)
+        # High-level prepared call reaches the same implementation and output.
+        actual = spmv_mod.flagsparse_spmv_csr(prepared=prepared, x=vector, out=out, out_dtype=output_dtype)
+        assert actual is out
+        torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+        if grid:
+            assert len(captures) == 4
+            for position in (1, 2, 3):
+                assert len({id(record[position]) for record in captures}) == 4
+        with pytest.raises(ValueError, match="op"):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, vector, op="trans")
+        with pytest.raises(ValueError):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, vector, config={"cooperative_parts": 2 if parts != 2 else 4})
+        if a.numel() >= shape[0] > 0:
+            with pytest.raises(ValueError, match="overlap"):
+                spmv_mod.flagsparse_spmv_csr_run(prepared, vector, out=a[:shape[0]], out_dtype=dtype)
+        too_small = dict(config, workspace_limit_bytes=stats["workspace_peak_bytes"] - 1)
+        small = _new_prepared(a, i, p, shape, alg, config=too_small)
+        with pytest.raises(ValueError, match="workspace"):
+            spmv_mod.flagsparse_spmv_csr_run(small, vector, out=out, out_dtype=output_dtype)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    for original, snapshot in zip((a, i, p, vector), saved):
+        torch.testing.assert_close(original, snapshot, rtol=0, atol=0)
+    assert torch.isnan(backing[1::3]).all() and torch.isnan(backing[2::3]).all()

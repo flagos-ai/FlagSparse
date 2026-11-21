@@ -580,3 +580,187 @@ S=0及阈值边界、重复run、宽输出、strided x/out、NaN覆盖、容量�
 同时报告各算法自身收益与加入新候选后的逐矩阵最优GM、胜出占比及回退；
 无有效baseline时只报告自身相对改进。保留精度FAIL的有效时间及独立准确性状态。
 完整命令仅在对话提供。源码接入与静态审查不代表Triton编译、正确性或性能已通过。
+
+## 14. 有界consumer独立算法：csr_short_rowqueue_strided_vector
+
+### 14.1 数据依据和实施边界
+
+11.21消融中，neos3在S32/S128均只有一条排队行，但启动容量分别为62273/15930；
+wheel_601均有602条排队行，容量分别为65782/16828。分类相同而consumer时间下降，
+表明空program调度成本值得单独验证。原算法S128在FP16/BF16宽输出下只让整个算法族
+最佳GM提升约1.98%/1.87%，主要胜出集中于上述矩阵，mip1仍弱于旧分段队列。
+
+新增 `csr_short_rowqueue_strided_vector`，保留 `csr_short_rowqueue_vector` 的kernel、
+launch、默认S32和所有其他算法默认路由。共用不修改的短行producer及乘积helper；
+新consumer和run函数独立。目标是减少按保守容量启动的空program，不宣称解决单条
+超长行的跨program并行，也不引入任务领取atomic、GPU计数读回、跨调用缓存或调优器。
+
+### 14.2 核心实现与正确性
+
+队列容量仍为 `C=min(M, floor(nnz/(S+1)))`。新consumer实际grid为
+`G=min(C, grid_blocks)`；C为0时不启动consumer。
+
+每个program加载已经完成的producer计数Q，按 `slot=pid, pid+G, pid+2G, ... < Q`
+处理队列。每轮加载一条完整行，重置实/虚两个lane累加器，按实际行长执行K-lane
+加载与累加，然后统一归约并按实际out stride写回。slot、G、地址和行指针计算为int64；
+队列计数仍使用已检查范围的int32。
+
+对每个合法slot，`pid=slot mod G`、`round=floor(slot/G)`唯一，因此无重复或遗漏任务。
+producer仅写短行，consumer仅写排队行；两者输出互斥，不需要浮点atomic或最终归并。
+三阶段按同一实际执行流顺序提交，不使用自旋或跨program屏障。
+
+该改动不减少行号队列的分配容量，不消除计数器初始化及producer开销。Q为0但C大于0
+时仍启动G个空program。G太小会增加串行轮数；固定步长也可能在行长高度不均时形成
+尾部等待。任务顺序由producer整数atomic决定，不能假定全局按行号有序。
+
+### 14.3 配置、数值、接口与诊断
+
+| 字段 | 新算法默认 | 含义 |
+|---|---:|---|
+| short_row_threshold | 128 | 沿用11.21较好阈值作为实验起点 |
+| rows_per_program | 64 | producer每program行数 |
+| block_nnz | 128 | consumer每行lane块长 |
+| grid_blocks | 256 | consumer program上限，显式整数1–1024 |
+| producer_num_warps / num_warps | 2 / 4 | 沿用后端合法launch筛选 |
+| num_stages | 1 | 不新增流水因素 |
+| workspace_limit_bytes | 268435456 | 仍约束8*C+4字节队列空间 |
+
+主要性能候选为grid_blocks=128/256/512/1024；更小整数用于正确性边界及机制控制。
+显式非法参数报错；`grid_blocks`不能传给旧算法。配置解析仅复用旧字段校验，不改变
+旧算法解析结果，不跨算法继承prepared配置。运行不缓存任务队列。
+
+仍仅声明CUDA/ROCm、non、FP16/BF16/FP32/FP64/complex64/complex128。
+半精度计算和中间累加FP32，输出可为同类型或FP32；FP32输入计算FP64，FP64保持FP64，
+complex64/128分别按FP32/FP64分量计算。宽输出不先窄化。合法索引、strided x/out、
+原始存储重叠检查及同算法索引回退沿用主库契约。trans/conj明确不支持；不以旧转置
+路径冒充新算法。原高层API、prepare/run、查询、compare和两级导出不新增专属函数。
+
+新增元数据：`consumer_grid_limit`为请求上限，`consumer_grid_blocks`为实际启动数量，
+`consumer_rounds_capacity=ceil(C/G)`为容量轮数上界（C为0时为0），不是实际任务轮数。
+`task_acquisition=static_grid_stride`。regular和mixed CSR CSV均保存这些字段。
+benchmark在已有CPU结构诊断中另算实际Q、有效program比例、每program任务数与最大轮数，
+明确属于CPU结构模型，不在正常run额外同步GPU。复数沿用现有指标模型的限制，
+若逻辑吞吐/带宽不可用仍记录原因及有效计时。
+
+计时保持完整 `ms=process_cpu_ms+gpu_ms`，CPU process正常为0。init包含计数器清零、
+必要视图物化；producer同时分类和短行计算，consumer属于compute；无finish。
+完整测量与诊断仍是独立run；开启timing会发生额外诊断执行及独立队列重建。
+所有初始化、队列构建、计算和写回留在run内，不改变baseline和精度FAIL性能记录规则。
+
+### 14.4 原测试链路与后续验收
+
+原CSR accuracy参数化加入新名称，覆盖六dtype、四种半精度组合、合法索引、输出精度、
+空维度、空行、长短行混杂、重复调用、非法配置、op冲突、存储重叠和安全索引回退。
+新增grid边界用例使用Q=0/1/G-1/G/G+1/2G+3；G=1/8/256，normal增加1024。
+使用不同长度及符号的行，检查每轮累加器清零、任务唯一性、strided输入/NaN输出、
+返回对象身份及未改输入。测试内可在run结束后读回队列验证，不进入算子或性能计时。
+启动捕获检查一次完整run及额外诊断分别创建新队列，实际grid不超过上限。
+
+纯Python策略测试增加配置隔离、旧默认保持、能力筛选、无浮点atomic要求及结构模型。
+原runner、marker、GPU CI和benchmark按已有注册机制枚举新名称，无新入口或Python文件。
+
+性能实验须先固定S128/R64/K128，对照旧队列S128及新G128/256/512/1024。
+不能只比较旧默认S32和新默认S128并把阈值收益归给有界grid。compare继续提供全部旧
+算法对照；算法族旧最佳应同时纳入本轮旧S128控制结果，再计算加入新候选后的最佳GM。
+regular四类型、mixed四组合分别测试，保留厂商baseline、吞吐/逻辑带宽和阶段诊断。
+先小样本准确性，再单矩阵，最后30矩阵。胜出矩阵交错重复以排除11.21已观察到的批次差异。
+
+源码审查基线为zyq_sparse的1ea86738d65f4f8ff2f02c3ab90b511b3542bcb6；初始工作区干净。
+当前仅静态审查，Triton编译、准确性及性能均待计算节点验收。完整测试命令只在对话提供，
+本轮不暂存提交，不切默认，不把容量缩小等同于硬件性能已提升。
+
+## 15. 长行固定协作归约：csr_longrow_cooperative_reduce
+
+### 15.1 与有界consumer同时保留，分别检验
+
+本候选与第14节同时接入原算法族，不替换彼此或任何旧算法。第14节减少空consumer启动；
+本节针对一条长行不能跨program并行的问题。二者均为CSR SpMV non独立算法，当前不扩展
+转置生命周期。支持FP16/BF16同类型及FP32输出、FP32、FP64、complex64、complex128。
+半精度计算/部分和为FP32，FP32输入按原新CSR策略使用FP64，复数使用对应分量精度。
+
+11.21的BF16宽输出中，mip1原队列算法约0.2257ms，而整行队列S128约0.2625ms；
+wiki-Talk原NNZ-local约0.2624ms，整行队列约0.3756ms。排队行分别承载约83.16%和83.55%的NNZ。
+这些结果支持继续研究行内并行，不能据此认定根因已经是HBM、寄存器或atomic竞争。
+目标必须由本次同条件实测确认，不把上述旧数据作为新实现收益。
+
+### 15.2 执行与正确性不变量
+
+每次run顺序执行初始化、producer、consumer、finish，使用当前执行流，kernel边界负责
+跨program可见性，不使用自旋屏障。
+
+1. 初始化一个int32队列计数器，分配int64行号队列及计算精度部分和。部分和使用empty，
+   不做全容量清零；consumer必须写完所有被finish读取的槽位，包括零工作分区。
+2. producer处理R行×V个lane。长度不超过L的行按实际组内最大普通行长度分块向量累加，
+   最终沿V归约写输出；空行写零。长度超过L的行仅入队，整数scan和一次组级整数atomic
+   取得独占队列位置，不计算这些行的乘积、不展开segment描述符。
+3. consumer的grid为(G,P)，G=min(C,grid_blocks)。每个program处理队列位置
+   pid0、pid0+G、…，固定pid1=p负责该行第p个协作区间。每次换行重置累加器。
+4. finish的grid为(G,)，按相同队列步长遍历，加载每行P个部分和归约，按实际out stride
+   写回。普通行和排队行的输出所有权互斥；每个队列位置只被一个finish program处理。
+
+设一行非零元范围为[a,b)，K为block_nnz，Q=ceil((b-a)/K)。第p个协作分区为：
+
+\[
+u_p=a+K\lfloor Qp/P\rfloor,\quad
+v_p=\min(b,a+K\lfloor Q(p+1)/P\rfloor).
+\]
+
+相邻区间端点连续，首端为a、末端覆盖b，各区间互斥，K块数量相差至多1。空区间写零，
+其余区间从u_p按K递增并屏蔽v_p后的lane。不同program写PARTIAL[slot,p]独占位置；
+复数分量分开存储。finish只读取slot<count的所有P个位置，因此不会读到未写的容量尾部。
+所有指针、队列位置、chunk数量和乘法地址使用int64；int32只用于已检查上限的队列计数。
+
+与旧方案的实质差别：整行vector没有行内跨program并行；旧longrow队列生成逐段任务并
+通过浮点atomic合并；本候选只保存行号，段边界在consumer内算出，固定P槽位独占写入。
+固定P牺牲可变段数的粒度适配，换取简单计划与无浮点atomic归并。
+
+### 15.3 配置、空间与可观测信息
+
+| 字段 | 起始值 | 合法范围/用途 |
+|---|---:|---|
+| long_row_threshold | 1024 | 整数0至1048576；性能优先256/512/1024/2048/4096 |
+| cooperative_parts | 8 | 1/2/4/8/16；P=1是无跨program协作控制组 |
+| grid_blocks | 128 | 1至1024；这是队列行维上限，不是总consumer数量 |
+| rows_per_program | 8 | 4/8/16/32，producer同时处理行数 |
+| lanes_per_row | 16 | 2/4/8/16/32/64，受subgroup宽度限制 |
+| block_nnz | 128 | 32/64/128/256，consumer分区中的向量宽度 |
+| producer_num_warps | 2 | 后端合法集合；也用于finish |
+| num_warps | 4 | consumer合法warp数 |
+| num_stages | 1 | 本轮固定 |
+| workspace_limit_bytes | 268435456 | 描述符与数值临时空间合计上限 |
+
+起始值未调优；显式非法参数报错。CUDA/ROCm能力来自现有对象，要求int64、归约、scan和
+整数atomic；FP64计算按实际类型检查，不要求浮点atomic支持。
+
+队列容量C=min(M,floor(nnz/(L+1)))。数值空间为C×P×每部分和字节数，描述符为8C+4字节。
+复数部分和计两个实数分量。总量超限直接报错，不自动降低P、不隐式分批或换算法。
+输出及已有输入不算临时workspace；resolve_conj/neg沿用原路径处理，必要物化仍在run内。
+
+新增元数据包含cooperative_parts、row_grid_blocks、partial_slot_capacity，以及数值/描述符
+空间。consumer_grid_blocks=G×P，consumer_grid_limit=配置grid_blocks×P；
+consumer_rounds_capacity=ceil(C/G)，不是实际任务轮数。正常run不为统计读回GPU计数。
+benchmark在计时外计算cooperative_queue结构模型：实际超阈值行数、NNZ占比、预计非空/空
+协作任务数量及行维轮数；GPU入队顺序不确定，不根据CPU行序伪造worker尾时或占用率。
+
+### 15.4 成本假设与验证顺序
+
+可能减少：单条长行的串行计算尾部、逐segment描述符、任务领取atomic及浮点atomic竞争。
+新增：P份行指针读取、C×P部分和空间、独立finish及空分区写零。P太大或长行太少且很短时，
+固定成本可能占优；大量长行时G过小也可能形成串行轮次。普通行producer仍存在组内等待。
+不声称此方案必胜NNZ-local或旧动态队列，更不把它当作所有不均匀矩阵的统一答案。
+
+原accuracy新增全部8种输入/输出对、P=1/4/8（normal增加2/16）、空维度、无长行、单长行、
+多轮队列、L/K/P分区边界及混合索引；使用NaN部分和检查空分区写零，并按行逐part检查
+贡献范围。覆盖strided输入/out、宽输出、别名拒绝、容量不足、重复run、独立诊断和安全回退。
+配置/能力/结构模型测试扩展原policy文件，原marker与runner入口不变。
+
+先过smoke，再regular/mixed分别对全部矩阵compare，同时包含有界consumer和本候选。
+固定L1024/G128/K128，只改变P=1/2/4/8/16；下一步固定有效P再改变L，不同时改全部参数。
+重点分析mip1/wiki-Talk的consumer与finish，以及neos3/wheel等少量异常行；短行和小矩阵
+继续记录回退。P>1必须胜过同候选P=1才能归因于协作；还须超越旧算法族最佳才算增加整体
+覆盖。固定条件报告GM/AM、胜出比例、回退和准确性，FAIL的有效耗时按既有规则保留。
+保留cuSPARSE baseline、吞吐及逻辑带宽，完整时间仍为cpu+gpu，诊断另行运行。
+
+当前交付为源码接入，GPU编译、准确性和实际收益均未验证。沿用第14节基线commit，保留
+已完成的有界consumer未提交改动，不改变旧计算体、默认配置、C API JIT契约或默认路由。
+完整计算节点命令仅在对话提供，不新增Python文件，不暂存提交。
