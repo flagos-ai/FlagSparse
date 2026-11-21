@@ -450,3 +450,133 @@ bash tools/run_cuda_tests.sbatch --repo "$PWD" -- \
 源码/AST/diff检查不是Triton编译验证。未运行任何算子、pytest、功能导入或离线编译；无CUDA/ROCm通过声明。原11.18 CSR smoke只有summary、不含失败traceback，尚不能定位或宣称修复；需保留该任务的pytest完整日志（不能仅summary）。这不阻断独立COO候选源码接入，但在CSR长尾性能结论前必须解决。
 
 验收分三项独立记录：源码接线完成、实机正确性通过、性能假设成立。当前只有第一项完成；baseline描述符修复等待复测，BF16数值/慢路径仍待厂商诊断数据。
+
+## 12. 11.19 数据反馈与 2026-11-21 定向修复
+
+本节记录第11节之后的状态，原实验记录保留。修复前目标库为
+`zyq_sparse`，HEAD=`37b9c3b4e7843e6528053be00de67b0d7b9bd1c4`，工作区干净。
+数据分析在工作区 `test_mixed_data/11.19-data/analysis/REPORT.md`；
+性能 FAIL 的有效时间仍保留，不能以整体最优有提升代替数值验收。
+
+### 12.1 NNZ local 编译修复
+
+`nnz_local_reduce_atomic_kernel` 的 single-owner 快捷路径是运行时分支：
+快捷分支的 start/stop 是标量，分段分支的同名变量是 `[T]`。
+Triton 3.6 在分支合流时拒绝形状不同的同名变量。11.19 的 quick 206 个失败、
+normal 494 个失败均报告此错误，尚无该实现的有效性能结论。
+
+将标量边界命名为 `single_start/single_stop`，向量边界命名为
+`row_starts/row_stops`。仅隔离分支局部变量，不改变 upper-bound、分段 scan、
+完整行 store、跨界 atomic、计算精度、输出缓冲、转置生命周期及计时范围。
+仅该算法的 `implementation_version` 提升为2；所有默认配置和路由保持原样。
+
+原 `test_spmv_csr_nnz_local_native` 增加 full-search + fast-path 的配置。
+原准确性文件增加 `test_spmv_csr_nnz_local_branch_regression`：同一 launch
+包含完整单行tile、1+127跨行tile、跨三个tile的长行、尾部padding和连续空行，
+分别测试 bounded/full、boundary/all、BF16宽输出与complex128。
+原case继续覆盖其它dtype、op、索引、fallback与out，不新增测试入口。
+policy测试校验默认配置未改、显式fast/search参数完整传递、实现版本可查询。
+
+### 12.2 scalar-bound/strip 长行误差：保留失败，补充可辨析证据
+
+normal另有16个数值失败，均在BF16→FP32的第155行（长度8193），涉及
+`csr_row_scalar_bound/strip`、默认/32行配置及四种索引组合。
+记录的最大相对差约1.6182e-6，超过共享rtol=1.3e-6；不能简单归为容差问题。
+
+本轮不改这两个旧kernel、不更换测试输入、不新增xfail/skip、不提高计算精度、
+不放宽容差。原short-row测试失败后，针对最差的半精度→FP32行，在CPU用
+同一存储输入诊断：顺序FP32累加、显式树形FP32累加、FP64参考、乘积绝对值和、
+归一化误差及GPU结果是否与顺序FP32完全相同。数据写入既有pytest JSON的
+`properties.short_row_numerics`，然后重新抛出原断言，结果仍为FAIL。
+只在准确性失败后执行诊断，不进入算子或benchmark计时，也不修改公共接口。
+
+若GPU匹配顺序FP32且树形误差明显改善，才有证据规划独立的长行数值稳健版本；
+若不匹配，则优先检查实际乘加顺序、编译融合、地址和覆盖。CPU诊断不是
+GPU指令序列证明，仍需计算节点验证。本轮不把尚未运行的诊断称为已定位数值根因。
+
+### 12.3 后续验收与范围
+
+先复测分支回归及原NNZ-local quick，再运行normal NNZ/short-row；normal不应
+在第一个数值FAIL处终止，以保留所有失败诊断。NNZ编译/正确性通过后，再进行
+一个真实矩阵及完整性能对照。原runner、marker、benchmark无需新增开关或入口，
+CUDA继续通过既有sbatch包装脚本，完整命令仅在对话提供。
+
+本地仅做AST与diff检查；未运行算子、pytest、功能导入或离线编译，未暂存提交。
+环境挂载断连和cuSPARSE窄输出慢路径未因本次源码修复而得到解决；
+COO转换/分类和CSR参数消融继续按原报告建议推进，不与编译修复混算收益。
+
+## 13. CSR non 独立候选：csr_short_rowqueue_vector
+
+### 13.1 优化对象与区别
+
+11.19数据提示，CSR不应只增加超长行分段版本。mip1平均行长约155.77，
+129–1024区间含有大量NNZ；旧1024阈值的长行队列只迁走约2.12%的NNZ。
+wheel_601最大行长602，旧阈值不会迁走任何行；其64行组的逻辑槽位利用率约8.47%。
+这意味着中长行拖住多行组也值得独立优化。neos3则是多数极短行、少数长行，
+不能仅凭最大行长把整矩阵划为超长行负载。
+
+本轮新增 `csr_short_rowqueue_vector`，不更改旧kernel、默认配置或路由。
+其思路是**短行标量并行、超过阈值的整行排队后独立向量归约**。
+与 `csr_longrow_queue_atomic/grid_atomic` 的区别是队列只有行号，不含分段描述符，
+不分配数值部分和、不做浮点atomic、不启动最终归并kernel。
+与 `row_vector` 的区别是空行和短行不各占一个program；与scalar-bound的区别是
+超过阈值的行不再延长短行组的循环。它不是超长单行跨program并行方案。
+
+### 13.2 执行步骤与正确性
+
+1. 每次run创建一个int32计数器和int64行号队列，只清零计数器。
+2. producer每program负责R个连续行。长度大于S的行用整数cumsum及每组一次整数
+   atomic取得队列槽位；其余行以标量链计算。循环上限是本组普通行最大长度，不超过S。
+3. consumer每program处理一条排队的完整行，以K个lane按实际行长循环，末尾归约写回。
+   producer与consumer在同一实际执行流顺序提交，无设备自旋或跨program屏障。
+4. 两条路径按 `length <= S` 与 `length > S` 完整互斥。空行由producer写零；
+   所有输出仅有一个最终写入者，因此无需清零完整输出，也无需数值归并。
+
+每条排队行至少含S+1个NNZ，队列容量上界为
+`C = min(M, floor(nnz / (S + 1)))`。consumer启动C个program，在设备上读实际计数，
+多余program立即退出；不为了缩小grid读回计数。C超过int32计数可表示范围时明确报错。
+描述符峰值为 `8*C+4` 字节，数值工作空间为0；本算法的workspace限额同时约束描述符。
+容量不是有效排队行数。benchmark的CPU结构诊断另外记录实际排队行/NNZ比例及
+有效program/容量比，明确标为结构模型，不混称GPU运行时读回数据。
+
+FP16/BF16乘法前提升FP32，部分和全程FP32；支持同类型或FP32输出。
+FP32输入保持现有新CSR路径FP64计算，FP64保持FP64；complex64/128分别使用
+FP32/FP64实虚分量。复数分量分别归约，直接按真实x/out stride访问，最终store才窄化。
+长行采用lane子序列累加后归约，求和顺序不同于短行标量链，需沿用原容差验证。
+
+### 13.3 配置、开销与验收
+
+| 参数 | 默认 | 显式候选 |
+|---|---:|---|
+| rows_per_program | 64 | 32/64/128 |
+| short_row_threshold | 32 | 0/8/16/32/64/128/256 |
+| block_nnz | 128 | 64/128/256 |
+| producer_num_warps | 2 | 已知合法launch集合 |
+| num_warps | 4 | 已知合法launch集合 |
+| num_stages | 1 | 1 |
+| workspace_limit_bytes | 268435456 | 显式正整数 |
+
+S=0是全部非空行排队的控制组。默认warp依现有后端能力选择合法保守值；显式非法
+参数拒绝，不裁剪。首版仅声明CUDA/ROCm、non、六种dtype及四种半精度组合。
+需要整数scan/atomic和归约能力；不要求FP32/FP64浮点atomic，FP64计算能力仍按类型检查。
+
+代价包括计数器初始化、队列写入和第二次launch，以及保守容量中的空program。
+均匀短行通常没有理由胜过无队列的scalar-bound；只有少数超长行时，一个consumer
+独占一整行仍可能成为尾部瓶颈。大容量低利用率或超长单行应继续对照NNZ/split算法。
+本算法的预期收益来自短行不等待中长行及更少的计划/数值归并开销，不能在实测前宣称提速。
+
+计时仍为 `ms=process_cpu_ms+gpu_ms`，完整run含全部初始化、producer、consumer。
+诊断 `init_ms` 归处理；producer同时分类与短行计算，记 `fused_plan_compute_ms`，
+不能把producer全当纯分类时间。`compute_ms=producer_ms+consumer_ms` 仅是另次诊断，
+不覆盖完整事件耗时；`finish_ms=0`。
+
+原API、compare、runner、支持表和原CSR准确性文件接入新名称。测试覆盖六种dtype、
+四种半精度组合、合法混合索引、空行/零行矩阵、满队列、602/713中长行、单超长行、
+S=0及阈值边界、重复run、宽输出、strided x/out、NaN覆盖、容量不足和同算法索引回退。
+非non操作按规格明确拒绝；无新顶层API和新测试入口。
+
+计算节点先运行新名称的小样本准确性，再以相同输入对照scalar-bound、row_vector、
+旧queue/grid与新候选。先固定R64/K128比较S8/32/128/256，随后固定S比较K。
+同时报告各算法自身收益与加入新候选后的逐矩阵最优GM、胜出占比及回退；
+无有效baseline时只报告自身相对改进。保留精度FAIL的有效时间及独立准确性状态。
+完整命令仅在对话提供。源码接入与静态审查不代表Triton编译、正确性或性能已通过。

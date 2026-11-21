@@ -142,7 +142,7 @@ def test_coo_runclass_candidates_use_existing_delivery():
 
 def test_short_csr_and_partition_csc_use_original_delivery():
     for op, names in {
-        "spmv_csr": ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_longrow_queue_atomic", "csr_row_scalar_tail_reduce", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic"),
+        "spmv_csr": ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_longrow_queue_atomic", "csr_row_scalar_tail_reduce", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector"),
         "spmv_csc": ("csc_col_scalar_bound", "csc_col_scalar_tail_reduce"),
         "spmm_csc": ("csc_col_partition_panel_atomic",),
     }.items():

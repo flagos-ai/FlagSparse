@@ -20,6 +20,18 @@ def test_irregular_spmv_profiles_and_capabilities():
     caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True,
                               scan=True, fp32_atomic=True, fp64_atomic=True, int32_atomic=True)
     local, grid = "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic"
+    assert policy.algorithm_spec(local)["implementation_version"] == 2
+    # Fixing the runtime branch typing does not change launch defaults or turn
+    # the single-owner shortcut into a different algorithm selection.
+    defaults, _ = policy.resolve_config(local, caps)
+    assert defaults == dict(block_nnz=256, owner_search="bounded", single_row_fastpath=True,
+                            atomic_mode="boundary", num_warps=4, num_stages=1)
+    for search in ("bounded", "full"):
+        for fast in (False, True):
+            supplied = dict(owner_search=search, single_row_fastpath=fast)
+            cfg, source = policy.resolve_config(local, caps, supplied)
+            assert cfg == dict(defaults, **supplied) and source == "explicit"
+            assert supplied == dict(owner_search=search, single_row_fastpath=fast)
     for alg in (local, grid):
         for dtype in policy.VALUE_DTYPES:
             for op in policy.algorithm_spec(alg)["ops"]:
@@ -46,10 +58,50 @@ def test_irregular_spmv_profiles_and_capabilities():
         policy.assert_route_match(local, policy.resolve_config(local, caps)[0], grid, None, caps)
 
 
+def test_short_rowqueue_policy_capacity_and_no_fp_atomic_requirement():
+    from dataclasses import replace
+    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True,
+                              scan=True, fp32_atomic=False, fp64_atomic=False, int32_atomic=True)
+    alg = "csr_short_rowqueue_vector"
+    assert policy.algorithm_spec(alg)["ops"] == ("non",)
+    for dtype in policy.VALUE_DTYPES:
+        policy.validate_support(alg, "non", dtype, "int64", "int32", caps)
+    for op in ("trans", "conj"):
+        with unittest.TestCase().assertRaises(NotImplementedError):
+            policy.validate_support(alg, op, "float16", "int32", "int32", caps)
+    cfg, _ = policy.resolve_config(alg, caps)
+    assert cfg["short_row_threshold"] == 32 and cfg["block_nnz"] == 128
+    for invalid in ([], "", 0):
+        with unittest.TestCase().assertRaises(TypeError):
+            policy.resolve_config(alg, caps, invalid)
+    for threshold in (0, 8, 16, 32, 64, 128, 256):
+        resolved, _ = policy.resolve_config(alg, caps, {"short_row_threshold": threshold})
+        for lengths in ([], [0] * 19, [0, 4, 128, 602, 713, 1024], [threshold + 1] * 129):
+            result = policy.short_rowqueue_capacity(len(lengths), sum(lengths), resolved)
+            assert sum(n > threshold for n in lengths) <= result["row_queue_capacity"] <= len(lengths)
+            assert result["numeric_workspace_bytes"] == 0
+            assert result["workspace_peak_bytes"] == result["row_queue_capacity"] * 8 + 4
+    for invalid in ({"segment_nnz": 128}, {"worker_programs": 64}, {"short_row_threshold": True},
+                    {"short_row_threshold": 33}, {"rows_per_program": 16}, {"block_nnz": 32},
+                    {"workspace_limit_bytes": 0}, {"num_stages": 2}):
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config(alg, caps, invalid)
+    for feature in ("scan", "int32_atomic"):
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.resolve_config(alg, replace(caps, **{feature: None}))
+    with unittest.TestCase().assertRaises(ValueError):
+        policy.short_rowqueue_capacity(2**31, (2**31) * 33, cfg)
+    with unittest.TestCase().assertRaises(ValueError):
+        policy.short_rowqueue_capacity(3, 99, dict(cfg, workspace_limit_bytes=27))
+    assert policy.short_rowqueue_capacity(3, 99, dict(cfg, workspace_limit_bytes=28))["row_queue_capacity"] == 3
+    with unittest.TestCase().assertRaises(ValueError):
+        policy.assert_route_match(alg, cfg, "csr_longrow_queue_atomic", None, caps)
+
+
 def test_irregular_spmv_execution_has_no_host_plan_reads():
     tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    for name in ("run_nnz_local_reduce", "run_longrow_grid"):
+    for name in ("run_nnz_local_reduce", "run_longrow_grid", "run_short_rowqueue"):
         calls = {n.func.attr for n in ast.walk(functions[name]) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
         assert not calls & {"item", "tolist", "nonzero", "cumsum", "repeat_interleave", "unique_consecutive"}
     owner = functions["_nnz_local_owner"]
@@ -58,6 +110,12 @@ def test_irregular_spmv_execution_has_no_host_plan_reads():
     consumer = ast.unparse(functions["longrow_grid_consumer_kernel"])
     assert "program_id" in consumer and "COUNTERS + 2" not in consumer
     assert "while" not in consumer and "PARTIAL" in consumer
+    row_consumer = ast.unparse(functions["short_rowqueue_vector_kernel"])
+    assert "atomic_add" not in row_consumer and "store" in row_consumer
+    assert "PARTIAL" not in row_consumer and "tl.load(COUNT)" in row_consumer
+    launch = ast.unparse(functions["run_short_rowqueue"])
+    assert "torch.zeros(1, dtype=torch.int32" in launch
+    assert "y.zero_" not in launch and "y.copy_" not in launch
 
 
 def test_csr_tile_structure_counts_without_device_imports():
@@ -82,6 +140,11 @@ def test_csr_tile_structure_counts_without_device_imports():
     assert empty["single_owner_tile_ratio"] is None and empty["ratio_reason"] == "no_nonzeros"
     with unittest.TestCase().assertRaises(ValueError):
         analyze([0, 2, 1])
+    row_queue = analyze([0, 0, 8, 8, 9, 10], config={"short_row_threshold": 4,
+                        "producer_num_warps": 2, "rows_per_program": 64})["row_queue"]
+    assert row_queue["expected_queued_rows"] == 1 and row_queue["row_queue_capacity"] == 2
+    assert row_queue["queued_nnz_fraction"] == 0.8
+    assert row_queue["expected_active_program_ratio"] == 0.5
 
 
 def test_coo_csc_structure_models_without_device_imports():

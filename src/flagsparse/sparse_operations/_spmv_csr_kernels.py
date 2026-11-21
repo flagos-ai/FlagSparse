@@ -58,22 +58,24 @@ def nnz_local_reduce_atomic_kernel(A, I, P, X, Y, M, NNZ, XS, YS,
         first, last = tl.full((), 0, tl.int64), tl.cast(M, tl.int64) - 1
     re, im = _short_row_product(A, I, X, pos, valid, XS, COMPLEX, ACC)
     if FAST & (first == last):
-        start = tl.load(P + first).to(tl.int64)
-        stop = tl.load(P + first + 1).to(tl.int64)
+        # Runtime branches must not merge scalar and [T] SSA values under the
+        # same name (Triton 3.6 rejects that even when they are branch-local).
+        single_start = tl.load(P + first).to(tl.int64)
+        single_stop = tl.load(P + first + 1).to(tl.int64)
         _nnz_local_write(Y, first, tl.sum(re, 0), tl.sum(im, 0),
-                         tl.full((), True, tl.int1), (start >= begin) & (stop <= end),
+                         tl.full((), True, tl.int1), (single_start >= begin) & (single_stop <= end),
                          YS, COMPLEX, BOUNDARY)
     else:
         if BOUNDED:
             row = _nnz_local_owner(P, pos, valid, first, last, T)
         else:
             row = _nnz_local_owner(P, pos, valid, 0, M - 1, T)
-        start = tl.load(P + row, valid, 0).to(tl.int64)
-        stop = tl.load(P + row + 1, valid, 0).to(tl.int64)
-        head = (lane == 0) | (pos == start) | ~valid
+        row_starts = tl.load(P + row, valid, 0).to(tl.int64)
+        row_stops = tl.load(P + row + 1, valid, 0).to(tl.int64)
+        head = (lane == 0) | (pos == row_starts) | ~valid
         sr, si, _ = tl.associative_scan((re, im, head), 0, _nnz_local_scan)
-        tail = valid & ((pos + 1 == stop) | (pos + 1 == end))
-        _nnz_local_write(Y, row, sr, si, tail, (start >= begin) & (stop <= end),
+        tail = valid & ((pos + 1 == row_stops) | (pos + 1 == end))
+        _nnz_local_write(Y, row, sr, si, tail, (row_starts >= begin) & (row_stops <= end),
                          YS, COMPLEX, BOUNDARY)
 
 
@@ -109,6 +111,111 @@ def run_nnz_local_reduce(prepared, x, out, timing, phase):
                    output_buffer_identity="output" if direct else "compute_precision_buffer",
                    initialization="compute_target_zero", output_conversion="none" if direct else "final_copy_cast",
                    x_stride=tuple(x.stride()), y_stride=tuple(y.stride()))
+
+
+@triton.jit
+def short_rowqueue_producer_kernel(A, I, P, X, Y, COUNT, ROWS, M, XS, YS,
+                                   R: tl.constexpr, S: tl.constexpr,
+                                   COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    valid = row < M
+    starts = tl.load(P + row, valid, 0).to(tl.int64)
+    stops = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    queued = valid & (stops - starts > S)
+    flags = queued.to(tl.int32)
+    count = tl.sum(flags, 0)
+    if count > 0:
+        first_slot = tl.atomic_add(COUNT, count, sem="relaxed").to(tl.int64)
+        slots = first_slot + tl.cumsum(flags, 0).to(tl.int64) - 1
+        tl.store(ROWS + slots, row, queued)
+    ordinary = valid & ~queued
+    steps = tl.max(tl.where(ordinary, stops - starts, 0), 0)
+    re = tl.zeros((R,), ACC)
+    im = tl.zeros((R,), ACC)
+    for step in range(steps):
+        pos = starts + step
+        pr, pi = _short_row_product(A, I, X, pos, ordinary & (pos < stops), XS, COMPLEX, ACC)
+        re += pr
+        if COMPLEX:
+            im += pi
+    target = row * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * target, re, ordinary)
+        tl.store(Y + 2 * target + 1, im, ordinary)
+    else:
+        tl.store(Y + target, re, ordinary)
+
+
+@triton.jit
+def short_rowqueue_vector_kernel(A, I, P, X, Y, COUNT, ROWS, XS, YS,
+                                 K: tl.constexpr, COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    slot = tl.program_id(0).to(tl.int64)
+    # The producer launch has finished on this stream: no global spin barrier
+    # or integer task-acquisition atomic is needed in the consumer.
+    if slot < tl.load(COUNT).to(tl.int64):
+        row = tl.load(ROWS + slot).to(tl.int64)
+        start = tl.load(P + row).to(tl.int64)
+        stop = tl.load(P + row + 1).to(tl.int64)
+        lane = tl.arange(0, K).to(tl.int64)
+        re = tl.zeros((K,), ACC)
+        im = tl.zeros((K,), ACC)
+        for base in range(start, stop, K):
+            pos = base + lane
+            pr, pi = _short_row_product(A, I, X, pos, pos < stop, XS, COMPLEX, ACC)
+            re += pr
+            if COMPLEX:
+                im += pi
+        target = row * tl.cast(YS, tl.int64)
+        if COMPLEX:
+            tl.store(Y + 2 * target, tl.sum(re, 0))
+            tl.store(Y + 2 * target + 1, tl.sum(im, 0))
+        else:
+            tl.store(Y + target, tl.sum(re, 0))
+
+
+def run_short_rowqueue(prepared, x, out, timing, phase):
+    from ._spmv_csr_config import short_rowqueue_capacity
+
+    cfg = prepared.config
+    stats = short_rowqueue_capacity(prepared.n_rows, prepared.data.numel(), cfg)
+    capacity = stats["row_queue_capacity"]
+    complex_input = prepared.data.is_complex()
+    fp64 = prepared.data.dtype in (torch.float32, torch.float64, torch.complex128)
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    def initialize():
+        return (prepared.data.resolve_conj().resolve_neg(), x.resolve_conj().resolve_neg(),
+                torch.zeros(1, dtype=torch.int32, device=x.device),
+                torch.empty(capacity, dtype=torch.int64, device=x.device))
+    (data, vector, count, rows), init_ms = phase(initialize, timing)
+    view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+    common = dict(COMPLEX=complex_input, ACC=tl.float64 if fp64 else tl.float32,
+                  num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    def produce():
+        if prepared.n_rows:
+            short_rowqueue_producer_kernel[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                count, rows, prepared.n_rows, vector.stride(0), y.stride(0),
+                R=cfg["rows_per_program"], S=cfg["short_row_threshold"],
+                num_warps=cfg["producer_num_warps"], **common)
+    _, producer_ms = phase(produce, timing)
+    def consume():
+        if capacity:
+            short_rowqueue_vector_kernel[(capacity,)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                count, rows, vector.stride(0), y.stride(0),
+                K=cfg["block_nnz"], num_warps=cfg["num_warps"], **common)
+    _, consumer_ms = phase(consume, timing)
+    return y, dict(stats, process_cpu_ms=0.0, process_gpu_ms=init_ms,
+                   compute_ms=producer_ms + consumer_ms if timing else None,
+                   init_ms=init_ms, producer_ms=producer_ms, consumer_ms=consumer_ms,
+                   finish_ms=0.0 if timing else None, fused_plan_compute_ms=producer_ms,
+                   queue_count_readback=False, plan_strategy="per_run_row_ids_only",
+                   task_acquisition="static_capacity_grid", floating_point_atomic=False,
+                   initialization="queue_counter_only", output_conversion="final_store",
+                   execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                   execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                   x_stride=tuple(x.stride()), y_stride=tuple(y.stride()),
+                   output_buffer_identity="out" if out is not None else "allocated")
 
 
 @triton.jit

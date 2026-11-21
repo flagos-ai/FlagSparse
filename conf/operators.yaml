@@ -86,6 +86,7 @@ ops:
       Explicit csr_row_scalar_tail_reduce: native non, scalar prefix followed by local parallel tail reduction; six dtypes and half/bfloat16 same-type or FP32 output; no plan or atomic, hardware unverified.
       Explicit csr_nnz_local_reduce_atomic: six dtypes and half/bfloat16 wide output; non/trans/conj; fused owner lookup, single-row sum and boundary atomics; hardware unverified.
       Explicit csr_longrow_grid_atomic: six dtypes, non only; same producer and finish as queue, static-capacity GPU consumers; hardware unverified.
+      Explicit csr_short_rowqueue_vector: six dtypes and four half/bfloat16 output combinations, non only; capped scalar short rows and a per-run GPU row-id queue of whole-row vector consumers, no floating atomic or partial buffer; hardware unverified.
       Explicit csr_row_scalar_strip and csr_row_static_tile: six floating/complex dtypes, non only; independent short-row candidates, no runtime plan; half/bfloat16 support same-type or FP32 output; hardware unverified.
       Explicit csr_transpose_sharded_atomic: six floating/complex dtypes, trans/conj only; native CSR output shards with compute-precision atomics; hardware unverified.
     for:

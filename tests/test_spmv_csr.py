@@ -83,7 +83,7 @@ FIELDS = [
     "validation",
     "sample_rule",
     "owner_search", "single_row_fastpath", "atomic_mode", "nnz_tile_count",
-    "grid_capacity", "task_acquisition", "csr_structure",
+    "grid_capacity", "task_acquisition", "csr_structure", "row_queue_capacity", "floating_point_atomic",
 ]
 
 

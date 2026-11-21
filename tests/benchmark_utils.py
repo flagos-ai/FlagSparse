@@ -135,6 +135,21 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
         result["queue"] = dict(expected_long_rows=int(long_lengths.size), expected_jobs=expected,
                                job_capacity=jobs, expected_active_job_ratio=expected / jobs if jobs else None,
                                ratio_reason=None if jobs else "zero_capacity")
+    if {"short_row_threshold", "producer_num_warps", "rows_per_program"} <= cfg.keys():
+        threshold = cfg["short_row_threshold"]
+        if type(threshold) is not int or threshold < 0:
+            raise ValueError("row-queue threshold must be a nonnegative integer")
+        queued = lengths > threshold
+        capacity = min(rows, nnz // (threshold + 1))
+        queued_rows = int(np.count_nonzero(queued))
+        queued_nnz = int(lengths[queued].sum())
+        result["row_queue"] = dict(short_row_threshold=threshold,
+            expected_queued_rows=queued_rows, expected_queued_nnz=queued_nnz,
+            queued_nnz_fraction=queued_nnz / nnz if nnz else None,
+            row_queue_capacity=capacity,
+            expected_active_program_ratio=queued_rows / capacity if capacity else None,
+            ratio_reason=None if capacity else "zero_capacity",
+            count_source="cpu_structure_model_not_gpu_readback")
     return result
 
 
