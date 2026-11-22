@@ -446,6 +446,117 @@ def run_longrow_cooperative(prepared, x, out, timing, phase):
 
 
 @triton.jit
+def three_tier_producer_kernel(A, I, P, X, Y, COUNTS, MEDIUM, LONG, M, XS, YS,
+                              R: tl.constexpr, S: tl.constexpr, L: tl.constexpr,
+                              COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
+    valid = row < M
+    start = tl.load(P + row, valid, 0).to(tl.int64)
+    stop = tl.load(P + row + 1, valid, 0).to(tl.int64)
+    length = stop - start
+    short = valid & (length <= S)
+    medium = valid & (length > S) & (length <= L)
+    long = valid & (length > L)
+    medium_flags = medium.to(tl.int32)
+    medium_count = tl.sum(medium_flags, 0)
+    if medium_count > 0:
+        medium_base = tl.atomic_add(COUNTS, medium_count, sem="relaxed").to(tl.int64)
+        medium_slot = medium_base + tl.cumsum(medium_flags, 0).to(tl.int64) - 1
+        tl.store(MEDIUM + medium_slot, row, medium)
+    long_flags = long.to(tl.int32)
+    long_count = tl.sum(long_flags, 0)
+    if long_count > 0:
+        long_base = tl.atomic_add(COUNTS + 1, long_count, sem="relaxed").to(tl.int64)
+        long_slot = long_base + tl.cumsum(long_flags, 0).to(tl.int64) - 1
+        tl.store(LONG + long_slot, row, long)
+    steps = tl.max(tl.where(short, length, 0), 0)
+    re = tl.zeros((R,), ACC)
+    im = tl.zeros((R,), ACC)
+    for step in range(steps):
+        pos = start + step
+        pr, pi = _short_row_product(A, I, X, pos, short & (pos < stop), XS, COMPLEX, ACC)
+        re += pr
+        if COMPLEX:
+            im += pi
+    target = row * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * target, re, short)
+        tl.store(Y + 2 * target + 1, im, short)
+    else:
+        tl.store(Y + target, re, short)
+
+
+def run_three_tier_queue(prepared, x, out, timing, phase):
+    from ._spmv_csr_config import three_tier_queue_capacity
+
+    cfg = prepared.config
+    stats = three_tier_queue_capacity(prepared.n_rows, prepared.data.numel(), cfg, prepared.data.dtype)
+    medium_capacity, long_capacity = stats["medium_queue_capacity"], stats["long_queue_capacity"]
+    parts = cfg["cooperative_parts"]
+    long_grid = min(long_capacity, cfg["long_grid_blocks"])
+    complex_input = prepared.data.is_complex()
+    fp64 = prepared.data.dtype in (torch.float32, torch.float64, torch.complex128)
+    component = torch.float64 if fp64 else torch.float32
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    def initialize():
+        return (prepared.data.resolve_conj().resolve_neg(), x.resolve_conj().resolve_neg(),
+                torch.zeros(2, dtype=torch.int32, device=x.device),
+                torch.empty(medium_capacity, dtype=torch.int64, device=x.device),
+                torch.empty(long_capacity, dtype=torch.int64, device=x.device),
+                torch.empty(long_capacity * parts * (2 if complex_input else 1), dtype=component, device=x.device))
+    (data, vector, counts, medium_rows, long_rows, partial), init_ms = phase(initialize, timing)
+    long_count = counts[1:]
+    view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+    common = dict(COMPLEX=complex_input, ACC=tl.float64 if fp64 else tl.float32,
+                  num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    def produce():
+        if prepared.n_rows:
+            three_tier_producer_kernel[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                counts, medium_rows, long_rows, prepared.n_rows, vector.stride(0), y.stride(0),
+                R=cfg["rows_per_program"], S=cfg["short_row_threshold"], L=cfg["long_row_threshold"],
+                num_warps=cfg["producer_num_warps"], **common)
+    _, producer_ms = phase(produce, timing)
+    # Reuse unchanged whole-row and exclusive-part mathematical kernels. This
+    # route never invokes an old run function or inherits another route's plan.
+    def medium_compute():
+        if medium_capacity:
+            short_rowqueue_vector_kernel[(medium_capacity,)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                counts, medium_rows, vector.stride(0), y.stride(0), K=cfg["block_nnz"],
+                num_warps=cfg["num_warps"], **common)
+    _, medium_ms = phase(medium_compute, timing)
+    def long_compute():
+        if long_grid:
+            cooperative_row_consumer_kernel[(long_grid, parts)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), long_count,
+                long_rows, partial, vector.stride(0), K=cfg["block_nnz"], PARTS=parts,
+                num_warps=cfg["num_warps"], **common)
+    _, long_ms = phase(long_compute, timing)
+    def finish():
+        if long_grid:
+            cooperative_row_finish_kernel[(long_grid,)](
+                long_count, long_rows, partial, view(y), y.stride(0), PARTS=parts,
+                num_warps=cfg["producer_num_warps"], **common)
+    _, finish_ms = phase(finish, timing)
+    return y, dict(stats, process_cpu_ms=0.0, process_gpu_ms=init_ms,
+                   compute_ms=producer_ms + medium_ms + long_ms + finish_ms if timing else None,
+                   init_ms=init_ms, producer_ms=producer_ms,
+                   medium_consumer_ms=medium_ms, long_consumer_ms=long_ms,
+                   consumer_ms=medium_ms + long_ms if timing else None, finish_ms=finish_ms,
+                   fused_plan_compute_ms=producer_ms, queue_count_readback=False,
+                   plan_strategy="per_run_three_tier_row_ids", floating_point_atomic=False,
+                   task_acquisition="medium_capacity_grid_long_fixed_parts", cooperative_parts=parts,
+                   medium_grid_blocks=medium_capacity, long_row_grid_blocks=long_grid,
+                   long_consumer_grid_blocks=long_grid * parts,
+                   initialization="two_queue_counters_only", output_conversion="final_store",
+                   x_stride=tuple(x.stride()), y_stride=tuple(y.stride()),
+                   execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                   execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                   output_buffer_identity="out" if out is not None else "allocated")
+
+
+@triton.jit
 def longrow_grid_consumer_kernel(A, I, X, COUNTERS, JOB_SLOT, JOB_START, JOB_END,
                                  PARTIAL, XS, K: tl.constexpr, COMPLEX: tl.constexpr,
                                  ACC: tl.constexpr):

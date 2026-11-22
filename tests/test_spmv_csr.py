@@ -85,7 +85,7 @@ FIELDS = [
     "owner_search", "single_row_fastpath", "atomic_mode", "nnz_tile_count",
     "grid_capacity", "task_acquisition", "csr_structure", "row_queue_capacity", "floating_point_atomic",
     "consumer_grid_blocks", "consumer_grid_limit", "consumer_rounds_capacity",
-    "cooperative_parts", "row_grid_blocks", "partial_slot_capacity",
+    "cooperative_parts", "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "long_row_grid_blocks", "long_consumer_grid_blocks",
 ]
 
 
@@ -295,7 +295,7 @@ def main(argv=None):
             p.error("no registered algorithms support the selected combinations")
     else:
         explicit_algorithms = choices(args.alg, ("auto",) + registered)
-    fields = FIELDS + (["process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms", "scatter_ms", "reduce_ms"] if args.timing else [])
+    fields = FIELDS + (["process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "medium_consumer_ms", "long_consumer_ms", "finish_ms", "scatter_ms", "reduce_ms"] if args.timing else [])
     if args.perf_metrics:
         fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
                    "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",

@@ -202,7 +202,7 @@ def test_cooperative_queue_contract_and_workspace():
 def test_irregular_spmv_execution_has_no_host_plan_reads():
     tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    for name in ("run_nnz_local_reduce", "run_longrow_grid", "run_short_rowqueue", "run_short_rowqueue_strided", "run_longrow_cooperative"):
+    for name in ("run_nnz_local_reduce", "run_longrow_grid", "run_short_rowqueue", "run_short_rowqueue_strided", "run_longrow_cooperative", "run_three_tier_queue"):
         calls = {n.func.attr for n in ast.walk(functions[name]) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
         assert not calls & {"item", "tolist", "nonzero", "cumsum", "repeat_interleave", "unique_consecutive"}
     owner = functions["_nnz_local_owner"]
@@ -1308,3 +1308,79 @@ def test_targeted_native_kernels_do_not_construct_structural_plans():
         source = (ROOT / "tests/pytest" / filename).read_text(encoding="utf-8")
         for name in names:
             assert name in source
+
+
+def test_three_tier_profiles_capacity_and_capabilities():
+    from dataclasses import replace
+    alg = "csr_three_tier_queue_reduce"
+    for backend, subgroup in (("cuda", 32), ("rocm", 64)):
+        caps = policy.BackendCaps(backend, "unverified", backend, subgroup, 1024, True, True, True,
+                                  scan=True, int32_atomic=True, fp32_atomic=False, fp64_atomic=False)
+        cfg, source = policy.resolve_config(alg, caps)
+        assert source == "three-tier-conservative-v1"
+        assert cfg["short_row_threshold"] == 32 and cfg["long_row_threshold"] == 1024
+        assert cfg["cooperative_parts"] == 4 and cfg["rows_per_program"] == 128
+        assert policy.algorithm_spec(alg)["ops"] == ("non",)
+        assert policy.algorithm_spec(alg)["cross_call_plan_cache"] is False
+        for dtype in policy.VALUE_DTYPES:
+            policy.validate_support(alg, "non", dtype, "int64", "int32", caps)
+            stats = policy.three_tier_queue_capacity(100, 2050, cfg, dtype)
+            assert stats["medium_queue_capacity"] == 62 and stats["long_queue_capacity"] == 2
+            assert stats["partial_slot_capacity"] == 8
+            component = 8 if dtype in ("float32", "float64", "complex128") else 4
+            components = 2 if dtype.startswith("complex") else 1
+            assert stats["numeric_workspace_bytes"] == 8 * component * components
+            assert stats["descriptor_peak_bytes"] == 8 + 8 * 64
+            limit = stats["workspace_peak_bytes"]
+            assert policy.three_tier_queue_capacity(100, 2050, dict(cfg, workspace_limit_bytes=limit), dtype) == stats
+            with unittest.TestCase().assertRaisesRegex(ValueError, "workspace"):
+                policy.three_tier_queue_capacity(100, 2050, dict(cfg, workspace_limit_bytes=limit - 1), dtype)
+        assert policy.three_tier_queue_capacity(0, 0, cfg, "float16")["workspace_peak_bytes"] == 8
+        with unittest.TestCase().assertRaisesRegex(ValueError, "int32"):
+            policy.three_tier_queue_capacity(2**31, 2**31 * 1025, cfg, "float16")
+        for op in ("trans", "conj"):
+            assert alg not in policy.list_algorithms(op=op)
+            with unittest.TestCase().assertRaises(NotImplementedError):
+                policy.validate_support(alg, op, "float32", "int32", "int32", caps)
+        for feature in ("scan", "int32_atomic", "reduction", "int64"):
+            with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+                policy.validate_support(alg, "non", "float16", "int32", "int32", replace(caps, **{feature: None}))
+        for bad in ({"long_row_threshold": 32}, {"short_row_threshold": -1}, {"cooperative_parts": 3},
+                    {"long_grid_blocks": 0}, {"long_grid_blocks": True}, {"rows_per_program": 8},
+                    {"num_warps": 3}, {"num_stages": 2}, {"grid_blocks": 128}, {"lanes_per_row": 8}):
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.resolve_config(alg, caps, bad)
+        supplied = {"long_grid_blocks": 3, "long_row_threshold": 128, "cooperative_parts": 1}
+        snapshot = dict(supplied)
+        resolved, source = policy.resolve_config(alg, caps, supplied)
+        assert resolved == dict(cfg, **supplied) and supplied == snapshot and source == "explicit"
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.assert_route_match(alg, cfg, "csr_longrow_cooperative_reduce", None, caps)
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config("csr_longrow_cooperative_reduce", caps, {"long_grid_blocks": 128})
+
+
+def test_three_tier_structure_model_and_launch_contract():
+    tree = ast.parse((ROOT / "tests/benchmark_utils.py").read_text(encoding="utf-8"))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "csr_tile_structure")
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "three_tier_structure_policy", "exec"), namespace)
+    stats = namespace["csr_tile_structure"]([0, 0, 2, 6, 11], config={
+        "short_row_threshold": 2, "long_row_threshold": 4, "long_grid_blocks": 1,
+        "cooperative_parts": 4, "block_nnz": 4, "producer_num_warps": 2, "rows_per_program": 32})
+    assert "row_queue" not in stats and "cooperative_queue" not in stats
+    q = stats["three_tier_queue"]
+    assert (q["expected_short_rows"], q["expected_medium_rows"], q["expected_long_rows"]) == (2, 1, 1)
+    assert q["expected_medium_nnz"] == 4 and q["expected_long_nnz"] == 5
+    assert q["medium_queue_capacity"] == 3 and q["long_queue_capacity"] == 2
+    assert q["expected_nonempty_part_tasks"] == 2 and q["expected_empty_part_tasks"] == 2
+    kernels = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
+    functions = {n.name:n for n in kernels.body if isinstance(n, ast.FunctionDef)}
+    runtime = ast.unparse(functions["run_three_tier_queue"])
+    for name in ("three_tier_producer_kernel", "short_rowqueue_vector_kernel", "cooperative_row_consumer_kernel", "cooperative_row_finish_kernel"):
+        assert name in runtime
+    assert "run_longrow_cooperative(" not in runtime and "run_short_rowqueue(" not in runtime
+    for path in (ROOT / "tests/test_spmv_csr.py", ROOT / "tests/benchmark_utils.py"):
+        source = path.read_text(encoding="utf-8")
+        for field in ("medium_queue_capacity", "long_queue_capacity", "medium_consumer_ms", "long_consumer_ms"):
+            assert field in source

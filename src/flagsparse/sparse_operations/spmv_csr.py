@@ -49,6 +49,7 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "csr_short_rowqueue_vector",
     "csr_short_rowqueue_strided_vector",
     "csr_longrow_cooperative_reduce",
+    "csr_three_tier_queue_reduce",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1775,6 +1776,9 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
             "execution_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix("torch."),
         }
     alg = prepared.alg
+    if alg == "csr_three_tier_queue_reduce":
+        from ._spmv_csr_kernels import run_three_tier_queue
+        return run_three_tier_queue(prepared, x, out, timing, _spmv_phase)
     if alg == "csr_longrow_cooperative_reduce":
         from ._spmv_csr_kernels import run_longrow_cooperative
         return run_longrow_cooperative(prepared, x, out, timing, _spmv_phase)
@@ -2049,6 +2053,19 @@ def flagsparse_spmv_csr_run(
             meta.update(execution_path="native_csr_scalar_tail_reduce", scalar_steps=actual.config["scalar_steps"],
                         tail_block_nnz=actual.config["block_nnz"], workspace_peak_bytes=0,
                         plan_strategy="none", validation="unverified")
+        if actual.alg in _csr_config.THREE_TIER_ALGORITHMS:
+            meta.update(execution_path="native_" + actual.alg, validation="unverified")
+            for key in ("medium_queue_capacity", "long_queue_capacity", "partial_slot_capacity",
+                        "descriptor_peak_bytes", "numeric_workspace_bytes", "workspace_peak_bytes",
+                        "medium_grid_blocks", "long_row_grid_blocks", "long_consumer_grid_blocks",
+                        "cooperative_parts", "queue_count_readback", "plan_strategy", "task_acquisition",
+                        "floating_point_atomic", "initialization", "output_conversion",
+                        "x_stride", "y_stride", "output_buffer_identity"):
+                meta[key] = phases[key]
+            if timing:
+                meta.update({key: phases[key] for key in
+                             ("init_ms", "producer_ms", "consumer_ms", "medium_consumer_ms",
+                              "long_consumer_ms", "finish_ms", "fused_plan_compute_ms")})
         if actual.alg in _csr_config.ROWQUEUE_ALGORITHMS + _csr_config.COOPERATIVE_ALGORITHMS:
             meta.update(execution_path="native_" + actual.alg, validation="unverified")
             for key in ("row_queue_capacity", "descriptor_peak_bytes", "numeric_workspace_bytes",

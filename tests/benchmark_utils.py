@@ -135,7 +135,7 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
         result["queue"] = dict(expected_long_rows=int(long_lengths.size), expected_jobs=expected,
                                job_capacity=jobs, expected_active_job_ratio=expected / jobs if jobs else None,
                                ratio_reason=None if jobs else "zero_capacity")
-    if {"short_row_threshold", "producer_num_warps", "rows_per_program"} <= cfg.keys():
+    if {"short_row_threshold", "producer_num_warps", "rows_per_program"} <= cfg.keys() and "long_grid_blocks" not in cfg:
         threshold = cfg["short_row_threshold"]
         if type(threshold) is not int or threshold < 0:
             raise ValueError("row-queue threshold must be a nonnegative integer")
@@ -163,7 +163,7 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
                 expected_max_rounds=(queued_rows + grid - 1) // grid if grid else 0,
                 consumer_rounds_capacity=(capacity + grid - 1) // grid if grid else 0,
             )
-    if "cooperative_parts" in cfg:
+    if "cooperative_parts" in cfg and "long_grid_blocks" not in cfg:
         threshold, parts = cfg["long_row_threshold"], cfg["cooperative_parts"]
         block, limit = cfg["block_nnz"], cfg["grid_blocks"]
         if (any(type(v) is not int for v in (threshold, parts, block, limit)) or threshold < 0
@@ -187,6 +187,29 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
             consumer_rounds_capacity=(capacity + grid - 1) // grid if grid else 0,
             # Queue insertion order depends on GPU scheduling; do not invent
             # worker makespan or occupancy from the CPU row order.
+            count_source="cpu_structure_model_not_gpu_readback")
+    if "long_grid_blocks" in cfg:
+        short, long = cfg["short_row_threshold"], cfg["long_row_threshold"]
+        parts, block, limit = cfg["cooperative_parts"], cfg["block_nnz"], cfg["long_grid_blocks"]
+        if (any(type(v) is not int for v in (short, long, parts, block, limit)) or
+                not 0 <= short < long or parts not in (1, 2, 4, 8, 16) or block <= 0 or not 1 <= limit <= 1024):
+            raise ValueError("invalid three-tier structure configuration")
+        medium = lengths[(lengths > short) & (lengths <= long)]
+        long_lengths = lengths[lengths > long]
+        cm, cl = min(rows, nnz // (short + 1)), min(rows, nnz // (long + 1))
+        grid = min(cl, limit)
+        useful_parts = int(np.minimum((long_lengths + block - 1) // block, parts).sum())
+        result["three_tier_queue"] = dict(
+            short_row_threshold=short, long_row_threshold=long,
+            expected_short_rows=int(np.count_nonzero(lengths <= short)),
+            expected_medium_rows=int(medium.size), expected_long_rows=int(long_lengths.size),
+            expected_medium_nnz=int(medium.sum()), expected_long_nnz=int(long_lengths.sum()),
+            medium_nnz_fraction=int(medium.sum()) / nnz if nnz else None,
+            long_nnz_fraction=int(long_lengths.sum()) / nnz if nnz else None,
+            medium_queue_capacity=cm, long_queue_capacity=cl, medium_grid_blocks=cm,
+            long_row_grid_blocks=grid, long_consumer_grid_blocks=grid * parts,
+            expected_nonempty_part_tasks=useful_parts,
+            expected_empty_part_tasks=int(long_lengths.size) * parts - useful_parts,
             count_source="cpu_structure_model_not_gpu_readback")
     return result
 
@@ -475,9 +498,9 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
               "vendor_format", "vendor_a_dtype", "vendor_rhs_dtype", "vendor_output_dtype",
               "vendor_alpha", "vendor_beta", "reference", "rtol", "atol"]
     if operator == "spmv_csr":
-        fields += ["row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
+        fields += ["medium_consumer_ms", "long_consumer_ms", "row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
                    "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
-                   "row_grid_blocks", "partial_slot_capacity"]
+                   "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "long_row_grid_blocks", "long_consumer_grid_blocks"]
     if metrics_enabled:
         fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
                    "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",
@@ -735,12 +758,14 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 progress("phase_diagnostics", row)
                                 _, _, diagnostics = run(prepared, rhs, timing=True, **kwargs)
                                 row.update({key: diagnostics.get(key) for key in ("process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms", "scatter_ms", "reduce_ms")})
+                                if operator == "spmv_csr":
+                                    row.update({key: diagnostics.get(key) for key in ("medium_consumer_ms", "long_consumer_ms")})
                             row["metadata"] = meta
                             if operator == "spmv_csr":
                                 row.update({key: meta.get(key) for key in
                                             ("row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
                                              "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
-                                             "row_grid_blocks", "partial_slot_capacity")})
+                                             "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "long_row_grid_blocks", "long_consumer_grid_blocks")})
                             row["alg_resolved"] = meta.get("alg_resolved", meta.get("alg", alg))
                             row["vendor_status"] = "SKIP"
                             row["vendor_reason"] = "disabled"

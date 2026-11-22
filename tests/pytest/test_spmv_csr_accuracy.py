@@ -555,15 +555,17 @@ def test_spmv_csr_new_fallback_preserves_selection(alg, dtype, op, monkeypatch):
               else {"long_row_threshold": 32, "segment_nnz": 32, "block_nnz": 32} if alg in spmv_mod._csr_config.LONGROW_ALGORITHMS
               else {"short_row_threshold": 8, "block_nnz": 64} if alg in spmv_mod._csr_config.ROWQUEUE_ALGORITHMS
               else {"long_row_threshold": 32, "cooperative_parts": 4, "block_nnz": 32} if alg in spmv_mod._csr_config.COOPERATIVE_ALGORITHMS
+              else {"short_row_threshold": 8, "long_row_threshold": 32, "block_nnz": 64} if alg in spmv_mod._csr_config.THREE_TIER_ALGORITHMS
               else {"block_nnz": 128, "atomic_mode": "all"} if alg == "csr_nnz_local_reduce_atomic"
               else {"block_nnz": 16} if alg == "csr_row_static_tile"
               else {"row_vector": {"block_nnz": 64}})
     prepared = _new_prepared(data, col, ptr, shape, alg, config=config, op=op)
-    if alg in spmv_mod._csr_config.LONGROW_ALGORITHMS + spmv_mod._csr_config.ROWQUEUE_ALGORITHMS + spmv_mod._csr_config.COOPERATIVE_ALGORITHMS + ("csr_nnz_local_reduce_atomic",):
+    if alg in spmv_mod._csr_config.LONGROW_ALGORITHMS + spmv_mod._csr_config.ROWQUEUE_ALGORITHMS + spmv_mod._csr_config.COOPERATIVE_ALGORITHMS + spmv_mod._csr_config.THREE_TIER_ALGORITHMS + ("csr_nnz_local_reduce_atomic",):
         name = {"csr_longrow_queue_atomic": "run_longrow_queue", "csr_longrow_grid_atomic": "run_longrow_grid",
                 "csr_nnz_local_reduce_atomic": "run_nnz_local_reduce", "csr_short_rowqueue_vector": "run_short_rowqueue",
                 "csr_short_rowqueue_strided_vector": "run_short_rowqueue_strided",
-                "csr_longrow_cooperative_reduce": "run_longrow_cooperative"}[alg]
+                "csr_longrow_cooperative_reduce": "run_longrow_cooperative",
+                "csr_three_tier_queue_reduce": "run_three_tier_queue"}[alg]
         original = getattr(kernels, name)
         def fail_queue_i64(route, vector, output, timing, phase):
             if route.kernel_indices.dtype == torch.int64:
@@ -1279,7 +1281,7 @@ def test_spmv_sharded_workspace_and_fallback(monkeypatch):
 @pytest.mark.parametrize("alg", ["csr_row_refill_reduce", "csr_transpose_sharded_atomic",
                                   "csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_row_scalar_tail_reduce", "csr_longrow_queue_atomic",
                                   "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector",
-                                  "csr_short_rowqueue_strided_vector", "csr_longrow_cooperative_reduce"])
+                                  "csr_short_rowqueue_strided_vector", "csr_longrow_cooperative_reduce", "csr_three_tier_queue_reduce"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_spmv_targeted_wide_output_not_roundtrip(alg, dtype):
     from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
@@ -1851,3 +1853,185 @@ def test_spmv_csr_longrow_cooperative_native(dtype, output_dtype, parts, case, i
     for original, snapshot in zip((a, i, p, vector), saved):
         torch.testing.assert_close(original, snapshot, rtol=0, atol=0)
     assert torch.isnan(backing[1::3]).all() and torch.isnan(backing[2::3]).all()
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("dtype,output_dtype", [
+    pytest.param(torch.float32, torch.float32, id="regular_f32"),
+    pytest.param(torch.float64, torch.float64, id="regular_f64"),
+    pytest.param(torch.complex64, torch.complex64, id="regular_c32"),
+    pytest.param(torch.complex128, torch.complex128, id="regular_c64"),
+    pytest.param(torch.float16, torch.float16, id="mixed_f16_f16"),
+    pytest.param(torch.float16, torch.float32, id="mixed_f16_f32"),
+    pytest.param(torch.bfloat16, torch.bfloat16, id="mixed_bf16_bf16"),
+    pytest.param(torch.bfloat16, torch.float32, id="mixed_bf16_f32"),
+])
+@pytest.mark.parametrize("parts", [1, 4] if _MIXED_QUICK_MODE else [1, 4, 16])
+@pytest.mark.parametrize("case", ["empty", "zero_cols", "short_only", "medium_only", "long_only", "mixed", "tail"])
+@pytest.mark.parametrize("index_pair", [(torch.int64, torch.int32)] if _MIXED_QUICK_MODE else [
+    (torch.int32, torch.int32), (torch.int32, torch.int64), (torch.int64, torch.int32), (torch.int64, torch.int64)])
+def test_spmv_csr_three_tier_native(dtype, output_dtype, parts, case, index_pair,
+                                   monkeypatch, record_property):
+    from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable, three_tier_queue_capacity
+
+    alg = "csr_three_tier_queue_reduce"
+    lengths = {
+        "empty": [], "zero_cols": [0] * 35, "short_only": [0, 1, 7, 8] * 9,
+        "medium_only": [9, 63, 64] * 13, "long_only": [65, 129, 1025] * 3,
+        "mixed": [0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 513] * 3,
+        "tail": [0] * 128 + [8, 64, 64 * (parts * 3 + 1) + 1],
+    }[case]
+    cfg = dict(short_row_threshold=8, long_row_threshold=64, rows_per_program=128,
+               block_nnz=64, cooperative_parts=parts, long_grid_blocks=2)
+    a, i, p, x, shape = _native_case(lengths, dtype, *index_pair, n=0 if case == "zero_cols" else 19)
+    values = ((torch.arange(a.numel(), device=a.device) % 7) - 3).float() / 16
+    a.copy_((torch.complex(values, values / 2) if dtype.is_complex else values).to(dtype))
+    storage = torch.ones(x.numel() * 3, device=x.device, dtype=dtype)
+    vector = storage[::3]
+    values_x = (torch.arange(x.numel(), device=x.device) % 5).float() / 8
+    vector.copy_((torch.complex(values_x, values_x / 2) if dtype.is_complex else values_x).to(dtype))
+    originals = [v.clone() for v in (a, i, p, vector)]
+    backing = torch.full((shape[0] * 3,), float("nan"), device=x.device, dtype=output_dtype)
+    out = backing[::3]
+    captures, partials = [], []
+    producer, consumer = kernels.three_tier_producer_kernel, kernels.cooperative_row_consumer_kernel
+    class CaptureProducer:
+        def __getitem__(self, grid):
+            launch = producer[grid]
+            def call(*args, **kwargs):
+                captures.append((args[5], args[6], args[7]))
+                return launch(*args, **kwargs)
+            return call
+    class CaptureLong:
+        def __getitem__(self, grid):
+            launch = consumer[grid]
+            def call(*args, **kwargs):
+                args[6].fill_(float("nan"))  # Only accuracy tests poison partial storage.
+                partials.append((args[4], args[6]))
+                return launch(*args, **kwargs)
+            return call
+    monkeypatch.setattr(kernels, "three_tier_producer_kernel", CaptureProducer())
+    monkeypatch.setattr(kernels, "cooperative_row_consumer_kernel", CaptureLong())
+    def forbidden(*args, **kwargs):
+        raise AssertionError("three-tier route must not call another algorithm or build segment plans")
+    for name in ("build_plan", "run_short_rowqueue", "run_short_rowqueue_strided", "run_longrow_cooperative", "run_longrow_queue"):
+        monkeypatch.setattr(kernels, name, forbidden)
+    for key, value in dict(algorithm=alg, a_dtype=str(dtype), rhs_dtype=str(dtype), output_dtype=str(output_dtype),
+                           compute_dtype=spmv_mod._csr_config.compute_dtype(alg, dtype), opA="non", config=cfg).items():
+        record_property(key, value)
+    try:
+        prepared = _new_prepared(a, i, p, shape, alg, config=cfg)
+        stats = three_tier_queue_capacity(shape[0], a.numel(), prepared.config, dtype)
+        ref_dtype = torch.complex128 if dtype.is_complex else torch.float64
+        expected = golden_csr(a.to(ref_dtype), i, p, vector.to(ref_dtype), shape).to(output_dtype)
+        rtol, atol = close_tolerances(output_dtype)
+        for diagnostic in (False, True):
+            out.fill_(float("nan"))
+            actual, meta = spmv_mod.flagsparse_spmv_csr_run(prepared, vector, out=out, out_dtype=output_dtype,
+                                                          timing=diagnostic, return_meta=True)
+            assert actual is out and meta["alg_resolved"] == alg
+            torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+            assert meta["ms"] == meta["gpu_ms"] + meta["process_cpu_ms"]
+            assert not meta["queue_count_readback"] and not meta["floating_point_atomic"]
+            assert meta["plan_strategy"] == "per_run_three_tier_row_ids"
+            for key, value in stats.items():
+                assert meta[key] == value
+            if diagnostic:
+                assert meta["consumer_ms"] == meta["medium_consumer_ms"] + meta["long_consumer_ms"]
+            if shape[0]:
+                count, mids, longs = captures[-1]
+                qm, ql = count.cpu().tolist()  # Test-only ownership audit.
+                assert sorted(mids[:qm].cpu().tolist()) == [r for r, n in enumerate(lengths) if 8 < n <= 64]
+                assert sorted(longs[:ql].cpu().tolist()) == [r for r, n in enumerate(lengths) if n > 64]
+            if partials:
+                count, partial = partials[-1]
+                q = int(count.item())
+                assert torch.isfinite(partial[:q * parts * (2 if dtype.is_complex else 1)]).all()
+        actual = spmv_mod.flagsparse_spmv_csr(prepared=prepared, x=vector, out=out, out_dtype=output_dtype)
+        assert actual is out
+        torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+        if shape[0]:
+            assert len(captures) == 4  # full, full+diagnostic, high-level call
+            for position in range(3):
+                assert len({id(c[position]) for c in captures}) == 4
+        with pytest.raises(ValueError, match="op"):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, vector, op="trans")
+        with pytest.raises(ValueError):
+            spmv_mod.flagsparse_spmv_csr_run(prepared, vector, config={"short_row_threshold": 16})
+        if a.numel() >= shape[0] > 0:
+            with pytest.raises(ValueError, match="overlap"):
+                spmv_mod.flagsparse_spmv_csr_run(prepared, vector, out=a[:shape[0]], out_dtype=dtype)
+        small = _new_prepared(a, i, p, shape, alg, config=dict(cfg, workspace_limit_bytes=stats["workspace_peak_bytes"] - 1))
+        with pytest.raises(ValueError, match="workspace"):
+            spmv_mod.flagsparse_spmv_csr_run(small, vector, out=out, out_dtype=output_dtype)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    for value, snapshot in zip((a, i, p, vector), originals):
+        torch.testing.assert_close(value, snapshot, rtol=0, atol=0)
+    assert torch.isnan(backing[1::3]).all() and torch.isnan(backing[2::3]).all()
+    assert torch.equal(storage[1::3], torch.ones_like(storage[1::3]))
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_spmv_csr_three_tier_mixed_wide_output(dtype, record_property):
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    alg = "csr_three_tier_queue_reduce"
+    a, i, p, x, shape = _native_case([2, 64, 2049], dtype, torch.int64, torch.int32, n=19)
+    a.zero_()
+    delta = 2 ** (-11 if dtype == torch.float16 else -9)
+    for start, end in ((0, 2), (2, 66), (66, 2115)):
+        a[start], a[end - 1] = 1, delta
+    x.fill_(1)
+    for k, v in dict(algorithm=alg, a_dtype=str(dtype), rhs_dtype=str(dtype), compute_dtype="float32",
+                     output_dtype="float32", opA="non").items():
+        record_property(k, v)
+    try:
+        route = _new_prepared(a, i, p, shape, alg)
+        actual = spmv_mod.flagsparse_spmv_csr_run(route, x, out_dtype=torch.float32)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))
+    expected = torch.full((3,), 1 + delta, dtype=torch.float32, device=x.device)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, actual.to(dtype).float())
+
+
+@pytest.mark.spmv_csr
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("wide", [False, True])
+def test_spmv_csr_three_tier_mixed_index_fallback(dtype, wide, monkeypatch, record_property):
+    from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
+    from flagsparse.sparse_operations._spmv_csr_config import BackendCapabilityUnavailable
+    alg = "csr_three_tier_queue_reduce"
+    a, i, p, x, shape = _native_case([2, 64, 2049], dtype, torch.int64, torch.int64, n=19)
+    a.fill_(0.125)
+    x.fill_(0.5)
+    output_dtype = torch.float32 if wide else dtype
+    out = torch.full((shape[0],), float("nan"), dtype=output_dtype, device=x.device)
+    implementation = kernels.run_three_tier_queue
+    calls = []
+    def inject(route, vector, target, timing, phase):
+        calls.append(route.kernel_indices.dtype)
+        assert route.alg == alg and target is out and target.dtype == output_dtype
+        if route.kernel_indices.dtype == torch.int64:
+            raise RuntimeError("unsupported int64 kernel indices")
+        return implementation(route, vector, target, timing, phase)
+    monkeypatch.setattr(kernels, "run_three_tier_queue", inject)
+    for k, v in dict(algorithm=alg, a_dtype=str(dtype), rhs_dtype=str(dtype), output_dtype=str(output_dtype),
+                     compute_dtype="float32", opA="non").items():
+        record_property(k, v)
+    try:
+        route = _new_prepared(a, i, p, shape, alg)
+        actual, meta = spmv_mod.flagsparse_spmv_csr_run(route, x, out=out, out_dtype=output_dtype, return_meta=True)
+        assert actual is out and calls == [torch.int64, torch.int32]
+        assert meta["index_fallback_applied"] and meta["alg_resolved"] == alg
+        assert meta["config"] == route.config and meta["output_dtype"] == str(output_dtype).removeprefix("torch.")
+        expected = golden_csr(a.double(), i, p, x.double(), shape).to(output_dtype)
+        rtol, atol = close_tolerances(output_dtype)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+        route.index_fallback_policy = "strict"
+        with pytest.raises(RuntimeError, match="unsupported int64"):
+            spmv_mod.flagsparse_spmv_csr_run(route, x, out=out, out_dtype=output_dtype)
+    except BackendCapabilityUnavailable as exc:
+        pytest.skip(str(exc))

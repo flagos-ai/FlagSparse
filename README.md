@@ -374,6 +374,13 @@ benchmark producer without changing either summary schema.
 
 When adding or changing an operator test entry, keep the implementation/API registration, `conf/operators.yaml` entry, pytest marker in `pytest.ini`, accuracy test, performance command, and public replacement/export registration in sync.
 
+The explicit CSR SpMV candidate `csr_three_tier_queue_reduce` supports `non` on
+CUDA/ROCm with six value dtypes and FP16/BF16 same-type or FP32 output. It classifies
+rows on every run into short, whole-row vector, and cooperative long-row work;
+it is included by the existing CSR benchmark `compare` and accuracy marker.
+Defaults remain unchanged; GPU validation is pending. See the
+[three-tier design](docs/spmv_spmm_optimization/CSR_SPMV_THREE_TIER_QUEUE_PLAN_20261122.md).
+
 **test_spmv.py** - CSR SpMV (SuiteSparse `.mtx`, synthetic, or CSR CSV export):
 
 ```bash
