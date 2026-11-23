@@ -11,7 +11,7 @@ SHORT_ROW_ALGORITHMS = ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_
 LONGROW_ALGORITHMS = ("csr_longrow_queue_atomic", "csr_longrow_grid_atomic")
 ROWQUEUE_ALGORITHMS = ("csr_short_rowqueue_vector", "csr_short_rowqueue_strided_vector")
 COOPERATIVE_ALGORITHMS = ("csr_longrow_cooperative_reduce",)
-THREE_TIER_ALGORITHMS = ("csr_three_tier_queue_reduce",)
+THREE_TIER_ALGORITHMS = ("csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce")
 NEW_ALGORITHMS += SHORT_ROW_ALGORITHMS + LONGROW_ALGORITHMS + ROWQUEUE_ALGORITHMS + COOPERATIVE_ALGORITHMS + ("csr_nnz_local_reduce_atomic",)
 NON_ONLY_ALGORITHMS = SHORT_ROW_ALGORITHMS + LONGROW_ALGORITHMS + ROWQUEUE_ALGORITHMS + COOPERATIVE_ALGORITHMS
 NEW_ALGORITHMS += THREE_TIER_ALGORITHMS
@@ -106,7 +106,11 @@ def algorithm_spec(alg):
             dt: (dt, "float32")
             for dt in ("float16", "bfloat16")
         },
-        "config_candidates": ({"rows_per_program": (64, 128), "short_row_threshold": (16, 32, 64),
+        "config_candidates": ({"medium_grid_blocks": (256, 512, 1024),
+                               "long_grid_blocks": (64, 128, 256), "cooperative_parts": (1, 4, 8, 16),
+                               "short_row_threshold": (32, 64, 128), "long_row_threshold": (512, 1024, 2048)}
+                              if name == "csr_three_tier_bounded_reduce" else
+                              {"rows_per_program": (64, 128), "short_row_threshold": (16, 32, 64),
                                "long_row_threshold": (128, 256, 512, 1024), "cooperative_parts": (1, 2, 4, 8)}
                               if name in THREE_TIER_ALGORITHMS else {"long_row_threshold": (256, 512, 1024, 2048, 4096),
                                "cooperative_parts": (1, 2, 4, 8, 16), "grid_blocks": (64, 128, 256),
@@ -373,6 +377,9 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
                    producer_num_warps=max((w for w in warps if w <= 2), default=min(warps)),
                    num_warps=max((w for w in warps if w <= 4), default=min(warps)),
                    num_stages=1, workspace_limit_bytes=268435456)
+        if alg == "csr_three_tier_bounded_reduce":
+            # Keep every other default identical to the capacity-grid control.
+            cfg["medium_grid_blocks"] = 512
         supplied = config or {}
         if set(supplied) - set(cfg):
             raise ValueError(f"unused three-tier config fields: {sorted(set(supplied) - set(cfg))}")
@@ -387,7 +394,10 @@ def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_
                 cfg["producer_num_warps"] not in warps or cfg["num_warps"] not in warps or
                 cfg["num_stages"] != 1 or cfg["workspace_limit_bytes"] <= 0):
             raise ValueError("invalid three-tier queue configuration")
-        result = (cfg, "explicit" if supplied else "three-tier-conservative-v1")
+        if "medium_grid_blocks" in cfg and not 1 <= cfg["medium_grid_blocks"] <= 1024:
+            raise ValueError("medium_grid_blocks must be an integer between 1 and 1024")
+        source = "three-tier-bounded-conservative-v1" if alg == "csr_three_tier_bounded_reduce" else "three-tier-conservative-v1"
+        result = (cfg, "explicit" if supplied else source)
         return result + ([],) if return_rejections else result
     if alg in COOPERATIVE_ALGORITHMS:
         if (caps.backend not in ("cuda", "rocm") or caps.subgroup_width not in (32, 64)

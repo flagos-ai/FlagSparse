@@ -85,7 +85,7 @@ FIELDS = [
     "owner_search", "single_row_fastpath", "atomic_mode", "nnz_tile_count",
     "grid_capacity", "task_acquisition", "csr_structure", "row_queue_capacity", "floating_point_atomic",
     "consumer_grid_blocks", "consumer_grid_limit", "consumer_rounds_capacity",
-    "cooperative_parts", "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "long_row_grid_blocks", "long_consumer_grid_blocks",
+    "cooperative_parts", "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "medium_grid_limit", "medium_rounds_capacity", "long_row_grid_blocks", "long_consumer_grid_blocks",
 ]
 
 

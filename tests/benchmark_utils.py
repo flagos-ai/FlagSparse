@@ -197,6 +197,10 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
         medium = lengths[(lengths > short) & (lengths <= long)]
         long_lengths = lengths[lengths > long]
         cm, cl = min(rows, nnz // (short + 1)), min(rows, nnz // (long + 1))
+        medium_limit = cfg.get("medium_grid_blocks", cm)
+        if "medium_grid_blocks" in cfg and (type(medium_limit) is not int or not 1 <= medium_limit <= 1024):
+            raise ValueError("invalid bounded medium structure configuration")
+        medium_grid = min(cm, medium_limit)
         grid = min(cl, limit)
         useful_parts = int(np.minimum((long_lengths + block - 1) // block, parts).sum())
         result["three_tier_queue"] = dict(
@@ -206,11 +210,18 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
             expected_medium_nnz=int(medium.sum()), expected_long_nnz=int(long_lengths.sum()),
             medium_nnz_fraction=int(medium.sum()) / nnz if nnz else None,
             long_nnz_fraction=int(long_lengths.sum()) / nnz if nnz else None,
-            medium_queue_capacity=cm, long_queue_capacity=cl, medium_grid_blocks=cm,
+            medium_queue_capacity=cm, long_queue_capacity=cl, medium_grid_blocks=medium_grid,
             long_row_grid_blocks=grid, long_consumer_grid_blocks=grid * parts,
             expected_nonempty_part_tasks=useful_parts,
             expected_empty_part_tasks=int(long_lengths.size) * parts - useful_parts,
             count_source="cpu_structure_model_not_gpu_readback")
+        if "medium_grid_blocks" in cfg:
+            result["three_tier_queue"].update(
+                medium_grid_limit=medium_limit,
+                medium_rounds_capacity=(cm + medium_grid - 1) // medium_grid if medium_grid else 0,
+                expected_medium_active_programs=min(int(medium.size), medium_grid),
+                expected_medium_empty_programs=max(0, medium_grid - int(medium.size)),
+                expected_medium_max_rounds=(int(medium.size) + medium_grid - 1) // medium_grid if medium_grid else 0)
     return result
 
 
@@ -500,7 +511,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     if operator == "spmv_csr":
         fields += ["medium_consumer_ms", "long_consumer_ms", "row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
                    "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
-                   "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "long_row_grid_blocks", "long_consumer_grid_blocks"]
+                   "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "medium_grid_limit", "medium_rounds_capacity", "long_row_grid_blocks", "long_consumer_grid_blocks"]
     if metrics_enabled:
         fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
                    "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",
@@ -765,7 +776,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 row.update({key: meta.get(key) for key in
                                             ("row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
                                              "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
-                                             "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "long_row_grid_blocks", "long_consumer_grid_blocks")})
+                                             "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "medium_grid_limit", "medium_rounds_capacity", "long_row_grid_blocks", "long_consumer_grid_blocks")})
                             row["alg_resolved"] = meta.get("alg_resolved", meta.get("alg", alg))
                             row["vendor_status"] = "SKIP"
                             row["vendor_reason"] = "disabled"

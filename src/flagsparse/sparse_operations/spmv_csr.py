@@ -50,6 +50,7 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "csr_short_rowqueue_strided_vector",
     "csr_longrow_cooperative_reduce",
     "csr_three_tier_queue_reduce",
+    "csr_three_tier_bounded_reduce",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1673,7 +1674,7 @@ def _spmv_check_output(out, prepared, x, output_dtype=None):
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
-    strided_algorithms = ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_longrow_queue_atomic", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS, *_csr_config.ROWQUEUE_ALGORITHMS, *_csr_config.COOPERATIVE_ALGORITHMS)
+    strided_algorithms = ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_longrow_queue_atomic", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS, *_csr_config.ROWQUEUE_ALGORITHMS, *_csr_config.COOPERATIVE_ALGORITHMS, *_csr_config.THREE_TIER_ALGORITHMS)
     if not out.is_contiguous() and prepared.alg not in strided_algorithms:
         raise ValueError("out must be contiguous")
     if prepared.alg in strided_algorithms and out.numel() > 1 and out.stride(0) <= 0:
@@ -1779,6 +1780,9 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
     if alg == "csr_three_tier_queue_reduce":
         from ._spmv_csr_kernels import run_three_tier_queue
         return run_three_tier_queue(prepared, x, out, timing, _spmv_phase)
+    if alg == "csr_three_tier_bounded_reduce":
+        from ._spmv_csr_kernels import run_three_tier_bounded
+        return run_three_tier_bounded(prepared, x, out, timing, _spmv_phase)
     if alg == "csr_longrow_cooperative_reduce":
         from ._spmv_csr_kernels import run_longrow_cooperative
         return run_longrow_cooperative(prepared, x, out, timing, _spmv_phase)
@@ -2055,6 +2059,8 @@ def flagsparse_spmv_csr_run(
                         plan_strategy="none", validation="unverified")
         if actual.alg in _csr_config.THREE_TIER_ALGORITHMS:
             meta.update(execution_path="native_" + actual.alg, validation="unverified")
+            if actual.alg == "csr_three_tier_bounded_reduce":
+                meta.update({key: phases[key] for key in ("medium_grid_limit", "medium_rounds_capacity")})
             for key in ("medium_queue_capacity", "long_queue_capacity", "partial_slot_capacity",
                         "descriptor_peak_bytes", "numeric_workspace_bytes", "workspace_peak_bytes",
                         "medium_grid_blocks", "long_row_grid_blocks", "long_consumer_grid_blocks",

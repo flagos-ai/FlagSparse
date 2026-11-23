@@ -160,3 +160,77 @@ consumer采用二维grid `(min(C_long,G_long), P)`；同一队列行的P份按K�
 `consumer_ms` 诊断为 `medium_consumer_ms + long_consumer_ms`，便于旧表头兼容；它不是完整gpu_ms的替代。全部精度FAIL记录和厂商baseline路径保持原规则。
 
 静态检查不验证Triton编译、GPU数值或性能。CUDA/ROCm smoke及真实矩阵验收待计算节点结果，支持表保持UNVERIFIED。
+
+## 9. 2026-11-23：有界中行独立候选
+
+### 证据与范围
+
+基线分支 `zyq_sparse`，commit `057f0b4ec564860ef44bf7d06d94d8c2f8ec6621`，实施前工作区干净。
+`test_mixed_data/11.22-newdata/analysis/REPORT.md` 记录了240条件零次最佳，以及两组smoke的
+strided out验证失败。先修复 `_spmv_check_output` 的THREE_TIER算法集合遗漏，保留正stride、
+形状/类型/设备、lazy view和输入存储别名检查，不把测试改成连续out。
+
+新增 `csr_three_tier_bounded_reduce`，保留 `csr_three_tier_queue_reduce` 的实现、默认参数和默认路由。
+范围仍为CUDA/ROCm、non、六种输入dtype及四种半精度组合。半精度FP32累加，FP32输入沿用FP64，
+复数沿用对应实数分量精度。未知后端能力明确排除。
+
+### 唯一的调度差异
+
+新run使用原三类producer，两条队列保持每次调用重建。设中行容量上界为C，有效行数为Q，
+显式配置上限为G，则实际中行网格为 `g=min(C,G)`。program p读取GPU有效count，依次处理
+`p, p+g, p+2g, ... < Q`，每行仍由原整行向量数学内核完成一次最终归约并直接写out。
+
+- 新配置 `medium_grid_blocks=512`，合法整数1～1024（拒绝bool/浮点/字符串）。
+- 其余默认保持S32/L1024/R128/K128/P4/长行G128；producer 2 warps、consumer 4 warps、stage1，按原能力解析。
+- 独立入口 `run_three_tier_bounded`，不调用旧run。复用未修改的
+  `three_tier_producer_kernel`、`short_rowqueue_strided_vector_kernel`、
+  `cooperative_row_consumer_kernel`、`cooperative_row_finish_kernel`。
+- 极长行不进入中行CTA，继续P份协作、独占部分和、最终归并。不增加全局任务领取atomic、
+  浮点atomic、CPU count读回、缓存或转格式。
+- producer、两类consumer、finish仍分开提交到同一执行流。本轮不同时融合kernel或改动P1写回方式。
+
+正确性：每个中行queue slot与一个p模g余数唯一对应，每行在本CTA中完整归约；短/中/长分类互斥，
+所有行恰好写一次，空行由producer输出零。累加器在每条新中行开始时清零，地址和slot使用int64。
+长行部分和全部在finish之前提交完成，没有跨CTA自旋屏障。合法strided out直接按YS写回，
+半精度只在最终store窄化；FP32宽输出不会经过半精度中间结果。
+
+容量和工作空间没有因G缩小而虚报减少：仍为两条行ID队列和长行计算精度部分和，沿用原256MiB限额。
+减小的是启动CTA数量，不是队列容量、有效工作量或GPU读回值。
+
+### 成本假设和风险
+
+wiki-Talk旧中行capacity=152163、Q=10347；G512时由152163个CTA改为512个program，
+最长约21轮中行任务。mip1容量66463、Q37347，同配置最长约73轮。上述只预测任务数，不预测耗时。
+有界调度可能减少空CTA/重复调度，但也可能减少并行度，或因queue顺序不同造成尾部不均。
+长行独立P/G消融仍必要：新旧compare里P4/P8不同，不能把所有差异都归因于有界网格。
+全短行矩阵仍支付空consumer的launch，本候选不争取替代scalar/static全局最优。
+
+元数据新增 `medium_grid_limit`、`medium_rounds_capacity`；后者为容量轮数上界，不是实测轮数。
+结构诊断另记 `expected_medium_active_programs/empty_programs/max_rounds`，来自CPU真实行长。
+`task_acquisition=medium_bounded_grid_stride_long_fixed_parts` 区分旧capacity版本。
+常规与mixed CSV均保留这些字段及各阶段诊断；不新增GPU同步获取精确统计。
+
+### 原测试链路与验收
+
+原 `test_spmv_csr_three_tier_native` 扩展capacity、bounded G1/G4三组，保持regular/mixed可读ID。
+所有dtype、P1/P4（normal另P16）、七种边界形状、strided out、两类queue归属、重复run、
+NaN部分和、输入不变、配置隔离、工作空间限制均覆盖；G1/G4强制多轮消费。
+原宽输出、半精度fallback和通用fallback参数化加入新名称。CPU策略测试补充合法配置、
+old/new专用参数隔离、结构模型、执行入口和实际out guard回归，GPU CI注册检查加入名称。
+原runner的marker/compare自动枚举，无新增runner开关，也不改变默认测试交付。
+
+执行顺序：先regular/mixed smoke（包含修复后的旧capacity版本），再normal；性能分别进行
+全30矩阵compare及独立S128。P4/8/16固定G中512/G长128；随后固定P8比较G中256/512/1024，
+再固定P8/G中512比较G长64/128/256。同批保留旧capacity P4/8/16，避免P混杂。
+全部四种regular dtype和四种mixed组合分别测试，non/int32，baseline及perf-metrics保持开启。
+完整命令交付在对话中，不在文档重复维护。
+
+评价继续使用 `ms=process_cpu_ms+gpu_ms`；诊断另行执行；精度FAIL的有效速度保留。
+统一compare厂商分子，分别计算旧最佳含S128、新默认最佳、显式配置候选最佳，不能将事后配置
+最优冒充默认路由收益。先看mip1/wiki目标矩阵，再看全体GM、胜出与回退，TSOPF作为控制。
+未经新数据验证，不宣称有界中行已经提速，不修改默认算法。
+
+本轮静态验收：修改Python文件AST通过，`git diff --check`通过；与基线AST逐函数比较，
+原48个kernel/runtime函数均保持不变，仅新增 `run_three_tier_bounded`。
+未运行功能导入、策略测试、pytest、算子或离线Triton编译，未暂存/提交。
+源码接通、硬件正确性与性能收益仍作为三个独立状态记录。

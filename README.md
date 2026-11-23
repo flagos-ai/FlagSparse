@@ -374,6 +374,15 @@ benchmark producer without changing either summary schema.
 
 When adding or changing an operator test entry, keep the implementation/API registration, `conf/operators.yaml` entry, pytest marker in `pytest.ini`, accuracy test, performance command, and public replacement/export registration in sync.
 
+The independent CSR SpMV candidate `csr_three_tier_bounded_reduce` keeps the
+three-tier producer and exclusive long-row partials, but consumes medium rows
+with a bounded grid-stride schedule (`medium_grid_blocks=512` by default).
+All other defaults match `csr_three_tier_queue_reduce`; compare these names at
+the same `cooperative_parts` and `long_grid_blocks`. Both support positive
+strided `out`, six value dtypes and the four half-precision input/output
+combinations. The original API, benchmark `compare`, and pytest runner expose
+the new candidate; hardware correctness and performance remain unverified.
+
 The explicit CSR SpMV candidate `csr_three_tier_queue_reduce` supports `non` on
 CUDA/ROCm with six value dtypes and FP16/BF16 same-type or FP32 output. It classifies
 rows on every run into short, whole-row vector, and cooperative long-row work;

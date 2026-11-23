@@ -202,7 +202,7 @@ def test_cooperative_queue_contract_and_workspace():
 def test_irregular_spmv_execution_has_no_host_plan_reads():
     tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    for name in ("run_nnz_local_reduce", "run_longrow_grid", "run_short_rowqueue", "run_short_rowqueue_strided", "run_longrow_cooperative", "run_three_tier_queue"):
+    for name in ("run_nnz_local_reduce", "run_longrow_grid", "run_short_rowqueue", "run_short_rowqueue_strided", "run_longrow_cooperative", "run_three_tier_queue", "run_three_tier_bounded"):
         calls = {n.func.attr for n in ast.walk(functions[name]) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
         assert not calls & {"item", "tolist", "nonzero", "cumsum", "repeat_interleave", "unique_consecutive"}
     owner = functions["_nnz_local_owner"]
@@ -1384,3 +1384,93 @@ def test_three_tier_structure_model_and_launch_contract():
         source = path.read_text(encoding="utf-8")
         for field in ("medium_queue_capacity", "long_queue_capacity", "medium_consumer_ms", "long_consumer_ms"):
             assert field in source
+
+
+def test_three_tier_bounded_policy_and_schedule():
+    from dataclasses import replace
+    alg = "csr_three_tier_bounded_reduce"
+    for backend, subgroup in (("cuda", 32), ("rocm", 64)):
+        caps = policy.BackendCaps(backend, "unverified", backend, subgroup, 1024, True, True, True,
+                                  scan=True, int32_atomic=True, fp32_atomic=False, fp64_atomic=False)
+        cfg, source = policy.resolve_config(alg, caps)
+        old, _ = policy.resolve_config("csr_three_tier_queue_reduce", caps)
+        assert cfg == dict(old, medium_grid_blocks=512)
+        assert source == "three-tier-bounded-conservative-v1"
+        for dtype in policy.VALUE_DTYPES:
+            assert alg in policy.list_algorithms(op="non", dtype=dtype, backend=backend)
+            policy.validate_support(alg, "non", dtype, "int64", "int32", caps)
+            assert policy.three_tier_queue_capacity(100, 2050, cfg, dtype) == policy.three_tier_queue_capacity(100, 2050, old, dtype)
+        for op in ("trans", "conj"):
+            assert alg not in policy.list_algorithms(op=op)
+            with unittest.TestCase().assertRaises(NotImplementedError):
+                policy.validate_support(alg, op, "float16", "int32", "int32", caps)
+        for feature in ("scan", "int32_atomic", "int64", "reduction"):
+            with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+                policy.validate_support(alg, "non", "float16", "int32", "int32", replace(caps, **{feature: None}))
+        for value in (0, -1, 1025, True, 1.5, "256"):
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.resolve_config(alg, caps, {"medium_grid_blocks": value})
+        for value in (1, 4, 256, 512, 1024):
+            supplied = {"medium_grid_blocks": value}
+            resolved, _ = policy.resolve_config(alg, caps, supplied)
+            assert resolved == dict(cfg, **supplied) and supplied == {"medium_grid_blocks": value}
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config("csr_three_tier_queue_reduce", caps, {"medium_grid_blocks": 256})
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.assert_route_match(alg, cfg, "csr_three_tier_queue_reduce", None, caps)
+    tree = ast.parse((ROOT / "tests/benchmark_utils.py").read_text(encoding="utf-8"))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "csr_tile_structure")
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "bounded_structure_policy", "exec"), namespace)
+    stats = namespace["csr_tile_structure"]([0, 0, 2, 6, 10, 14, 19], config={
+        "short_row_threshold": 2, "long_row_threshold": 4, "long_grid_blocks": 1,
+        "medium_grid_blocks": 2, "cooperative_parts": 4, "block_nnz": 4})["three_tier_queue"]
+    assert stats["medium_queue_capacity"] == 6 and stats["medium_grid_blocks"] == 2
+    assert stats["expected_medium_rows"] == 3 and stats["expected_medium_max_rounds"] == 2
+    assert stats["medium_rounds_capacity"] == 3 and stats["expected_medium_empty_programs"] == 0
+    functions = {n.name:n for n in ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8")).body if isinstance(n, ast.FunctionDef)}
+    runtime = ast.unparse(functions["run_three_tier_bounded"])
+    for name in ("three_tier_producer_kernel", "short_rowqueue_strided_vector_kernel", "cooperative_row_consumer_kernel", "cooperative_row_finish_kernel"):
+        assert name in runtime
+    assert "short_rowqueue_vector_kernel" not in runtime and "run_three_tier_queue(" not in runtime
+    for path in (ROOT / "tests/test_spmv_csr.py", ROOT / "tests/benchmark_utils.py"):
+        source = path.read_text(encoding="utf-8")
+        assert all(field in source for field in ("medium_grid_limit", "medium_rounds_capacity"))
+
+
+def test_three_tier_strided_out_validation_regression():
+    """Validate both names through the real guard without initializing a GPU."""
+    tree = ast.parse((SOURCE / "spmv_csr.py").read_text(encoding="utf-8"))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_spmv_check_output")
+    class Tensor:
+        device, dtype, shape = "cuda", "float32", (35,)
+        def __init__(self, stride=3, pointer=100):
+            self.step, self.pointer = stride, pointer
+        def is_contiguous(self):
+            return self.step == 1
+        def stride(self, axis):
+            return self.step
+        def numel(self):
+            return self.shape[0]
+        def is_conj(self):
+            return False
+        def is_neg(self):
+            return False
+        def untyped_storage(self):
+            return types.SimpleNamespace(data_ptr=lambda: self.pointer)
+    namespace = dict(torch=types.SimpleNamespace(is_tensor=lambda v: isinstance(v, Tensor)),
+                     _is_accel_tensor=lambda v: True, _csr_config=policy)
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "strided_out_policy", "exec"), namespace)
+    guard = namespace["_spmv_check_output"]
+    for alg in policy.THREE_TIER_ALGORITHMS:
+        prepared = types.SimpleNamespace(alg=alg, data=Tensor(pointer=1), kernel_indices=Tensor(pointer=2),
+                                         kernel_indptr=Tensor(pointer=3), transpose=False, n_rows=35, n_cols=0)
+        vector = Tensor(pointer=4)
+        guard(Tensor(), prepared, vector)
+        for stride in (0, -1):
+            with unittest.TestCase().assertRaisesRegex(ValueError, "positive strides"):
+                guard(Tensor(stride=stride), prepared, vector)
+        with unittest.TestCase().assertRaisesRegex(ValueError, "overlap"):
+            guard(Tensor(pointer=1), prepared, vector)
+        with unittest.TestCase().assertRaisesRegex(ValueError, "shape/dtype"):
+            guard(Tensor(), prepared, vector, output_dtype="float16")
