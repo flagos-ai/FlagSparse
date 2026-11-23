@@ -11,7 +11,7 @@ SHORT_ROW_ALGORITHMS = ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_
 LONGROW_ALGORITHMS = ("csr_longrow_queue_atomic", "csr_longrow_grid_atomic")
 ROWQUEUE_ALGORITHMS = ("csr_short_rowqueue_vector", "csr_short_rowqueue_strided_vector")
 COOPERATIVE_ALGORITHMS = ("csr_longrow_cooperative_reduce",)
-THREE_TIER_ALGORITHMS = ("csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce")
+THREE_TIER_ALGORITHMS = ("csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce")
 NEW_ALGORITHMS += SHORT_ROW_ALGORITHMS + LONGROW_ALGORITHMS + ROWQUEUE_ALGORITHMS + COOPERATIVE_ALGORITHMS + ("csr_nnz_local_reduce_atomic",)
 NON_ONLY_ALGORITHMS = SHORT_ROW_ALGORITHMS + LONGROW_ALGORITHMS + ROWQUEUE_ALGORITHMS + COOPERATIVE_ALGORITHMS
 NEW_ALGORITHMS += THREE_TIER_ALGORITHMS
@@ -106,7 +106,11 @@ def algorithm_spec(alg):
             dt: (dt, "float32")
             for dt in ("float16", "bfloat16")
         },
-        "config_candidates": ({"medium_grid_blocks": (256, 512, 1024),
+        "config_candidates": ({"long_schedule": ("static", "ticket"), "ticket_batch": (1, 4),
+                               "long_worker_programs": (0, 256, 512, 1024, 2048),
+                               "medium_grid_blocks": (512, 1024), "cooperative_parts": (4, 8, 16)}
+                              if name == "csr_three_tier_ticket_reduce" else
+                              {"medium_grid_blocks": (256, 512, 1024),
                                "long_grid_blocks": (64, 128, 256), "cooperative_parts": (1, 4, 8, 16),
                                "short_row_threshold": (32, 64, 128), "long_row_threshold": (512, 1024, 2048)}
                               if name == "csr_three_tier_bounded_reduce" else
@@ -362,9 +366,52 @@ def three_tier_queue_capacity(rows, nnz, config, dtype):
                 descriptor_peak_bytes=descriptors, workspace_peak_bytes=numeric + descriptors)
 
 
+def ticket_counter_bound(task_capacity, workers, batch):
+    """Int32 fetch-add bound, including padding and each worker's exit claim."""
+    if (any(type(v) is not int for v in (task_capacity, workers, batch)) or
+            task_capacity < 0 or workers < 0 or workers > task_capacity or
+            batch not in (1, 4) or (task_capacity > 0 and workers == 0)):
+        raise ValueError("invalid ticket task capacity/workers/batch")
+    bound = 0 if task_capacity <= workers else batch * (
+        (task_capacity - workers + batch - 1) // batch + workers)
+    if bound > 2**31 - 1:
+        raise ValueError("ticket counter including exit claims exceeds int32 range")
+    return bound
+
+
+def ticket_queue_capacity(rows, nnz, config, dtype):
+    stats = three_tier_queue_capacity(rows, nnz, config, dtype)
+    tasks = stats["long_queue_capacity"] * config["cooperative_parts"]
+    requested = config["long_worker_programs"]
+    workers = (min(tasks, requested) if requested else
+               min(stats["long_queue_capacity"], config["long_grid_blocks"]) * config["cooperative_parts"])
+    bound = ticket_counter_bound(tasks, workers, config["ticket_batch"]) if config["long_schedule"] == "ticket" else 0
+    stats["descriptor_peak_bytes"] += 4
+    stats["workspace_peak_bytes"] += 4
+    if stats["workspace_peak_bytes"] > config["workspace_limit_bytes"]:
+        raise ValueError(f"ticket workspace requires {stats['workspace_peak_bytes']} bytes")
+    stats.update(task_capacity=tasks, long_worker_programs=workers,
+                 long_worker_limit=requested, ticket_counter_max_bound=bound,
+                 ticket_counter_dtype="int32")
+    return stats
+
+
 def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_nnz=0):
     if config is not None and not isinstance(config, dict):
         raise TypeError("CSR SpMV config must be a dictionary")
+    if alg == "csr_three_tier_ticket_reduce":
+        supplied = dict(config or {})
+        schedule = supplied.pop("long_schedule", "ticket")
+        batch = supplied.pop("ticket_batch", 1)
+        workers = supplied.pop("long_worker_programs", 0)
+        if (schedule not in ("static", "ticket") or type(batch) is not int or batch not in (1, 4)
+                or type(workers) is not int or workers not in (0, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+                or (schedule == "static" and batch != 1)):
+            raise ValueError("invalid ticket schedule/batch/worker configuration")
+        cfg, _, rejected = resolve_config("csr_three_tier_bounded_reduce", caps, supplied, return_rejections=True)
+        cfg.update(long_schedule=schedule, ticket_batch=batch, long_worker_programs=workers)
+        result = (cfg, "explicit" if config else "three-tier-ticket-conservative-v1")
+        return result + (rejected,) if return_rejections else result
     if alg in THREE_TIER_ALGORITHMS:
         if (caps.backend not in ("cuda", "rocm") or caps.subgroup_width not in (32, 64)
                 or not caps.scan or caps.int32_atomic is not True):

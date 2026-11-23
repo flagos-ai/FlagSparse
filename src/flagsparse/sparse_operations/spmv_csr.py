@@ -51,6 +51,7 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "csr_longrow_cooperative_reduce",
     "csr_three_tier_queue_reduce",
     "csr_three_tier_bounded_reduce",
+    "csr_three_tier_ticket_reduce",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1783,6 +1784,9 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
     if alg == "csr_three_tier_bounded_reduce":
         from ._spmv_csr_kernels import run_three_tier_bounded
         return run_three_tier_bounded(prepared, x, out, timing, _spmv_phase)
+    if alg == "csr_three_tier_ticket_reduce":
+        from ._spmv_csr_kernels import run_three_tier_ticket
+        return run_three_tier_ticket(prepared, x, out, timing, _spmv_phase)
     if alg == "csr_longrow_cooperative_reduce":
         from ._spmv_csr_kernels import run_longrow_cooperative
         return run_longrow_cooperative(prepared, x, out, timing, _spmv_phase)
@@ -2059,8 +2063,12 @@ def flagsparse_spmv_csr_run(
                         plan_strategy="none", validation="unverified")
         if actual.alg in _csr_config.THREE_TIER_ALGORITHMS:
             meta.update(execution_path="native_" + actual.alg, validation="unverified")
-            if actual.alg == "csr_three_tier_bounded_reduce":
+            if actual.alg in ("csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce"):
                 meta.update({key: phases[key] for key in ("medium_grid_limit", "medium_rounds_capacity")})
+            if actual.alg == "csr_three_tier_ticket_reduce":
+                meta.update({key: phases[key] for key in (
+                    "long_schedule", "ticket_batch", "long_worker_programs", "long_worker_limit",
+                    "task_capacity", "ticket_counter_dtype", "ticket_counter_max_bound")})
             for key in ("medium_queue_capacity", "long_queue_capacity", "partial_slot_capacity",
                         "descriptor_peak_bytes", "numeric_workspace_bytes", "workspace_peak_bytes",
                         "medium_grid_blocks", "long_row_grid_blocks", "long_consumer_grid_blocks",

@@ -222,6 +222,22 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
                 expected_medium_active_programs=min(int(medium.size), medium_grid),
                 expected_medium_empty_programs=max(0, medium_grid - int(medium.size)),
                 expected_medium_max_rounds=(int(medium.size) + medium_grid - 1) // medium_grid if medium_grid else 0)
+        if "long_schedule" in cfg:
+            schedule, batch, requested = cfg["long_schedule"], cfg["ticket_batch"], cfg["long_worker_programs"]
+            if (schedule not in ("static", "ticket") or type(batch) is not int or batch not in (1, 4)
+                    or type(requested) is not int or requested not in (0, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+                    or (schedule == "static" and batch != 1)):
+                raise ValueError("invalid ticket structure configuration")
+            workers = min(cl * parts, requested) if requested else grid * parts
+            tasks = int(long_lengths.size) * parts
+            claims = ((tasks - workers + batch - 1) // batch + workers
+                      if schedule == "ticket" and tasks > workers else 0)
+            result["three_tier_queue"].update(
+                long_schedule=schedule, ticket_batch=batch, long_worker_limit=requested,
+                long_consumer_grid_blocks=workers, task_capacity=cl * parts,
+                expected_long_tasks=tasks, expected_initial_tasks=min(tasks, workers),
+                predicted_ticket_acquisitions=claims, predicted_ticket_final_value=batch * claims,
+                ticket_model_source="cpu_structure_not_device_counter")
     return result
 
 
@@ -511,7 +527,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     if operator == "spmv_csr":
         fields += ["medium_consumer_ms", "long_consumer_ms", "row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
                    "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
-                   "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "medium_grid_limit", "medium_rounds_capacity", "long_row_grid_blocks", "long_consumer_grid_blocks"]
+                   "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "medium_grid_limit", "medium_rounds_capacity", "long_row_grid_blocks", "long_consumer_grid_blocks", "long_schedule", "ticket_batch", "long_worker_programs", "long_worker_limit", "task_capacity", "ticket_counter_dtype", "ticket_counter_max_bound"]
     if metrics_enabled:
         fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
                    "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",
@@ -776,7 +792,7 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 row.update({key: meta.get(key) for key in
                                             ("row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
                                              "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
-                                             "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "medium_grid_limit", "medium_rounds_capacity", "long_row_grid_blocks", "long_consumer_grid_blocks")})
+                                             "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "medium_grid_limit", "medium_rounds_capacity", "long_row_grid_blocks", "long_consumer_grid_blocks", "long_schedule", "ticket_batch", "long_worker_programs", "long_worker_limit", "task_capacity", "ticket_counter_dtype", "ticket_counter_max_bound")})
                             row["alg_resolved"] = meta.get("alg_resolved", meta.get("alg", alg))
                             row["vendor_status"] = "SKIP"
                             row["vendor_reason"] = "disabled"

@@ -374,6 +374,16 @@ benchmark producer without changing either summary schema.
 
 When adding or changing an operator test entry, keep the implementation/API registration, `conf/operators.yaml` entry, pytest marker in `pytest.ini`, accuracy test, performance command, and public replacement/export registration in sync.
 
+The independent CSR SpMV candidate `csr_three_tier_ticket_reduce` supports `non`,
+six value dtypes and four half-precision combinations on CUDA/ROCm. It retains
+bounded medium rows and fixed-P exclusive partials; long-row workers process a
+static first wave, then claim remaining tasks using an integer ticket. Use
+`long_schedule="static"` for the internal control, `ticket_batch=1/4` for ticket
+batching, and `long_worker_programs=0` for the original grid-derived worker count.
+It checks int32 ticket overflow including terminal claims, and never uses floating
+atomics. Original APIs, compare and pytest expose it without changing the default;
+hardware compilation, accuracy and performance remain unverified.
+
 The independent CSR SpMV candidate `csr_three_tier_bounded_reduce` keeps the
 three-tier producer and exclusive long-row partials, but consumes medium rows
 with a bounded grid-stride schedule (`medium_grid_blocks=512` by default).

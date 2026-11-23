@@ -311,6 +311,13 @@ pytest tests/pytest --mode quick -m "spmv_coo_tocsr"
 
 新增或修改算子测试项时，需要同步维护算子实现/API 注册、`conf/operators.yaml` 注册、`pytest.ini` marker、精度测试、性能命令以及公开替换/导出注册。
 
+CSR SpMV 新增独立候选 `csr_three_tier_ticket_reduce`，支持CUDA/ROCm的non、六种dtype及四种半精度组合。
+它保留有界中行和固定P独占部分和；长行worker先处理静态首轮，剩余任务通过整数ticket领取，不使用浮点atomic。
+`long_schedule="static"`提供同kernel数学路径的静态对照；`ticket_batch=1/4`控制领取批量，
+`long_worker_programs=0`按原网格派生worker数量。计数溢出检查包括退出领取。
+通过原API、compare和pytest使用，旧算法和默认路由不变；硬件编译、准确性与收益尚未验证。
+详见[ticket实施设计](docs/spmv_spmm_optimization/CSR_SPMV_TICKET_LONGROW_PLAN_20261123.md)。
+
 CSR SpMV 独立候选 `csr_three_tier_bounded_reduce` 保留三类分类和长行独占部分和，
 将中行改为有界网格跨步消费，新增 `medium_grid_blocks`（默认512）。其余默认参数与
 `csr_three_tier_queue_reduce` 相同，需固定 `cooperative_parts/long_grid_blocks` 比较。

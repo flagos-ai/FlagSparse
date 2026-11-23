@@ -202,7 +202,7 @@ def test_cooperative_queue_contract_and_workspace():
 def test_irregular_spmv_execution_has_no_host_plan_reads():
     tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    for name in ("run_nnz_local_reduce", "run_longrow_grid", "run_short_rowqueue", "run_short_rowqueue_strided", "run_longrow_cooperative", "run_three_tier_queue", "run_three_tier_bounded"):
+    for name in ("run_nnz_local_reduce", "run_longrow_grid", "run_short_rowqueue", "run_short_rowqueue_strided", "run_longrow_cooperative", "run_three_tier_queue", "run_three_tier_bounded", "run_three_tier_ticket"):
         calls = {n.func.attr for n in ast.walk(functions[name]) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
         assert not calls & {"item", "tolist", "nonzero", "cumsum", "repeat_interleave", "unique_consecutive"}
     owner = functions["_nnz_local_owner"]
@@ -1474,3 +1474,89 @@ def test_three_tier_strided_out_validation_regression():
             guard(Tensor(pointer=1), prepared, vector)
         with unittest.TestCase().assertRaisesRegex(ValueError, "shape/dtype"):
             guard(Tensor(), prepared, vector, output_dtype="float16")
+
+
+
+def test_three_tier_ticket_configuration_capacity_and_overflow():
+    from dataclasses import replace
+    alg = "csr_three_tier_ticket_reduce"
+    for backend, subgroup in (("cuda", 32), ("rocm", 64)):
+        caps = policy.BackendCaps(backend, "unverified", backend, subgroup, 1024, True, True, True,
+                                  scan=True, int32_atomic=True, fp32_atomic=False, fp64_atomic=False)
+        old, _ = policy.resolve_config("csr_three_tier_bounded_reduce", caps)
+        cfg, source = policy.resolve_config(alg, caps)
+        assert cfg == dict(old, long_schedule="ticket", ticket_batch=1, long_worker_programs=0)
+        assert source == "three-tier-ticket-conservative-v1"
+        spec = policy.algorithm_spec(alg)
+        assert spec["ops"] == ("non",) and not spec["cross_call_plan_cache"]
+        assert alg in policy.list_algorithms("non", "float16", backend)
+        assert alg not in policy.list_algorithms("trans", "float16", backend)
+        for dtype in policy.VALUE_DTYPES:
+            policy.validate_support(alg, "non", dtype, "int64", "int32", caps)
+            base = policy.three_tier_queue_capacity(100, 2050, old, dtype)
+            stats = policy.ticket_queue_capacity(100, 2050, cfg, dtype)
+            assert stats["workspace_peak_bytes"] == base["workspace_peak_bytes"] + 4
+            assert stats["numeric_workspace_bytes"] == base["numeric_workspace_bytes"]
+            assert stats["long_worker_programs"] == 8 and stats["task_capacity"] == 8
+            assert stats["ticket_counter_max_bound"] == 0
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.ticket_queue_capacity(100, 2050, dict(cfg, workspace_limit_bytes=stats["workspace_peak_bytes"] - 1), dtype)
+            with unittest.TestCase().assertRaises(NotImplementedError):
+                policy.validate_support(alg, "trans", dtype, "int32", "int32", caps)
+        assert policy.ticket_queue_capacity(0, 0, cfg, "float16")["workspace_peak_bytes"] == 12
+        for invalid in ({"ticket_batch": 2}, {"ticket_batch": True}, {"long_schedule": "dynamic"},
+                        {"long_schedule": "static", "ticket_batch": 4}, {"long_worker_programs": 1},
+                        {"long_worker_programs": True}, {"long_worker_programs": -32}, {"unknown": 1}):
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.resolve_config(alg, caps, invalid)
+        for schedule, batch in (("static", 1), ("ticket", 1), ("ticket", 4)):
+            explicit = dict(long_schedule=schedule, ticket_batch=batch, long_worker_programs=32)
+            original = dict(explicit)
+            resolved, source = policy.resolve_config(alg, caps, explicit)
+            assert explicit == original and source == "explicit"
+            assert resolved == dict(cfg, **explicit)
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config("csr_three_tier_bounded_reduce", caps, {"long_schedule": "ticket"})
+        for feature in ("scan", "int32_atomic", "reduction", "int64"):
+            with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+                policy.validate_support(alg, "non", "float16", "int32", "int32", replace(caps, **{feature: None}))
+    # Terminal claims must fit too; T <= int32 max alone is insufficient for B4.
+    assert policy.ticket_counter_bound(7936, 1024, 1) == 7936
+    assert policy.ticket_counter_bound(7936, 1024, 4) == 11008
+    assert policy.ticket_counter_bound(32, 32, 4) == 0
+    assert policy.ticket_counter_bound(35, 32, 4) == 132
+    assert policy.ticket_counter_bound(2**31 - 1, 32, 1) == 2**31 - 1
+    assert policy.ticket_counter_bound(2**31 - 128, 32, 4) == 2**31 - 32
+    for args in ((2**31 - 1, 32, 4), (1, 0, 1), (0, 1, 1), (32, 32, True)):
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.ticket_counter_bound(*args)
+
+
+def test_three_tier_ticket_structure_and_wiring():
+    import numpy as np
+    source = (ROOT / "tests/benchmark_utils.py").read_text(encoding="utf-8")
+    function = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "csr_tile_structure")
+    namespace = {"np": np}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "ticket_structure_policy", "exec"), namespace)
+    config = dict(short_row_threshold=8, long_row_threshold=64, block_nnz=64, cooperative_parts=1,
+                  long_grid_blocks=2, medium_grid_blocks=4, long_schedule="ticket", ticket_batch=4, long_worker_programs=32)
+    ptr = np.concatenate(([0], np.cumsum([257] * 35)))
+    q = namespace["csr_tile_structure"](ptr, config=config)["three_tier_queue"]
+    assert q["expected_long_tasks"] == 35 and q["long_consumer_grid_blocks"] == 32
+    assert q["predicted_ticket_acquisitions"] == 33 and q["predicted_ticket_final_value"] == 132
+    q = namespace["csr_tile_structure"](ptr, config=dict(config, long_schedule="static", ticket_batch=1))["three_tier_queue"]
+    assert q["predicted_ticket_acquisitions"] == 0
+    functions = {n.name: n for n in ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8")).body if isinstance(n, ast.FunctionDef)}
+    runtime = ast.unparse(functions["run_three_tier_ticket"])
+    for name in ("ticket_queue_capacity", "three_tier_producer_kernel", "short_rowqueue_strided_vector_kernel",
+                 "three_tier_ticket_consumer_kernel", "cooperative_row_finish_kernel"):
+        assert name in runtime
+    assert "run_three_tier_bounded(" not in runtime and ".item(" not in runtime
+    helper = ast.unparse(functions["_ticket_exclusive_part"])
+    assert "atomic_add" not in helper
+    consumer = ast.unparse(functions["three_tier_ticket_consumer_kernel"])
+    assert "total > WORKERS" in consumer and "scope='gpu'" in consumer
+    assert "tl.static_range(0, BATCH)" in consumer
+    for path in (ROOT / "tests/test_spmv_csr.py", ROOT / "tests/benchmark_utils.py"):
+        content = path.read_text(encoding="utf-8")
+        assert all(field in content for field in ("ticket_counter_max_bound", "long_schedule", "ticket_batch", "long_worker_limit"))

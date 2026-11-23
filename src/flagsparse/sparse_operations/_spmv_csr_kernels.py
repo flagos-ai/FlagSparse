@@ -632,6 +632,134 @@ def run_three_tier_bounded(prepared, x, out, timing, phase):
 
 
 @triton.jit
+def _ticket_exclusive_part(A, I, P, X, ROWS, PARTIAL, TASK, XS,
+                           K: tl.constexpr, PARTS: tl.constexpr,
+                           COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    slot = TASK // PARTS
+    part = TASK % PARTS
+    row = tl.load(ROWS + slot).to(tl.int64)
+    start = tl.load(P + row).to(tl.int64)
+    stop = tl.load(P + row + 1).to(tl.int64)
+    chunks = (stop - start + K - 1) // K
+    begin = start + ((chunks * part) // PARTS) * K
+    end = tl.minimum(stop, start + ((chunks * (part + 1)) // PARTS) * K)
+    lane = tl.arange(0, K).to(tl.int64)
+    re = tl.zeros((K,), ACC)
+    im = tl.zeros((K,), ACC)
+    for base in range(begin, end, K):
+        pos = base + lane
+        pr, pi = _short_row_product(A, I, X, pos, pos < end, XS, COMPLEX, ACC)
+        re += pr
+        if COMPLEX:
+            im += pi
+    # Empty parts still write zero; finish never reads uninitialized valid slots.
+    if COMPLEX:
+        tl.store(PARTIAL + 2 * TASK, tl.sum(re, 0))
+        tl.store(PARTIAL + 2 * TASK + 1, tl.sum(im, 0))
+    else:
+        tl.store(PARTIAL + TASK, tl.sum(re, 0))
+
+
+@triton.jit
+def three_tier_ticket_consumer_kernel(A, I, P, X, COUNTS, ROWS, PARTIAL, XS,
+                                       WORKERS: tl.constexpr, BATCH: tl.constexpr,
+                                       STATIC: tl.constexpr, K: tl.constexpr,
+                                       PARTS: tl.constexpr, COMPLEX: tl.constexpr,
+                                       ACC: tl.constexpr):
+    total = tl.load(COUNTS + 1).to(tl.int64) * PARTS
+    task = tl.program_id(0).to(tl.int64)
+    if STATIC:
+        while task < total:
+            _ticket_exclusive_part(A, I, P, X, ROWS, PARTIAL, task, XS, K, PARTS, COMPLEX, ACC)
+            task += WORKERS
+    else:
+        # Static first wave avoids initial contention. T <= W needs no atomic.
+        if task < total:
+            _ticket_exclusive_part(A, I, P, X, ROWS, PARTIAL, task, XS, K, PARTS, COMPLEX, ACC)
+        if total > WORKERS:
+            first = WORKERS + tl.atomic_add(COUNTS + 2, BATCH, sem="relaxed", scope="gpu").to(tl.int64)
+            while first < total:
+                for offset in tl.static_range(0, BATCH):
+                    current = first + offset
+                    if current < total:
+                        _ticket_exclusive_part(A, I, P, X, ROWS, PARTIAL, current, XS, K, PARTS, COMPLEX, ACC)
+                first = WORKERS + tl.atomic_add(COUNTS + 2, BATCH, sem="relaxed", scope="gpu").to(tl.int64)
+
+
+def run_three_tier_ticket(prepared, x, out, timing, phase):
+    from ._spmv_csr_config import ticket_queue_capacity
+
+    cfg = prepared.config
+    stats = ticket_queue_capacity(prepared.n_rows, prepared.data.numel(), cfg, prepared.data.dtype)
+    medium_capacity, long_capacity = stats["medium_queue_capacity"], stats["long_queue_capacity"]
+    medium_grid = min(medium_capacity, cfg["medium_grid_blocks"])
+    parts = cfg["cooperative_parts"]
+    long_grid = min(long_capacity, cfg["long_grid_blocks"])
+    workers = stats["long_worker_programs"]
+    complex_input = prepared.data.is_complex()
+    fp64 = prepared.data.dtype in (torch.float32, torch.float64, torch.complex128)
+    component = torch.float64 if fp64 else torch.float32
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    def initialize():
+        return (prepared.data.resolve_conj().resolve_neg(), x.resolve_conj().resolve_neg(),
+                torch.zeros(3, dtype=torch.int32, device=x.device),
+                torch.empty(medium_capacity, dtype=torch.int64, device=x.device),
+                torch.empty(long_capacity, dtype=torch.int64, device=x.device),
+                torch.empty(long_capacity * parts * (2 if complex_input else 1), dtype=component, device=x.device))
+    (data, vector, counts, medium_rows, long_rows, partial), init_ms = phase(initialize, timing)
+    long_count = counts[1:2]
+    view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+    common = dict(COMPLEX=complex_input, ACC=tl.float64 if fp64 else tl.float32,
+                  num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    def produce():
+        if prepared.n_rows:
+            three_tier_producer_kernel[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                counts, medium_rows, long_rows, prepared.n_rows, vector.stride(0), y.stride(0),
+                R=cfg["rows_per_program"], S=cfg["short_row_threshold"], L=cfg["long_row_threshold"],
+                num_warps=cfg["producer_num_warps"], **common)
+    _, producer_ms = phase(produce, timing)
+    def medium_compute():
+        if medium_grid:
+            short_rowqueue_strided_vector_kernel[(medium_grid,)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                counts, medium_rows, vector.stride(0), y.stride(0), K=cfg["block_nnz"],
+                num_warps=cfg["num_warps"], **common)
+    _, medium_ms = phase(medium_compute, timing)
+    def long_compute():
+        if workers:
+            three_tier_ticket_consumer_kernel[(workers,)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), counts,
+                long_rows, partial, vector.stride(0), WORKERS=workers, BATCH=cfg["ticket_batch"],
+                STATIC=cfg["long_schedule"] == "static", K=cfg["block_nnz"], PARTS=parts,
+                num_warps=cfg["num_warps"], **common)
+    _, long_ms = phase(long_compute, timing)
+    def finish():
+        if long_grid:
+            cooperative_row_finish_kernel[(long_grid,)](
+                long_count, long_rows, partial, view(y), y.stride(0), PARTS=parts,
+                num_warps=cfg["producer_num_warps"], **common)
+    _, finish_ms = phase(finish, timing)
+    return y, dict(stats, process_cpu_ms=0.0, process_gpu_ms=init_ms,
+                   compute_ms=producer_ms + medium_ms + long_ms + finish_ms if timing else None,
+                   init_ms=init_ms, producer_ms=producer_ms,
+                   medium_consumer_ms=medium_ms, long_consumer_ms=long_ms,
+                   consumer_ms=medium_ms + long_ms if timing else None, finish_ms=finish_ms,
+                   fused_plan_compute_ms=producer_ms, queue_count_readback=False,
+                   plan_strategy="per_run_three_tier_row_ids", floating_point_atomic=False,
+                   task_acquisition="static_flat_parts" if cfg["long_schedule"] == "static" else "static_first_wave_ticket_remaining",
+                   long_schedule=cfg["long_schedule"], ticket_batch=cfg["ticket_batch"], cooperative_parts=parts,
+                   medium_grid_blocks=medium_grid, medium_grid_limit=cfg["medium_grid_blocks"],
+                   medium_rounds_capacity=triton.cdiv(medium_capacity, medium_grid) if medium_grid else 0,
+                   long_row_grid_blocks=long_grid, long_consumer_grid_blocks=workers,
+                   initialization="two_queue_counters_and_ticket", output_conversion="final_store",
+                   x_stride=tuple(x.stride()), y_stride=tuple(y.stride()),
+                   execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                   execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                   output_buffer_identity="out" if out is not None else "allocated")
+
+
+@triton.jit
 def longrow_grid_consumer_kernel(A, I, X, COUNTERS, JOB_SLOT, JOB_START, JOB_END,
                                  PARTIAL, XS, K: tl.constexpr, COMPLEX: tl.constexpr,
                                  ACC: tl.constexpr):
