@@ -52,6 +52,9 @@ SPMV_CSR_NEW_ALGORITHMS = (
     "csr_three_tier_queue_reduce",
     "csr_three_tier_bounded_reduce",
     "csr_three_tier_ticket_reduce",
+    "csr_three_tier_fused_static_reduce",
+    "csr_window_grouped_reduce",
+    "csr_merge_event_atomic",
 )
 SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
 SPMV_CSR_NEW_VALUE_DTYPES = (
@@ -1675,7 +1678,7 @@ def _spmv_check_output(out, prepared, x, output_dtype=None):
         or out.shape != (prepared.n_cols if prepared.transpose else prepared.n_rows,)
     ):
         raise ValueError("out shape/dtype/device must match the CSR SpMV result")
-    strided_algorithms = ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_longrow_queue_atomic", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS, *_csr_config.ROWQUEUE_ALGORITHMS, *_csr_config.COOPERATIVE_ALGORITHMS, *_csr_config.THREE_TIER_ALGORITHMS)
+    strided_algorithms = ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_longrow_queue_atomic", "csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_transpose_sharded_atomic", *_csr_config.SHORT_ROW_ALGORITHMS, *_csr_config.ROWQUEUE_ALGORITHMS, *_csr_config.COOPERATIVE_ALGORITHMS, *_csr_config.THREE_TIER_ALGORITHMS, *_csr_config.EXPERIMENT_ALGORITHMS)
     if not out.is_contiguous() and prepared.alg not in strided_algorithms:
         raise ValueError("out must be contiguous")
     if prepared.alg in strided_algorithms and out.numel() > 1 and out.stride(0) <= 0:
@@ -1787,6 +1790,9 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
     if alg == "csr_three_tier_ticket_reduce":
         from ._spmv_csr_kernels import run_three_tier_ticket
         return run_three_tier_ticket(prepared, x, out, timing, _spmv_phase)
+    if alg == "csr_three_tier_fused_static_reduce":
+        from ._spmv_csr_kernels import run_three_tier_fused_static
+        return run_three_tier_fused_static(prepared, x, out, timing, _spmv_phase)
     if alg == "csr_longrow_cooperative_reduce":
         from ._spmv_csr_kernels import run_longrow_cooperative
         return run_longrow_cooperative(prepared, x, out, timing, _spmv_phase)
@@ -1845,6 +1851,13 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
     else:
         execution, plan, buckets = prepared, None, None
         process_ms = 0.0 if timing else None
+
+    if alg in _csr_config.EXPERIMENT_ALGORITHMS:
+        from ._spmv_csr_kernels import run_window_or_merge
+        y, stats = run_window_or_merge(execution, x, out, timing, _spmv_phase)
+        if timing:
+            stats["process_gpu_ms"] += process_ms or 0.0
+        return y, stats
 
     if alg == "csr_nnz_local_reduce_atomic":
         from ._spmv_csr_kernels import run_nnz_local_reduce
@@ -2063,8 +2076,13 @@ def flagsparse_spmv_csr_run(
                         plan_strategy="none", validation="unverified")
         if actual.alg in _csr_config.THREE_TIER_ALGORITHMS:
             meta.update(execution_path="native_" + actual.alg, validation="unverified")
-            if actual.alg in ("csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce"):
+            if actual.alg in ("csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce", "csr_three_tier_fused_static_reduce"):
                 meta.update({key: phases[key] for key in ("medium_grid_limit", "medium_rounds_capacity")})
+            if actual.alg == "csr_three_tier_fused_static_reduce":
+                meta.update({key: phases[key] for key in (
+                    "consumer_timing_scope", "consumer_grid_blocks", "long_worker_programs", "long_schedule")})
+                if timing:
+                    meta["consumer_fused_ms"] = phases["consumer_fused_ms"]
             if actual.alg == "csr_three_tier_ticket_reduce":
                 meta.update({key: phases[key] for key in (
                     "long_schedule", "ticket_batch", "long_worker_programs", "long_worker_limit",
@@ -2110,6 +2128,15 @@ def flagsparse_spmv_csr_run(
             meta.update(grid_capacity=phases["grid_capacity"], task_acquisition=phases["task_acquisition"])
             if timing:
                 meta.update({key: phases[key] for key in ("init_ms", "producer_ms", "consumer_ms", "finish_ms")})
+        if actual.alg in _csr_config.EXPERIMENT_ALGORITHMS:
+            meta.update(execution_path="native_" + actual.alg, validation="unverified")
+            for key in ("plan_strategy", "workspace_peak_bytes", "descriptor_peak_bytes", "output_buffer_identity",
+                        "initialization", "output_conversion", "x_stride", "y_stride", "event_count",
+                        "events_per_program", "atomic_scope", "local_ordering_scope", "row_order", "compute_timing_scope"):
+                if key in phases:
+                    meta[key] = phases[key]
+            if timing and "fused_plan_compute_ms" in phases:
+                meta["fused_plan_compute_ms"] = phases["fused_plan_compute_ms"]
         if actual.alg == "csr_nnz_local_reduce_atomic":
             meta.update(execution_path="native_csr_nnz_local_reduce_atomic", validation="unverified")
             meta.update({key: actual.config[key] for key in ("owner_search", "single_row_fastpath", "atomic_mode")})

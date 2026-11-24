@@ -311,6 +311,13 @@ pytest tests/pytest --mode quick -m "spmv_coo_tocsr"
 
 新增或修改算子测试项时，需要同步维护算子实现/API 注册、`conf/operators.yaml` 注册、`pytest.ini` marker、精度测试、性能命令以及公开替换/导出注册。
 
+CSR SpMV 新增独立候选 `csr_three_tier_fused_static_reduce`：中行和长行静态consumer合为一次launch，
+分别使用各自的跨步大小，保留独占部分和及独立finish；支持CUDA/ROCm的non、六种dtype和四种半精度组合。
+旧算法、static对照和默认路由不变。CSR benchmark可配合`--perf-metrics`和CSV输出启用
+`--task-diagnostics`，通过`--task-diagnostic-repeats`指定重复次数；实际队列、工作量模型和ticket插桩数据
+单独保存，不进入性能采样。联合阶段为`consumer_fused_ms`，不虚构单独的中行/长行耗时。
+源码接入不代表硬件通过或已经提速，详见[融合设计与诊断边界](docs/spmv_spmm_optimization/CSR_SPMV_FUSED_STATIC_PLAN_20261124.md)。
+
 CSR SpMV 新增独立候选 `csr_three_tier_ticket_reduce`，支持CUDA/ROCm的non、六种dtype及四种半精度组合。
 它保留有界中行和固定P独占部分和；长行worker先处理静态首轮，剩余任务通过整数ticket领取，不使用浮点atomic。
 `long_schedule="static"`提供同kernel数学路径的静态对照；`ticket_batch=1/4`控制领取批量，
@@ -529,3 +536,12 @@ prepare、转置、稳态、图重放和首次调用的原计时范围保持各�
 此过滤只针对重复耗时样本，不修改准确性容差、FAIL 汇总规则或算法选择。
 原 runner 命令继续有效；`benchmark/test_sparse_perf.py` 仍是占位入口。
 新增统计与描述符生命周期策略用例供 CI 执行，本地只做静态检查。
+
+
+CSR SpMV 新增独立候选 `csr_window_grouped_reduce`（窗口内行长重组，无全局计划）与
+`csr_merge_event_atomic`（行边界/NNZ 联合事件划分，仅跨 program 片段 atomic）。
+支持六种 CSR 数值类型、四种半精度组合和 non/trans/conj；转置沿用原 CSR 生命周期。
+旧 kernel、默认算法及配置保留；新候选硬件编译、正确性和性能尚未验证。
+原 benchmark 可用 `--locality-diagnostics` 配合 `--perf-metrics` 和 CSV 输出采集
+计时外的 CPU 局部性模型；结果不是硬件缓存命中率。
+详见[三组实验与交付状态](docs/spmv_spmm_optimization/SPMV_THREE_TRACK_EXECUTION_PLAN_20261124.md)。

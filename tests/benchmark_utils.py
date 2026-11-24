@@ -19,6 +19,130 @@ from pathlib import Path
 
 import torch
 
+
+CSR_LOCALITY_FIELDS = ["locality_diagnostic_status", "locality_diagnostic_reason", "locality_diagnostic_path",
+                       "locality_summary", "structure_fingerprint", "matrix_fingerprint", "rhs_fingerprint"]
+CSR_EXPERIMENT_FIELDS = ["event_count", "events_per_program", "atomic_scope", "local_ordering_scope",
+                         "row_order", "compute_timing_scope"]
+
+
+def csr_locality_structure(indptr, indices, shape, *, op="non", element_bytes=4, rhs_stride=1,
+                           window_rows=64, rows_per_group=8, lanes_per_row=8, max_windows=4096):
+    """CPU-only proxies; neither hardware cache counters nor execution plans."""
+    import numpy as np
+
+    if op not in ("non", "trans", "conj"):
+        raise ValueError("invalid locality operation")
+    if min(window_rows, rows_per_group, lanes_per_row, max_windows, element_bytes, rhs_stride) <= 0 or window_rows % rows_per_group:
+        raise ValueError("invalid locality model dimensions")
+    ptr = np.asarray(indptr, dtype=np.int64)
+    col = np.asarray(indices, dtype=np.int64)
+    if len(ptr) != int(shape[0]) + 1 or ptr[0] != 0 or ptr[-1] != len(col) or np.any(ptr[1:] < ptr[:-1]):
+        raise ValueError("invalid CSR structure for locality model")
+    if len(col) and (col.min() < 0 or col.max() >= int(shape[1])):
+        raise ValueError("locality column index out of range")
+    if op != "non":
+        order = np.argsort(col, kind="stable")
+        owners = np.repeat(np.arange(shape[0], dtype=np.int64), np.diff(ptr))
+        counts = np.bincount(col, minlength=shape[1])
+        ptr = np.concatenate((np.array([0], dtype=np.int64), np.cumsum(counts, dtype=np.int64)))
+        col = owners[order]  # retain duplicates, zeros and stable storage order
+    lengths = np.diff(ptr)
+    count = (len(lengths) + window_rows - 1) // window_rows
+    selected = np.unique(np.linspace(0, count - 1, min(max_windows, count), dtype=np.int64)) if count else np.empty(0, dtype=np.int64)
+    def scheduled(values):
+        padded = np.zeros(window_rows, dtype=np.int64)
+        padded[:len(values)] = values
+        # Python integers avoid overflow in aggregate cost proxies.
+        return sum(rows_per_group * lanes_per_row * ((int(v) + lanes_per_row - 1) // lanes_per_row)
+                   for v in padded.reshape(-1, rows_per_group).max(axis=1))
+    def address_blocks(values, size):
+        # Object arithmetic avoids overflow for large legal dense strides.
+        addresses = values.astype(object) * int(element_bytes) * int(rhs_stride)
+        return np.unique(addresses // size)
+    def inspect(window):
+        lo, hi = window * window_rows, min((window + 1) * window_rows, len(lengths))
+        values = col[ptr[lo]:ptr[hi]]
+        prev = col[ptr[max(0, lo - window_rows)]:ptr[lo]]
+        result = dict(window=int(window), nnz=int(len(values)), rows=int(hi - lo),
+                      distinct_x_ratio=float(len(np.unique(values)) / len(values)) if len(values) else None,
+                      scheduled_original=scheduled(lengths[lo:hi]),
+                      scheduled_grouped=scheduled(np.sort(lengths[lo:hi])[::-1]))
+        for size in (32, 64, 128):
+            blocks = address_blocks(values, size)
+            result[f"model_blocks_{size}"] = int(len(blocks))
+            result[f"adjacent_reuse_{size}"] = (float(len(np.intersect1d(blocks, address_blocks(prev, size))) / len(blocks))
+                                                   if lo and len(blocks) else None)
+        return result
+    samples = [inspect(int(w)) for w in selected]
+    # Supplemental extreme windows are explicitly separate from the grid sample.
+    extremes = np.unique(np.argsort(lengths, kind="stable")[-min(8, len(lengths)):] // window_rows) if len(lengths) else []
+    supplemental = sorted(set(map(int, extremes)) | ({0, count - 1} if count else set()))
+    original = sum(s["scheduled_original"] for s in samples)
+    grouped = sum(s["scheduled_grouped"] for s in samples)
+    summary = dict(model="csr_locality_v1", op=op, total_windows=count, sampled_windows=len(samples),
+                   coverage="exact" if len(samples) == count else "deterministic_even_windows_not_unbiased",
+                   sampled_nnz=sum(s["nnz"] for s in samples), total_nnz=int(len(col)),
+                   scheduled_original=original, scheduled_grouped=grouped,
+                   grouped_position_ratio=grouped / original if original else None,
+                   element_bytes=element_bytes, rhs_stride=rhs_stride,
+                   window_rows=window_rows, rows_per_group=rows_per_group, lanes_per_row=lanes_per_row,
+                   address_alignment="normalized_zero_offset_not_device_address",
+                   metric_scope="logical_proxies_not_hardware_cache_or_occupancy",
+                   grouping_scope="hypothetical_window_model_not_claimed_algorithm_schedule")
+    return dict(summary=summary, windows=samples, supplemental_windows=[inspect(w) for w in supplemental])
+
+
+def write_csr_locality_diagnostics(csv_path, row, arrays, rhs, shape, op, config, cache):
+    """Best-effort diagnostics after timing; errors never erase the timed result."""
+    import gzip
+    import hashlib
+    import json
+    import traceback
+
+    try:
+        cfg = config or {}
+        # Other algorithms use the same explicit comparison model, not their launch geometry.
+        actual_window = row.get("alg") == "csr_window_grouped_reduce"
+        w, r, v = ((cfg["window_rows"], cfg["rows_per_group"], cfg["lanes_per_row"])
+                   if actual_window else (64, 8, 8))
+        source_key = ("locality_source", row["matrix"], tuple(shape),
+                      tuple((str(t.dtype), t.data_ptr(), tuple(t.stride())) for t in (*arrays, rhs)))
+        if source_key not in cache:
+            data, indices, indptr = (t.detach().cpu().contiguous() for t in arrays)
+            digest = hashlib.sha256()
+            for t in (data, indices, indptr):
+                digest.update(str((str(t.dtype), tuple(t.shape))).encode())
+                digest.update(t.view(torch.uint8).numpy().tobytes())
+            structure = hashlib.sha256(str(tuple(shape)).encode() +
+                                       indices.to(torch.int64).numpy().tobytes() +
+                                       indptr.to(torch.int64).numpy().tobytes()).hexdigest()
+            vector = rhs.detach().cpu().contiguous()
+            fingerprint = hashlib.sha256(vector.view(torch.uint8).numpy().tobytes()).hexdigest()
+            cache[source_key] = (indices.numpy(), indptr.numpy(), digest.hexdigest(), structure, fingerprint)
+        indices, indptr, matrix_hash, structure_hash, rhs_hash = cache[source_key]
+        key = (source_key, op, rhs.element_size(), rhs.stride(0), w, r, v)
+        if key not in cache:
+            payload = csr_locality_structure(indptr, indices, shape, op=op, element_bytes=rhs.element_size(),
+                                             rhs_stride=rhs.stride(0), window_rows=w, rows_per_group=r, lanes_per_row=v)
+            identity = dict(matrix=row["matrix"], structure=structure_hash, op=op,
+                            element_bytes=rhs.element_size(), stride=rhs.stride(0), w=w, r=r, v=v)
+            token = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
+            folder = Path(str(csv_path) + ".locality")
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / f"{token}.json.gz"
+            with gzip.open(target, "wt", encoding="utf-8") as handle:
+                json.dump(dict(identity=identity, **payload), handle, ensure_ascii=False)
+            cache[key] = dict(locality_diagnostic_status="collected", locality_diagnostic_reason="",
+                              locality_diagnostic_path=str(target), locality_summary=payload["summary"])
+        return dict(cache[key], structure_fingerprint=structure_hash,
+                    matrix_fingerprint=row.get("matrix_fingerprint") or matrix_hash,
+                    rhs_fingerprint=row.get("rhs_fingerprint") or rhs_hash)
+    except Exception as exc:
+        print(f"[locality diagnostic ERROR] {row.get('matrix')} {row.get('alg')}: {exc}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        return dict(locality_diagnostic_status="ERROR", locality_diagnostic_reason=f"{type(exc).__name__}: {exc}")
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -203,6 +327,27 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
         medium_grid = min(cm, medium_limit)
         grid = min(cl, limit)
         useful_parts = int(np.minimum((long_lengths + block - 1) // block, parts).sum())
+        # Order-independent task sizes. Never infer worker load from CPU row order.
+        chunks = (long_lengths + block - 1) // block
+        quotient, remainder = chunks // parts, chunks % parts
+        histogram = {}
+        for values, weights in ((quotient, parts - remainder), (quotient + 1, remainder)):
+            for size, weight in zip(values.tolist(), weights.tolist()):
+                if weight:
+                    histogram[size] = histogram.get(size, 0) + weight
+        total_tasks = int(long_lengths.size) * parts
+        def task_percentile(q):
+            rank, count = max(1, int(np.ceil(q * total_tasks))), 0
+            for size in sorted(histogram):
+                count += histogram[size]
+                if count >= rank:
+                    return size
+        task_distribution = dict(
+            unit="K_sized_chunks_not_time", tasks=total_tasks,
+            total_chunks=int(chunks.sum()), zero_tasks=histogram.get(0, 0),
+            p50=task_percentile(.5), p90=task_percentile(.9), p99=task_percentile(.99),
+            maximum=max(histogram, default=0), histogram=histogram,
+            queue_order="not_observed", worker_balance="not_inferred")
         result["three_tier_queue"] = dict(
             short_row_threshold=short, long_row_threshold=long,
             expected_short_rows=int(np.count_nonzero(lengths <= short)),
@@ -214,6 +359,7 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
             long_row_grid_blocks=grid, long_consumer_grid_blocks=grid * parts,
             expected_nonempty_part_tasks=useful_parts,
             expected_empty_part_tasks=int(long_lengths.size) * parts - useful_parts,
+            long_part_chunks=task_distribution,
             count_source="cpu_structure_model_not_gpu_readback")
         if "medium_grid_blocks" in cfg:
             result["three_tier_queue"].update(
@@ -239,6 +385,189 @@ def csr_tile_structure(indptr, *, tiles=(128, 256, 512, 1024), config=None):
                 predicted_ticket_acquisitions=claims, predicted_ticket_final_value=batch * claims,
                 ticket_model_source="cpu_structure_not_device_counter")
     return result
+
+
+def csr_queue_work_model(indptr, medium_rows, long_rows, *, block, parts, medium_grid, workers,
+                         long_grid, mapping="flat"):
+    """Offline work model using the actually observed producer order."""
+    import numpy as np
+
+    ptr = np.asarray(indptr, dtype=np.int64)
+    medium = np.asarray(medium_rows, dtype=np.int64)
+    long = np.asarray(long_rows, dtype=np.int64)
+    if (ptr.ndim != 1 or not ptr.size or ptr[0] != 0 or np.any(np.diff(ptr) < 0)
+            or mapping not in ("flat", "two_dimensional") or block <= 0 or parts <= 0
+            or medium_grid < 0 or workers < 0 or long_grid < 0):
+        raise ValueError("invalid task diagnostic model parameters")
+    for rows in (medium, long):
+        if rows.ndim != 1 or np.any(rows < 0) or np.any(rows >= ptr.size - 1):
+            raise ValueError("invalid diagnostic queue owner")
+    if len(np.unique(np.concatenate((medium, long)))) != medium.size + long.size:
+        raise ValueError("duplicate/overlapping diagnostic row queues")
+    if (medium.size and not medium_grid) or (long.size and not workers):
+        raise ValueError("nonempty queue requires a nonzero grid")
+    if mapping == "two_dimensional" and workers != long_grid * parts:
+        raise ValueError("2D grid does not match worker count")
+    lengths = np.diff(ptr)
+    medium_chunks = (lengths[medium] + block - 1) // block
+    long_chunks = (lengths[long] + block - 1) // block
+    mt = np.zeros(medium_grid, dtype=np.int64)
+    mw = np.zeros(medium_grid, dtype=np.int64)
+    if medium.size:
+        owners = np.arange(medium.size, dtype=np.int64) % medium_grid
+        np.add.at(mt, owners, 1)
+        np.add.at(mw, owners, medium_chunks)
+    tasks = np.zeros(workers, dtype=np.int64)
+    work = np.zeros(workers, dtype=np.int64)
+    maxima = np.zeros(workers, dtype=np.int64)
+    initial = np.zeros(workers, dtype=np.int64)
+    histogram = {}
+    slots = np.arange(long.size, dtype=np.int64)
+    for part in range(parts):
+        sizes = long_chunks * (part + 1) // parts - long_chunks * part // parts
+        if not long.size:
+            continue
+        ids = slots * parts + part
+        owners = ids % workers if mapping == "flat" else part * long_grid + slots % long_grid
+        np.add.at(tasks, owners, 1)
+        np.add.at(work, owners, sizes)
+        np.maximum.at(maxima, owners, sizes)
+        first = ids < workers if mapping == "flat" else slots < long_grid
+        np.add.at(initial, owners[first], sizes[first])
+        unique, counts = np.unique(sizes, return_counts=True)
+        for size, count in zip(unique.tolist(), counts.tolist()):
+            histogram[size] = histogram.get(size, 0) + count
+    def summary(values):
+        return dict(total=int(values.sum()), maximum=int(values.max()) if values.size else 0,
+                    mean=float(values.mean()) if values.size else 0.0,
+                    max_over_mean=float(values.max() / values.mean()) if values.size and values.mean() else None,
+                    nonzero=int(np.count_nonzero(values)))
+    return dict(model="observed_queue_static_chunk_work_v1", unit="K_sized_chunks_not_time_or_occupancy",
+                mapping=mapping, block_nnz=block, parts=parts,
+                medium_row_ids=medium.tolist(), long_row_ids=long.tolist(),
+                medium_row_chunks=medium_chunks.tolist(), long_row_chunks=long_chunks.tolist(),
+                long_part_chunk_histogram=histogram,
+                medium_worker_tasks=mt.tolist(), medium_worker_chunks=mw.tolist(),
+                long_worker_tasks=tasks.tolist(), long_worker_chunks=work.tolist(),
+                long_worker_max_task_chunks=maxima.tolist(), long_worker_initial_chunks=initial.tolist(),
+                long_worker_remaining_chunks=(work-initial).tolist(),
+                medium_summary=summary(mw), long_summary=summary(work),
+                task_count=int(tasks.sum()), total_long_chunks=int(work.sum()))
+
+
+def collect_csr_task_diagnostics(prepared, rhs, expected_output, *, repeats=1):
+    """Separate, synchronous diagnostic launches; never used inside benchmark sampling.
+
+    Temporarily wrap the producer to retain this run's real queue tensors. Only
+    the ticket consumer uses an instrumented replacement; all overrides restore
+    even after compilation/execution failure. Standalone benchmark use is serial.
+    """
+    import hashlib
+    import importlib
+    from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
+    from flagsparse.sparse_operations import _spmv_csr_config as policy
+
+    if prepared.alg not in policy.THREE_TIER_ALGORITHMS:
+        return dict(status="not_applicable", reason="requires a three-tier CSR route")
+    if type(repeats) is not int or not 1 <= repeats <= 16:
+        raise ValueError("task diagnostic repeats must be between 1 and 16")
+    route = importlib.import_module("flagsparse.sparse_operations.spmv_csr")
+    producer, ticket = kernels.three_tier_producer_kernel, kernels.three_tier_ticket_consumer_kernel
+    ptr = prepared.kernel_indptr.cpu().numpy()
+    expected = expected_output.detach().cpu()
+    cfg = prepared.config
+    results = []
+    for iteration in range(repeats):
+        captured = {}
+        class ProducerCapture:
+            def __getitem__(self, grid):
+                launch = producer[grid]
+                def call(*args, **kwargs):
+                    captured.update(counts=args[5], medium=args[6], long=args[7])
+                    return launch(*args, **kwargs)
+                return call
+        class TicketTrace:
+            def __getitem__(self, grid):
+                def call(*args, **kwargs):
+                    trace = torch.empty((kwargs["WORKERS"], 6), dtype=torch.int64, device=rhs.device)
+                    captured["trace"] = trace
+                    return kernels.three_tier_ticket_trace_kernel[grid](*args, trace, **kwargs)
+                return call
+        try:
+            kernels.three_tier_producer_kernel = ProducerCapture()
+            if prepared.alg == "csr_three_tier_ticket_reduce":
+                kernels.three_tier_ticket_consumer_kernel = TicketTrace()
+            output = route.flagsparse_spmv_csr_run(prepared, rhs, out_dtype=expected_output.dtype)
+            # These synchronizations and reads are outside all performance samples.
+            torch.testing.assert_close(output.detach().cpu(), expected, rtol=0, atol=0, equal_nan=True)
+        finally:
+            kernels.three_tier_producer_kernel = producer
+            kernels.three_tier_ticket_consumer_kernel = ticket
+        stats = policy.three_tier_queue_capacity(prepared.n_rows, prepared.data.numel(), cfg, prepared.data.dtype)
+        gm = min(stats["medium_queue_capacity"], cfg.get("medium_grid_blocks", stats["medium_queue_capacity"]))
+        gl = min(stats["long_queue_capacity"], cfg["long_grid_blocks"])
+        workers = (policy.ticket_queue_capacity(prepared.n_rows, prepared.data.numel(), cfg, prepared.data.dtype)["long_worker_programs"]
+                   if prepared.alg == "csr_three_tier_ticket_reduce" else gl * cfg["cooperative_parts"])
+        counts = captured["counts"].cpu().tolist() if captured else [0, 0, 0]
+        qm, ql = counts[:2]
+        medium = captured["medium"][:qm].cpu().numpy() if captured else []
+        long = captured["long"][:ql].cpu().numpy() if captured else []
+        # Validate actual queues against the CSR, not just their counts.
+        import numpy as np
+        lengths = np.diff(ptr)
+        assert np.array_equal(np.sort(medium), np.flatnonzero((lengths > cfg["short_row_threshold"]) & (lengths <= cfg["long_row_threshold"])))
+        assert np.array_equal(np.sort(long), np.flatnonzero(lengths > cfg["long_row_threshold"]))
+        mapping = "two_dimensional" if prepared.alg in ("csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce") else "flat"
+        model = csr_queue_work_model(ptr, medium, long, block=cfg["block_nnz"], parts=cfg["cooperative_parts"],
+                                     medium_grid=gm, workers=workers, long_grid=gl, mapping=mapping)
+        model.update(iteration=iteration, queue_order_sha256=hashlib.sha256(np.asarray(long, dtype="<i8").tobytes()).hexdigest(),
+                     medium_queue_sha256=hashlib.sha256(np.asarray(medium, dtype="<i8").tobytes()).hexdigest(),
+                     counters=counts, output_matches_uninstrumented=True,
+                     worker_model_basis="static_assignment_on_this_actual_queue")
+        if "trace" in captured:
+            trace = captured["trace"].cpu().numpy()
+            total = ql * cfg["cooperative_parts"]
+            claims = ((total - workers + cfg["ticket_batch"] - 1) // cfg["ticket_batch"] + workers
+                      if cfg["long_schedule"] == "ticket" and total > workers else 0)
+            assert int(trace[:, 0].sum()) == total
+            assert int(trace[:, 1].sum()) == model["total_long_chunks"]
+            assert int(trace[:, 3].sum()) == claims and counts[2] == claims * cfg["ticket_batch"]
+            model.update(observed_worker_trace=trace.tolist(),
+                         trace_columns=["tasks", "chunks", "max_task_chunks", "claims", "initial_chunks", "remaining_chunks"],
+                         trace_scope="separate_instrumented_run_not_timed_run",
+                         trace_schedule_perturbation="extra_loads_and_stores_can_change_ticket_acquisition_order")
+            if cfg["long_schedule"] == "static":
+                assert trace[:, 0].tolist() == model["long_worker_tasks"]
+                assert trace[:, 1].tolist() == model["long_worker_chunks"]
+        results.append(model)
+    return dict(status="collected", algorithm=prepared.alg, config=dict(cfg),
+                output_dtype=str(expected_output.dtype), repetitions=results,
+                timing_scope="diagnostics_excluded_from_all_performance_samples")
+
+
+def write_csr_task_diagnostics(csv_path, row, prepared, rhs, expected_output, repeats):
+    """Persist detailed queues separately; keep terminal/CSV compact."""
+    import gzip
+    import hashlib
+    import json
+
+    payload = collect_csr_task_diagnostics(prepared, rhs, expected_output, repeats=repeats)
+    if payload["status"] == "not_applicable":
+        return dict(task_diagnostic_status="not_applicable", task_diagnostic_reason=payload["reason"])
+    identity = {k: row.get(k) for k in ("matrix", "dtype", "type_combo", "op", "index_dtype", "indptr_dtype", "alg")}
+    identity["config"] = prepared.config
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
+    folder = Path(str(csv_path) + ".task_diagnostics")
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / (digest + ".json.gz")
+    payload.update(identity=identity, timing_samples={key: row.get(key) for key in ("timing_samples", "wall_samples")},
+                   measurement={key: row.get(key) for key in ("ms", "gpu_ms", "prepared_run_ms", "sample_rule",
+                       "output_reused", "event_time_boundary", "output_allocation_policy")})
+    with gzip.open(target, "wt", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False)
+    return dict(task_diagnostic_status="collected", task_diagnostic_reason="", task_diagnostic_path=str(target),
+                task_diagnostic_runs=len(payload["repetitions"]),
+                task_queue_order_variants=len({(r["medium_queue_sha256"], r["queue_order_sha256"]) for r in payload["repetitions"]}))
 
 
 def coo_run_structure(owners, *, tiles=(32, 64, 128, 256, 512, 1024)):
@@ -334,6 +663,9 @@ def add_type_combo_arguments(parser, *, spmm=False):
         ("--reference-peak-gflops", dict(type=float, default=None)),
         ("--reference-peak-source", dict(default=None)),
         ("--perf-metrics", dict(action="store_true", help="Useful real-value throughput and modeled logical bandwidth (type combos or regular SpMV CSR; not hardware counters)")),
+        ("--locality-diagnostics", dict(action="store_true", help="CSR SpMV only: CPU locality proxies outside sampling; requires --perf-metrics and CSV")),
+        ("--task-diagnostics", dict(action="store_true", help="CSR SpMV only: separate queue/worker diagnostics, outside performance samples")),
+        ("--task-diagnostic-repeats", dict(type=int, default=1, help="Separate diagnostic runs per three-tier case (1..16)")),
     ):
         if option not in parser._option_string_actions:
             parser.add_argument(option, **kwargs)
@@ -408,6 +740,10 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
     import traceback
 
     tokens = list(sys.argv[1:] if argv is None else argv)
+    if getattr(args, "locality_diagnostics", False) and (operator != "spmv_csr" or not args.perf_metrics):
+        parser.error("--locality-diagnostics requires SpMV CSR and --perf-metrics")
+    if getattr(args, "task_diagnostics", False) and (operator != "spmv_csr" or not args.perf_metrics or not 1 <= args.task_diagnostic_repeats <= 16):
+        parser.error("--task-diagnostics requires SpMV CSR, --perf-metrics, and diagnostic repeats in 1..16")
     try:
         vendor_algs, vendor_preprocessing, diagnostic_cases, diagnostic_lengths = parse_vendor_options(operator, args)
     except ValueError as exc:
@@ -525,9 +861,15 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
               "vendor_format", "vendor_a_dtype", "vendor_rhs_dtype", "vendor_output_dtype",
               "vendor_alpha", "vendor_beta", "reference", "rtol", "atol"]
     if operator == "spmv_csr":
+        fields += ["output_reused", "event_time_boundary", "output_allocation_policy", "consumer_fused_ms", "consumer_timing_scope", "task_diagnostic_status", "task_diagnostic_reason",
+                   "task_diagnostic_path", "task_diagnostic_runs", "task_queue_order_variants", "timing_samples", "wall_samples"]
         fields += ["medium_consumer_ms", "long_consumer_ms", "row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
                    "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
                    "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "medium_grid_limit", "medium_rounds_capacity", "long_row_grid_blocks", "long_consumer_grid_blocks", "long_schedule", "ticket_batch", "long_worker_programs", "long_worker_limit", "task_capacity", "ticket_counter_dtype", "ticket_counter_max_bound"]
+    if operator == "spmv_csr":
+        fields += CSR_EXPERIMENT_FIELDS
+        if args.locality_diagnostics:
+            fields += CSR_LOCALITY_FIELDS
     if metrics_enabled:
         fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
                    "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",
@@ -540,6 +882,11 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                    "cpu_gpu_overlap_risk", "reference_bandwidth_gbs", "reference_bandwidth_source",
                    "reference_peak_gflops", "reference_peak_source", "logical_bw_ratio", "gpu_logical_bw_ratio",
                    "logical_roofline_gflops", "gpu_logical_roofline_ratio", "csr_structure", "coo_structure", "csc_structure"]
+    fields = list(dict.fromkeys(fields))
+    if args.locality_diagnostics and not csv_path:
+        parser.error("--locality-diagnostics requires a CSV output path")
+    if getattr(args, "task_diagnostics", False) and not csv_path:
+        parser.error("--task-diagnostics requires a CSV output path")
     if csv_path:
         Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
     stream = open(csv_path, "w", newline="", encoding="utf-8") if csv_path else None
@@ -735,6 +1082,8 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 gpu.append(float(meta.get("gpu_ms", elapsed)))
                                 cpu.append(float(meta.get("process_cpu_ms", 0.0)))
                             row.update(paired_timing_summary(cpu, gpu))
+                            if getattr(args, "task_diagnostics", False):
+                                row["timing_samples"] = dict(cpu_ms=cpu, gpu_ms=gpu)
                             row["ms"] = row["gpu_ms"] + row["process_cpu_ms"]
                             if metrics_enabled:
                                 row.update(sparse_work_metrics(operator=operator, shape=tuple(map(int, shape)), nnz=a.numel(),
@@ -764,6 +1113,8 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                     wall_samples.append((time.perf_counter() - started) * 1000.0)
                                     del wall_result
                                 row["prepared_run_ms"] = filtered_avg_ms(wall_samples)
+                                if getattr(args, "task_diagnostics", False):
+                                    row["wall_samples"] = wall_samples
                                 row["prepared_run_time_basis"] = "synchronized_wall_run_without_internal_timing"
                                 wall_ms = row["prepared_run_ms"]
                                 row["prepared_useful_gflops"] = row["useful_flops"] / (wall_ms * 1e6) if wall_ms > 0 else None
@@ -786,13 +1137,25 @@ def run_type_combo_benchmark(operator, args, parser, argv=None):
                                 _, _, diagnostics = run(prepared, rhs, timing=True, **kwargs)
                                 row.update({key: diagnostics.get(key) for key in ("process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "finish_ms", "scatter_ms", "reduce_ms")})
                                 if operator == "spmv_csr":
-                                    row.update({key: diagnostics.get(key) for key in ("medium_consumer_ms", "long_consumer_ms")})
+                                    row.update({key: diagnostics.get(key) for key in ("medium_consumer_ms", "long_consumer_ms", "consumer_fused_ms")})
                             row["metadata"] = meta
+                            if operator == "spmv_csr":
+                                row["consumer_timing_scope"] = meta.get("consumer_timing_scope")
+                                row.update(output_reused=False, event_time_boundary="internal_event_after_public_validation",
+                                           output_allocation_policy="allocated_inside_each_run")
+                                if getattr(args, "task_diagnostics", False):
+                                    progress("task_diagnostics_outside_sampling", row)
+                                    row.update(write_csr_task_diagnostics(csv_path, row, prepared, rhs, result, args.task_diagnostic_repeats))
                             if operator == "spmv_csr":
                                 row.update({key: meta.get(key) for key in
                                             ("row_queue_capacity", "consumer_grid_blocks", "consumer_grid_limit",
                                              "consumer_rounds_capacity", "task_acquisition", "cooperative_parts",
                                              "row_grid_blocks", "partial_slot_capacity", "medium_queue_capacity", "long_queue_capacity", "medium_grid_blocks", "medium_grid_limit", "medium_rounds_capacity", "long_row_grid_blocks", "long_consumer_grid_blocks", "long_schedule", "ticket_batch", "long_worker_programs", "long_worker_limit", "task_capacity", "ticket_counter_dtype", "ticket_counter_max_bound")})
+                            if operator == "spmv_csr":
+                                row.update({key: meta.get(key) for key in CSR_EXPERIMENT_FIELDS})
+                                if args.locality_diagnostics:
+                                    progress("locality_diagnostics_outside_sampling", row)
+                                    row.update(write_csr_locality_diagnostics(csv_path, row, arrays, rhs, shape, op, prepared.config, structure_cache))
                             row["alg_resolved"] = meta.get("alg_resolved", meta.get("alg", alg))
                             row["vendor_status"] = "SKIP"
                             row["vendor_reason"] = "disabled"

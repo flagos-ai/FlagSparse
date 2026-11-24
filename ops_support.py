@@ -364,9 +364,12 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
                 value_const="SPMV_CSR_NEW_VALUE_DTYPES",
                 values=("float16", "bfloat16") if algorithm in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else None,
                 index_const="SUPPORTED_INDEX_DTYPES",
-                ops=(("non",) if algorithm in ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_row_scalar_tail_reduce", "csr_longrow_queue_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector", "csr_short_rowqueue_strided_vector", "csr_longrow_cooperative_reduce", "csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce") else
+                ops=(("non",) if algorithm in ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_row_scalar_tail_reduce", "csr_longrow_queue_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector", "csr_short_rowqueue_strided_vector", "csr_longrow_cooperative_reduce", "csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce", "csr_three_tier_fused_static_reduce") else
                      ("trans", "conj") if algorithm == "csr_transpose_sharded_atomic" else spmv_ops),
-                notes=("CUDA/ROCm; static-first-wave integer-ticket long-row tasks or static control; exclusive fixed-P partials, no floating atomic; non only; hardware unverified"
+                notes=("CUDA/ROCm; independent window-local row ordering and grouped reduction; all ops, six dtypes/four half combinations; hardware unverified"
+                       if algorithm == "csr_window_grouped_reduce" else "CUDA/ROCm; row-boundary/NNZ event partition; fused co-rank, local merge, compute-precision cross-program atomic; all ops; hardware unverified"
+                       if algorithm == "csr_merge_event_atomic" else "CUDA/ROCm; independent joint medium/long static consumer with separate domain strides and exclusive partials; non only; six dtypes/four half combinations; hardware unverified"
+                       if algorithm == "csr_three_tier_fused_static_reduce" else "CUDA/ROCm; static-first-wave integer-ticket long-row tasks or static control; exclusive fixed-P partials, no floating atomic; non only; hardware unverified"
                        if algorithm == "csr_three_tier_ticket_reduce" else "CUDA/ROCm; bounded medium grid-stride consumers and exclusive cooperative long-row partials; non only; six dtypes/four half combinations; hardware unverified"
                        if algorithm == "csr_three_tier_bounded_reduce" else "CUDA/ROCm; three-tier row-ID queues, direct short rows, whole medium rows and exclusive cooperative long-row reduction; non only; hardware unverified"
                        if algorithm == "csr_three_tier_queue_reduce" else "CUDA/ROCm; native CSR sharded transpose; compute-precision atomic; hardware validation pending"

@@ -1560,3 +1560,213 @@ def test_three_tier_ticket_structure_and_wiring():
     for path in (ROOT / "tests/test_spmv_csr.py", ROOT / "tests/benchmark_utils.py"):
         content = path.read_text(encoding="utf-8")
         assert all(field in content for field in ("ticket_counter_max_bound", "long_schedule", "ticket_batch", "long_worker_limit"))
+
+
+def test_three_tier_fused_static_policy_and_wiring():
+    from dataclasses import replace
+    alg = "csr_three_tier_fused_static_reduce"
+    for backend, subgroup in (("cuda", 32), ("rocm", 64)):
+        caps = policy.BackendCaps(backend, "test", backend, subgroup, 1024, True, True, True,
+                                  scan=True, fp32_atomic=True, fp64_atomic=True, int32_atomic=True)
+        cfg, source = policy.resolve_config(alg, caps)
+        old, _ = policy.resolve_config("csr_three_tier_bounded_reduce", caps)
+        assert cfg == old and source == "three-tier-fused-static-conservative-v1"
+        assert policy.algorithm_spec(alg)["ops"] == ("non",)
+        for dtype in policy.VALUE_DTYPES:
+            policy.validate_support(alg, "non", dtype, "int64", "int32", caps)
+            base = policy.three_tier_queue_capacity(100, 2050, cfg, dtype)
+            stats = policy.fused_static_queue_capacity(100, 2050, cfg, dtype)
+            assert stats["workspace_peak_bytes"] == base["workspace_peak_bytes"] + 4
+            assert stats["consumer_grid_blocks"] == min(base["medium_queue_capacity"], cfg["medium_grid_blocks"]) + stats["long_worker_programs"]
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.fused_static_queue_capacity(100, 2050, dict(cfg, workspace_limit_bytes=stats["workspace_peak_bytes"]-1), dtype)
+        assert policy.fused_static_queue_capacity(0, 0, cfg, "float16")["workspace_peak_bytes"] == 12
+        for invalid in ({"long_schedule": "ticket"}, {"ticket_batch": 1}, {"long_worker_programs": 32},
+                        {"medium_grid_blocks": 0}, {"cooperative_parts": 3}):
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.resolve_config(alg, caps, invalid)
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.resolve_config(alg, replace(caps, int32_atomic=None))
+        with unittest.TestCase().assertRaises(NotImplementedError):
+            policy.validate_support(alg, "trans", "float32", "int32", "int32", caps)
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.assert_route_match(alg, cfg, "csr_three_tier_ticket_reduce", None, caps)
+    tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
+    functions = {n.name: ast.unparse(n) for n in tree.body if isinstance(n, ast.FunctionDef)}
+    body = functions["three_tier_fused_static_consumer_kernel"]
+    assert "slot += GM" in body and "task += WORKERS" in body
+    assert "tl.num_programs" not in body and "atomic_add" not in body
+    runtime = functions["run_three_tier_fused_static"]
+    assert "three_tier_fused_static_consumer_kernel" in runtime and "cooperative_row_finish_kernel" in runtime
+    for forbidden in ("short_rowqueue_strided_vector_kernel", "three_tier_ticket_consumer_kernel", ".item(", "run_three_tier_ticket("):
+        assert forbidden not in runtime
+    assert "medium_consumer_ms=None" in runtime and "long_consumer_ms=None" in runtime
+    for path in (ROOT / "tests/test_spmv_csr.py", ROOT / "tests/benchmark_utils.py"):
+        text = path.read_text(encoding="utf-8")
+        assert "consumer_fused_ms" in text and "write_csr_task_diagnostics" in text
+
+
+def test_three_tier_diagnostic_work_models_and_boundaries():
+    import numpy as np
+    tree = ast.parse((ROOT / "tests/benchmark_utils.py").read_text(encoding="utf-8"))
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("csr_tile_structure", "csr_queue_work_model")]
+    namespace = {}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "task_work_models", "exec"), namespace)
+    ptr = np.concatenate(([0], np.cumsum([0, 8, 9, 64, 65, 129, 4097])))
+    cfg = dict(short_row_threshold=8, long_row_threshold=64, block_nnz=64, cooperative_parts=8,
+               medium_grid_blocks=4, long_grid_blocks=2)
+    structure = namespace["csr_tile_structure"](ptr, config=cfg)["three_tier_queue"]["long_part_chunks"]
+    assert structure["tasks"] == 24 and structure["total_chunks"] == 70
+    assert structure["zero_tasks"] == 11 and structure["maximum"] == 9
+    assert sum(int(k)*v for k,v in structure["histogram"].items()) == 70
+    model = namespace["csr_queue_work_model"]
+    for mapping in ("flat", "two_dimensional"):
+        result = model(ptr, [3,2], [6,4,5], block=64, parts=8, medium_grid=4, workers=16, long_grid=2, mapping=mapping)
+        assert result["task_count"] == 24 and result["total_long_chunks"] == 70
+        assert sum(result["medium_worker_tasks"]) == 2 and sum(result["medium_worker_chunks"]) == 2
+        assert sum(result["long_worker_initial_chunks"]) + sum(result["long_worker_remaining_chunks"]) == 70
+        assert result["long_row_ids"] == [6,4,5]
+    empty = model([0], [], [], block=64, parts=8, medium_grid=0, workers=0, long_grid=0)
+    assert empty["task_count"] == 0 and empty["long_summary"]["max_over_mean"] is None
+    for med, long, gm, workers in (([2],[4],0,16), ([2],[4],4,0), ([2],[2],4,16), ([9],[],4,0)):
+        with unittest.TestCase().assertRaises(ValueError):
+            model(ptr, med, long, block=64, parts=8, medium_grid=gm, workers=workers, long_grid=2)
+
+
+def test_fused_diagnostics_are_separate_from_runtime_and_sampling():
+    runtime = (SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8")
+    functions = {n.name: ast.unparse(n) for n in ast.parse(runtime).body if isinstance(n, ast.FunctionDef)}
+    for name, body in functions.items():
+        if name.startswith("run_"):
+            assert "three_tier_ticket_trace_kernel" not in body
+    helper = (ROOT / "tests/benchmark_utils.py").read_text(encoding="utf-8")
+    tree = ast.parse(helper)
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    diagnostic = functions["collect_csr_task_diagnostics"]
+    restores = [node for node in ast.walk(diagnostic) if isinstance(node, ast.Try) and node.finalbody]
+    assert len(restores) == 1
+    cleanup = ast.unparse(ast.Module(body=restores[0].finalbody, type_ignores=[]))
+    assert "kernels.three_tier_producer_kernel = producer" in cleanup
+    assert "kernels.three_tier_ticket_consumer_kernel = ticket" in cleanup
+    assert "equal_nan=True" in ast.unparse(diagnostic)
+    # There must be no diagnostic launch in an event/wall sampling loop.
+    for path, function_name in ((ROOT / "tests/benchmark_utils.py", "run_type_combo_benchmark"),
+                                (ROOT / "tests/test_spmv_csr.py", "main")):
+        function = next(n for n in ast.parse(path.read_text(encoding="utf-8")).body
+                        if isinstance(n, ast.FunctionDef) and n.name == function_name)
+        for node in ast.walk(function):
+            if isinstance(node, ast.For) and "args.iters" in ast.unparse(node.iter):
+                assert "write_csr_task_diagnostics" not in ast.unparse(node)
+    assert "--task-diagnostics" in helper and "--task-diagnostic-repeats" in helper
+    public = (SOURCE / "spmv_csr.py").read_text(encoding="utf-8")
+    assert '"csr_three_tier_fused_static_reduce"' in public
+    for name in ("ops_support.py", "conf/operators.yaml", "tests/ci/test_gpu_ci_policy.py"):
+        assert "csr_three_tier_fused_static_reduce" in (ROOT / name).read_text(encoding="utf-8")
+
+
+
+def test_window_merge_profiles_and_actual_compute_capabilities():
+    from dataclasses import replace
+    caps = policy.BackendCaps("cuda", "80", "cuda", 32, 1024, True, True, True,
+                              scan=True, fp32_atomic=True, fp64_atomic=True)
+    window, merge = policy.EXPERIMENT_ALGORITHMS
+    for alg in (window, merge):
+        assert policy.normalize_alg(alg) == alg
+        spec = policy.algorithm_spec(alg)
+        assert spec["ops"] == ("non", "trans", "conj")
+        assert spec["value_dtypes"] == policy.VALUE_DTYPES
+        assert spec["half_output_dtypes"]["float16"] == ("float16", "float32")
+        assert spec["half_output_dtypes"]["bfloat16"] == ("bfloat16", "float32")
+        for dtype in policy.VALUE_DTYPES:
+            for op in spec["ops"]:
+                policy.validate_support(alg, op, dtype, "int64", "int32", caps)
+        for invalid in ({"num_stages": 2}, {"num_warps": 3}, {"num_warps": True}, {"unused": 1}):
+            with unittest.TestCase().assertRaises(ValueError):
+                policy.resolve_config(alg, caps, invalid)
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.validate_support(alg, "non", "float32", "int32", "int32", replace(caps, fp64=False))
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.resolve_config(alg, replace(caps, subgroup_width=0))
+    wc, _ = policy.resolve_config(window, caps)
+    mc, _ = policy.resolve_config(merge, caps)
+    assert wc == dict(window_rows=64, rows_per_group=8, lanes_per_row=8, row_order="length_desc", num_warps=2, num_stages=1)
+    assert mc == dict(strips_per_program=64, events_per_strip=4, workspace_limit_bytes=268435456, num_warps=4, num_stages=1)
+    for invalid in ({"window_rows": 48}, {"lanes_per_row": 64}, {"row_order": "random"}, {"events_per_strip": 2}):
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config(window, caps, invalid)
+    for invalid in ({"events_per_strip": 1}, {"strips_per_program": 16}, {"workspace_limit_bytes": 0}, {"row_order": "original"}):
+        with unittest.TestCase().assertRaises(ValueError):
+            policy.resolve_config(merge, caps, invalid)
+    cfg, _ = policy.resolve_config(window, caps, dict(window_rows=16, rows_per_group=16))
+    assert cfg["window_rows"] == cfg["rows_per_group"]
+    for feature in ("scan", "fp32_atomic"):
+        with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+            policy.validate_support(merge, "non", "float16", "int32", "int64", replace(caps, **{feature: None}))
+    with unittest.TestCase().assertRaises(policy.BackendCapabilityUnavailable):
+        policy.validate_support(merge, "non", "float32", "int32", "int32", replace(caps, fp64_atomic=None))
+    policy.validate_support(window, "non", "float32", "int32", "int32", replace(caps, scan=False, fp64_atomic=False))
+    with unittest.TestCase().assertRaises(ValueError):
+        policy.assert_route_match(window, wc, merge, None, caps)
+    for alg in (window, merge):
+        tiny, _ = policy.resolve_config(alg, replace(caps, max_threads_per_block=32))
+        assert tiny["num_warps"] == 1
+
+
+def test_window_merge_independent_routes_and_locality_sampling_boundary():
+    kernel_tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
+    functions = {n.name: ast.unparse(n) for n in kernel_tree.body if isinstance(n, ast.FunctionDef)}
+    runtime = functions["run_window_or_merge"]
+    for expected in ("window_grouped_reduce_kernel", "merge_event_atomic_kernel", "workspace_limit_bytes"):
+        assert expected in runtime
+    for forbidden in ("build_plan(", ".item(", "run_nnz_local_reduce(", "run_three_tier", "torch.sort", "nonzero"):
+        assert forbidden not in runtime
+    assert "atomic" not in functions["window_grouped_reduce_kernel"]
+    assert "_merge_event_corank" in functions["merge_event_atomic_kernel"]
+    assert "_nnz_local_write" in functions["merge_event_atomic_kernel"]
+    public = ast.parse((SOURCE / "spmv_csr.py").read_text(encoding="utf-8"))
+    route = ast.unparse(next(n for n in public.body if isinstance(n, ast.FunctionDef) and n.name == "_execute_spmv_route"))
+    assert route.index("if needs_process:") < route.index("if alg in _csr_config.EXPERIMENT_ALGORITHMS:")
+    assert "run_window_or_merge(execution, x, out, timing, _spmv_phase)" in route
+    for path, fname in ((ROOT / "tests/test_spmv_csr.py", "main"),
+                         (ROOT / "tests/benchmark_utils.py", "run_type_combo_benchmark")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        body = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == fname)
+        assert "write_csr_locality_diagnostics" in ast.unparse(body)
+        for node in ast.walk(body):
+            if isinstance(node, ast.For) and "args.iters" in ast.unparse(node.iter):
+                assert "write_csr_locality_diagnostics" not in ast.unparse(node)
+    for name in ("ops_support.py", "conf/operators.yaml", "tests/ci/test_gpu_ci_policy.py"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assert all(alg in text for alg in policy.EXPERIMENT_ALGORITHMS)
+
+
+def test_csr_locality_models_preserve_duplicates_and_actual_adjacent_windows():
+    import numpy as np
+    tree = ast.parse((ROOT / "tests/benchmark_utils.py").read_text(encoding="utf-8"))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "csr_locality_structure")
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "csr_locality_model", "exec"), namespace)
+    model = namespace["csr_locality_structure"]
+    ptr, col = [0, 2, 2, 4, 5], [0, 1, 1, 2, 0]
+    result = model(ptr, col, (4, 3), window_rows=2, rows_per_group=1, lanes_per_row=1)
+    assert result["summary"]["total_nnz"] == 5 and result["summary"]["sampled_nnz"] == 5
+    assert result["windows"][0]["adjacent_reuse_32"] is None
+    assert result["windows"][1]["adjacent_reuse_32"] == 1.0
+    assert result["summary"]["scheduled_original"] == result["summary"]["scheduled_grouped"] == 5
+    trans = model(ptr, col, (4, 3), op="trans", window_rows=2, rows_per_group=1, lanes_per_row=1)
+    assert trans["summary"]["total_nnz"] == 5 and [w["rows"] for w in trans["windows"]] == [2, 1]
+    conj = model(ptr, col, (4, 3), op="conj", window_rows=2, rows_per_group=1, lanes_per_row=1)
+    assert trans["windows"] == conj["windows"] and trans["supplemental_windows"] == conj["supplemental_windows"]
+    # Alternating long/short rows reduce scheduled padded positions after local grouping.
+    grouped = model([0, 32, 33, 65, 66], np.zeros(66, dtype=np.int64), (4, 1),
+                    window_rows=4, rows_per_group=2, lanes_per_row=8)
+    assert grouped["summary"]["scheduled_original"] == 128
+    assert grouped["summary"]["scheduled_grouped"] == 80
+    sample = model(ptr, col, (4, 3), window_rows=1, rows_per_group=1, lanes_per_row=1, max_windows=2)
+    assert sample["summary"]["coverage"] == "deterministic_even_windows_not_unbiased"
+    assert [w["window"] for w in sample["windows"]] == [0, 3]
+    assert sample["windows"][1]["adjacent_reuse_32"] == 1.0
+    empty = model([0], [], (0, 0))
+    assert empty["summary"]["sampled_windows"] == 0 and empty["summary"]["grouped_position_ratio"] is None
+    with unittest.TestCase().assertRaises(ValueError):
+        model([0, 1], [2], (1, 2))

@@ -11,11 +11,13 @@ SHORT_ROW_ALGORITHMS = ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_
 LONGROW_ALGORITHMS = ("csr_longrow_queue_atomic", "csr_longrow_grid_atomic")
 ROWQUEUE_ALGORITHMS = ("csr_short_rowqueue_vector", "csr_short_rowqueue_strided_vector")
 COOPERATIVE_ALGORITHMS = ("csr_longrow_cooperative_reduce",)
-THREE_TIER_ALGORITHMS = ("csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce")
+THREE_TIER_ALGORITHMS = ("csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce", "csr_three_tier_fused_static_reduce")
 NEW_ALGORITHMS += SHORT_ROW_ALGORITHMS + LONGROW_ALGORITHMS + ROWQUEUE_ALGORITHMS + COOPERATIVE_ALGORITHMS + ("csr_nnz_local_reduce_atomic",)
 NON_ONLY_ALGORITHMS = SHORT_ROW_ALGORITHMS + LONGROW_ALGORITHMS + ROWQUEUE_ALGORITHMS + COOPERATIVE_ALGORITHMS
 NEW_ALGORITHMS += THREE_TIER_ALGORITHMS
 NON_ONLY_ALGORITHMS += THREE_TIER_ALGORITHMS
+EXPERIMENT_ALGORITHMS = ("csr_window_grouped_reduce", "csr_merge_event_atomic")
+NEW_ALGORITHMS += EXPERIMENT_ALGORITHMS
 LEGACY_ALGORITHMS = ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
 ALGORITHMS = LEGACY_ALGORITHMS + NEW_ALGORITHMS
 BACKENDS = ("cuda", "rocm", "metax", "mthreads", "ascend")
@@ -82,7 +84,7 @@ def algorithm_spec(alg):
     new = name in NEW_ALGORITHMS
     return {
         "name": name,
-        "implementation_version": 2 if name == "csr_nnz_local_reduce_atomic" else 1 if name in NON_ONLY_ALGORITHMS else IMPLEMENTATION_VERSION,
+        "implementation_version": 2 if name == "csr_nnz_local_reduce_atomic" else 1 if name in NON_ONLY_ALGORITHMS + EXPERIMENT_ALGORITHMS else IMPLEMENTATION_VERSION,
         "ops": ("non",) if name in NON_ONLY_ALGORITHMS else ("trans", "conj") if name == "csr_transpose_sharded_atomic" else ("non", "trans", "conj"),
         "value_dtypes": ("float16", "bfloat16") if name in ("csr_nnz_tile_reduce", "csr_subgroup_pair_mixed") else VALUE_DTYPES,
         "index_dtypes": (
@@ -99,21 +101,25 @@ def algorithm_spec(alg):
         ),
         "transpose_strategy": "unsupported" if name in NON_ONLY_ALGORITHMS else "native_csr_sharded_scatter" if name == "csr_transpose_sharded_atomic" else "per_run_csr_rebuild",
         "cross_call_plan_cache": False,
-        "capability_requirements": ("int64", "reduction", "scan", "int32_atomic") if name in ROWQUEUE_ALGORITHMS + COOPERATIVE_ALGORITHMS + THREE_TIER_ALGORITHMS else ("int64", "reduction", "scan", "int32_atomic", "atomic_by_compute_dtype") if name in LONGROW_ALGORITHMS else ("int64", "reduction", "scan", "atomic_by_compute_dtype") if name == "csr_nnz_local_reduce_atomic" else ("int64", "reduction", "atomic_by_compute_dtype") if name == "csr_transpose_sharded_atomic" else ("int64", "reduction", "scan") if name in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce") else ("int64", "reduction") if new else (),
+        "capability_requirements": ("int64", "reduction", "scan", "int32_atomic") if name in ROWQUEUE_ALGORITHMS + COOPERATIVE_ALGORITHMS + THREE_TIER_ALGORITHMS else ("int64", "reduction", "scan", "int32_atomic", "atomic_by_compute_dtype") if name in LONGROW_ALGORITHMS else ("int64", "reduction", "scan", "atomic_by_compute_dtype") if name in ("csr_nnz_local_reduce_atomic", "csr_merge_event_atomic") else ("int64", "reduction", "atomic_by_compute_dtype") if name == "csr_transpose_sharded_atomic" else ("int64", "reduction", "scan") if name in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce") else ("int64", "reduction") if new else (),
         "compute_dtype": "input_dependent",
         "compute_dtype_by_input": {dt: compute_dtype(name, dt) for dt in VALUE_DTYPES},
         "half_output_dtypes": {
             dt: (dt, "float32")
             for dt in ("float16", "bfloat16")
         },
-        "config_candidates": ({"long_schedule": ("static", "ticket"), "ticket_batch": (1, 4),
+        "config_candidates": ({"window_rows": (16, 32, 64, 128), "rows_per_group": (4, 8, 16),
+                               "lanes_per_row": (4, 8, 16, 32, 64), "row_order": ("original", "length_desc")}
+                              if name == "csr_window_grouped_reduce" else
+                              {"strips_per_program": (32, 64, 128), "events_per_strip": (2, 4, 8)}
+                              if name == "csr_merge_event_atomic" else {"long_schedule": ("static", "ticket"), "ticket_batch": (1, 4),
                                "long_worker_programs": (0, 256, 512, 1024, 2048),
                                "medium_grid_blocks": (512, 1024), "cooperative_parts": (4, 8, 16)}
                               if name == "csr_three_tier_ticket_reduce" else
                               {"medium_grid_blocks": (256, 512, 1024),
                                "long_grid_blocks": (64, 128, 256), "cooperative_parts": (1, 4, 8, 16),
                                "short_row_threshold": (32, 64, 128), "long_row_threshold": (512, 1024, 2048)}
-                              if name == "csr_three_tier_bounded_reduce" else
+                              if name in ("csr_three_tier_bounded_reduce", "csr_three_tier_fused_static_reduce") else
                               {"rows_per_program": (64, 128), "short_row_threshold": (16, 32, 64),
                                "long_row_threshold": (128, 256, 512, 1024), "cooperative_parts": (1, 2, 4, 8)}
                               if name in THREE_TIER_ALGORITHMS else {"long_row_threshold": (256, 512, 1024, 2048, 4096),
@@ -157,9 +163,9 @@ def list_algorithms(op=None, dtype=None, backend=None):
 
 def validate_support(alg, op, dtype, indices_dtype, indptr_dtype, caps):
     spec = algorithm_spec(alg)
-    if alg in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_nnz_local_reduce_atomic") and not caps.scan:
+    if alg in ("csr_rowgroup_stream_reduce", "csr_row_refill_reduce", "csr_nnz_local_reduce_atomic", "csr_merge_event_atomic") and not caps.scan:
         raise BackendCapabilityUnavailable("rowgroup reduction requires scan capability")
-    if alg in ("csr_transpose_sharded_atomic", "csr_nnz_local_reduce_atomic") + LONGROW_ALGORITHMS:
+    if alg in ("csr_transpose_sharded_atomic", "csr_nnz_local_reduce_atomic", "csr_merge_event_atomic") + LONGROW_ALGORITHMS:
         feature = "fp64_atomic" if compute_dtype(alg, dtype) in ("float64", "complex128") else "fp32_atomic"
         if getattr(caps, feature) is not True:
             raise BackendCapabilityUnavailable(f"{alg} requires known {feature} capability")
@@ -396,9 +402,60 @@ def ticket_queue_capacity(rows, nnz, config, dtype):
     return stats
 
 
+def fused_static_queue_capacity(rows, nnz, config, dtype):
+    """Keep the static control's three counter slots; the third remains unused."""
+    stats = three_tier_queue_capacity(rows, nnz, config, dtype)
+    stats["descriptor_peak_bytes"] += 4
+    stats["workspace_peak_bytes"] += 4
+    if stats["workspace_peak_bytes"] > config["workspace_limit_bytes"]:
+        raise ValueError(f"fused static workspace requires {stats['workspace_peak_bytes']} bytes")
+    medium = min(stats["medium_queue_capacity"], config["medium_grid_blocks"])
+    workers = min(stats["long_queue_capacity"], config["long_grid_blocks"]) * config["cooperative_parts"]
+    stats.update(long_worker_programs=workers, consumer_grid_blocks=medium + workers)
+    return stats
+
+
 def resolve_config(alg, caps, config=None, *, return_rejections=False, mean_row_nnz=0):
     if config is not None and not isinstance(config, dict):
         raise TypeError("CSR SpMV config must be a dictionary")
+    if alg in EXPERIMENT_ALGORITHMS:
+        if (caps.backend not in ("cuda", "rocm") or caps.subgroup_width not in (32, 64)
+                or not caps.int64 or not caps.reduction
+                or type(caps.max_threads_per_block) is not int or caps.max_threads_per_block <= 0):
+            raise BackendCapabilityUnavailable("window/merge launch capabilities unknown")
+        warps = [w for w in (1, 2, 4, 8) if w * caps.subgroup_width <= caps.max_threads_per_block]
+        if not warps:
+            raise BackendCapabilityUnavailable("no legal window/merge launch")
+        window = alg == "csr_window_grouped_reduce"
+        cfg = (dict(window_rows=64, rows_per_group=8, lanes_per_row=8, row_order="length_desc")
+               if window else dict(strips_per_program=64, events_per_strip=4, workspace_limit_bytes=268435456))
+        desired = 2 if window else 4
+        cfg.update(num_warps=max((w for w in warps if w <= desired), default=min(warps)), num_stages=1)
+        supplied = {} if config is None else config
+        if not isinstance(supplied, dict):
+            raise TypeError("window/merge config must be a dictionary")
+        if set(supplied) - set(cfg):
+            raise ValueError(f"unused {alg} config fields: {sorted(set(supplied) - set(cfg))}")
+        cfg.update(supplied)
+        if any(type(v) is not int for k, v in cfg.items() if k != "row_order"):
+            raise ValueError("window/merge dimensions must be integers")
+        if cfg["num_warps"] not in warps or cfg["num_stages"] != 1:
+            raise ValueError("invalid window/merge launch")
+        if window:
+            if (cfg["window_rows"] not in (16, 32, 64, 128) or cfg["rows_per_group"] not in (4, 8, 16)
+                    or cfg["lanes_per_row"] not in (4, 8, 16, 32, 64)
+                    or cfg["lanes_per_row"] > caps.subgroup_width
+                    or cfg["row_order"] not in ("original", "length_desc")):
+                raise ValueError("invalid window grouping configuration")
+        elif (cfg["strips_per_program"] not in (32, 64, 128) or cfg["events_per_strip"] not in (2, 4, 8)
+              or cfg["workspace_limit_bytes"] <= 0):
+            raise ValueError("invalid merge event configuration")
+        result = (cfg, "explicit" if supplied else "window-merge-conservative-v1")
+        return result + ([],) if return_rejections else result
+    if alg == "csr_three_tier_fused_static_reduce":
+        cfg, _, rejected = resolve_config("csr_three_tier_bounded_reduce", caps, config, return_rejections=True)
+        result = (cfg, "explicit" if config else "three-tier-fused-static-conservative-v1")
+        return result + (rejected,) if return_rejections else result
     if alg == "csr_three_tier_ticket_reduce":
         supplied = dict(config or {})
         schedule = supplied.pop("long_schedule", "ticket")

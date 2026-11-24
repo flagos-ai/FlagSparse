@@ -115,7 +115,7 @@ def _filtered_avg_ms(times):
     return sum(kept) / len(kept) if kept else median
 
 
-def event_benchmark(fn, warmup, iters):
+def event_benchmark(fn, warmup, iters, *, samples_out=None):
     if warmup < 0 or iters < 1:
         raise ValueError("require warmup >= 0 and iters >= 1")
     # Always compile before measuring, including --warmup=0.
@@ -132,6 +132,8 @@ def event_benchmark(fn, warmup, iters):
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end))
+    if samples_out is not None:
+        samples_out.extend(samples)
     return value, _filtered_avg_ms(samples)
 
 
@@ -170,7 +172,7 @@ def _rocm_graph_replay(fn, output):
         return fn
 
 
-def measure_route(prepared, x, warmup=10, iters=50, timing=False):
+def measure_route(prepared, x, warmup=10, iters=50, timing=False, *, samples_out=None):
     with _spmv_device_context(prepared.data.device):
         # Keep the timed operation equivalent to the prepared hipSPARSE path,
         # whose DnVec output is allocated during descriptor setup.  The CSR
@@ -184,7 +186,7 @@ def measure_route(prepared, x, warmup=10, iters=50, timing=False):
         def timed_op():
             return flagsparse_spmv_csr_run(prepared, x, out=out)
         value, gpu_ms = event_benchmark(
-            timed_op, warmup, iters
+            timed_op, warmup, iters, samples_out=samples_out
         )
         # A separate invocation collects metadata and optional phase events.
         _, meta = flagsparse_spmv_csr_run(

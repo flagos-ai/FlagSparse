@@ -374,6 +374,17 @@ benchmark producer without changing either summary schema.
 
 When adding or changing an operator test entry, keep the implementation/API registration, `conf/operators.yaml` entry, pytest marker in `pytest.ini`, accuracy test, performance command, and public replacement/export registration in sync.
 
+The independent candidate `csr_three_tier_fused_static_reduce` combines medium
+and long-row static consumers in one launch, using separate grid strides and the
+existing exclusive partial reduction. It supports CUDA/ROCm `non`, six dtypes and
+four half-precision combinations; existing algorithms and defaults are unchanged.
+CSR benchmarking optionally accepts `--task-diagnostics` with `--perf-metrics`
+and CSV output. It saves observed row queues, work models and instrumented ticket
+traces outside performance sampling, with `--task-diagnostic-repeats` controlling
+repetitions. The joint phase is `consumer_fused_ms`; individual medium/long phase
+times are unavailable. Hardware compilation, correctness and benefits are pending.
+See [design and diagnostic boundaries](docs/spmv_spmm_optimization/CSR_SPMV_FUSED_STATIC_PLAN_20261124.md).
+
 The independent CSR SpMV candidate `csr_three_tier_ticket_reduce` supports `non`,
 six value dtypes and four half-precision combinations on CUDA/ROCm. It retains
 bounded medium rows and fixed-P exclusive partials; long-row workers process a
@@ -652,3 +663,15 @@ Accuracy tolerances, FAIL aggregation and algorithm selection are unchanged.
 Existing runner commands remain valid; `benchmark/test_sparse_perf.py` remains
 a placeholder. Statistic and descriptor-lifecycle tests were added for CI; local
 validation is limited to source and static checks.
+
+
+CSR SpMV also registers the independent, hardware-unverified candidates
+`csr_window_grouped_reduce` (window-local row ordering, no global plan) and
+`csr_merge_event_atomic` (row-boundary/NNZ event partition with cross-program
+fragment atomic). Both support the six CSR value types and four half-precision
+input/output combinations, with `non/trans/conj` following the existing CSR
+transpose lifecycle. Existing defaults and kernels are unchanged.
+The original benchmark accepts `--locality-diagnostics` with `--perf-metrics`
+and a CSV path, for CPU logical-address/window models collected outside timing;
+these are not hardware cache counters. See the
+[three-track design and validation status](docs/spmv_spmm_optimization/SPMV_THREE_TRACK_EXECUTION_PLAN_20261124.md).

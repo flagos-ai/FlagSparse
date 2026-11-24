@@ -142,7 +142,7 @@ def test_coo_runclass_candidates_use_existing_delivery():
 
 def test_short_csr_and_partition_csc_use_original_delivery():
     for op, names in {
-        "spmv_csr": ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_longrow_queue_atomic", "csr_row_scalar_tail_reduce", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector", "csr_short_rowqueue_strided_vector", "csr_longrow_cooperative_reduce", "csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce"),
+        "spmv_csr": ("csr_row_scalar_strip", "csr_row_static_tile", "csr_row_scalar_bound", "csr_longrow_queue_atomic", "csr_row_scalar_tail_reduce", "csr_nnz_local_reduce_atomic", "csr_longrow_grid_atomic", "csr_short_rowqueue_vector", "csr_short_rowqueue_strided_vector", "csr_longrow_cooperative_reduce", "csr_three_tier_queue_reduce", "csr_three_tier_bounded_reduce", "csr_three_tier_ticket_reduce", "csr_three_tier_fused_static_reduce", "csr_window_grouped_reduce", "csr_merge_event_atomic"),
         "spmv_csc": ("csc_col_scalar_bound", "csc_col_scalar_tail_reduce"),
         "spmm_csc": ("csc_col_partition_panel_atomic",),
     }.items():

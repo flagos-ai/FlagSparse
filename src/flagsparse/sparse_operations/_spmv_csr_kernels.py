@@ -6,6 +6,212 @@ import triton.language as tl
 
 
 @triton.jit
+def _window_order(length, local_id, W: tl.constexpr, LOG_W: tl.constexpr):
+    lane = tl.arange(0, W)
+    for level in tl.static_range(1, LOG_W + 1):
+        for shift in tl.static_range(level - 1, -1, -1):
+            partner = lane ^ (1 << shift)
+            other_length = tl.gather(length, partner, 0)
+            other_id = tl.gather(local_id, partner, 0)
+            other_first = (other_length > length) | ((other_length == length) & (other_id < local_id))
+            self_first = (length > other_length) | ((length == other_length) & (local_id < other_id))
+            take_first = ((lane & (1 << level)) == 0) == ((lane & (1 << shift)) == 0)
+            swap = tl.where(take_first, other_first, self_first)
+            length = tl.where(swap, other_length, length)
+            local_id = tl.where(swap, other_id, local_id)
+    return local_id
+
+
+@triton.jit
+def _csr_direct_store(Y, row, re, im, valid, YS, COMPLEX: tl.constexpr):
+    offset = row.to(tl.int64) * tl.cast(YS, tl.int64)
+    if COMPLEX:
+        tl.store(Y + 2 * offset, re, valid)
+        tl.store(Y + 2 * offset + 1, im, valid)
+    else:
+        tl.store(Y + offset, re, valid)
+
+
+@triton.jit
+def window_grouped_reduce_kernel(A, I, P, X, Y, M, XS, YS,
+                                 W: tl.constexpr, R: tl.constexpr, V: tl.constexpr,
+                                 LOG_W: tl.constexpr, SORT: tl.constexpr,
+                                 COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    base = tl.program_id(0).to(tl.int64) * W
+    local_id = tl.arange(0, W)
+    if SORT:
+        rows = base + local_id.to(tl.int64)
+        begin = tl.load(P + rows, rows < M, 0).to(tl.int64)
+        end = tl.load(P + rows + 1, rows < M, 0).to(tl.int64)
+        length = tl.where(rows < M, end - begin, -1)
+        local_id = _window_order(length, local_id, W, LOG_W)
+    lanes = tl.arange(0, V).to(tl.int64)
+    for group in range(W // R):
+        offsets = group * R + tl.arange(0, R)
+        row = base + tl.gather(local_id, offsets, 0).to(tl.int64)
+        valid = row < M
+        start = tl.load(P + row, valid, 0).to(tl.int64)
+        stop = tl.load(P + row + 1, valid, 0).to(tl.int64)
+        re = tl.zeros((R, V), ACC)
+        im = tl.zeros((R, V), ACC)
+        for step in range(tl.cdiv(tl.max(stop - start, 0), V)):
+            pos = start[:, None] + step * V + lanes[None, :]
+            mask = valid[:, None] & (pos < stop[:, None])
+            pr, pi = _short_row_product(A, I, X, pos, mask, XS, COMPLEX, ACC)
+            re += pr
+            if COMPLEX:
+                im += pi
+        _csr_direct_store(Y, row, tl.sum(re, 1), tl.sum(im, 1), valid, YS, COMPLEX)
+
+
+@triton.jit
+def _merge_event_corank(P, D, M, Z, WIDTH: tl.constexpr):
+    # Stable merge: row-end events precede NNZ events at equal positions.
+    diagonal = D.to(tl.int64)
+    lo = tl.maximum(diagonal - Z, 0)
+    hi = tl.minimum(diagonal, M)
+    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+        active = lo < hi
+        mid = (lo + hi) // 2
+        boundary = tl.load(P + mid + 1, active & (mid < M), 0).to(tl.int64)
+        right = boundary < diagonal - mid
+        lo = tl.where(active & right, mid + 1, lo)
+        hi = tl.where(active & ~right, mid, hi)
+    return lo, diagonal - lo
+
+
+@triton.jit
+def _merge_event_scan(lr, li, la, lh, rr, ri, ra, rh):
+    return (tl.where(rh, rr, lr + rr), tl.where(rh, ri, li + ri),
+            tl.where(rh, ra, la | ra), lh | rh)
+
+
+@triton.jit
+def merge_event_atomic_kernel(A, I, P, X, Y, M, Z, XS, YS,
+                              C: tl.constexpr, L: tl.constexpr,
+                              COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    Q: tl.constexpr = C * L
+    start_d = tl.program_id(0).to(tl.int64) * Q
+    total = tl.cast(M, tl.int64) + tl.cast(Z, tl.int64)
+    edges = tl.minimum(start_d + tl.arange(0, 2).to(tl.int64) * Q, total)
+    edge_r, edge_p = _merge_event_corank(P, edges, M, Z, 2)
+    pb, pe = tl.min(edge_p, 0), tl.max(edge_p, 0)
+    pos = pb + tl.arange(0, Q).to(tl.int64)
+    prod_r, prod_i = _short_row_product(A, I, X, pos, pos < pe, XS, COMPLEX, ACC)
+    diagonal = tl.minimum(start_d + tl.arange(0, C).to(tl.int64) * L, total)
+    row, p = _merge_event_corank(P, diagonal, M, Z, C)
+    p0 = p
+    first_owner, last_owner = row, row
+    seen = tl.full((C,), False, tl.int1)
+    has = tl.full((C,), False, tl.int1)
+    re, im = tl.zeros((C,), ACC), tl.zeros((C,), ACC)
+    first_re, first_im = tl.zeros((C,), ACC), tl.zeros((C,), ACC)
+    first_active = tl.full((C,), False, tl.int1)
+    for step in tl.static_range(0, L):
+        active = diagonal + step < total
+        stop = tl.load(P + row + 1, active & (row < M), 0).to(tl.int64)
+        boundary = active & (row < M) & (stop <= p)
+        nz = active & ~boundary & (p < Z)
+        row_start = tl.load(P + row, boundary & has, 0).to(tl.int64)
+        complete = boundary & has & (row_start >= p0)
+        _csr_direct_store(Y, row, re, im, complete, YS, COMPLEX)
+        fragment = boundary & has & ~complete
+        first_re = tl.where(fragment, re, first_re)
+        first_im = tl.where(fragment, im, first_im)
+        first_active = first_active | fragment
+        first_owner = tl.where(nz & ~seen, row, first_owner)
+        last_owner = tl.where(nz, row, last_owner)
+        seen = seen | nz
+        offset = tl.minimum(tl.maximum(p - pb, 0), Q - 1).to(tl.int32)
+        value_r = tl.gather(prod_r, offset, 0)
+        value_i = tl.gather(prod_i, offset, 0)
+        re = tl.where(boundary, 0.0, re) + tl.where(nz, value_r, 0.0)
+        im = tl.where(boundary, 0.0, im) + tl.where(nz, value_i, 0.0)
+        has = (has & ~boundary) | nz
+        row = row + boundary.to(tl.int64)
+        p = p + nz.to(tl.int64)
+    start = tl.load(P + row, has & (row < M), 0).to(tl.int64)
+    stop = tl.load(P + row + 1, has & (row < M), 0).to(tl.int64)
+    full = has & (start >= p0) & (stop <= p)
+    _csr_direct_store(Y, row, re, im, full, YS, COMPLEX)
+    tail = has & ~full
+    # If a strip contains only part of one row, keep it in its first slot.
+    to_first = tail & (first_owner == row)
+    first_re = tl.where(to_first, re, first_re)
+    first_im = tl.where(to_first, im, first_im)
+    first_active = first_active | to_first
+    owner = tl.reshape(tl.join(first_owner, last_owner), (2 * C,))
+    rr = tl.reshape(tl.join(first_re, tl.where(tail & ~to_first, re, 0.0)), (2 * C,))
+    ri = tl.reshape(tl.join(first_im, tl.where(tail & ~to_first, im, 0.0)), (2 * C,))
+    live = tl.reshape(tl.join(first_active, tail & ~to_first), (2 * C,))
+    slot = tl.arange(0, 2 * C)
+    previous = tl.gather(owner, tl.maximum(slot - 1, 0), 0)
+    following = tl.gather(owner, tl.minimum(slot + 1, 2 * C - 1), 0)
+    head = (slot == 0) | (owner != previous)
+    sr, si, sa, _ = tl.associative_scan((rr, ri, live, head), 0, _merge_event_scan)
+    emit = sa & (owner < M) & ((slot == 2 * C - 1) | (owner != following))
+    row_begin = tl.load(P + owner, emit, 0).to(tl.int64)
+    row_end = tl.load(P + owner + 1, emit, 0).to(tl.int64)
+    _nnz_local_write(Y, owner, sr, si, emit, (row_begin >= pb) & (row_end <= pe), YS, COMPLEX, True)
+
+
+def run_window_or_merge(prepared, x, out, timing, phase):
+    """Independent window ordering / event-merge routes; no reusable plans."""
+    cfg = prepared.config
+    merge = prepared.alg == "csr_merge_event_atomic"
+    component = torch.float64 if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128) else torch.float32
+    complex_input = prepared.data.is_complex()
+    dtype = (torch.complex128 if component == torch.float64 else torch.complex64) if complex_input else component
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    extra = prepared.n_rows * (16 if dtype == torch.complex128 else 8 if dtype in (torch.float64, torch.complex64) else 4) if merge and y.dtype != dtype else 0
+    if merge and extra > cfg["workspace_limit_bytes"]:
+        raise ValueError(f"merge event numeric workspace {extra} exceeds workspace_limit_bytes")
+    if prepared.n_rows > (1 << 63) - 1 - prepared.data.numel():
+        raise ValueError("CSR row/NNZ event count exceeds int64")
+    def compute():
+        data, vector = prepared.data.resolve_conj().resolve_neg(), x.resolve_conj().resolve_neg()
+        target = torch.empty(prepared.n_rows, dtype=dtype, device=y.device) if extra else y
+        view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+        args = (view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(target))
+        launch = dict(COMPLEX=complex_input, ACC=tl.float64 if component == torch.float64 else tl.float32,
+                      num_warps=cfg["num_warps"], num_stages=1, enable_fp_fusion=False)
+        if merge:
+            target.zero_()
+            if data.numel():
+                q = cfg["strips_per_program"] * cfg["events_per_strip"]
+                merge_event_atomic_kernel[(triton.cdiv(prepared.n_rows + data.numel(), q),)](
+                    *args, prepared.n_rows, data.numel(), vector.stride(0), target.stride(0),
+                    C=cfg["strips_per_program"], L=cfg["events_per_strip"], **launch)
+        elif prepared.n_rows:
+            w = cfg["window_rows"]
+            window_grouped_reduce_kernel[(triton.cdiv(prepared.n_rows, w),)](
+                *args, prepared.n_rows, vector.stride(0), target.stride(0), W=w,
+                LOG_W=w.bit_length() - 1, R=cfg["rows_per_group"], V=cfg["lanes_per_row"],
+                SORT=cfg["row_order"] == "length_desc", **launch)
+        if target is not y:
+            y.copy_(target)
+    _, compute_ms = phase(compute, timing)
+    meta = dict(process_cpu_ms=0.0, process_gpu_ms=0.0 if timing else None, compute_ms=compute_ms,
+                execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                plan_strategy="merge_event_in_kernel" if merge else "window_order_in_kernel",
+                workspace_peak_bytes=extra, descriptor_peak_bytes=0,
+                output_buffer_identity="compute_precision_buffer" if extra else "output",
+                initialization="compute_target_zero" if merge else "kernel_writes_all_rows",
+                output_conversion="final_copy_cast" if extra else "final_store",
+                x_stride=tuple(x.stride()), y_stride=tuple(y.stride()))
+    if merge:
+        meta.update(event_count=prepared.n_rows + prepared.data.numel(),
+                    events_per_program=cfg["strips_per_program"] * cfg["events_per_strip"],
+                    atomic_scope="cross_program_row_fragments")
+    else:
+        meta.update(local_ordering_scope="inside_compute_kernel", row_order=cfg["row_order"],
+                    compute_timing_scope="local_order_and_numeric_compute",
+                    fused_plan_compute_ms=compute_ms)
+    return y, meta
+
+
+@triton.jit
 def _nnz_local_owner(P, POS, VALID, LOW, HIGH, WIDTH: tl.constexpr):
     lo = tl.full((WIDTH,), 0, tl.int64) + LOW
     hi = tl.full((WIDTH,), 0, tl.int64) + HIGH
@@ -684,6 +890,172 @@ def three_tier_ticket_consumer_kernel(A, I, P, X, COUNTS, ROWS, PARTIAL, XS,
                     if current < total:
                         _ticket_exclusive_part(A, I, P, X, ROWS, PARTIAL, current, XS, K, PARTS, COMPLEX, ACC)
                 first = WORKERS + tl.atomic_add(COUNTS + 2, BATCH, sem="relaxed", scope="gpu").to(tl.int64)
+
+
+@triton.jit
+def three_tier_fused_static_consumer_kernel(A, I, P, X, Y, COUNTS, MEDIUM, LONG, PARTIAL,
+                                             XS, YS, GM: tl.constexpr, WORKERS: tl.constexpr,
+                                             K: tl.constexpr, PARTS: tl.constexpr,
+                                             COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    pid = tl.program_id(0).to(tl.int64)
+    if pid < GM:
+        slot = pid
+        count = tl.load(COUNTS).to(tl.int64)
+        lane = tl.arange(0, K).to(tl.int64)
+        while slot < count:
+            row = tl.load(MEDIUM + slot).to(tl.int64)
+            start = tl.load(P + row).to(tl.int64)
+            stop = tl.load(P + row + 1).to(tl.int64)
+            re = tl.zeros((K,), ACC)
+            im = tl.zeros((K,), ACC)
+            for base in range(start, stop, K):
+                pos = base + lane
+                pr, pi = _short_row_product(A, I, X, pos, pos < stop, XS, COMPLEX, ACC)
+                re += pr
+                if COMPLEX:
+                    im += pi
+            target = row * tl.cast(YS, tl.int64)
+            if COMPLEX:
+                tl.store(Y + 2 * target, tl.sum(re, 0))
+                tl.store(Y + 2 * target + 1, tl.sum(im, 0))
+            else:
+                tl.store(Y + target, tl.sum(re, 0))
+            # Each domain uses its own stride, never the combined grid size.
+            slot += GM
+    else:
+        task = pid - GM
+        total = tl.load(COUNTS + 1).to(tl.int64) * PARTS
+        while task < total:
+            _ticket_exclusive_part(A, I, P, X, LONG, PARTIAL, task, XS, K, PARTS, COMPLEX, ACC)
+            task += WORKERS
+
+
+def run_three_tier_fused_static(prepared, x, out, timing, phase):
+    from ._spmv_csr_config import fused_static_queue_capacity
+
+    cfg = prepared.config
+    stats = fused_static_queue_capacity(prepared.n_rows, prepared.data.numel(), cfg, prepared.data.dtype)
+    medium_capacity, long_capacity = stats["medium_queue_capacity"], stats["long_queue_capacity"]
+    medium_grid = min(medium_capacity, cfg["medium_grid_blocks"])
+    parts = cfg["cooperative_parts"]
+    long_grid = min(long_capacity, cfg["long_grid_blocks"])
+    workers = stats["long_worker_programs"]
+    complex_input = prepared.data.is_complex()
+    fp64 = prepared.data.dtype in (torch.float32, torch.float64, torch.complex128)
+    component = torch.float64 if fp64 else torch.float32
+    y = out if out is not None else torch.empty(prepared.n_rows, dtype=prepared.data.dtype, device=x.device)
+    def initialize():
+        return (prepared.data.resolve_conj().resolve_neg(), x.resolve_conj().resolve_neg(),
+                torch.zeros(3, dtype=torch.int32, device=x.device),
+                torch.empty(medium_capacity, dtype=torch.int64, device=x.device),
+                torch.empty(long_capacity, dtype=torch.int64, device=x.device),
+                torch.empty(long_capacity * parts * (2 if complex_input else 1), dtype=component, device=x.device))
+    (data, vector, counts, medium_rows, long_rows, partial), init_ms = phase(initialize, timing)
+    long_count = counts[1:2]
+    view = lambda tensor: torch.view_as_real(tensor) if complex_input else tensor
+    common = dict(COMPLEX=complex_input, ACC=tl.float64 if fp64 else tl.float32,
+                  num_stages=cfg["num_stages"], enable_fp_fusion=False)
+    def produce():
+        if prepared.n_rows:
+            three_tier_producer_kernel[(triton.cdiv(prepared.n_rows, cfg["rows_per_program"]),)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                counts, medium_rows, long_rows, prepared.n_rows, vector.stride(0), y.stride(0),
+                R=cfg["rows_per_program"], S=cfg["short_row_threshold"], L=cfg["long_row_threshold"],
+                num_warps=cfg["producer_num_warps"], **common)
+    _, producer_ms = phase(produce, timing)
+    def consume():
+        if medium_grid + workers:
+            three_tier_fused_static_consumer_kernel[(medium_grid + workers,)](
+                view(data), prepared.kernel_indices, prepared.kernel_indptr, view(vector), view(y),
+                counts, medium_rows, long_rows, partial, vector.stride(0), y.stride(0),
+                GM=medium_grid, WORKERS=workers, K=cfg["block_nnz"], PARTS=parts,
+                num_warps=cfg["num_warps"], **common)
+    _, consumer_ms = phase(consume, timing)
+    def finish():
+        if long_grid:
+            cooperative_row_finish_kernel[(long_grid,)](
+                long_count, long_rows, partial, view(y), y.stride(0), PARTS=parts,
+                num_warps=cfg["producer_num_warps"], **common)
+    _, finish_ms = phase(finish, timing)
+    return y, dict(stats, process_cpu_ms=0.0, process_gpu_ms=init_ms,
+                   compute_ms=producer_ms + consumer_ms + finish_ms if timing else None,
+                   init_ms=init_ms, producer_ms=producer_ms, consumer_ms=consumer_ms,
+                   consumer_fused_ms=consumer_ms, medium_consumer_ms=None, long_consumer_ms=None,
+                   consumer_timing_scope="joint_medium_long", finish_ms=finish_ms,
+                   fused_plan_compute_ms=producer_ms, queue_count_readback=False,
+                   plan_strategy="per_run_three_tier_row_ids", floating_point_atomic=False,
+                   task_acquisition="partitioned_static_domains", long_schedule="static",
+                   cooperative_parts=parts, medium_grid_blocks=medium_grid,
+                   medium_grid_limit=cfg["medium_grid_blocks"],
+                   medium_rounds_capacity=triton.cdiv(medium_capacity, medium_grid) if medium_grid else 0,
+                   long_row_grid_blocks=long_grid, long_consumer_grid_blocks=workers,
+                   initialization="two_queue_counters_and_unused_control_slot", output_conversion="final_store",
+                   x_stride=tuple(x.stride()), y_stride=tuple(y.stride()),
+                   execution_indices_dtype=str(prepared.kernel_indices.dtype).removeprefix("torch."),
+                   execution_indptr_dtype=str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+                   output_buffer_identity="out" if out is not None else "allocated")
+
+
+@triton.jit
+def _diagnostic_part_chunks(P, ROWS, TASK, K: tl.constexpr, PARTS: tl.constexpr):
+    row = tl.load(ROWS + TASK // PARTS).to(tl.int64)
+    length = tl.load(P + row + 1).to(tl.int64) - tl.load(P + row).to(tl.int64)
+    chunks = (length + K - 1) // K
+    part = TASK % PARTS
+    return chunks * (part + 1) // PARTS - chunks * part // PARTS
+
+
+@triton.jit
+def three_tier_ticket_trace_kernel(A, I, P, X, COUNTS, ROWS, PARTIAL, XS, TRACE,
+                                    WORKERS: tl.constexpr, BATCH: tl.constexpr,
+                                    STATIC: tl.constexpr, K: tl.constexpr, PARTS: tl.constexpr,
+                                    COMPLEX: tl.constexpr, ACC: tl.constexpr):
+    """Instrumented diagnostic only; never launched by the normal run route."""
+    total = tl.load(COUNTS + 1).to(tl.int64) * PARTS
+    pid = tl.program_id(0).to(tl.int64)
+    task = pid
+    done = tl.full((), 0, tl.int64)
+    work = tl.full((), 0, tl.int64)
+    maximum = tl.full((), 0, tl.int64)
+    claims = tl.full((), 0, tl.int64)
+    first_work = tl.full((), 0, tl.int64)
+    if STATIC:
+        while task < total:
+            _ticket_exclusive_part(A, I, P, X, ROWS, PARTIAL, task, XS, K, PARTS, COMPLEX, ACC)
+            chunks = _diagnostic_part_chunks(P, ROWS, task, K, PARTS)
+            first_work += tl.where(task == pid, chunks, 0)
+            done += 1
+            work += chunks
+            maximum = tl.maximum(maximum, chunks)
+            task += WORKERS
+    else:
+        if task < total:
+            _ticket_exclusive_part(A, I, P, X, ROWS, PARTIAL, task, XS, K, PARTS, COMPLEX, ACC)
+            chunks = _diagnostic_part_chunks(P, ROWS, task, K, PARTS)
+            first_work = chunks
+            done += 1
+            work += chunks
+            maximum = tl.maximum(maximum, chunks)
+        if total > WORKERS:
+            first = WORKERS + tl.atomic_add(COUNTS + 2, BATCH, sem="relaxed", scope="gpu").to(tl.int64)
+            claims += 1
+            while first < total:
+                for offset in tl.static_range(0, BATCH):
+                    current = first + offset
+                    if current < total:
+                        _ticket_exclusive_part(A, I, P, X, ROWS, PARTIAL, current, XS, K, PARTS, COMPLEX, ACC)
+                        chunks = _diagnostic_part_chunks(P, ROWS, current, K, PARTS)
+                        done += 1
+                        work += chunks
+                        maximum = tl.maximum(maximum, chunks)
+                first = WORKERS + tl.atomic_add(COUNTS + 2, BATCH, sem="relaxed", scope="gpu").to(tl.int64)
+                claims += 1
+    tl.store(TRACE + 6 * pid, done)
+    tl.store(TRACE + 6 * pid + 1, work)
+    tl.store(TRACE + 6 * pid + 2, maximum)
+    tl.store(TRACE + 6 * pid + 3, claims)
+    tl.store(TRACE + 6 * pid + 4, first_work)
+    tl.store(TRACE + 6 * pid + 5, work - first_work)
 
 
 def run_three_tier_ticket(prepared, x, out, timing, phase):

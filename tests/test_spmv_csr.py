@@ -197,6 +197,10 @@ def main(argv=None):
         args.alg = "compare"
     if args.warmup < 0 or args.iters < 1:
         p.error("require warmup >= 0 and iters >= 1")
+    if args.locality_diagnostics and not args.csv_csr:
+        p.error("--locality-diagnostics requires --csv-csr")
+    if args.task_diagnostics and not args.csv_csr:
+        p.error("--task-diagnostics requires --csv-csr")
     if not args.paths and not args.synthetic:
         p.error("supply .mtx paths or --synthetic")
     sys.path.insert(0, str(ROOT / "src"))
@@ -296,7 +300,9 @@ def main(argv=None):
             p.error("no registered algorithms support the selected combinations")
     else:
         explicit_algorithms = choices(args.alg, ("auto",) + registered)
-    fields = FIELDS + (["process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "medium_consumer_ms", "long_consumer_ms", "finish_ms", "scatter_ms", "reduce_ms"] if args.timing else [])
+    fields = FIELDS + (["process_gpu_ms", "compute_ms", "fused_plan_compute_ms", "init_ms", "producer_ms", "consumer_ms", "medium_consumer_ms", "long_consumer_ms", "consumer_fused_ms", "finish_ms", "scatter_ms", "reduce_ms"] if args.timing else [])
+    fields += ["output_reused", "event_time_boundary", "output_allocation_policy", "consumer_timing_scope", "task_diagnostic_status", "task_diagnostic_reason", "task_diagnostic_path",
+               "task_diagnostic_runs", "task_queue_order_variants", "timing_samples", "wall_samples"]
     if args.perf_metrics:
         fields += ["metrics_model", "metrics_time_basis", "useful_flops", "sparse_input_bytes",
                    "rhs_gather_bytes", "output_write_bytes", "logical_bytes", "arithmetic_intensity",
@@ -305,6 +311,11 @@ def main(argv=None):
                    "prepared_useful_gflops", "prepared_logical_gbs", "cpu_gpu_overlap_risk"]
     if common._is_rocm_runtime():
         fields += ["execution_kernel", "nnz_prepare_ms", "nnz_metadata_bytes"]
+    from benchmark_utils import CSR_LOCALITY_FIELDS, CSR_EXPERIMENT_FIELDS
+    fields += CSR_EXPERIMENT_FIELDS
+    if args.locality_diagnostics:
+        fields += CSR_LOCALITY_FIELDS
+    fields = list(dict.fromkeys(fields))
     csv_file = None
     writer = None
     failures = 0
@@ -454,7 +465,9 @@ def main(argv=None):
                                     raise
                                 continue
                             for alg in algorithms:
-                                row = dict(base, alg=alg)
+                                row = dict(base, alg=alg, output_reused=True,
+                                           event_time_boundary="outer_event_public_prepared_run",
+                                           output_allocation_policy="out_allocated_before_sampling")
                                 try:
                                     prepared = fs.prepare_spmv_csr(
                                         data,
@@ -465,13 +478,17 @@ def main(argv=None):
                                         alg=alg,
                                         config=args.config,
                                     )
+                                    timing_samples = [] if args.task_diagnostics else None
                                     value, meta = measure_route(
                                         prepared,
                                         x,
                                         args.warmup,
                                         args.iters,
                                         args.timing,
+                                        samples_out=timing_samples,
                                     )
+                                    if args.task_diagnostics:
+                                        row["timing_samples"] = dict(gpu_ms=timing_samples)
                                     ok, error = check_result(value, ref, rtol, atol)
                                     row.update(
                                         meta,
@@ -517,11 +534,19 @@ def main(argv=None):
                                             wall_samples.append((time.perf_counter() - start) * 1000)
                                             del wall_result
                                         wall = filtered_avg_ms(wall_samples)
+                                        if args.task_diagnostics:
+                                            row["wall_samples"] = wall_samples
                                         row.update(prepared_run_ms=wall,
                                                    prepared_run_time_basis="synchronized_wall_run_without_internal_timing",
                                                    prepared_useful_gflops=row["useful_flops"] / (wall * 1e6) if wall > 0 and row.get("useful_flops") is not None else None,
                                                    prepared_logical_gbs=row["logical_bytes"] / (wall * 1e6) if wall > 0 and row.get("logical_bytes") is not None else None,
                                                    cpu_gpu_overlap_risk=row["process_cpu_ms"] > 0)
+                                    if args.locality_diagnostics:
+                                        from benchmark_utils import write_csr_locality_diagnostics
+                                        row.update(write_csr_locality_diagnostics(args.csv_csr, row, (data, ci, rp), x, shape, op, prepared.config, structure_cache))
+                                    if args.task_diagnostics:
+                                        from benchmark_utils import write_csr_task_diagnostics
+                                        row.update(write_csr_task_diagnostics(args.csv_csr, row, prepared, x, value, args.task_diagnostic_repeats))
                                     row["speedup_vs_vendor"] = (
                                         row["vendor_ms"] / row["ms"]
                                         if isinstance(row.get("vendor_ms"), (int, float))

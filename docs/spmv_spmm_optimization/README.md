@@ -6,6 +6,9 @@
 
 | 文档 | 范围 | 当前状态 |
 |---|---|---|
+| [11.24 三组实验实际落地方案](SPMV_THREE_TRACK_EXECUTION_PLAN_20261124.md) | 直接算法配置消融、局部行重组/merge事件两个独立候选、局部性与开销诊断、原测试联动 | 两个独立算法与局部性诊断源码接入、静态检查完成；硬件编译/正确性/收益未验证；旧默认不变 |
+| [11.24 SpMV多方向理论与实践复盘规划](SPMV_PORTFOLIO_RESEARCH_PLAN_20261124.md) | 已验证方向深化、事件空间分解、局部重排、x局部性、结构复用及实验门槛 | 分析与研究计划；未修改算子，不以方案代替实机证据 |
+| [11.24 CSR SpMV 独立静态consumer融合](CSR_SPMV_FUSED_STATIC_PLAN_20261124.md) | 有界中行＋长行静态consumer融合，实际队列/任务粒度诊断 | 源码接入，硬件编译、准确性和性能待验收；保留旧static及默认路由 |
 | [11.23 CSR SpMV 长行ticket动态领取方案](CSR_SPMV_TICKET_LONGROW_PLAN_20261123.md) | 首轮静态＋余下隐式分片动态领取；static对照、B1/B4及原测试接入 | 源码/静态检查完成，GPU编译与实机待验收；non-only，保留旧算法及默认路由 |
 | [11.22 CSR SpMV 三类任务协作计划及11.23有界中行增量](CSR_SPMV_THREE_TIER_QUEUE_PLAN_20261122.md) | 同批S128、G及L/P验证；新增有界中行＋长行协作独立候选 | 原候选11.22批次零次最佳；修复strided out遗漏，新bounded候选源码接入、硬件待验收；保留默认路由 |
 | [CSR non SpMV 定向优化候选](CSR_NON_SPMV_TARGETED_CANDIDATES.md) | scalar-strip、static-tile、长行任务队列及 Triton 实现约束 | 设计提案，待独立评审，未实现 |
